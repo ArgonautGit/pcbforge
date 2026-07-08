@@ -23,11 +23,11 @@ done-when. Task prompts live in `docs/backlog.md`.
 - [x] CAM-1 — Isolation + rub-out path generator
 - [x] CAM-2 — Sliver force-clear
 - [ ] CAM-3 — Heat-aware ordering
-- [ ] CAM-4 — Pass planner
+- [x] CAM-4 — Pass planner
 - [ ] CAM-5 — Dual-machine splitter
 - [ ] CAM-6 — Process compilers: mask-open / legend / stencil / drill map
 - [x] CAM-7 — Design-rule checker
-- [ ] CAM-8 — Fiducial/tooling feature injector
+- [x] CAM-8 — Fiducial/tooling feature injector
 - [ ] CAM-9 — Tiling for the slide extension *(stretch)*
 
 ## WS-EMIT — Backends & CLI
@@ -58,7 +58,7 @@ done-when. Task prompts live in `docs/backlog.md`.
 - [x] ORC-1 — SQLite persistence *(schema.sql agent-authored per operator direction — see decisions.md)*
 - [ ] ORC-2 — Stage engine
 - [ ] ORC-3 — ClearanceLoop executor
-- [ ] ORC-4 — Airflow interlock
+- [x] ORC-4 — Airflow interlock *(live block-the-duct gate deferred to docs/checklists/orc-4-airflow-live.md)*
 - [ ] ORC-5 — Cross-machine handoff
 - [ ] ORC-6 — Double-sided flip flow
 - [ ] ORC-7 — Guided drilling

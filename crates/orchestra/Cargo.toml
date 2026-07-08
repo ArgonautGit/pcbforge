@@ -7,3 +7,4 @@ license.workspace = true
 [dependencies]
 pcb-core = { workspace = true }
 rusqlite = { version = "0.37", features = ["bundled"] }
+serialport = { version = "4.9.0", default-features = false }
