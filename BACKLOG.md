@@ -22,9 +22,9 @@ done-when. Task prompts live in `docs/backlog.md`.
 - [x] GEO-1 — Boolean/offset foundation
 - [x] CAM-1 — Isolation + rub-out path generator
 - [x] CAM-2 — Sliver force-clear
-- [ ] CAM-3 — Heat-aware ordering
+- [x] CAM-3 — Heat-aware ordering
 - [x] CAM-4 — Pass planner
-- [ ] CAM-5 — Dual-machine splitter
+- [x] CAM-5 — Dual-machine splitter
 - [ ] CAM-6 — Process compilers: mask-open / legend / stencil / drill map
 - [x] CAM-7 — Design-rule checker
 - [x] CAM-8 — Fiducial/tooling feature injector
