@@ -55,7 +55,7 @@ done-when. Task prompts live in `docs/backlog.md`.
 - [ ] VIS-13 — Verification-cross measurement
 
 ## WS-ORC — Orchestration
-- [ ] ORC-1 — SQLite persistence
+- [x] ORC-1 — SQLite persistence *(schema.sql agent-authored per operator direction — see decisions.md)*
 - [ ] ORC-2 — Stage engine
 - [ ] ORC-3 — ClearanceLoop executor
 - [ ] ORC-4 — Airflow interlock

@@ -38,6 +38,16 @@ discovered constraints here.
   versions RES-1 audited), nalgebra 0.35.0 (RES-1 audited 0.34-era APIs; the
   SVD/solve entry points VIS-5 needs are unchanged in 0.35).
 
+## 2026-07-08 — ORC-1 notes
+
+- `docs/schema.sql` was agent-authored (same operator authorization as
+  scaffold.md) — the playbook's verbatim schema was never provided. Tables:
+  pallet/board/runlog/material plus schema_version; JSON detail columns are
+  writer-owned strings. Future playbook content supersedes via migration.
+- rusqlite pinned to 0.37 (bundled): 0.40's libsqlite3-sys build script uses
+  the unstable `cfg_select!` macro and fails on rustc 1.94.1. Revisit on the
+  next toolchain bump.
+
 ## 2026-07-08 — INF-2 notes
 
 - Action versions verified against their repos on 2026-07-08 (per the task's
