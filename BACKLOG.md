@@ -19,7 +19,7 @@ done-when. Task prompts live in `docs/backlog.md`.
 - [ ] ING-6 — kicad-cli invoker
 
 ## WS-GEO / WS-CAM — Geometry kernel & ablation CAM
-- [ ] GEO-1 — Boolean/offset foundation
+- [x] GEO-1 — Boolean/offset foundation
 - [ ] CAM-1 — Isolation + rub-out path generator
 - [ ] CAM-2 — Sliver force-clear
 - [ ] CAM-3 — Heat-aware ordering

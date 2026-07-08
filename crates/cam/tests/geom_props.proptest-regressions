@@ -1,0 +1,10 @@
+# Seeds for failure cases proptest has generated in the past. It is
+# automatically read and these particular cases re-run before any
+# novel cases are generated.
+#
+# It is recommended to check this file in to source control so that
+# everyone who runs the test benefits from these saved cases.
+cc 6192a0bceeaae8ce5d8efdfbe72675125ee3291bf889b4254e197c20dcf433a1 # shrinks to p = Poly { outer: [P { x: 500000, y: 0 }, P { x: -250000, y: 433013 }, P { x: -250000, y: -433013 }], holes: [] }, frac = 0.05
+cc 9e8f3ffc3fc0b83058fbaf4992f34ec24150982ee9745493fdb97dc1f6255fb5 # shrinks to p = Poly { outer: [P { x: -6614926, y: -3786115 }, P { x: -3614534, y: -6710220 }, P { x: 1832030, y: -7398350 }, P { x: 5991326, y: -4711255 }, P { x: 7619807, y: -174506 }, P { x: 6938697, y: 3153790 }, P { x: 2387637, y: 7238170 }, P { x: -1630054, y: 7445457 }, P { x: -5081801, y: 5680424 }, P { x: -6817241, y: 3408393 }], holes: [] }, frac = 0.3350236768540799
+cc 07dfcd8b44a821e878504b5406eb325c7584dd76b0cf5afd5f9007933d7eb44f # shrinks to p = Poly { outer: [P { x: 500000, y: 0 }, P { x: -250000, y: 433013 }, P { x: -250000, y: -433013 }], holes: [] }, frac = 0.05
+cc e5043751304f48edcbee5b98801ef5523ada66911a1eb72698134f50bb33aad4 # shrinks to p = Poly { outer: [P { x: -3962259, y: 3981506 }, P { x: -5534875, y: 957627 }, P { x: -5060592, y: -2437682 }, P { x: -3008983, y: -4743196 }, P { x: 1928524, y: -5275669 }, P { x: 5616579, y: -76974 }, P { x: 3256163, y: 4577040 }, P { x: -2270057, y: 5137969 }], holes: [] }, frac = 0.3767417951083723
