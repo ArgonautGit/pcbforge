@@ -91,4 +91,4 @@ done-when. Task prompts live in `docs/backlog.md`.
 - [ ] RES-1 — Crate due diligence
 - [x] RES-2 — LightBurn automation surface
 - [ ] RES-3 — JCZ protocol public documentation survey
-- [ ] RES-4 — Consumables & floor benchmarks *(optional)*
+- [x] RES-4 — Consumables & floor benchmarks *(optional)*
