@@ -81,7 +81,7 @@ done-when. Task prompts live in `docs/backlog.md`.
 - [ ] DRV-8 — Correction-mesh pre-warp in the native path
 
 ## WS-QA — Testing & quality
-- [ ] QA-1 — Geometry property-test expansion
+- [x] QA-1 — Geometry property-test expansion
 - [ ] QA-2 — CI virtual-fab integration test
 - [ ] QA-3 — AOI corpus & annotation tool
 - [ ] QA-4 — Nightly hardware-in-loop script
