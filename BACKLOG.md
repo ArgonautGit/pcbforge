@@ -36,7 +36,7 @@ done-when. Task prompts live in `docs/backlog.md`.
 - [ ] EMIT-3 — CLI surface
 
 ## WS-SIM — Virtual board
-- [ ] SIM-1 — Raster sim backend (v1)
+- [x] SIM-1 — Raster sim backend (v1)
 - [ ] SIM-2 — Heightmap sim + removal model (v2)
 
 ## WS-VIS — Vision & calibration

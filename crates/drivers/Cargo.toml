@@ -6,3 +6,8 @@ license.workspace = true
 
 [dependencies]
 pcb-core = { workspace = true }
+image = { version = "0.25.10", default-features = false, features = ["png"] }
+
+[dev-dependencies]
+testkit = { path = "../testkit" }
+cam = { path = "../cam" }
