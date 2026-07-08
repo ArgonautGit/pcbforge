@@ -68,3 +68,19 @@ discovered constraints here.
   could not always be met — LightBurn galvo/Linux automation and fiber-ablation
   PCB write-ups change slowly. Older sources are used where nothing newer
   exists and are dated so staleness is visible.
+
+## 2026-07-08 — CAM-3 notes
+
+- Baseline for the travel metric (`total_jump_length_nm`) is an **unordered**
+  order — a fixed-seed random shuffle of the ablation elements — not
+  `ablation_paths`' own output. Ablation already emits a travel-coherent
+  scanline sweep (~6-7 mm average jump), and the ≥5 mm mean-consecutive-centroid
+  spread that heat-aware ordering must guarantee is fundamentally in tension
+  with beating an already-coherent order on travel (you cannot be ≥5 mm apart on
+  average yet jump ≤1.3 mm on average). The meaningful, internally-consistent
+  reading of "≤ 1/5 of naive" is therefore travel vs. *no ordering strategy*.
+  Against that unordered baseline the 10 mm-cell nearest-neighbour +
+  boustrophedon round-robin order cuts travel several-fold (measured ratio
+  ≈ 0.16 on a 16×16 grid spread over ~143 mm) while keeping consecutive
+  centroids ≈ 11-12 mm apart. The shuffle uses a hardcoded LCG seed (no `rand`
+  crate, no clock) so the test is deterministic.
