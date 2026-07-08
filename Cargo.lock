@@ -67,8 +67,8 @@ name = "cam"
 version = "0.1.0"
 dependencies = [
  "cavalier_contours",
- "core",
  "i_overlay",
+ "pcb-core",
  "proptest",
 ]
 
@@ -89,10 +89,6 @@ source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "9330f8b2ff13f34540b44e946ef35111825727b38d33286ef986142615121801"
 
 [[package]]
-name = "core"
-version = "0.1.0"
-
-[[package]]
 name = "crc32fast"
 version = "1.5.0"
 source = "registry+https://github.com/rust-lang/crates.io-index"
@@ -105,7 +101,7 @@ dependencies = [
 name = "drivers"
 version = "0.1.0"
 dependencies = [
- "core",
+ "pcb-core",
 ]
 
 [[package]]
@@ -255,7 +251,7 @@ dependencies = [
 name = "ingest"
 version = "0.1.0"
 dependencies = [
- "core",
+ "pcb-core",
 ]
 
 [[package]]
@@ -395,14 +391,18 @@ checksum = "9f7c3e4beb33f85d45ae3e3a1792185706c8e16d043238c593331cc7cd313b50"
 name = "orchestra"
 version = "0.1.0"
 dependencies = [
- "core",
+ "pcb-core",
 ]
+
+[[package]]
+name = "pcb-core"
+version = "0.1.0"
 
 [[package]]
 name = "pcbforge"
 version = "0.1.0"
 dependencies = [
- "core",
+ "pcb-core",
 ]
 
 [[package]]
@@ -628,8 +628,8 @@ name = "testkit"
 version = "0.1.0"
 dependencies = [
  "anyhow",
- "core",
  "image",
+ "pcb-core",
 ]
 
 [[package]]
@@ -655,8 +655,8 @@ name = "vision"
 version = "0.1.0"
 dependencies = [
  "approx",
- "core",
  "nalgebra",
+ "pcb-core",
 ]
 
 [[package]]

@@ -1,6 +1,6 @@
 //! Golden-image test harness (dev-dependency only).
 //!
-//! Provides a reference software rasterizer for [`core::Layer`], an image
+//! Provides a reference software rasterizer for [`pcb_core::Layer`], an image
 //! comparison assertion that dumps diff artifacts on failure, and a helper to
 //! shell out to external rasterizers (gerbv, tracespace, ...) and load their
 //! PNG output.
@@ -16,8 +16,8 @@ use std::path::{Path, PathBuf};
 use std::process::Command;
 
 use anyhow::{Context, ensure};
-use core::{Layer, NM_PER_UM, Nm, P, Ring};
 use image::{GrayImage, Luma, Rgb, RgbImage};
+use pcb_core::{Layer, NM_PER_UM, Nm, P, Ring};
 
 /// Pixel value for filled (copper) area.
 pub const FILLED: u8 = 255;
@@ -293,7 +293,7 @@ fn collect_crossings(ring: &Ring, ys: Nm, out: &mut Vec<Nm>) {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use core::{NM_PER_MM, Poly};
+    use pcb_core::{NM_PER_MM, Poly};
     use std::panic::{AssertUnwindSafe, catch_unwind};
 
     fn rect(x0: Nm, y0: Nm, x1: Nm, y1: Nm) -> Ring {

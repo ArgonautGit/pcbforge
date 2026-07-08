@@ -27,11 +27,13 @@ discovered constraints here.
   by RES-1's crate audit. INF-1's "use it verbatim" now refers to the
   agent-authored scaffold. Any future playbook content that disagrees should
   supersede via a follow-up refactor, not silent divergence.
-- Naming note: the shared-types crate is genuinely named `core`. An explicit
-  `core = { workspace = true }` dependency shadows Rust's built-in `core` in
-  dependent crates — verified by compiling `core::P::new` through crates/cam.
-  Code inside dependent crates therefore cannot refer to the *built-in* core
-  by that name (use `std::` paths, which is what we do anyway).
+- Naming note (superseded same day): the shared-types crate was first named
+  `core`, which compiles for plain code but breaks macro expansions that use
+  absolute `core::…` paths (proptest's `core::concat!`), discovered during
+  GEO-1. Renamed workspace-wide to `pcb-core` (imported as `pcb_core::…`);
+  directory remains `crates/core`. scaffold.md carries the amendment. The
+  backlog prompts' `core::Layer` spelling should be read as `pcb_core::Layer`
+  from here on.
 - Pinned by INF-1: i_overlay 7.0.2, cavalier_contours 0.7.0 (both exactly the
   versions RES-1 audited), nalgebra 0.35.0 (RES-1 audited 0.34-era APIs; the
   SVD/solve entry points VIS-5 needs are unchanged in 0.35).

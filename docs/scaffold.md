@@ -58,12 +58,19 @@ edition = "2024"
 license = "MIT"
 
 [workspace.dependencies]
-core = { path = "crates/core" }
+pcb-core = { path = "crates/core" }
 ```
 
 Every crate's `Cargo.toml` sets `edition.workspace = true` and
-`license.workspace = true`, and depends on core via
-`core = { workspace = true }` (all crates except core itself).
+`license.workspace = true`, and depends on the shared-types crate via
+`pcb-core = { workspace = true }` (all crates except core itself); code
+imports it as `pcb_core::…`.
+
+> Amendment (2026-07-08, GEO-1): the package was originally named `core`.
+> That works for plain code (an explicit dependency shadows the built-in
+> `core` in the extern prelude) but breaks macro expansions that spell out
+> absolute `core::…` paths — proptest's macros, for one. Renamed to
+> `pcb-core` workspace-wide; the directory stays `crates/core`.
 
 Dependency pins (the only `cargo add` commands in this task — later tasks add
 their own):

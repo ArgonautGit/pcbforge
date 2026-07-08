@@ -16,4 +16,4 @@ edition = "2024"
 license = "MIT"
 
 [workspace.dependencies]
-core = { path = "crates/core" }
+pcb-core = { path = "crates/core" }
