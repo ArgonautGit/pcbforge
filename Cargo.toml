@@ -1,0 +1,19 @@
+[workspace]
+resolver = "3"
+members = [
+    "crates/core",
+    "crates/ingest",
+    "crates/cam",
+    "crates/vision",
+    "crates/orchestra",
+    "crates/drivers",
+    "crates/testkit",
+    "crates/cli",
+]
+
+[workspace.package]
+edition = "2024"
+license = "MIT"
+
+[workspace.dependencies]
+core = { path = "crates/core" }

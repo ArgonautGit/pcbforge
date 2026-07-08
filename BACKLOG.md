@@ -5,7 +5,7 @@ agent-prepared: DRV-1's captures, DRV-5's S2–S5, QA-4's burns, every "live"
 done-when. Task prompts live in `docs/backlog.md`.
 
 ## WS-INF — Repo & infrastructure
-- [ ] INF-1 — Workspace scaffold + core types *(blocked: docs/scaffold.md not yet provided)*
+- [x] INF-1 — Workspace scaffold + core types *(scaffold.md agent-authored per operator direction — see decisions.md)*
 - [ ] INF-2 — CI pipeline
 - [ ] INF-3 — Fixture manifest & validator
 - [ ] INF-4 — Golden-image test harness

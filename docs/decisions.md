@@ -19,6 +19,23 @@ discovered constraints here.
     bus, no `/dev/video*`, and no tshark → DRV-1 blocked; DRV-2..8 downstream.
 - Only RES-1..4 were executable; all four were run on 2026-07-08.
 
+## 2026-07-08 — Scaffold authored by agent (INF-1 deviation)
+
+- The operator directed the agent to author `docs/scaffold.md` itself rather
+  than wait for the playbook §2.1 paste. The core types were designed from
+  the backlog's own usage (every prompt that references `core::*`), informed
+  by RES-1's crate audit. INF-1's "use it verbatim" now refers to the
+  agent-authored scaffold. Any future playbook content that disagrees should
+  supersede via a follow-up refactor, not silent divergence.
+- Naming note: the shared-types crate is genuinely named `core`. An explicit
+  `core = { workspace = true }` dependency shadows Rust's built-in `core` in
+  dependent crates — verified by compiling `core::P::new` through crates/cam.
+  Code inside dependent crates therefore cannot refer to the *built-in* core
+  by that name (use `std::` paths, which is what we do anyway).
+- Pinned by INF-1: i_overlay 7.0.2, cavalier_contours 0.7.0 (both exactly the
+  versions RES-1 audited), nalgebra 0.35.0 (RES-1 audited 0.34-era APIs; the
+  SVD/solve entry points VIS-5 needs are unchanged in 0.35).
+
 ## 2026-07-08 — RES-1..4 notes
 
 - RES-1: no Cargo.toml exists yet, so there are no *pinned* versions to audit;
