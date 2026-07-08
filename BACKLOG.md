@@ -89,6 +89,6 @@ done-when. Task prompts live in `docs/backlog.md`.
 
 ## WS-RES — Research tasks
 - [ ] RES-1 — Crate due diligence
-- [ ] RES-2 — LightBurn automation surface
+- [x] RES-2 — LightBurn automation surface
 - [ ] RES-3 — JCZ protocol public documentation survey
 - [ ] RES-4 — Consumables & floor benchmarks *(optional)*
