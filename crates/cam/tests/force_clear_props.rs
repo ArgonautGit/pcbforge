@@ -83,3 +83,40 @@ proptest! {
         }
     }
 }
+
+/// Regression for the vertically-symmetric neck whose area centroid lands
+/// exactly on a run of boundary vertices: the ray-cast centerline used to
+/// find zero crossings (half-open edge-parameter rule dropped the vertex
+/// hits) and emit no pass. The perpendicular sign-change crossing test fixes
+/// it. Seed also retained in force_clear_props.proptest-regressions.
+#[test]
+fn symmetric_neck_centroid_on_vertices_still_gets_a_pass() {
+    let (wa, ha, wb, hb): (f64, f64, f64, f64) = (2.0, 12.60018862423093, 2.0, 4.33523880584033);
+    let sep = 1.243725335666157f64;
+    let w = 0.31357007713172325f64;
+    let min_feature = 0.4236508416960037f64;
+
+    let yc = ha.min(hb) / 2.0;
+    let a = rect_mm(0.0, 0.0, wa, ha);
+    let b = rect_mm(wa + sep, 0.0, wa + sep + wb, hb);
+    let neck = rect_mm(wa - 0.5, yc - w / 2.0, wa + sep + 0.5, yc + w / 2.0);
+    let region = geom::union(&geom::union(&[a], &[b]), &[neck]);
+
+    let passes = force_clear(&region, min_feature);
+    assert!(!passes.is_empty(), "thin neck must get a pass");
+    let slack: Nm = NM_PER_UM;
+    let x0 = (wa * NM_PER_MM as f64).round() as Nm - slack;
+    let x1 = ((wa + sep) * NM_PER_MM as f64).round() as Nm + slack;
+    let y0 = ((yc - w / 2.0) * NM_PER_MM as f64).round() as Nm - slack;
+    let y1 = ((yc + w / 2.0) * NM_PER_MM as f64).round() as Nm + slack;
+    for pl in &passes {
+        for p in &pl.pts {
+            assert!(
+                p.x >= x0 && p.x <= x1 && p.y >= y0 && p.y <= y1,
+                "vertex ({}, {}) outside neck box",
+                p.x,
+                p.y
+            );
+        }
+    }
+}

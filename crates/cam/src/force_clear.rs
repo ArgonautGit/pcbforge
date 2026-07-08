@@ -126,21 +126,29 @@ fn centerline(comp: &Poly, inset_nm: f64) -> Option<PolylineNm> {
 
     // Crossings of the line `c + t*u` with every edge of every ring.
     // Half-open edge parameter s in [0, 1) so a vertex hit counts once.
+    // Signed perpendicular distance of a point from the ray line through `c`
+    // along `u`: zero exactly on the line. An edge crosses the line iff its
+    // endpoints have different `perp < 0` classifications, treating `perp == 0`
+    // as non-negative. This counts each crossing exactly once even when the
+    // ray passes precisely through a vertex — which happens whenever the
+    // centroid is vertically (or horizontally) centered on a symmetric neck,
+    // the case the edge-parameter `[0,1)` test used to miss entirely.
+    let perp = |p: &P| (p.x as f64 - c.0) * u.1 - (p.y as f64 - c.1) * u.0;
     let mut ts: Vec<f64> = Vec::new();
     let mut cross_edges = |ring: &[P]| {
         for (i, a) in ring.iter().enumerate() {
             let b = &ring[(i + 1) % ring.len()];
-            let (dx, dy) = ((b.x - a.x) as f64, (b.y - a.y) as f64);
-            let denom = u.0 * dy - u.1 * dx;
-            let edge_len = dx.hypot(dy);
-            if denom.abs() <= 1e-12 * edge_len {
-                continue; // edge parallel to the axis
+            let (pa, pb) = (perp(a), perp(b));
+            if (pa < 0.0) == (pb < 0.0) {
+                continue; // both endpoints on the same side: no crossing
             }
-            let (ax, ay) = (a.x as f64 - c.0, a.y as f64 - c.1);
-            let s = (ax * u.1 - ay * u.0) / denom;
-            if (0.0..1.0).contains(&s) {
-                ts.push((ax * dy - ay * dx) / denom);
-            }
+            let s = pa / (pa - pb); // edge param where perp == 0
+            let (cx, cy) = (
+                a.x as f64 + s * (b.x - a.x) as f64,
+                a.y as f64 + s * (b.y - a.y) as f64,
+            );
+            // Position of the crossing along the unit axis from `c`.
+            ts.push((cx - c.0) * u.0 + (cy - c.1) * u.1);
         }
     };
     cross_edges(&comp.outer);
