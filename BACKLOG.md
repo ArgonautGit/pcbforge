@@ -44,7 +44,7 @@ done-when. Task prompts live in `docs/backlog.md`.
 - [ ] VIS-2 — Intrinsics calibration
 - [ ] VIS-3 — Bed homography
 - [ ] VIS-4 — Fiducial detectors
-- [ ] VIS-5 — Affine fit + residuals
+- [x] VIS-5 — Affine fit + residuals
 - [ ] VIS-6 — Burned-grid galvo calibration + register
 - [ ] VIS-7 — TPS field correction *(stretch)*
 - [ ] VIS-8 — Clearance classifier

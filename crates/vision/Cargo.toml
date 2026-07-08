@@ -7,3 +7,6 @@ license.workspace = true
 [dependencies]
 core = { workspace = true }
 nalgebra = "0.35.0"
+
+[dev-dependencies]
+approx = "0.5"
