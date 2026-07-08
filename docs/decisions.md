@@ -48,6 +48,25 @@ discovered constraints here.
   the unstable `cfg_select!` macro and fails on rustc 1.94.1. Revisit on the
   next toolchain bump.
 
+## 2026-07-08 — INF-3 notes
+
+- The `xtask fixtures` validator is complete and self-tested (synthetic
+  fixture trees in tempdirs), but its done-when has a real-repo half that
+  awaits inputs: with no `samples/` yet, `cargo xtask fixtures` correctly
+  exits nonzero and names every missing fixture (the "nonzero when I rename a
+  sample" half is proven by the `renamed_lbrn2_sample_fails` test). The
+  "exits 0 on the real repo" half will pass once `samples/kicad` (>=2
+  `.kicad_pcb`) and the `samples/lbrn2` set exist.
+- The "10 named schema samples from playbook §0.3" list was never provided,
+  so `EXPECTED_LBRN2` in xtask/src/main.rs is an agent-authored stand-in
+  (base + one file per single-setting variant + a uv- variant, matching the
+  dimensions EMIT-1 diffs). Editing that one array is all it takes to adopt
+  the real §0.3 names.
+- Wiring: added `xtask` as a workspace member and `.cargo/config.toml` with
+  the `xtask = "run --package xtask --"` alias (standard cargo-xtask pattern,
+  foreseen by scaffold.md). These are outside the xtask crate proper but are
+  the minimal, conventional glue to make `cargo xtask` resolve.
+
 ## 2026-07-08 — ORC-2 notes
 
 - `docs/stages.ron` is agent-authored (same operator authorization as

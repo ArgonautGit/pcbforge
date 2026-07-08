@@ -1,0 +1,3 @@
+[alias]
+# `cargo xtask <cmd>` runs the repo-local tooling crate (INF-3 onward).
+xtask = "run --package xtask --quiet --"

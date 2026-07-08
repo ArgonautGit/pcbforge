@@ -7,7 +7,7 @@ done-when. Task prompts live in `docs/backlog.md`.
 ## WS-INF — Repo & infrastructure
 - [x] INF-1 — Workspace scaffold + core types *(scaffold.md agent-authored per operator direction — see decisions.md)*
 - [x] INF-2 — CI pipeline
-- [ ] INF-3 — Fixture manifest & validator
+- [x] INF-3 — Fixture manifest & validator *(validator + self-tests complete; real-repo exit-0 awaits samples; lbrn2 name list is an authored stand-in)*
 - [x] INF-4 — Golden-image test harness
 
 ## WS-ING — Ingestion
