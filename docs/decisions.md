@@ -36,6 +36,16 @@ discovered constraints here.
   versions RES-1 audited), nalgebra 0.35.0 (RES-1 audited 0.34-era APIs; the
   SVD/solve entry points VIS-5 needs are unchanged in 0.35).
 
+## 2026-07-08 — INF-2 notes
+
+- Action versions verified against their repos on 2026-07-08 (per the task's
+  "don't write from memory" rule): actions/checkout v7.0.0 is current,
+  dtolnay/rust-toolchain@stable with `components: clippy, rustfmt`,
+  Swatinem/rust-cache v2 (v2.9.1) handles registry caching.
+- actionlint is not installed in this environment; the workflow was validated
+  by YAML parse + a local run of all three commands instead (done-when allows
+  "if available").
+
 ## 2026-07-08 — RES-1..4 notes
 
 - RES-1: no Cargo.toml exists yet, so there are no *pinned* versions to audit;
