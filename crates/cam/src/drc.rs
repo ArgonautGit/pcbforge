@@ -98,7 +98,7 @@ const MEASURE_TOL_NM: Nm = 250;
 /// locations. A non-positive or sub-nanometer floor yields no violations.
 pub fn drc(layer: &Layer, machine_floor_mm: f64) -> Vec<Violation> {
     let mut out = Vec::new();
-    if !(machine_floor_mm > 0.0) {
+    if machine_floor_mm.is_nan() || machine_floor_mm <= 0.0 {
         return out;
     }
     let r_nm = mm_to_nm(machine_floor_mm / 2.0);
