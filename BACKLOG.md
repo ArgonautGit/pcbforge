@@ -56,7 +56,7 @@ done-when. Task prompts live in `docs/backlog.md`.
 
 ## WS-ORC — Orchestration
 - [x] ORC-1 — SQLite persistence *(schema.sql agent-authored per operator direction — see decisions.md)*
-- [ ] ORC-2 — Stage engine
+- [x] ORC-2 — Stage engine *(pallet-tag read stubbed pending VIS-11; stages.ron agent-authored)*
 - [ ] ORC-3 — ClearanceLoop executor
 - [x] ORC-4 — Airflow interlock *(live block-the-duct gate deferred to docs/checklists/orc-4-airflow-live.md)*
 - [ ] ORC-5 — Cross-machine handoff

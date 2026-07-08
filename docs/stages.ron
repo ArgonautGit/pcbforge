@@ -1,0 +1,49 @@
+// PCBForge stage graph (playbook stand-in).
+//
+// Provenance: authored by the coding agent at the operator's direction
+// (2026-07-08) because the playbook's verbatim stages.ron was never provided.
+// ORC-2 loads this file as-is; recorded in docs/decisions.md.
+//
+// A board advances through a DAG of stages. Each stage names its executor
+// kind and its successor(s). `start` is the entry; a stage with no successors
+// is terminal. The engine reads the current stage from the DB, runs its
+// executor, and advances to the (single, for now) successor. Branching
+// successors are reserved for the double-sided flip flow (ORC-6).
+//
+// Executor kinds:
+//   Manual       — an operator step the engine prompts for and records
+//                  (e.g. load board, register fiducials).
+//   Laser        — emits a compiled job set for a machine and waits for the
+//                  burn (ORC-3/DRV-6 wire the real emission; a bring-up stub
+//                  just records intent).
+//   ClearanceLoop — the closed inspect/correct loop (ORC-3). Stubbed here:
+//                  the stub executor records a pass-through and advances.
+
+Stages(
+    entry: "fiducials",
+    stages: {
+        "fiducials": (
+            kind: Manual,
+            detail: "Register the three board fiducials",
+            next: Some("bulk_top"),
+        ),
+        "bulk_top": (
+            kind: Laser,
+            detail: "Fiber bulk copper clearance, top side",
+            machine: Some("fiber"),
+            process: Some("ablate-top"),
+            next: Some("iso_check"),
+        ),
+        "iso_check": (
+            kind: ClearanceLoop,
+            detail: "Inspect isolation and run correctives until clear",
+            machine: Some("fiber"),
+            next: Some("done"),
+        ),
+        "done": (
+            kind: Manual,
+            detail: "Board complete",
+            next: None,
+        ),
+    },
+)

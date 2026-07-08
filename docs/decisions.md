@@ -48,6 +48,20 @@ discovered constraints here.
   the unstable `cfg_select!` macro and fails on rustc 1.94.1. Revisit on the
   next toolchain bump.
 
+## 2026-07-08 — ORC-2 notes
+
+- `docs/stages.ron` is agent-authored (same operator authorization as
+  scaffold.md / schema.sql) — the playbook's verbatim stages.ron was never
+  provided. It defines the top-side ablation walk fiducials → bulk_top →
+  iso_check → done. Future playbook content supersedes via edit + migration.
+- VIS-11 (camera/AprilTag pallet ID) is unavailable in this environment, so
+  the stage engine reads the pallet tag through a `PalletSource` trait with a
+  stub impl (`PCBFORGE_PALLET_TAG` env / fixed default). VIS-11 provides the
+  real implementation later; the engine is otherwise complete and the walk is
+  verified across re-opened-DB "restarts".
+- ClearanceLoop is a pass-through stub here; ORC-3 replaces it with the real
+  inspect/correct loop.
+
 ## 2026-07-08 — INF-2 notes
 
 - Action versions verified against their repos on 2026-07-08 (per the task's
