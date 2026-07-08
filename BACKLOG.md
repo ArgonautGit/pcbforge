@@ -88,7 +88,7 @@ done-when. Task prompts live in `docs/backlog.md`.
 - [ ] QA-5 — Seeded-defect fixture generator
 
 ## WS-RES — Research tasks
-- [ ] RES-1 — Crate due diligence
+- [x] RES-1 — Crate due diligence
 - [x] RES-2 — LightBurn automation surface
 - [x] RES-3 — JCZ protocol public documentation survey
 - [x] RES-4 — Consumables & floor benchmarks *(optional)*
