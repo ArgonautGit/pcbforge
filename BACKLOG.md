@@ -21,7 +21,7 @@ done-when. Task prompts live in `docs/backlog.md`.
 ## WS-GEO / WS-CAM — Geometry kernel & ablation CAM
 - [x] GEO-1 — Boolean/offset foundation
 - [x] CAM-1 — Isolation + rub-out path generator
-- [ ] CAM-2 — Sliver force-clear
+- [x] CAM-2 — Sliver force-clear
 - [ ] CAM-3 — Heat-aware ordering
 - [ ] CAM-4 — Pass planner
 - [ ] CAM-5 — Dual-machine splitter
