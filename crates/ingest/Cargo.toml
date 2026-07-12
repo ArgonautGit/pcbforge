@@ -5,4 +5,5 @@ edition.workspace = true
 license.workspace = true
 
 [dependencies]
+cam = { version = "0.1.0", path = "../cam" }
 pcb-core = { workspace = true }

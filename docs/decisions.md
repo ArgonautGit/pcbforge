@@ -48,6 +48,34 @@ discovered constraints here.
   the unstable `cfg_select!` macro and fails on rustc 1.94.1. Revisit on the
   next toolchain bump.
 
+## 2026-07-12 — `pcbforge noncopper` (operator-requested FlatCAM replacement)
+
+- The operator asked for a tool cutting FlatCAM out of the old workflow:
+  KiCad Gerber → non-copper regions as contiguous closed shapes → EZCAD
+  fill/ablate. Delivered as `ingest::gerber` (tolerant RS-274X/X2 parser for
+  the KiCad dialect), `cam::noncopper` (board region from Edge.Cuts with
+  cutout parity, or copper bbox + margin; inversion with beam-compensation
+  offset), `cam::export` (DXF R12 closed POLYLINEs + even-odd SVG + color
+  preview), and the `pcbforge noncopper` CLI verb.
+- Relation to the backlog: this is a working slice of ING-3 plus new export
+  glue. ING-3 itself stays unticked — its done-when requires real
+  `kicad-cli`-exported gerbers (cross-checked against ING-1's SVG path) and
+  X2 attribute preservation, neither of which exists here yet. The parser's
+  fixtures are hand-authored in KiCad's output style; validating against a
+  real export is the first thing to do once `samples/kicad` lands.
+- Layering: `ingest` now depends on `cam` (for `geom`) — the parser unions
+  primitives into a normalized Layer at ingest time. No cycle (cam never
+  imports ingest).
+- Robustness note: a straight segment issued while arc mode (G02/G03) is
+  still modal puts the arc "center" on an endpoint (I/J default 0). The
+  parser rejects arcs whose start/end radii disagree instead of emitting
+  garbage — this caught exactly that bug in the first fixture draft.
+- Area fidelity: circles/dots are polygonized at the equal-area radius;
+  capsule caps stay at true radius with doubled vertex density (equal-area
+  inflation there would widen the stroke's straight sides — a first-order
+  error). Verified: fixture copper ∪ non-copper tiles the board region to
+  ≥ 99.95 % of pixels at 10 µm/px and to 1e-9 relative in exact area.
+
 ## 2026-07-08 — INF-3 notes
 
 - The `xtask fixtures` validator is complete and self-tested (synthetic

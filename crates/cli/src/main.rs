@@ -1,10 +1,14 @@
 //! `pcbforge` — the operator CLI.
 //!
-//! ORC-2 ships one verb, `next`: advance the board on the bed by one stage.
-//! Each invocation opens the DB, reads the pallet tag, runs the current stage's
-//! executor, advances, and persists — so running `pcbforge next` repeatedly
-//! walks a board through the graph, one stage per call.
+//! * `next` (ORC-2): advance the board on the bed by one stage. Each
+//!   invocation opens the DB, reads the pallet tag, runs the current stage's
+//!   executor, advances, and persists.
+//! * `noncopper`: the FlatCAM-replacement inversion — read a KiCad copper
+//!   Gerber (plus optionally the Edge.Cuts Gerber), compute the non-copper
+//!   regions as contiguous closed shapes, and export DXF/SVG for EZCAD's
+//!   fill-and-ablate workflow.
 
+use std::path::PathBuf;
 use std::process::ExitCode;
 
 use clap::{Parser, Subcommand};
@@ -12,6 +16,7 @@ use clap::{Parser, Subcommand};
 use orchestra::db::Db;
 use orchestra::engine::{self, BoardDefaults, EnvPalletSource, ExecutorRegistry, StepReport};
 use orchestra::stages::StageGraph;
+use pcb_core::NM_PER_MM;
 
 /// Default database path when `--db` is not given.
 const DEFAULT_DB: &str = "pcbforge.sqlite";
@@ -35,6 +40,39 @@ enum Command {
         #[arg(long)]
         design: Option<String>,
     },
+    /// Invert a KiCad copper Gerber into fillable non-copper shapes (DXF/SVG
+    /// for EZCAD) — replaces the FlatCAM step.
+    Noncopper {
+        /// Copper layer Gerber (e.g. F_Cu.gbr from `kicad-cli pcb export gerbers`).
+        #[arg(long)]
+        copper: PathBuf,
+
+        /// Board outline Gerber (Edge.Cuts). Without it the board region is
+        /// the copper bounding box grown by --margin-mm.
+        #[arg(long)]
+        outline: Option<PathBuf>,
+
+        /// Beam-compensation clearance kept around every copper edge, mm
+        /// (typically half the effective spot diameter). 0 = exact inverse.
+        #[arg(long, default_value_t = 0.0)]
+        offset_mm: f64,
+
+        /// Bounding-box margin when no --outline is given, mm.
+        #[arg(long, default_value_t = 1.0)]
+        margin_mm: f64,
+
+        /// Write the shapes as DXF R12 (EZCAD's most reliable import).
+        #[arg(long)]
+        dxf: Option<PathBuf>,
+
+        /// Write the shapes as an SVG (black, even-odd fill).
+        #[arg(long)]
+        svg: Option<PathBuf>,
+
+        /// Write a color preview SVG (board / copper / to-ablate) for eyeballing.
+        #[arg(long)]
+        preview: Option<PathBuf>,
+    },
 }
 
 fn main() -> ExitCode {
@@ -51,7 +89,96 @@ fn main() -> ExitCode {
 fn run(cli: &Cli) -> Result<(), Box<dyn std::error::Error>> {
     match &cli.command {
         Command::Next { design } => next(&cli.db, design.as_deref()),
+        Command::Noncopper {
+            copper,
+            outline,
+            offset_mm,
+            margin_mm,
+            dxf,
+            svg,
+            preview,
+        } => noncopper_cmd(
+            copper,
+            outline.as_deref(),
+            *offset_mm,
+            *margin_mm,
+            dxf.as_deref(),
+            svg.as_deref(),
+            preview.as_deref(),
+        ),
     }
+}
+
+/// The FlatCAM-replacement pipeline: Gerber → copper polys → board region →
+/// inverted fillable shapes → DXF/SVG.
+fn noncopper_cmd(
+    copper_path: &std::path::Path,
+    outline_path: Option<&std::path::Path>,
+    offset_mm: f64,
+    margin_mm: f64,
+    dxf: Option<&std::path::Path>,
+    svg: Option<&std::path::Path>,
+    preview: Option<&std::path::Path>,
+) -> Result<(), Box<dyn std::error::Error>> {
+    if dxf.is_none() && svg.is_none() && preview.is_none() {
+        return Err("nothing to do: pass at least one of --dxf, --svg, --preview".into());
+    }
+    if !(0.0..10.0).contains(&offset_mm) {
+        return Err(format!("--offset-mm {offset_mm} out of range [0, 10)").into());
+    }
+
+    let copper = ingest::gerber::load_gerber(copper_path)?;
+    eprintln!(
+        "copper: {} shape(s) from {}",
+        copper.polys.len(),
+        copper_path.display()
+    );
+
+    let board = match outline_path {
+        Some(p) => {
+            let outline = ingest::gerber::load_gerber(p)?;
+            let region = cam::noncopper::board_region_from_outline(&outline.polys);
+            if region.is_empty() {
+                return Err(format!("outline {} encloses no area", p.display()).into());
+            }
+            eprintln!("board: outline region from {}", p.display());
+            region
+        }
+        None => {
+            let margin_nm = (margin_mm * NM_PER_MM as f64).round() as i64;
+            eprintln!("board: copper bounding box + {margin_mm} mm margin (no --outline)");
+            cam::noncopper::board_region_bbox(&copper.polys, margin_nm)
+        }
+    };
+    if board.is_empty() {
+        return Err("empty board region (no copper and no outline)".into());
+    }
+
+    let offset_nm = (offset_mm * NM_PER_MM as f64).round() as i64;
+    let shapes = cam::noncopper::noncopper(&board, &copper.polys, offset_nm);
+    let rings: usize = shapes.iter().map(|p| 1 + p.holes.len()).sum();
+    eprintln!(
+        "non-copper: {} contiguous shape(s), {} ring(s), offset {offset_mm} mm",
+        shapes.len(),
+        rings
+    );
+    if shapes.is_empty() {
+        return Err("inversion produced no shapes (offset too large?)".into());
+    }
+
+    if let Some(p) = dxf {
+        cam::export::write_dxf(&shapes, p)?;
+        println!("wrote {}", p.display());
+    }
+    if let Some(p) = svg {
+        cam::export::write_svg(&shapes, p)?;
+        println!("wrote {}", p.display());
+    }
+    if let Some(p) = preview {
+        cam::export::write_preview_svg(&board, &copper.polys, &shapes, p)?;
+        println!("wrote {}", p.display());
+    }
+    Ok(())
 }
 
 fn next(db_path: &str, design: Option<&str>) -> Result<(), Box<dyn std::error::Error>> {

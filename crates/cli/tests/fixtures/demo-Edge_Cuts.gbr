@@ -1,0 +1,15 @@
+%TF.GenerationSoftware,KiCad,Pcbnew,(9.0)*%
+%TF.FileFunction,Profile,NP*%
+%FSLAX46Y46*%
+%MOMM*%
+G04 Hand-authored KiCad-style test fixture: 20 x 15 mm outline*
+%LPD*%
+G01*
+%ADD10C,0.050000*%
+D10*
+X0Y0D02*
+X20000000Y0D01*
+X20000000Y15000000D01*
+X0Y15000000D01*
+X0Y0D01*
+M02*

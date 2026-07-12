@@ -481,6 +481,7 @@ dependencies = [
 name = "ingest"
 version = "0.1.0"
 dependencies = [
+ "cam",
  "pcb-core",
 ]
 
@@ -689,9 +690,12 @@ version = "0.1.0"
 name = "pcbforge"
 version = "0.1.0"
 dependencies = [
+ "cam",
  "clap",
+ "ingest",
  "orchestra",
  "pcb-core",
+ "testkit",
 ]
 
 [[package]]

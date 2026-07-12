@@ -13,7 +13,7 @@ done-when. Task prompts live in `docs/backlog.md`.
 ## WS-ING — Ingestion
 - [ ] ING-1 — KiCad SVG → Layer
 - [ ] ING-2 — Excellon drills
-- [ ] ING-3 — Gerber X2 ingest (robust path)
+- [ ] ING-3 — Gerber X2 ingest (robust path) *(partial: ingest::gerber parses the KiCad dialect for `pcbforge noncopper`; full done-when awaits real samples — see decisions.md 2026-07-12)*
 - [ ] ING-4 — Net-ID source + net raster
 - [ ] ING-5 — Board metadata (.gbrjob)
 - [ ] ING-6 — kicad-cli invoker
