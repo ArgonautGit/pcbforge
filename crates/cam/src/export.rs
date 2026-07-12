@@ -1,13 +1,16 @@
-//! Vector exporters for the EZCAD import workflow.
+//! Vector exporters for the galvo-software import step (LightBurn, EZCAD).
 //!
-//! * [`write_dxf`] — minimal DXF R12 with one closed `POLYLINE` per ring
-//!   (outers and holes alike, all on one layer). EZCAD2's DXF import reads
-//!   these directly; select everything and hatch-fill with the even-odd
-//!   rule and the nesting reproduces holes/islands automatically.
 //! * [`write_svg`] — one `<path>` per polygon (outer + hole subpaths),
-//!   `fill-rule="evenodd"` — the shapes read exactly as they will ablate.
-//! * [`write_preview_svg`] — copper + to-ablate regions overlaid in color
-//!   for a quick eyeball before importing anything into EZCAD.
+//!   `fill-rule="evenodd"`, explicit mm dimensions. **Preferred for
+//!   LightBurn**: it reads the physical units directly (no DPI guess), and
+//!   a closed path with hole subpaths set to Fill renders/burns the holes
+//!   and islands correctly on its own.
+//! * [`write_dxf`] — minimal DXF R12 with one closed `POLYLINE` per ring
+//!   (outers and holes alike, all on one layer). Works in both EZCAD2 and
+//!   LightBurn; R12 carries no unit field, so the importer must be set to
+//!   mm (LightBurn: Settings → File Settings → DXF import units).
+//! * [`write_preview_svg`] — board + copper + to-ablate overlaid in color
+//!   for a quick eyeball before importing anything.
 //!
 //! All coordinates are emitted in millimeters. DXF keeps the board's y-up
 //! frame; SVG output is y-flipped into screen space so previews look right.

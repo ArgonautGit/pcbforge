@@ -100,7 +100,7 @@ pub fn board_region_bbox(copper: &[Poly], margin_nm: Nm) -> Vec<Poly> {
 /// `offset_nm` is the beam-compensation clearance kept around every copper
 /// edge (typically half the effective spot diameter); `0` is the exact
 /// geometric inverse. Output shapes are disjoint, outers CCW, holes CW —
-/// each one a contiguous closed region as the EZCAD fill workflow expects.
+/// each one a contiguous closed region as the fill-and-burn workflow expects.
 pub fn noncopper(board: &[Poly], copper: &[Poly], offset_nm: Nm) -> Vec<Poly> {
     let grown = if offset_nm == 0 {
         copper.to_vec()

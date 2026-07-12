@@ -5,8 +5,8 @@
 //!   executor, advances, and persists.
 //! * `noncopper`: the FlatCAM-replacement inversion — read a KiCad copper
 //!   Gerber (plus optionally the Edge.Cuts Gerber), compute the non-copper
-//!   regions as contiguous closed shapes, and export DXF/SVG for EZCAD's
-//!   fill-and-ablate workflow.
+//!   regions as contiguous closed shapes, and export SVG/DXF for the
+//!   fill-and-ablate workflow in LightBurn or EZCAD.
 
 use std::path::PathBuf;
 use std::process::ExitCode;
@@ -40,8 +40,8 @@ enum Command {
         #[arg(long)]
         design: Option<String>,
     },
-    /// Invert a KiCad copper Gerber into fillable non-copper shapes (DXF/SVG
-    /// for EZCAD) — replaces the FlatCAM step.
+    /// Invert a KiCad copper Gerber into fillable non-copper shapes (SVG/DXF
+    /// for LightBurn or EZCAD) — replaces the FlatCAM step.
     Noncopper {
         /// Copper layer Gerber (e.g. F_Cu.gbr from `kicad-cli pcb export gerbers`).
         #[arg(long)]
@@ -61,11 +61,13 @@ enum Command {
         #[arg(long, default_value_t = 1.0)]
         margin_mm: f64,
 
-        /// Write the shapes as DXF R12 (EZCAD's most reliable import).
+        /// Write the shapes as DXF R12 (EZCAD; also fine in LightBurn with
+        /// DXF import units set to mm).
         #[arg(long)]
         dxf: Option<PathBuf>,
 
-        /// Write the shapes as an SVG (black, even-odd fill).
+        /// Write the shapes as an SVG (black, even-odd fill, mm units) —
+        /// the preferred LightBurn import: set the layer to Fill and burn.
         #[arg(long)]
         svg: Option<PathBuf>,
 
