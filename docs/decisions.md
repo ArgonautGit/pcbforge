@@ -3,6 +3,26 @@
 Per the backlog conventions: every task records deviations from its prompt and
 discovered constraints here.
 
+## 2026-07-13 — CAM-9 (tiling, stretch) — geometry only
+
+- `cam::tiles::tile(&Paths, field_mm, overlap_mm) -> TilePlan` splits an
+  oversize job into ≤ field-mm tiles overlapping by overlap-mm (defaults
+  140 / 2 mm). Ownership is by element **centroid** — each element is assigned
+  whole to exactly one authoritative tile, never clipped. That makes the union
+  of tiles exactly the original job (the done-when's "== original within 1 µm"
+  holds to 0), and "every stitched element in exactly one authoritative set" a
+  true partition. Adjacent field windows overlap by exactly overlap-mm by
+  construction (stride = field − overlap).
+- An element larger than one field in some axis cannot fit any tile; rather
+  than mis-tile it silently it is still assigned but reported in
+  `TilePlan.oversized` (the backlog's "stop and surface" rule). Real jobs are
+  many small path elements, so this is an edge guard, not the common case.
+- Per the prompt: execution needs ComMarker Studio to drive the slide between
+  tiles; VIS-6 will later fill in the real re-registration handshake. This
+  task is geometry only — `ReRegister` records which field to bring under the
+  head; nothing here commands motion. Deviation from the stated
+  "Depends: VIS-6": the geometry stands alone and is tested without it.
+
 ## 2026-07-13 — ING-3 + ING-4 (X2 attributes + net raster)
 
 - ING-3: extended the existing `ingest::gerber` parser (rather than writing a
