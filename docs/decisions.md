@@ -18,8 +18,26 @@ discovered constraints here.
   (ING-5) rather than assumed. mm_per_pass / kerf / z_step are machine facts:
   an operator calibration ladder (agent-prepared checklist) precedes the
   first real cut, and shipped defaults warn until overridden.
-- Not yet implemented — plan only. Implementation touches crates/{core,cam,cli}
-  (PathKind::Cut, CutOpts/CutStep/CutSchedule, cam::cut, `pcbforge cut`).
+- Implemented (same day): pcb_core gained PathKind::Cut and
+  CutOpts/CutStep/CutSchedule; cam::cut has cut_paths + schedule + tab_ring;
+  cam::export gained write_paths_{svg,dxf} (open/closed stroke polylines);
+  the `pcbforge cut` verb writes per-focus-step SVG/DXF + cut-schedule.txt.
+  Verified against the real valdemo2 board via kicad-cli (36×30 outline +
+  Ø4 cutout, 1.6 mm): 4 tabs on the cutout, 4 on the perimeter, 9-step focus
+  schedule for 1.6 + 0.1 mm at the conservative defaults. 220 tests green.
+- Two discovered constraints, both worked around in cam::cut (not by touching
+  the shared geom kernel):
+  1. `geom::offset` on the Gerber-polygonized circular cutout (~300 verts,
+     offset by +25 µm) left ~98 sub-µm² sliver *holes* alongside the one real
+     12.56 mm² cutout. cut_paths drops rings below MIN_RING_AREA_MM2 (1e-4 mm²,
+     ~500× the artifact scale, far below any cuttable cutout).
+  2. The same offset returns the real cutout ring as a ~1178-vertex loop with
+     sub-µm zigzag noise whose *per-vertex* turns hit 81°, which naive corner
+     detection read as ~196 corners and refused to tab. Corner detection now
+     measures turning between directions averaged over a ±40 µm arc window, so
+     only genuine corners register — and the emitted cut path stays the exact
+     kerf offset (kerf-clearance property holds to 1 µm), rather than being
+     geometrically simplified (which would have eaten into the clearance).
 
 ## 2026-07-08 — Repo bootstrap (pre-INF-1)
 

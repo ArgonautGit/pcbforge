@@ -73,6 +73,10 @@ pub enum PathKind {
     Boundary,
     /// Fiducial / tooling mark.
     Mark,
+    /// Board-outline through-cut (depaneling) segment. Kerf-compensated onto
+    /// the waste side and broken by holding tabs; run as the board's final
+    /// job with a lowering focal plane (see `cam::cut`).
+    Cut,
 }
 
 /// A single polyline the laser will trace.
@@ -166,6 +170,65 @@ pub struct PassGroup {
 pub enum Machine {
     Fiber,
     Uv,
+}
+
+/// Board-outline through-cut (depaneling) parameters. Lengths in millimeters.
+///
+/// `kerf_mm`, `mm_per_pass`, and `z_step_mm` are **machine facts** measured
+/// on scrap FR4 (see `cam::cut` and docs/plans/cam-10-board-cut.md); the
+/// [`Default`] values are deliberately conservative placeholders that the CLI
+/// flags as un-calibrated.
+#[derive(Debug, Clone, Copy, PartialEq)]
+pub struct CutOpts {
+    /// Measured beam kerf width at focus, mm. The cut centerline is offset
+    /// onto the waste side by `kerf_mm / 2`.
+    pub kerf_mm: f64,
+    /// Holding tabs left per closed ring.
+    pub tab_count: u32,
+    /// Width of solid material each tab leaves standing, mm.
+    pub tab_mm: f64,
+    /// Depth of FR4 removed per pass at the cut process params, mm.
+    pub mm_per_pass: f64,
+    /// Maximum focal-plane drop per step, mm — must not exceed the lens's
+    /// usable depth of focus, or the beam defocuses at the step's floor.
+    pub z_step_mm: f64,
+    /// Extra commanded depth past the far face so the cut fully severs, mm.
+    pub overcut_mm: f64,
+    /// Which machine cuts (fiber for FR4 bulk; UV for thin/finishing).
+    pub machine: Machine,
+}
+
+impl Default for CutOpts {
+    fn default() -> Self {
+        Self {
+            kerf_mm: 0.05,
+            tab_count: 4,
+            tab_mm: 0.5,
+            mm_per_pass: 0.05,
+            z_step_mm: 0.2,
+            overcut_mm: 0.1,
+            machine: Machine::Fiber,
+        }
+    }
+}
+
+/// One focus step of a through-cut: run `passes` passes at the current focal
+/// plane, then lower the head (or raise the bed) by `focus_drop_mm` so focus
+/// tracks the descending cut floor. `focus_drop_mm` is `0.0` on the final
+/// step (the cut is through; nothing follows).
+#[derive(Debug, Clone, Copy, PartialEq)]
+pub struct CutStep {
+    pub passes: u32,
+    pub focus_drop_mm: f64,
+}
+
+/// The full focus schedule for a through-cut: an ordered list of steps whose
+/// commanded depth reaches `total_depth_mm` (board thickness + overcut).
+#[derive(Debug, Clone, PartialEq)]
+pub struct CutSchedule {
+    pub steps: Vec<CutStep>,
+    /// Total commanded cut depth, mm (thickness + overcut).
+    pub total_depth_mm: f64,
 }
 
 #[cfg(test)]

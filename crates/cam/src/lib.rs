@@ -1,6 +1,7 @@
 //! WS-CAM — geometry kernel & ablation CAM.
 
 pub mod ablation;
+pub mod cut;
 pub mod drc;
 pub mod export;
 pub mod features;

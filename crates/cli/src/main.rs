@@ -16,7 +16,7 @@ use clap::{Parser, Subcommand};
 use orchestra::db::Db;
 use orchestra::engine::{self, BoardDefaults, EnvPalletSource, ExecutorRegistry, StepReport};
 use orchestra::stages::StageGraph;
-use pcb_core::NM_PER_MM;
+use pcb_core::{CutOpts, Machine, NM_PER_MM, Nm};
 
 /// Default database path when `--db` is not given.
 const DEFAULT_DB: &str = "pcbforge.sqlite";
@@ -75,6 +75,58 @@ enum Command {
         #[arg(long)]
         preview: Option<PathBuf>,
     },
+    /// Generate the board-outline through-cut (depaneling) job from Edge.Cuts:
+    /// kerf-compensated, tabbed cut geometry plus a focus-step schedule that
+    /// lowers the focal plane as the cut deepens (CAM-10).
+    Cut {
+        /// KiCad board (.kicad_pcb): Edge.Cuts is exported via kicad-cli.
+        #[arg(long)]
+        board: Option<PathBuf>,
+
+        /// Board outline Gerber (Edge.Cuts) — alternative to --board.
+        #[arg(long)]
+        outline: Option<PathBuf>,
+
+        /// Finished board thickness, mm. Required with --outline; with --board
+        /// it overrides any thickness found in the .gbrjob.
+        #[arg(long)]
+        thickness_mm: Option<f64>,
+
+        /// Output directory for per-step SVG/DXF files and cut-schedule.txt.
+        #[arg(long)]
+        out: PathBuf,
+
+        /// Measured beam kerf width, mm. The cut centerline is offset onto the
+        /// waste side by kerf/2. Leave unset to use the (un-calibrated) default.
+        #[arg(long)]
+        kerf_mm: Option<f64>,
+
+        /// Holding tabs left per closed ring.
+        #[arg(long, default_value_t = 4)]
+        tabs: u32,
+
+        /// Width of solid material each tab leaves standing, mm.
+        #[arg(long, default_value_t = 0.5)]
+        tab_mm: f64,
+
+        /// Measured FR4 depth removed per pass at cut params, mm. Leave unset
+        /// to use the (un-calibrated) default.
+        #[arg(long)]
+        mm_per_pass: Option<f64>,
+
+        /// Maximum focal-plane drop per step, mm (≤ the lens depth of focus).
+        /// Leave unset to use the (un-calibrated) default.
+        #[arg(long)]
+        z_step_mm: Option<f64>,
+
+        /// Extra commanded depth past the far face, mm.
+        #[arg(long, default_value_t = 0.1)]
+        overcut_mm: f64,
+
+        /// Cutting machine: "fiber" (FR4 bulk) or "uv".
+        #[arg(long, default_value = "fiber")]
+        machine: String,
+    },
 }
 
 fn main() -> ExitCode {
@@ -108,7 +160,267 @@ fn run(cli: &Cli) -> Result<(), Box<dyn std::error::Error>> {
             svg.as_deref(),
             preview.as_deref(),
         ),
+        Command::Cut {
+            board,
+            outline,
+            thickness_mm,
+            out,
+            kerf_mm,
+            tabs,
+            tab_mm,
+            mm_per_pass,
+            z_step_mm,
+            overcut_mm,
+            machine,
+        } => cut_cmd(CutArgs {
+            board: board.as_deref(),
+            outline: outline.as_deref(),
+            thickness_mm: *thickness_mm,
+            out,
+            kerf_mm: *kerf_mm,
+            tabs: *tabs,
+            tab_mm: *tab_mm,
+            mm_per_pass: *mm_per_pass,
+            z_step_mm: *z_step_mm,
+            overcut_mm: *overcut_mm,
+            machine,
+        }),
     }
+}
+
+struct CutArgs<'a> {
+    board: Option<&'a std::path::Path>,
+    outline: Option<&'a std::path::Path>,
+    thickness_mm: Option<f64>,
+    out: &'a std::path::Path,
+    kerf_mm: Option<f64>,
+    tabs: u32,
+    tab_mm: f64,
+    mm_per_pass: Option<f64>,
+    z_step_mm: Option<f64>,
+    overcut_mm: f64,
+    machine: &'a str,
+}
+
+/// The board-outline through-cut pipeline: Edge.Cuts → board region →
+/// kerf-compensated tabbed cut geometry + focus schedule → per-step SVG/DXF
+/// and a human-readable cut-schedule.txt.
+fn cut_cmd(a: CutArgs) -> Result<(), Box<dyn std::error::Error>> {
+    let defaults = CutOpts::default();
+    let machine = match a.machine.to_ascii_lowercase().as_str() {
+        "fiber" => Machine::Fiber,
+        "uv" => Machine::Uv,
+        other => return Err(format!("unknown --machine '{other}' (want fiber or uv)").into()),
+    };
+    // kerf / mm-per-pass / z-step are machine facts; unset means un-calibrated.
+    let uncalibrated = a.kerf_mm.is_none() || a.mm_per_pass.is_none() || a.z_step_mm.is_none();
+    let opts = CutOpts {
+        kerf_mm: a.kerf_mm.unwrap_or(defaults.kerf_mm),
+        tab_count: a.tabs,
+        tab_mm: a.tab_mm,
+        mm_per_pass: a.mm_per_pass.unwrap_or(defaults.mm_per_pass),
+        z_step_mm: a.z_step_mm.unwrap_or(defaults.z_step_mm),
+        overcut_mm: a.overcut_mm,
+        machine,
+    };
+
+    // Board region + thickness, from a .kicad_pcb (via kicad-cli) or a Gerber.
+    let (board_region, thickness_nm) = load_board_and_thickness(&a)?;
+    if board_region.is_empty() {
+        return Err("outline encloses no board area".into());
+    }
+
+    let paths = cam::cut::cut_paths(&board_region, &opts);
+    if paths.elems.is_empty() {
+        return Err("no cut geometry produced (kerf too large for the board?)".into());
+    }
+    let sched = cam::cut::schedule(&opts, thickness_nm);
+
+    std::fs::create_dir_all(a.out)?;
+    // v1: every focus step traces the same geometry; the per-step files exist
+    // so the operator runs exactly `passes` of each and the stopping points
+    // are files, not counted passes.
+    let mut step_files = Vec::new();
+    for i in 0..sched.steps.len() {
+        let stem = format!("cut-step-{:02}", i + 1);
+        let svg = a.out.join(format!("{stem}.svg"));
+        let dxf = a.out.join(format!("{stem}.dxf"));
+        cam::export::write_paths_svg(&paths, &svg)?;
+        cam::export::write_paths_dxf(&paths, "CUT", &dxf)?;
+        step_files.push(stem);
+    }
+
+    let ring_groups = paths.elems.len();
+    let cutouts: Vec<&pcb_core::Ring> = board_region.iter().flat_map(|p| p.holes.iter()).collect();
+    let schedule_txt = render_cut_schedule(
+        &opts,
+        &sched,
+        thickness_nm,
+        ring_groups,
+        &cutouts,
+        &step_files,
+        uncalibrated,
+    );
+    let sched_path = a.out.join("cut-schedule.txt");
+    std::fs::write(&sched_path, schedule_txt)?;
+
+    println!(
+        "wrote {} step file pair(s) + {}",
+        sched.steps.len(),
+        sched_path.display()
+    );
+    if uncalibrated {
+        eprintln!(
+            "pcbforge: WARNING — kerf/mm-per-pass/z-step are placeholder defaults; \
+             run the scrap-FR4 ladder and pass measured values before cutting"
+        );
+    }
+    Ok(())
+}
+
+/// Resolve the board region (filled outline with cutouts open) and the board
+/// thickness in nm from the CLI arguments.
+fn load_board_and_thickness(
+    a: &CutArgs,
+) -> Result<(Vec<pcb_core::Poly>, Nm), Box<dyn std::error::Error>> {
+    match (a.outline, a.board) {
+        (Some(outline), _) => {
+            let thickness_mm = a
+                .thickness_mm
+                .ok_or("--thickness-mm is required with --outline")?;
+            let layer = ingest::gerber::load_gerber(outline)?;
+            let region = cam::noncopper::board_region_from_outline(&layer.polys);
+            Ok((region, mm_to_nm(thickness_mm)))
+        }
+        (None, Some(board)) => {
+            let cli = ingest::kicad_cli::KicadCli::discover()
+                .map_err(|e| format!("--board needs kicad-cli to export Edge.Cuts: {e}"))?;
+            let tmp = std::env::temp_dir().join(format!("pcbforge-cut-{}", std::process::id()));
+            std::fs::create_dir_all(&tmp)?;
+            let gerbers = cli.export_gerbers(board, &["Edge.Cuts"], &tmp)?;
+            let layer = ingest::gerber::load_gerber(&gerbers[0])?;
+            let region = cam::noncopper::board_region_from_outline(&layer.polys);
+            // Thickness: CLI override, else a .gbrjob if kicad wrote one.
+            let thickness_nm = match a.thickness_mm {
+                Some(mm) => mm_to_nm(mm),
+                None => find_gbrjob_thickness(&tmp)
+                    .ok_or("board thickness unknown: pass --thickness-mm (no .gbrjob found)")?,
+            };
+            Ok((region, thickness_nm))
+        }
+        (None, None) => Err("pass one of --board or --outline".into()),
+    }
+}
+
+fn find_gbrjob_thickness(dir: &std::path::Path) -> Option<Nm> {
+    for e in std::fs::read_dir(dir).ok()?.flatten() {
+        let p = e.path();
+        if p.extension().and_then(|x| x.to_str()) == Some("gbrjob")
+            && let Ok(meta) = ingest::gbrjob::load_gbrjob(&p)
+        {
+            return Some(meta.thickness_nm);
+        }
+    }
+    None
+}
+
+fn mm_to_nm(mm: f64) -> Nm {
+    (mm * NM_PER_MM as f64).round() as Nm
+}
+
+/// Render the operator-facing cut-schedule.txt.
+#[allow(clippy::too_many_arguments)]
+fn render_cut_schedule(
+    opts: &CutOpts,
+    sched: &pcb_core::CutSchedule,
+    thickness_nm: Nm,
+    ring_groups: usize,
+    cutouts: &[&pcb_core::Ring],
+    step_files: &[String],
+    uncalibrated: bool,
+) -> String {
+    let mut s = String::new();
+    let machine = match opts.machine {
+        Machine::Fiber => "fiber",
+        Machine::Uv => "UV",
+    };
+    let thickness_mm = thickness_nm as f64 / NM_PER_MM as f64;
+    s.push_str("PCBForge board-outline cut schedule\n");
+    s.push_str("===================================\n\n");
+    s.push_str(&format!("Machine:        {machine}\n"));
+    s.push_str(&format!(
+        "Kerf:           {:.3} mm  (centerline offset {:.3} mm onto the waste side)\n",
+        opts.kerf_mm,
+        opts.kerf_mm / 2.0
+    ));
+    s.push_str(&format!(
+        "Tabs:           {} per ring, {:.2} mm solid each\n",
+        opts.tab_count, opts.tab_mm
+    ));
+    s.push_str(&format!(
+        "Depth:          {:.3} mm board + {:.3} mm overcut = {:.3} mm total\n",
+        thickness_mm, opts.overcut_mm, sched.total_depth_mm
+    ));
+    s.push_str(&format!(
+        "Per pass:       {:.3} mm removed; focus drops in steps of <= {:.3} mm\n",
+        opts.mm_per_pass, opts.z_step_mm
+    ));
+    s.push_str(&format!(
+        "Cut contours:   {ring_groups} segment(s), {} interior cutout(s) cut before the perimeter\n\n",
+        cutouts.len()
+    ));
+
+    if uncalibrated {
+        s.push_str(
+            "!! UN-CALIBRATED: kerf / mm-per-pass / z-step are placeholder defaults.\n\
+             \x20  Run the scrap-FR4 ladder (docs/plans/cam-10-board-cut.md): burn cut lines\n\
+             \x20  at 5/10/15... passes at fixed focus, measure depth for mm-per-pass and the\n\
+             \x20  depth where it flattens for the depth of focus, and measure kerf width.\n\
+             \x20  Pass the measured values before cutting a real board.\n\n",
+        );
+    }
+    let mut warned = false;
+    for hole in cutouts {
+        let d = cam::cut::ring_min_dim_mm(hole);
+        if d < cam::cut::SLUG_WARN_MM {
+            let (cx, cy) = cam::cut::ring_centroid_mm(hole);
+            s.push_str(&format!(
+                "!! Small cutout ~{d:.1} mm near ({cx:.1}, {cy:.1}) mm: the slug may jam the\n\
+                 \x20  kerf — plan to hold or remove it by hand.\n",
+            ));
+            warned = true;
+        }
+    }
+    if warned {
+        s.push('\n');
+    }
+
+    s.push_str("Focus steps (run each file's passes, then adjust focus as noted):\n");
+    for (i, step) in sched.steps.iter().enumerate() {
+        let file = &step_files[i];
+        if step.focus_drop_mm > 0.0 {
+            s.push_str(&format!(
+                "  Step {:02}: {file}  ->  {} pass(es), then LOWER THE HEAD by {:.3} mm\n",
+                i + 1,
+                step.passes,
+                step.focus_drop_mm
+            ));
+        } else {
+            s.push_str(&format!(
+                "  Step {:02}: {file}  ->  {} pass(es)  (final step — the cut is through)\n",
+                i + 1,
+                step.passes
+            ));
+        }
+    }
+    s.push_str(
+        "\nSequencing: interior cutouts are cut before the perimeter, and this whole\n\
+         cut job runs LAST — after all ablation/mask/legend/drill — because a\n\
+         through-cut removes registration and rigidity. \"Lower the head\" means move\n\
+         the focal plane down into the material by the stated amount (raise the bed\n\
+         if your Z is the bed), keeping the lens-to-cut-floor distance at focus.\n",
+    );
+    s
 }
 
 /// The FlatCAM-replacement pipeline: Gerber → copper polys → board region →

@@ -18,7 +18,7 @@
 use std::io::Write;
 use std::path::Path;
 
-use pcb_core::{NM_PER_MM, Poly, Ring};
+use pcb_core::{NM_PER_MM, Paths, Poly, Ring};
 
 fn mm(v: i64) -> f64 {
     v as f64 / NM_PER_MM as f64
@@ -156,6 +156,77 @@ pub fn write_preview_svg(
     std::fs::File::create(path)?.write_all(doc.as_bytes())
 }
 
+/// Bounding box over path elements as (min_x, min_y, max_x, max_y) in nm.
+fn paths_bbox(paths: &Paths) -> Option<(i64, i64, i64, i64)> {
+    let mut b: Option<(i64, i64, i64, i64)> = None;
+    for e in &paths.elems {
+        for p in &e.pts {
+            b = Some(match b {
+                None => (p.x, p.y, p.x, p.y),
+                Some((x0, y0, x1, y1)) => (x0.min(p.x), y0.min(p.y), x1.max(p.x), y1.max(p.y)),
+            });
+        }
+    }
+    b
+}
+
+/// Write path elements as DXF R12 `POLYLINE`s on `layer` (open polylines for
+/// `closed: false`, closed for `closed: true`), coordinates in mm, y-up
+/// (native board frame). Unlike [`write_dxf`] these are open tool paths (cut
+/// contours), not filled regions.
+pub fn write_paths_dxf(paths: &Paths, layer: &str, path: &Path) -> std::io::Result<()> {
+    let mut out = String::new();
+    out.push_str("0\nSECTION\n2\nHEADER\n9\n$ACADVER\n1\nAC1009\n0\nENDSEC\n");
+    out.push_str("0\nSECTION\n2\nENTITIES\n");
+    for e in &paths.elems {
+        let flag = if e.closed { 1 } else { 0 };
+        out.push_str(&format!("0\nPOLYLINE\n8\n{layer}\n66\n1\n70\n{flag}\n"));
+        for p in &e.pts {
+            out.push_str(&format!(
+                "0\nVERTEX\n8\n{layer}\n10\n{:.6}\n20\n{:.6}\n",
+                mm(p.x),
+                mm(p.y)
+            ));
+        }
+        out.push_str("0\nSEQEND\n");
+    }
+    out.push_str("0\nENDSEC\n0\nEOF\n");
+    std::fs::File::create(path)?.write_all(out.as_bytes())
+}
+
+/// Write path elements as an SVG of stroked (unfilled) polylines, mm units,
+/// y-flipped into screen space. This is the importable form of a set of tool
+/// paths (e.g. the board-outline cut).
+pub fn write_paths_svg(paths: &Paths, path: &Path) -> std::io::Result<()> {
+    let (x0, y0, x1, y1) = paths_bbox(paths).unwrap_or((0, 0, 0, 0));
+    let flip = mm(y0) + mm(y1);
+    let mut body = String::new();
+    for e in &paths.elems {
+        if e.pts.is_empty() {
+            continue;
+        }
+        let mut d = String::new();
+        for (i, p) in e.pts.iter().enumerate() {
+            let cmd = if i == 0 { 'M' } else { 'L' };
+            d.push_str(&format!("{cmd}{:.6} {:.6}", mm(p.x), flip - mm(p.y)));
+        }
+        if e.closed {
+            d.push('Z');
+        }
+        body.push_str(&format!(
+            "  <path d=\"{d}\" fill=\"none\" stroke=\"#000\" stroke-width=\"0.05\"/>\n"
+        ));
+    }
+    let doc = svg_document(
+        &body,
+        mm(x0),
+        mm(y0),
+        mm(x1 - x0).max(0.001),
+        mm(y1 - y0).max(0.001),
+    );
+    std::fs::File::create(path)?.write_all(doc.as_bytes())
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -236,5 +307,38 @@ mod tests {
         let a = text.find("#333333").unwrap();
         let c = text.find("#b87333").unwrap();
         assert!(b < a && a < c, "paint order must be board, ablate, copper");
+    }
+
+    #[test]
+    fn paths_dxf_marks_open_and_closed_polylines() {
+        use pcb_core::{PathElem, PathKind, Paths};
+        let paths = Paths {
+            elems: vec![
+                PathElem {
+                    kind: PathKind::Cut,
+                    pts: vec![P::new(0, 0), P::new(5 * MM, 0), P::new(5 * MM, 5 * MM)],
+                    closed: false,
+                },
+                PathElem {
+                    kind: PathKind::Cut,
+                    pts: vec![P::new(0, 0), P::new(MM, 0), P::new(MM, MM)],
+                    closed: true,
+                },
+            ],
+        };
+        let path = tmp("cut.dxf");
+        write_paths_dxf(&paths, "CUT", &path).unwrap();
+        let text = std::fs::read_to_string(&path).unwrap();
+        assert_eq!(text.matches("POLYLINE").count(), 2);
+        assert!(text.contains("70\n0\n"), "open polyline flag");
+        assert!(text.contains("70\n1\n"), "closed polyline flag");
+        assert!(text.contains("8\nCUT\n"));
+
+        let svg = tmp("cut.svg");
+        write_paths_svg(&paths, &svg).unwrap();
+        let stext = std::fs::read_to_string(&svg).unwrap();
+        assert_eq!(stext.matches("<path").count(), 2);
+        assert!(stext.contains("fill=\"none\""));
+        assert!(stext.contains("stroke=\"#000\""));
     }
 }

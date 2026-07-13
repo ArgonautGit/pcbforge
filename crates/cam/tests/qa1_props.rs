@@ -411,6 +411,7 @@ fn kind_ord(k: PathKind) -> (u8, u32) {
         PathKind::ForceClear => (2, 0),
         PathKind::Boundary => (3, 0),
         PathKind::Mark => (4, 0),
+        PathKind::Cut => (5, 0),
     }
 }
 

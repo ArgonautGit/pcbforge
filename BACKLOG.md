@@ -29,7 +29,7 @@ done-when. Task prompts live in `docs/backlog.md`.
 - [x] CAM-7 — Design-rule checker
 - [x] CAM-8 — Fiducial/tooling feature injector
 - [ ] CAM-9 — Tiling for the slide extension *(stretch)*
-- [ ] CAM-10 — Board-outline cut pass (depaneling with focus stepping) *(operator-added; plan in docs/plans/cam-10-board-cut.md)*
+- [x] CAM-10 — Board-outline cut pass (depaneling with focus stepping) *(operator-added; cam::cut + `pcbforge cut`; plan in docs/plans/cam-10-board-cut.md)*
 
 ## WS-EMIT — Backends & CLI
 - [ ] EMIT-1 — lbrn2 schema report *(blocked: samples/lbrn2 fixtures not yet provided)*
