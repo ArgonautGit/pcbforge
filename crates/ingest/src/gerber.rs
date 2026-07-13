@@ -73,9 +73,16 @@ pub fn load_gerber(path: &Path) -> Result<Layer, GerberError> {
 pub fn parse_gerber(src: &str) -> Result<Layer, GerberError> {
     let mut p = Parser::new(src);
     p.run()?;
-    // Fold polarity batches: dark = union, clear = difference.
+    Ok(Layer {
+        polys: fold_batches(&p.batches),
+    })
+}
+
+/// Fold polarity batches into normalized geometry: dark = union, clear =
+/// difference, in stream order.
+fn fold_batches(batches: &[(bool, Vec<Poly>)]) -> Vec<Poly> {
     let mut acc: Vec<Poly> = Vec::new();
-    for (dark, polys) in &p.batches {
+    for (dark, polys) in batches {
         if polys.is_empty() {
             continue;
         }
@@ -85,7 +92,132 @@ pub fn parse_gerber(src: &str) -> Result<Layer, GerberError> {
             geom::difference(&acc, polys)
         };
     }
-    Ok(Layer { polys: acc })
+    acc
+}
+
+/// X2 aperture attributes (Ucamco §5.6). Only the fields ING-3/ING-4 consume.
+#[derive(Clone, Default, Debug, PartialEq, Eq)]
+pub struct ApertureAttrs {
+    /// Primary value of `.AperFunction` (§5.6.10): e.g. `ComponentPad`,
+    /// `SMDPad`, `ViaPad`, `Conductor`, `FiducialPad`.
+    pub function: Option<String>,
+}
+
+/// One attributed graphical object (a flash, stroke, or region) with the X2
+/// attributes that were in force when it was drawn.
+#[derive(Clone, Debug)]
+pub struct GerberObject {
+    /// The object's geometry (nm), before polarity folding.
+    pub polys: Vec<Poly>,
+    /// False for clear (LPC) knockout objects.
+    pub dark: bool,
+    /// `.N` net name (§5.6.13), when present.
+    pub net: Option<String>,
+    /// `.P` component pad `(reference, pin)` (§5.6.14), when present.
+    pub pad: Option<(String, String)>,
+    /// Primary `.AperFunction` value of the object's aperture, when present.
+    pub aper_function: Option<String>,
+}
+
+impl GerberObject {
+    /// True for a fiducial pad (`.AperFunction,FiducialPad`).
+    pub fn is_fiducial(&self) -> bool {
+        self.aper_function.as_deref() == Some("FiducialPad")
+    }
+
+    /// True for any pad-class aperture function.
+    pub fn is_pad(&self) -> bool {
+        matches!(
+            self.aper_function.as_deref(),
+            Some(
+                "ComponentPad"
+                    | "SMDPad"
+                    | "ConnectorPad"
+                    | "HeatsinkPad"
+                    | "TestPad"
+                    | "ViaPad"
+                    | "FiducialPad"
+            )
+        )
+    }
+}
+
+/// A Gerber layer parsed with X2 attributes preserved (ING-3).
+///
+/// [`layer`](Self::layer) is the same normalized geometry [`load_gerber`]
+/// produces (the ING-1 cross-check); [`objects`](Self::objects) additionally
+/// carries each object's net / pad / aperture-function attributes, and
+/// [`net_polys`](Self::net_polys) unions the copper of a chosen net (the
+/// input ING-4's `net_raster` needs).
+pub struct AttributedLayer {
+    layer: Layer,
+    objects: Vec<GerberObject>,
+}
+
+impl AttributedLayer {
+    /// The folded, normalized layer geometry (identical to [`load_gerber`]).
+    pub fn layer(&self) -> &Layer {
+        &self.layer
+    }
+
+    /// Every attributed object, in stream order.
+    pub fn objects(&self) -> &[GerberObject] {
+        &self.objects
+    }
+
+    /// Distinct net names present on copper objects, sorted.
+    pub fn net_names(&self) -> Vec<String> {
+        let mut names: Vec<String> = self
+            .objects
+            .iter()
+            .filter(|o| o.dark)
+            .filter_map(|o| o.net.clone())
+            .collect();
+        names.sort();
+        names.dedup();
+        names
+    }
+
+    /// Union of the dark copper tagged with net `name` (empty if none).
+    pub fn net_polys(&self, name: &str) -> Vec<Poly> {
+        let mut acc: Vec<Poly> = Vec::new();
+        for o in &self.objects {
+            if o.dark && o.net.as_deref() == Some(name) {
+                acc = geom::union(&acc, &o.polys);
+            }
+        }
+        acc
+    }
+
+    /// All fiducial-pad objects.
+    pub fn fiducials(&self) -> Vec<&GerberObject> {
+        self.objects.iter().filter(|o| o.is_fiducial()).collect()
+    }
+}
+
+/// Read and parse a Gerber X2 file, preserving aperture/object attributes
+/// (ING-3).
+pub fn load_gerber_x2(path: &Path) -> Result<AttributedLayer, GerberError> {
+    let src = std::fs::read_to_string(path).map_err(|e| GerberError {
+        line: 0,
+        msg: format!("cannot read {}: {e}", path.display()),
+    })?;
+    parse_gerber_x2(&src)
+}
+
+/// Parse Gerber X2 source, preserving attributes. The `.layer()` geometry is
+/// identical to [`parse_gerber`]'s.
+pub fn parse_gerber_x2(src: &str) -> Result<AttributedLayer, GerberError> {
+    let mut p = Parser::new(src);
+    p.track_attrs = true;
+    p.run()?;
+    let layer = Layer {
+        polys: fold_batches(&p.batches),
+    };
+    Ok(AttributedLayer {
+        layer,
+        objects: std::mem::take(&mut p.objects),
+    })
 }
 
 // ---------------------------------------------------------------------------
@@ -140,6 +272,20 @@ struct Parser<'a> {
     batches: Vec<(bool, Vec<Poly>)>,
     dark: bool,
     ended: bool,
+    // --- X2 attribute tracking (ING-3); inert unless `track_attrs` ---
+    /// When true, every emitted object is also recorded in `objects` with the
+    /// X2 attributes in force (see [`parse_gerber_x2`]).
+    track_attrs: bool,
+    /// Current `.N` net-name object attribute (Ucamco §5.6.13).
+    obj_net: Option<String>,
+    /// Current `.P` component-pad object attribute (ref, pin) (§5.6.14).
+    obj_pad: Option<(String, String)>,
+    /// Current aperture-attribute dictionary (attached to each `%AD`).
+    aper_dict: ApertureAttrs,
+    /// `.AperFunction` recorded per aperture D-code at definition time.
+    aperture_fn: HashMap<u32, Option<String>>,
+    /// Attributed objects, in stream order.
+    objects: Vec<GerberObject>,
 }
 
 impl<'a> Parser<'a> {
@@ -163,6 +309,12 @@ impl<'a> Parser<'a> {
             batches: vec![(true, Vec::new())],
             dark: true,
             ended: false,
+            track_attrs: false,
+            obj_net: None,
+            obj_pad: None,
+            aper_dict: ApertureAttrs::default(),
+            aperture_fn: HashMap::new(),
+            objects: Vec::new(),
         }
     }
 
@@ -179,11 +331,80 @@ impl<'a> Parser<'a> {
     }
 
     fn emit(&mut self, polys: Vec<Poly>) {
+        if self.track_attrs {
+            // A region (G36/G37) is not an aperture flash, so it carries no
+            // aperture function even though `current_aperture` may still be
+            // set from a prior flash.
+            let aper_function = if self.in_region {
+                None
+            } else {
+                self.current_aperture
+                    .and_then(|d| self.aperture_fn.get(&d).cloned().flatten())
+            };
+            self.objects.push(GerberObject {
+                polys: polys.clone(),
+                dark: self.dark,
+                net: self.obj_net.clone(),
+                pad: self.obj_pad.clone(),
+                aper_function,
+            });
+        }
         let last = self.batches.last_mut().expect("batches never empty");
         if last.0 == self.dark {
             last.1.extend(polys);
         } else {
             self.batches.push((self.dark, polys));
+        }
+    }
+
+    /// `%TA<name>,<v1>,<v2>…` — set an aperture-dictionary attribute. Only
+    /// `.AperFunction` (§5.6.10) and a standalone `.FiducialPad` are
+    /// interpreted; the primary value is kept.
+    fn set_aperture_attr(&mut self, rest: &str) {
+        let mut it = rest.splitn(2, ',');
+        let name = it.next().unwrap_or("");
+        let val = it.next().unwrap_or("");
+        match name {
+            ".AperFunction" => {
+                let primary = val.split(',').next().unwrap_or("").to_string();
+                self.aper_dict.function = (!primary.is_empty()).then_some(primary);
+            }
+            ".FiducialPad" => self.aper_dict.function = Some("FiducialPad".to_string()),
+            _ => {}
+        }
+    }
+
+    /// `%TO<name>,<v1>,<v2>…` — set an object attribute. `.N` net name
+    /// (§5.6.13) and `.P` component pad (ref, pin) (§5.6.14) are kept.
+    fn set_object_attr(&mut self, rest: &str) {
+        let mut it = rest.splitn(2, ',');
+        let name = it.next().unwrap_or("");
+        let val = it.next().unwrap_or("");
+        match name {
+            ".N" => self.obj_net = (!val.is_empty()).then(|| val.to_string()),
+            ".P" => {
+                let mut p = val.splitn(2, ',');
+                let refdes = p.next().unwrap_or("").to_string();
+                let pin = p.next().unwrap_or("").to_string();
+                self.obj_pad = Some((refdes, pin));
+            }
+            _ => {}
+        }
+    }
+
+    /// `%TD[<name>]` — delete one attribute, or all when no name is given
+    /// (§5.6.16). KiCad emits a bare `%TD*%` to reset between objects.
+    fn delete_attr(&mut self, rest: &str) {
+        match rest {
+            "" => {
+                self.obj_net = None;
+                self.obj_pad = None;
+                self.aper_dict = ApertureAttrs::default();
+            }
+            ".N" => self.obj_net = None,
+            ".P" => self.obj_pad = None,
+            ".AperFunction" | ".FiducialPad" => self.aper_dict.function = None,
+            _ => {}
         }
     }
 
@@ -276,12 +497,29 @@ impl<'a> Parser<'a> {
             };
             return Ok(());
         }
-        if first.starts_with("TF")
-            || first.starts_with("TA")
-            || first.starts_with("TO")
-            || first.starts_with("TD")
-        {
-            return Ok(()); // X2 attributes: metadata only
+        // X2 attributes (Ucamco §5.6). `.TF` file attributes are pure
+        // metadata; `.TA`/`.TO`/`.TD` maintain the aperture/object attribute
+        // dictionary that ING-3 preserves (inert unless `track_attrs`).
+        if first.starts_with("TF") {
+            return Ok(());
+        }
+        if let Some(rest) = first.strip_prefix("TA") {
+            if self.track_attrs {
+                self.set_aperture_attr(rest);
+            }
+            return Ok(());
+        }
+        if let Some(rest) = first.strip_prefix("TO") {
+            if self.track_attrs {
+                self.set_object_attr(rest);
+            }
+            return Ok(());
+        }
+        if let Some(rest) = first.strip_prefix("TD") {
+            if self.track_attrs {
+                self.delete_attr(rest);
+            }
+            return Ok(());
         }
         if first.starts_with("IN") || first.starts_with("LN") || first == "IPPOS" {
             return Ok(()); // legacy names / positive image polarity
@@ -515,6 +753,11 @@ impl<'a> Parser<'a> {
                 Aperture::Compiled(polys)
             }
         };
+        if self.track_attrs {
+            // Attach the current aperture-dictionary function to this D-code.
+            self.aperture_fn
+                .insert(dcode, self.aper_dict.function.clone());
+        }
         self.apertures.insert(dcode, ap);
         Ok(())
     }

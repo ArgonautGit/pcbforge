@@ -13,8 +13,8 @@ done-when. Task prompts live in `docs/backlog.md`.
 ## WS-ING — Ingestion
 - [x] ING-1 — KiCad SVG → Layer
 - [x] ING-2 — Excellon drills *(ground truth from authored board source; dual API for G85 slots — see module docs)*
-- [ ] ING-3 — Gerber X2 ingest (robust path) *(partial: ingest::gerber parses the KiCad dialect for `pcbforge noncopper`; golden-validated against real kicad-cli 7.0.11 output on the sample board — see decisions.md 2026-07-13; X2 attribute *preservation* still pending)*
-- [ ] ING-4 — Net-ID source + net raster
+- [x] ING-3 — Gerber X2 ingest (robust path) *(load_gerber_x2/AttributedLayer preserves .N/.P/.AperFunction; geometry identical to plain parse, which is golden-validated vs KiCad — see decisions.md)*
+- [x] ING-4 — Net-ID source + net raster *(ingest::net_raster from X2 .N attributes; VCC/GND distinct IDs on valdemo2 — see decisions.md for the net-source decision)*
 - [x] ING-5 — Board metadata (.gbrjob)
 - [x] ING-6 — kicad-cli invoker
 

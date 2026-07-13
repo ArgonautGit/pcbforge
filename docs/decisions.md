@@ -3,6 +3,39 @@
 Per the backlog conventions: every task records deviations from its prompt and
 discovered constraints here.
 
+## 2026-07-13 — ING-3 + ING-4 (X2 attributes + net raster)
+
+- ING-3: extended the existing `ingest::gerber` parser (rather than writing a
+  second parser) to track the X2 attribute dictionary — `%TA.AperFunction`,
+  `%TO.N` (net), `%TO.P` (component pad ref/pin), `%TD` reset (Ucamco §5.6).
+  New `load_gerber_x2`/`parse_gerber_x2` return an `AttributedLayer` carrying
+  per-object attributes; the folded `.layer()` geometry is byte-for-byte
+  identical to plain `load_gerber` (asserted on valdemo + valdemo2). The
+  done-when's "X2 layer vs SVG layer ≥99.5%" is met transitively: plain
+  `load_gerber` is already golden-validated against KiCad's own SVG render
+  (kicad_golden.rs), and the X2 path produces identical geometry, so no
+  separate y-frame reconciliation between the y-down gerber and y-up svg
+  ingest was needed. Attribute tracking is inert (`track_attrs=false`) on the
+  plain path, so existing behavior/tests are unchanged.
+- Evaluated the crates.io `gerber-types`/parser crates per the prompt: the
+  hand-rolled tolerant parser already handles the KiCad dialect and is
+  golden-validated, so adding a dependency to re-parse would be strictly more
+  code and risk — kept the in-house parser (noted here per the prompt).
+- ING-4 net-source decision: chose **(b) X2 `.N` attributes** over (a) a
+  per-net kicad-cli export (none exists) and (c) parsing the `.kicad_pcb`
+  s-expression netlist. (b) is far less code — ING-3 already renders every
+  copper object with correct geometry AND tags its net, so `net_raster` is a
+  union-per-net + scanline fill; (c) would re-derive footprint/pad geometry
+  (rotation, roundrect, thermal reliefs) the gerber path already produces.
+  `ingest::net_raster::net_raster(&AttributedLayer, um_per_px) -> (IdImage,
+  Vec<NetName>)`; verified on valdemo2 that VCC and GND get distinct IDs and
+  each net's pad centroid samples back to its own ID (frame-correct sample
+  points taken from the parsed geometry, in lieu of pasted GUI coordinates —
+  same authored-ground-truth substitution as the ING wave).
+- net_polys unions dark objects per net; clears (thermal reliefs) are not
+  subtracted per-net (copper layers are positive; the folded layer still
+  carries them). Adequate for the clearance loop's short/open classification.
+
 ## 2026-07-13 — CAM-10 added (board-outline cut / depaneling)
 
 - Operator-requested new task: the backlog never freed the board from the
