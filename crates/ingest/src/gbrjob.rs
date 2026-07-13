@@ -21,7 +21,7 @@
 use std::fmt;
 use std::path::Path;
 
-use pcb_core::{Nm, NM_PER_MM};
+use pcb_core::{NM_PER_MM, Nm};
 use serde_json::Value;
 
 /// Board-level metadata parsed from a `.gbrjob` file.
@@ -158,7 +158,7 @@ fn layer_number(value: Option<&Value>) -> Result<u32, GbrjobError> {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::kicad_cli::{available, KicadCli};
+    use crate::kicad_cli::{KicadCli, available};
     use std::path::PathBuf;
 
     /// Minimal but structurally faithful copy of what KiCad 7.0.11 writes
