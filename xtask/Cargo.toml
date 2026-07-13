@@ -6,4 +6,12 @@ license.workspace = true
 publish = false
 
 [dependencies]
+anyhow = "1.0"
+cam = { version = "0.1.0", path = "../crates/cam" }
+image = { version = "0.25", default-features = false, features = ["png"] }
+ingest = { version = "0.1.0", path = "../crates/ingest" }
+pcb-core = { workspace = true }
 sha2 = "0.10"
+# testkit is normally dev-only, but xtask *is* a dev tool (publish = false,
+# never shipped), and seed-defect's built-in golden check needs its rasterizer.
+testkit = { version = "0.1.0", path = "../crates/testkit" }

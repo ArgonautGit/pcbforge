@@ -85,7 +85,7 @@ done-when. Task prompts live in `docs/backlog.md`.
 - [ ] QA-2 — CI virtual-fab integration test
 - [ ] QA-3 — AOI corpus & annotation tool
 - [ ] QA-4 — Nightly hardware-in-loop script
-- [ ] QA-5 — Seeded-defect fixture generator
+- [x] QA-5 — Seeded-defect fixture generator *(geometric defect spec; net-named placement awaits ING-4)*
 
 ## WS-RES — Research tasks
 - [x] RES-1 — Crate due diligence

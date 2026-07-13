@@ -6,15 +6,21 @@
 //!
 //! * `fixtures` — validate the test-fixture tree and (re)write
 //!   `samples/MANIFEST.toml`. See [`fixtures`].
+//! * `seed-defect` — inject a known defect (copper sliver or local trace
+//!   thinning) into a board's F.Cu artwork and emit golden-checked modified
+//!   artwork. See [`xtask::seed_defect`].
 //!
-//! INF-3. This crate is `publish = false` and is only ever run as a dev tool;
-//! nothing in the shipped workspace depends on it.
+//! INF-3 / QA-5. This crate is `publish = false` and is only ever run as a
+//! dev tool; nothing in the shipped workspace depends on it.
 
 use std::fmt::Write as _;
 use std::path::{Path, PathBuf};
 use std::process::ExitCode;
 
 use sha2::{Digest, Sha256};
+
+/// Top-level usage line.
+const USAGE: &str = "usage: cargo xtask <fixtures | seed-defect ...>";
 
 /// Minimum number of KiCad board projects `samples/kicad` must contain.
 const MIN_KICAD_PROJECTS: usize = 2;
@@ -61,12 +67,28 @@ fn main() -> ExitCode {
                 }
             }
         }
+        Some("seed-defect") => {
+            let rest: Vec<String> = args.collect();
+            match xtask::seed_defect::cli(&rest) {
+                Ok(report) => {
+                    println!("{report}");
+                    ExitCode::SUCCESS
+                }
+                Err(e) => {
+                    eprintln!("seed-defect failed: {e:#}");
+                    ExitCode::FAILURE
+                }
+            }
+        }
         Some(other) => {
-            eprintln!("unknown xtask command: {other}\n\nusage: cargo xtask fixtures");
+            eprintln!(
+                "unknown xtask command: {other}\n\n{USAGE}\n{}",
+                xtask::seed_defect::USAGE
+            );
             ExitCode::from(2)
         }
         None => {
-            eprintln!("usage: cargo xtask fixtures");
+            eprintln!("{USAGE}\n{}", xtask::seed_defect::USAGE);
             ExitCode::from(2)
         }
     }

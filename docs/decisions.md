@@ -48,6 +48,32 @@ discovered constraints here.
   the unstable `cfg_select!` macro and fails on rustc 1.94.1. Revisit on the
   next toolchain bump.
 
+## 2026-07-13 — ING wave (ING-1/2/5/6, CAM-6, QA-5) on the real KiCad toolchain
+
+- With kicad-cli 7.0.11 installed, the whole KiCad-gated software chain was
+  built and verified against real exports: ING-6 (invoker with runtime flag
+  verification — the only shell-out point), ING-1 (SVG→Layer, golden vs
+  rsvg-convert 0.99999 on both boards; KiCad SVGs paint white knockout
+  shapes over black, folded like Gerber LPC), ING-2 (Excellon incl. G85
+  slots, exact-integer decimal-mm→nm), ING-5 (.gbrjob — real structure is
+  nested GeneralSpecs.Size.{X,Y}), CAM-6 (process compilers reusing
+  ablation's hatcher via an identity rubout construction), QA-5
+  (xtask seed-defect with a built-in SVG round-trip golden and
+  drc-detectability enforcement).
+- Standing deviation for the wave: done-when values the backlog said the
+  operator would "paste from the KiCad GUI" are instead taken from the
+  authored in-repo board sources (exact by construction, no transcription).
+  Real user-designed boards remain the next-best validation input.
+- samples/kicad now holds TWO real boards (valdemo, valdemo2), so INF-3's
+  real-repo gate now fails only on the missing samples/lbrn2 set.
+- Coordinate-frame convention note: gerber/excellon ingest keep KiCad's
+  plotted y-down frame (negative Y) verbatim; svg ingest normalizes to the
+  y-up board frame. Registration across gerber+drill is consistent; anyone
+  mixing svg-ingested and gerber-ingested layers must reconcile frames
+  (future ING-4/CAM glue should settle a single convention).
+- ING-4 (net raster) is the one remaining KiCad-adjacent task; it needs a
+  net↔geometry source decision (X2 .N attributes vs s-expression netlist).
+
 ## 2026-07-13 — kicad-cli installed; parser golden-validated against real KiCad
 
 - Correction of an earlier claim: this environment CAN run KiCad — `apt
