@@ -3,6 +3,27 @@
 Per the backlog conventions: every task records deviations from its prompt and
 discovered constraints here.
 
+## 2026-07-13 — Operator correction: MOPA fluence is pulse-width + frequency
+
+- Operator (at the machine) corrected a wrong mental model: on their MOPA
+  fiber the effective ablation energy is governed by **Q-pulse width and
+  frequency** (plus speed/interval), not the "Max Power %" field, which sits
+  fixed (observed greyed at 20%). Physics they confirmed: peak power
+  ~= P_avg / (frequency * pulse_width), so a shorter pulse concentrates the
+  same pulse energy into less time and raises peak power (more aggressive,
+  cleaner ablation). Frequency trades the other way.
+- Consequences:
+  - EMIT fixture set: replaced `power.lbrn2` with `pulse-width.lbrn2` in
+    xtask's EXPECTED_LBRN2; frequency.lbrn2 retained. The two files that
+    isolate the real knobs are pulse-width and frequency.
+  - `AblationParams` already carries `frequency_khz` + `pulse_ns` alongside
+    `power_pct`; the lbrn2 emitter (EMIT-2) will treat pulse width and
+    frequency as first-class, and a derived peak-power term
+    (P_avg/(f*pulse)) is the natural input for heat-aware logic / the material
+    table's ablation-strength axis (rather than the % field).
+  - The earlier "unlock the greyed Max Power field" line of investigation was
+    a misread of the machine and is abandoned.
+
 ## 2026-07-13 — CAM-9 (tiling, stretch) — geometry only
 
 - `cam::tiles::tile(&Paths, field_mm, overlap_mm) -> TilePlan` splits an

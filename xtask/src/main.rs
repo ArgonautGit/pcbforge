@@ -34,7 +34,10 @@ const MIN_KICAD_PROJECTS: usize = 2;
 /// §0.3 names arrive, edit this array — nothing else changes.
 const EXPECTED_LBRN2: &[&str] = &[
     "base.lbrn2",
-    "power.lbrn2",
+    // MOPA fiber: fluence is set by pulse width + frequency, not the (often
+    // fixed) Max Power %. Peak power ~= P_avg / (frequency * pulse_width), so
+    // the Q-pulse-width variant is a primary process knob. See decisions.md.
+    "pulse-width.lbrn2",
     "speed.lbrn2",
     "frequency.lbrn2",
     "interval.lbrn2",
