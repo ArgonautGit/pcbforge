@@ -7,6 +7,8 @@ license.workspace = true
 [dependencies]
 cam = { version = "0.1.0", path = "../cam" }
 pcb-core = { workspace = true }
+serde_json = "1.0.150"
+usvg = "0.47.0"
 
 [dev-dependencies]
 testkit = { path = "../testkit" }

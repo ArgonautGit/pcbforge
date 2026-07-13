@@ -11,7 +11,7 @@ done-when. Task prompts live in `docs/backlog.md`.
 - [x] INF-4 — Golden-image test harness
 
 ## WS-ING — Ingestion
-- [ ] ING-1 — KiCad SVG → Layer
+- [x] ING-1 — KiCad SVG → Layer
 - [x] ING-2 — Excellon drills *(ground truth from authored board source; dual API for G85 slots — see module docs)*
 - [ ] ING-3 — Gerber X2 ingest (robust path) *(partial: ingest::gerber parses the KiCad dialect for `pcbforge noncopper`; golden-validated against real kicad-cli 7.0.11 output on the sample board — see decisions.md 2026-07-13; X2 attribute *preservation* still pending)*
 - [ ] ING-4 — Net-ID source + net raster
