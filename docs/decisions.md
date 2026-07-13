@@ -48,6 +48,28 @@ discovered constraints here.
   the unstable `cfg_select!` macro and fails on rustc 1.94.1. Revisit on the
   next toolchain bump.
 
+## 2026-07-13 — kicad-cli installed; parser golden-validated against real KiCad
+
+- Correction of an earlier claim: this environment CAN run KiCad — `apt
+  install --no-install-recommends kicad` (7.0.11) works fine; the earlier
+  "kicad-cli unavailable" blocker was never actually tested. Logged as a
+  process lesson: test the blocker before declaring it.
+- `samples/kicad/valdemo.kicad_pcb` is a real (agent-authored, KiCad-loaded)
+  board: rect/oval/roundrect/circle pads, straight+arc traces, a zone with a
+  C-shaped filled_polygon, Edge.Cuts outline.
+- `crates/ingest/tests/kicad_golden.rs`: kicad-cli exports the F.Cu Gerber
+  (parsed by ingest::gerber, rasterized by testkit) AND its own SVG render
+  of the same layer (rasterized by rsvg-convert); the two rasters must agree
+  on ≥ 99.5 % of pixels at 25 µm/px after content-bbox alignment. PASSES on
+  real KiCad 7.0.11 output — including the real RoundRect macro (closed
+  5-pair primitive 4 + primitive-20 corner bridges), negative-Y frame,
+  standalone G02/G03 mode words, and interleaved X2 attributes. The test
+  self-skips when kicad-cli/rsvg-convert are absent, so CI stays green.
+- Consequence for the backlog: the "needs KiCad" blocker on ING-1/2/5/6,
+  CAM-6, QA-5 is now soft — KiCad is installable in-session. Those tasks
+  are buildable; they still need a second sample board (INF-3 wants ≥ 2)
+  and pasted GUI ground-truth values where their done-whens demand them.
+
 ## 2026-07-12 — `pcbforge noncopper` (operator-requested FlatCAM replacement)
 
 - The operator asked for a tool cutting FlatCAM out of the old workflow:

@@ -1,0 +1,67 @@
+(kicad_pcb (version 20221018) (generator pcbnew)
+
+  (general
+    (thickness 1.6)
+  )
+
+  (paper "A4")
+
+  (layers
+    (0 "F.Cu" signal)
+    (31 "B.Cu" signal)
+    (36 "B.SilkS" user "B.Silkscreen")
+    (37 "F.SilkS" user "F.Silkscreen")
+    (38 "B.Mask" user)
+    (39 "F.Mask" user)
+    (44 "Edge.Cuts" user)
+  )
+
+  (setup
+    (pad_to_mask_clearance 0)
+    (pcbplotparams
+      (layerselection 0x00010fc_ffffffff)
+      (plot_on_all_layers_selection 0x0000000_00000000)
+      (disableapertmacros false)
+      (usegerberextensions true)
+      (usegerberattributes true)
+      (usegerberadvancedattributes true)
+      (creategerberjobfile true)
+    )
+  )
+
+  (net 0 "")
+  (net 1 "SIG")
+
+  (footprint "test:pads" (layer "F.Cu")
+    (at 105 105)
+    (attr smd)
+    (pad "1" smd rect (at -15 0) (size 1 1) (layers "F.Cu") (net 1 "SIG"))
+    (pad "2" smd oval (at 15 0) (size 1.6 1) (layers "F.Cu") (net 1 "SIG"))
+    (pad "3" smd roundrect (at 0 8) (size 2 1) (layers "F.Cu")
+      (roundrect_rratio 0.25) (net 1 "SIG"))
+    (pad "4" smd circle (at -10 8) (size 1.2 1.2) (layers "F.Cu"))
+  )
+
+  (segment (start 90 105) (end 120 105) (width 0.25) (layer "F.Cu") (net 1))
+  (arc (start 120 105) (mid 117.656854 110.656854) (end 112 113) (width 0.25) (layer "F.Cu") (net 1))
+  (segment (start 112 113) (end 105 113) (width 0.25) (layer "F.Cu") (net 1))
+
+  (zone (net 0) (net_name "") (layer "F.Cu") (name "pour")
+    (hatch edge 0.5)
+    (connect_pads (clearance 0.3))
+    (min_thickness 0.25) (filled_areas_thickness no)
+    (fill yes (thermal_gap 0.5) (thermal_bridge_width 0.5))
+    (polygon
+      (pts (xy 92 88) (xy 103 88) (xy 103 99) (xy 92 99))
+    )
+    (filled_polygon
+      (layer "F.Cu")
+      (pts
+        (xy 92.25 88.25) (xy 102.75 88.25) (xy 102.75 92.75) (xy 97.75 92.75)
+        (xy 97.75 95.25) (xy 102.75 95.25) (xy 102.75 98.75) (xy 92.25 98.75)
+      )
+    )
+  )
+
+  (gr_rect (start 85 85) (end 125 120) (layer "Edge.Cuts") (width 0.05) (fill none))
+)

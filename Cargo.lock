@@ -482,7 +482,9 @@ name = "ingest"
 version = "0.1.0"
 dependencies = [
  "cam",
+ "image",
  "pcb-core",
+ "testkit",
 ]
 
 [[package]]
