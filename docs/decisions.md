@@ -3,6 +3,24 @@
 Per the backlog conventions: every task records deviations from its prompt and
 discovered constraints here.
 
+## 2026-07-13 — CAM-10 added (board-outline cut / depaneling)
+
+- Operator-requested new task: the backlog never freed the board from the
+  stock (Edge.Cuts was only a region mask for noncopper and a bbox for
+  .gbrjob metadata). CAM-10 adds a kerf-compensated, tabbed through-cut with
+  a focus-step schedule; full design in `docs/plans/cam-10-board-cut.md`,
+  task prompt appended to `docs/backlog.md` (backlog now 54 tasks).
+- The operator-stated constraint that shaped the design: the focal plane must
+  be lowered during the cut. The plan encodes this as CutSteps (each removing
+  ≤ z_step_mm, i.e. within the lens's usable depth of focus) with an explicit
+  "lower the head by X mm" instruction between steps, pass counts derived
+  from a measured mm_per_pass, and board thickness taken from the .gbrjob
+  (ING-5) rather than assumed. mm_per_pass / kerf / z_step are machine facts:
+  an operator calibration ladder (agent-prepared checklist) precedes the
+  first real cut, and shipped defaults warn until overridden.
+- Not yet implemented — plan only. Implementation touches crates/{core,cam,cli}
+  (PathKind::Cut, CutOpts/CutStep/CutSchedule, cam::cut, `pcbforge cut`).
+
 ## 2026-07-08 — Repo bootstrap (pre-INF-1)
 
 - The repository was empty (no commits) when work started. `BACKLOG.md` was

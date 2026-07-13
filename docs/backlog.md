@@ -322,6 +322,40 @@ then implement with a property test: union of tile geometry == original within
 execution requires ComMarker Studio for stage moves — this task is geometry only.
 ```
 
+### CAM-10 — Board-outline cut pass (depaneling with focus stepping)
+Tier: standard · Depends: GEO-1, ING-1(gerber path), ING-5, CAM-4 · Delivers: `cam::cut`, `pcbforge cut`, `PathKind::Cut`
+```
+## Task
+Free the board from the stock: turn Edge.Cuts into a kerf-compensated,
+tabbed through-cut job with a focus-step schedule. Read
+docs/plans/cam-10-board-cut.md first and implement it — it is the design.
+
+## The one physics constraint that shapes everything
+The galvo's focal plane is fixed and its depth of focus is far shallower than
+the 1.6 mm board, so THE FOCAL PLANE MUST BE LOWERED DURING THE CUT: group
+passes into CutSteps that each remove ≤ z_step_mm, and after each step emit
+the literal instruction "lower the head by X mm" (focus follows the cut
+floor). Board thickness comes from the .gbrjob (ING-5), never assumed.
+
+## Shape
+cam::cut::{cut_paths(edge_cuts_region, &CutOpts) -> Paths,
+schedule(&CutOpts, thickness_nm) -> CutSchedule}. Kerf compensation is one
+geom::offset of the board region by +kerf/2 (winding puts the beam on the
+waste side of perimeter AND cutouts). Tabs: tab_count gaps of tab_mm+kerf per
+ring, evenly spread by arc length, nudged off corners. Interior rings before
+perimeter; the cut job is always a board's final job. New
+pcb_core::PathKind::Cut; CAM-3 must never interleave it, CAM-5 never routes
+it to the UV set. CLI: per-focus-step SVG/DXF files + cut-schedule.txt for
+the LightBurn workflow.
+
+## Done when
+The four property tests and the valdemo2 fixture/E2E tests in the plan's
+"Done-when" section pass verbatim (kerf clearance ±1 µm; tab arithmetic
+closes to ring length; schedule sums to thickness+overcut with every drop
+≤ z_step_mm and final drop 0; interior-before-perimeter ordering). Defaults
+print the run-the-calibration-ladder warning. Touch crates/{core,cam,cli}.
+```
+
 ---
 
 ## WS-EMIT — Backends & CLI
@@ -1008,4 +1042,4 @@ single anecdote as authoritative.
 
 ## Backlog checklist (copy into BACKLOG.md)
 
-INF-1..4 · ING-1..6 · GEO-1 · CAM-1..9 · EMIT-1..3 · SIM-1..2 · VIS-1..13 · ORC-1..8 · UI-1..4 · DRV-1..8 · QA-1..5 · RES-1..4 — 53 tasks. Stretch-tagged: CAM-9, VIS-7, DRV-7, RES-4. Human-executed but agent-prepared: DRV-1's captures, DRV-5's S2–S5, QA-4's burns, every "live" done-when.
+INF-1..4 · ING-1..6 · GEO-1 · CAM-1..10 · EMIT-1..3 · SIM-1..2 · VIS-1..13 · ORC-1..8 · UI-1..4 · DRV-1..8 · QA-1..5 · RES-1..4 — 54 tasks (CAM-10 operator-added 2026-07-13). Stretch-tagged: CAM-9, VIS-7, DRV-7, RES-4. Human-executed but agent-prepared: DRV-1's captures, DRV-5's S2–S5, QA-4's burns, every "live" done-when.

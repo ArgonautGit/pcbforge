@@ -1,6 +1,6 @@
 # PCBForge Backlog Checklist
 
-53 tasks. Stretch-tagged: CAM-9, VIS-7, DRV-7, RES-4. Human-executed but
+54 tasks (CAM-10 operator-added 2026-07-13). Stretch-tagged: CAM-9, VIS-7, DRV-7, RES-4. Human-executed but
 agent-prepared: DRV-1's captures, DRV-5's S2–S5, QA-4's burns, every "live"
 done-when. Task prompts live in `docs/backlog.md`.
 
@@ -29,6 +29,7 @@ done-when. Task prompts live in `docs/backlog.md`.
 - [x] CAM-7 — Design-rule checker
 - [x] CAM-8 — Fiducial/tooling feature injector
 - [ ] CAM-9 — Tiling for the slide extension *(stretch)*
+- [ ] CAM-10 — Board-outline cut pass (depaneling with focus stepping) *(operator-added; plan in docs/plans/cam-10-board-cut.md)*
 
 ## WS-EMIT — Backends & CLI
 - [ ] EMIT-1 — lbrn2 schema report *(blocked: samples/lbrn2 fixtures not yet provided)*
