@@ -45,7 +45,10 @@ const EXPECTED_LBRN2: &[&str] = &[
     "fill-angle.lbrn2",
     "line-vs-fill.lbrn2",
     "two-layer.lbrn2",
-    "uv-base.lbrn2",
+    // Both pass fields are captured (numPasses in passes.lbrn2, globalRepeat
+    // here). uv-base is deferred: the operator's rig is fiber-only (BSLFiber),
+    // so a UV-device variant can't be produced yet — see decisions.md.
+    "global-passes.lbrn2",
 ];
 
 /// Name of the manifest emitted into `samples/`.

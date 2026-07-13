@@ -7,7 +7,7 @@ done-when. Task prompts live in `docs/backlog.md`.
 ## WS-INF — Repo & infrastructure
 - [x] INF-1 — Workspace scaffold + core types *(scaffold.md agent-authored per operator direction — see decisions.md)*
 - [x] INF-2 — CI pipeline
-- [x] INF-3 — Fixture manifest & validator *(validator + self-tests complete; real-repo exit-0 awaits samples; lbrn2 name list is an authored stand-in)*
+- [x] INF-3 — Fixture manifest & validator *(complete; `cargo xtask fixtures` now exits 0 on the real repo — 2 kicad + 10 lbrn2 samples present)*
 - [x] INF-4 — Golden-image test harness
 
 ## WS-ING — Ingestion
@@ -32,7 +32,7 @@ done-when. Task prompts live in `docs/backlog.md`.
 - [x] CAM-10 — Board-outline cut pass (depaneling with focus stepping) *(operator-added; cam::cut + `pcbforge cut`; plan in docs/plans/cam-10-board-cut.md)*
 
 ## WS-EMIT — Backends & CLI
-- [ ] EMIT-1 — lbrn2 schema report *(blocked: samples/lbrn2 fixtures not yet provided)*
+- [x] EMIT-1 — lbrn2 schema report *(docs/lbrn2-schema.md, evidence-derived from 10 operator samples; Path-shape format pending one sample for EMIT-2)*
 - [ ] EMIT-2 — lbrn2 emitter
 - [ ] EMIT-3 — CLI surface
 

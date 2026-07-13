@@ -3,6 +3,28 @@
 Per the backlog conventions: every task records deviations from its prompt and
 discovered constraints here.
 
+## 2026-07-13 — EMIT-1 (lbrn2 schema) + samples landed
+
+- The operator provided 10 real `.lbrn2` files (LightBurn Pro 2.1.03, device
+  `BSLFiber`), each one setting apart from `base`. Placed in `samples/lbrn2/`
+  under canonical names; `docs/lbrn2-schema.md` derives the field map by diff
+  (frequency in Hz, QPulseWidth in integer ns, `type=Scan/Cut` = Fill/Line,
+  `angle`/`numPasses`/`globalRepeat` omitted-⇒-default, Rect `XForm` affine).
+- Fixture manifest change: `uv-base.lbrn2` was unobtainable (fiber-only rig),
+  so EXPECTED_LBRN2 uses `global-passes.lbrn2` instead — the operator supplied
+  both pass-field variants (`numPasses` and `globalRepeat`), which is more
+  useful than a UV stand-in. UV-device schema deferred until a UV profile
+  exists. `cargo xtask fixtures` now exits 0 on the real repo, closing INF-3's
+  last gate.
+- Power is operator-fixed at 20% (MOPA fluence = pulse width + frequency); the
+  emitter still writes power from AblationParams so power-varying rigs work.
+- EMIT-2 gap: the samples contain only `Type="Rect"` shapes. Arbitrary
+  toolpaths need LightBurn's `Type="Path"` encoding, which is absent from the
+  samples and (per the evidence-only rule) will not be guessed — EMIT-2's
+  geometry emitter waits on one sample containing a drawn polyline/polygon.
+  The CutSetting/layer/project serialization is fully determined and can be
+  built + golden-checked against the samples now.
+
 ## 2026-07-13 — Operator correction: MOPA fluence is pulse-width + frequency
 
 - Operator (at the machine) corrected a wrong mental model: on their MOPA
