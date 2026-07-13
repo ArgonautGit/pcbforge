@@ -11,3 +11,6 @@ i_overlay = "7.0.2"
 
 [dev-dependencies]
 proptest = "1.11.0"
+# Dev-only cycle cam -> ingest -> cam: cargo permits dev-dep cycles; the
+# production `cam` crate stays ingest-free (CAM-6 fixture tests only).
+ingest = { path = "../ingest" }

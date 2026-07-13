@@ -9,4 +9,5 @@ pub mod geom;
 pub mod noncopper;
 pub mod order;
 pub mod plan;
+pub mod process;
 pub mod split;

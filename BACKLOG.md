@@ -25,7 +25,7 @@ done-when. Task prompts live in `docs/backlog.md`.
 - [x] CAM-3 — Heat-aware ordering
 - [x] CAM-4 — Pass planner
 - [x] CAM-5 — Dual-machine splitter
-- [ ] CAM-6 — Process compilers: mask-open / legend / stencil / drill map
+- [x] CAM-6 — Process compilers: mask-open / legend / stencil / drill map *(fixture counts from authored board source — see test header)*
 - [x] CAM-7 — Design-rule checker
 - [x] CAM-8 — Fiducial/tooling feature injector
 - [ ] CAM-9 — Tiling for the slide extension *(stretch)*
