@@ -15,7 +15,7 @@ done-when. Task prompts live in `docs/backlog.md`.
 - [ ] ING-2 — Excellon drills
 - [ ] ING-3 — Gerber X2 ingest (robust path) *(partial: ingest::gerber parses the KiCad dialect for `pcbforge noncopper`; golden-validated against real kicad-cli 7.0.11 output on the sample board — see decisions.md 2026-07-13; X2 attribute *preservation* still pending)*
 - [ ] ING-4 — Net-ID source + net raster
-- [ ] ING-5 — Board metadata (.gbrjob)
+- [x] ING-5 — Board metadata (.gbrjob)
 - [x] ING-6 — kicad-cli invoker
 
 ## WS-GEO / WS-CAM — Geometry kernel & ablation CAM
