@@ -14,6 +14,7 @@ use std::path::{Path, PathBuf};
 use std::process::Command;
 
 use image::GrayImage;
+use ingest::kicad_cli::KicadCli;
 use testkit::{BINARY_THRESHOLD, assert_images_agree, command_available, rasterize};
 
 const UM_PER_PX: u32 = 25;
@@ -84,41 +85,26 @@ fn pad_to_common(a: GrayImage, b: GrayImage) -> (GrayImage, GrayImage) {
 
 #[test]
 fn parsed_gerber_matches_kicads_own_render() {
-    if !command_available("kicad-cli") || !command_available("rsvg-convert") {
+    if !ingest::kicad_cli::available() || !command_available("rsvg-convert") {
         eprintln!("SKIP: kicad-cli / rsvg-convert not installed; golden not run");
         return;
     }
+    let cli = KicadCli::discover().unwrap();
     let board = repo_root().join("samples/kicad/valdemo.kicad_pcb");
     assert!(board.is_file(), "sample board missing: {}", board.display());
     let dir = tmp_dir();
 
     // 1. Real Gerber from KiCad, parsed by us, rasterized by testkit.
-    run(Command::new("kicad-cli")
-        .args(["pcb", "export", "gerbers", "--layers", "F.Cu"])
-        .arg(&board)
-        .arg("-o")
-        .arg(&dir));
-    let layer = ingest::gerber::load_gerber(&dir.join("valdemo-F_Cu.gtl")).expect("parse");
+    let gerbers = cli
+        .export_gerbers(&board, &["F.Cu"], &dir)
+        .expect("gerbers");
+    let layer = ingest::gerber::load_gerber(&gerbers[0]).expect("parse");
     assert!(!layer.polys.is_empty());
     let ours = crop_to_content(&rasterize(&layer, UM_PER_PX));
 
     // 2. KiCad's own SVG render of the same layer, rasterized independently.
     let svg = dir.join("kicad-fcu.svg");
-    run(Command::new("kicad-cli")
-        .args([
-            "pcb",
-            "export",
-            "svg",
-            "--layers",
-            "F.Cu",
-            "--black-and-white",
-            "--exclude-drawing-sheet",
-            "--page-size-mode",
-            "2",
-        ])
-        .arg(&board)
-        .arg("-o")
-        .arg(&svg));
+    cli.export_svg(&board, "F.Cu", &svg).expect("svg");
     let png = dir.join("kicad-fcu.png");
     // dpi so that one pixel = UM_PER_PX µm: 25400 / UM_PER_PX.
     let dpi = (25_400 / UM_PER_PX).to_string();
