@@ -939,3 +939,13 @@ discovered constraints here.
   ÷px_per_mm move. Verified: under a keystone homography a (dpx,dpy) drag shifts
   the pivot's projected pixel by exactly (dpx,dpy); the uniform case still adds
   delta÷ppm to the translation.
+
+### Overlay legibility — outline instead of a blob
+
+- The Place/AR overlay filled each region translucently, so a solid ablate area
+  read as a red blob. `composite_over` now draws a soft fill (alpha ×0.4) plus a
+  crisp 2 px outline on every ring — outer *and* holes (alpha ×1.8, clamped) —
+  via a Bresenham `stroke_edge` + bounds-checked `blend_px`. Traces, pads, and
+  the board edge are now legible over the board; verified by rendering
+  `dump_place` (curved trace + pads + outline all crisp) and by a test asserting
+  the edge is ≥30 stronger than the interior fill.

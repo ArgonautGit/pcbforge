@@ -1969,7 +1969,10 @@ mod tests {
         let gray = image::GrayImage::from_pixel(200, 200, image::Luma([120]));
         let over = app.compose_ar(&gray);
         let at = |x: usize, y: usize| over.pixels[y * 200 + x];
-        assert!(at(50, 50).r() > 150, "copper tinted at the mapped center");
+        // The copper square maps to px (40,40)..(60,60); its outline (left edge
+        // x=40) is crisply tinted, and the interior is at least softly filled.
+        assert!(at(40, 50).r() > 150, "copper outline at the mapped edge");
+        assert!(at(50, 50).r() > 120, "copper interior softly filled");
         assert_eq!(
             at(150, 150),
             Color32::from_gray(120),

@@ -129,14 +129,12 @@ pub fn composite_over(
             None => (bx * px_per_mm, by * px_per_mm),
         }
     };
-    let (cr, cg, cb) = (color[0] as f64, color[1] as f64, color[2] as f64);
-    let blend = |dst: Color32| {
-        Color32::from_rgb(
-            (dst.r() as f64 * (1.0 - alpha) + cr * alpha) as u8,
-            (dst.g() as f64 * (1.0 - alpha) + cg * alpha) as u8,
-            (dst.b() as f64 * (1.0 - alpha) + cb * alpha) as u8,
-        )
-    };
+    let rgb = (color[0] as f64, color[1] as f64, color[2] as f64);
+    // A soft fill (so a solid region reads as area, not an opaque blob) with a
+    // crisp, thicker outline on every ring (outer + holes) so the shape edges —
+    // the traces — are clearly legible over the board.
+    let fill_a = (alpha * 0.4).clamp(0.0, 1.0);
+    let edge_a = (alpha * 1.8).clamp(0.0, 1.0);
 
     for poly in shapes {
         let rings: Vec<Vec<(f64, f64)>> = std::iter::once(&poly.outer)
@@ -147,6 +145,7 @@ pub fn composite_over(
         if rings.is_empty() {
             continue;
         }
+        // Even-odd fill (light).
         for j in 0..h {
             let yc = j as f64 + 0.5;
             let mut xs: Vec<f64> = Vec::new();
@@ -172,10 +171,70 @@ pub fn composite_over(
                 let x0 = xs[s].max(0.0).ceil() as usize;
                 let x1 = (xs[s + 1].min(w as f64)).floor() as usize;
                 for x in x0..x1.min(w) {
-                    px[j * w + x] = blend(px[j * w + x]);
+                    blend_px(px, w, h, x as i32, j as i32, rgb, fill_a);
                 }
                 s += 2;
             }
+        }
+        // Outline (crisp) — draw each ring edge as a thickened line.
+        for ring in &rings {
+            let n = ring.len();
+            for k in 0..n {
+                stroke_edge(px, w, h, ring[k], ring[(k + 1) % n], rgb, edge_a);
+            }
+        }
+    }
+}
+
+/// Alpha-blend `rgb` at pixel `(x, y)` (bounds-checked, no-op if off-image).
+fn blend_px(px: &mut [Color32], w: usize, h: usize, x: i32, y: i32, rgb: (f64, f64, f64), a: f64) {
+    if x < 0 || y < 0 || x as usize >= w || y as usize >= h {
+        return;
+    }
+    let i = y as usize * w + x as usize;
+    let d = px[i];
+    px[i] = Color32::from_rgb(
+        (d.r() as f64 * (1.0 - a) + rgb.0 * a) as u8,
+        (d.g() as f64 * (1.0 - a) + rgb.1 * a) as u8,
+        (d.b() as f64 * (1.0 - a) + rgb.2 * a) as u8,
+    );
+}
+
+/// Draw a 2 px-thick line from `p0` to `p1` (Bresenham) in `rgb` at alpha `a`.
+fn stroke_edge(
+    px: &mut [Color32],
+    w: usize,
+    h: usize,
+    p0: (f64, f64),
+    p1: (f64, f64),
+    rgb: (f64, f64, f64),
+    a: f64,
+) {
+    let (mut x0, mut y0) = (p0.0.round() as i32, p0.1.round() as i32);
+    let (x1, y1) = (p1.0.round() as i32, p1.1.round() as i32);
+    let dx = (x1 - x0).abs();
+    let dy = -(y1 - y0).abs();
+    let sx = if x0 < x1 { 1 } else { -1 };
+    let sy = if y0 < y1 { 1 } else { -1 };
+    let mut err = dx + dy;
+    loop {
+        // 2×2 block for a legible line at any zoom.
+        for oy in 0..2 {
+            for ox in 0..2 {
+                blend_px(px, w, h, x0 + ox, y0 + oy, rgb, a);
+            }
+        }
+        if x0 == x1 && y0 == y1 {
+            break;
+        }
+        let e2 = 2 * err;
+        if e2 >= dy {
+            err += dy;
+            x0 += sx;
+        }
+        if e2 <= dx {
+            err += dx;
+            y0 += sy;
         }
     }
 }
@@ -292,9 +351,11 @@ mod tests {
         };
         let img = composite(&frame, &job, &p, 10.0, Some(&hgt), [200, 60, 60], 0.9);
         let red = |x: usize, y: usize| img.pixels[y * 200 + x].r() > 150;
+        // The square's outline (left edge x=72) sits at the homography-mapped
+        // location, not the uniform-scale one (which would be near x=90).
         assert!(
-            red(80, 80),
-            "footprint sits at the homography-mapped location"
+            red(72, 80),
+            "outline sits at the homography-mapped location"
         );
         assert!(!red(100, 100), "not at the uniform-scale location");
     }
@@ -313,9 +374,37 @@ mod tests {
         };
         let img = composite(&frame, &job, &p, 10.0, None, [200, 60, 60], 0.5);
         let at = |x: usize, y: usize| img.pixels[y * 100 + x];
-        // Center (50,50) is inside the placed square → reddish (r raised).
-        assert!(at(50, 50).r() > 150, "footprint tinted at center");
-        // A far corner is untouched frame gray.
-        assert_eq!(at(5, 5), Color32::from_gray(120));
+        // The outline edge (left side x=40) reads strongly; the interior is
+        // softly filled (so a solid region isn't an opaque blob); a far corner
+        // is untouched frame gray.
+        assert!(at(40, 50).r() > 170, "crisp outline on the footprint edge");
+        assert!(
+            at(50, 50).r() > 120 && at(50, 50).r() < 170,
+            "interior softly filled, not a blob: {}",
+            at(50, 50).r()
+        );
+        assert_eq!(at(5, 5), Color32::from_gray(120), "far corner untouched");
+    }
+
+    #[test]
+    fn outline_reads_stronger_than_the_fill() {
+        // The whole point of the clearer overlay: the edge is more saturated
+        // than the interior fill of the same region.
+        let frame = GrayImage::from_pixel(100, 100, image::Luma([120]));
+        let job = [sq(0, 0, 2 * MM)]; // 4 mm square → 40 px, edges well clear of center
+        let p = Placement {
+            tx_mm: 5.0,
+            ty_mm: 5.0,
+            rot_deg: 0.0,
+            pivot_mm: (0.0, 0.0),
+        };
+        let img = composite(&frame, &job, &p, 10.0, None, [220, 40, 40], 0.6);
+        let r = |x: usize, y: usize| img.pixels[y * 100 + x].r();
+        let edge = r(30, 50); // left edge at x = (5-2)*10 = 30
+        let interior = r(50, 50); // center
+        assert!(
+            edge > interior + 30,
+            "edge {edge} should be clearly stronger than interior {interior}"
+        );
     }
 }
