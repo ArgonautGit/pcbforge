@@ -87,7 +87,32 @@ pub fn composite(
     alpha: f64,
 ) -> ColorImage {
     let (w, h) = (frame.width() as usize, frame.height() as usize);
-    let mut px: Vec<Color32> = frame.pixels().map(|p| Color32::from_gray(p[0])).collect();
+    let px: Vec<Color32> = frame.pixels().map(|p| Color32::from_gray(p[0])).collect();
+    let mut img = ColorImage {
+        size: [w, h],
+        pixels: px,
+    };
+    composite_over(
+        &mut img, shapes, placement, px_per_mm, homography, color, alpha,
+    );
+    img
+}
+
+/// Blend the placed job into an existing `img` (in place), so several design
+/// layers can be stacked over one frame for the AR overlay (UI-2). Same
+/// mapping as [`composite`]: Gerber-mm → bed-mm (placement) → pixels (the
+/// perspective `homography` when present, else a uniform `px_per_mm` scale).
+pub fn composite_over(
+    img: &mut ColorImage,
+    shapes: &[Poly],
+    placement: &Placement,
+    px_per_mm: f64,
+    homography: Option<&vision::Homography>,
+    color: [u8; 3],
+    alpha: f64,
+) {
+    let [w, h] = img.size;
+    let px = &mut img.pixels;
 
     let a = placement.affine();
     // Gerber-nm point → bed-mm (placement) → bed-px (perspective or uniform).
@@ -152,10 +177,6 @@ pub fn composite(
                 s += 2;
             }
         }
-    }
-    ColorImage {
-        size: [w, h],
-        pixels: px,
     }
 }
 

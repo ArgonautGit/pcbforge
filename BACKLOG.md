@@ -67,7 +67,7 @@ done-when. Task prompts live in `docs/backlog.md`.
 
 ## WS-UI — Operator console
 - [x] UI-1 — egui console skeleton *(crates/ui; egui-only core verified headless (22 tests incl. per-tab full-frame layout), eframe binary behind `native`. Status panel from SQLite + actions shelling `pcbforge` (via `cargo run --bin pcbforge` so it works from a repo checkout) + three central views: **Job preview**, **Fiducial check** (VIS-4 overlay), **Place on board** (drag/rotate the circuit over the bed frame → "Etch here" bakes the placement via `register`). Gaps: live-video pending VIS-1; verb output synchronous — see decisions.md/FLD)*
-- [ ] UI-2 — AR overlay
+- [x] UI-2 — AR overlay *(Camera tab: “🔲 AR overlay” projects the registered design over the feed through the fiducial homography, with per-layer toggles (board / copper / ablate); identity placement so Gerber coords go straight through the map — same frame contract as `register --frame`. Falls back to a uniform scale (labelled “unregistered”) until ≥4 fiducials are detected. Generalizes the Place overlay via `place::composite_over`; drill-center layer awaits Excellon ingest in the console — see decisions.md)*
 - [ ] UI-3 — Wizard panels
 - [ ] UI-4 — Escalation viewer
 
@@ -107,4 +107,4 @@ done-when. Task prompts live in `docs/backlog.md`.
 - [ ] FLD-10 — Console live-video panel once VIS-1 lands (replace the camera stub); wire the preview panel into UI-2's AR overlay
 - [x] FLD-11 — Fiducial-check view: live tracking on the camera feed (● Live re-detects each frame; reuses camera source + Capture thread; perspective refits live)
 - [ ] FLD-13 — `pcbforge cam --list/--grab` CLI verbs (VIS-1 CLI surface) reusing ui::camera or the opencv path
-- [ ] FLD-12 — Fiducial-check view: profile selector (DARK_DOT/ANNULUS/BACKLIT) + click-to-place expected fiducials; use the real VIS-3 BedMap instead of a uniform scale
+- [~] FLD-12 — Fiducial-check view: profile selector (DARK_DOT/ANNULUS/BACKLIT) + click-to-place expected fiducials *(profile combo threads a `FiducialProfile` into `check_frame`/live detection — verified a backlit frame the dark-dot matcher won't lock; “✚ click-to-place” appends an expected fiducial where you click (updates the layout, source of truth). Still on a uniform scale — the real VIS-3 BedMap is hardware-gated — see decisions.md)*

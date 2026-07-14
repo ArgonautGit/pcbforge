@@ -76,6 +76,11 @@ pub struct ConsoleApp {
     fid_px_per_mm: f64,
     fid_diameter_mm: f64,
     fid_search_mm: f64,
+    /// Which fiducial appearance the detector matches (FLD-12).
+    fid_profile: crate::fiducial::ProfileKind,
+    /// Click-to-place mode: a click on empty frame appends an expected
+    /// fiducial there (FLD-12), instead of only dragging existing markers.
+    fid_click_place: bool,
     fid_note: String,
     fid_rows: Vec<FidRow>,
     fid_measured_ppm: Option<f64>,
@@ -116,6 +121,17 @@ pub struct ConsoleApp {
     cam_devices: Vec<(u32, String)>,
     cam_capture: Option<crate::camera::Capture>,
     cam_capture_src: Option<crate::camera::Source>,
+
+    // AR overlay (UI-2): project the registered design over the camera frame
+    // through the fiducial homography, with per-layer toggles.
+    ar_overlay: bool,
+    ar_show_board: bool,
+    ar_show_copper: bool,
+    ar_show_ablate: bool,
+    ar_board: Vec<pcb_core::Poly>,
+    ar_copper: Vec<pcb_core::Poly>,
+    ar_ablate: Vec<pcb_core::Poly>,
+    ar_note: String,
 }
 
 impl ConsoleApp {
@@ -145,6 +161,8 @@ impl ConsoleApp {
             fid_px_per_mm: 10.0,
             fid_diameter_mm: 1.0,
             fid_search_mm: 2.0,
+            fid_profile: crate::fiducial::ProfileKind::DarkDot,
+            fid_click_place: false,
             fid_note: "Load a frame, drag each marker near its hole, then Check.".into(),
             fid_rows: Vec::new(),
             fid_measured_ppm: None,
@@ -178,6 +196,14 @@ impl ConsoleApp {
             cam_devices: crate::camera::list_devices(),
             cam_capture: None,
             cam_capture_src: None,
+            ar_overlay: false,
+            ar_show_board: false,
+            ar_show_copper: true,
+            ar_show_ablate: true,
+            ar_board: Vec::new(),
+            ar_copper: Vec::new(),
+            ar_ablate: Vec::new(),
+            ar_note: "Load the Job-tab Gerbers, detect fiducials, then AR overlays the registered design on the feed.".into(),
         }
     }
 
@@ -270,6 +296,17 @@ impl ConsoleApp {
         self.fid_note = "drag each ✛ near its hole, then Check".into();
     }
 
+    /// Append an expected fiducial at bed `(mx, my)` mm to the layout and sync
+    /// the markers (FLD-12 click-to-place). The layout string stays the source
+    /// of truth, so the new ✛ appears and feeds the homography correspondences.
+    fn add_expected_fiducial(&mut self, mx: f64, my: f64) {
+        let base = self.fid_layout.trim().trim_end_matches(';').trim();
+        let sep = if base.is_empty() { "" } else { "; " };
+        self.fid_layout = format!("{base}{sep}{mx:.1},{my:.1}");
+        self.sync_fid_markers();
+        self.fid_note = format!("added fiducial at ({mx:.1}, {my:.1}) mm");
+    }
+
     /// Resize the draggable markers to match the design layout, preserving
     /// existing (dragged) positions and seeding any new ones from the layout —
     /// so adding a 4th coordinate makes a 4th ✛ appear without a manual reset.
@@ -352,11 +389,12 @@ impl ConsoleApp {
         let Some(frame) = &self.fid_frame_img else {
             return;
         };
+        let profile = self.fid_profile.to_profile(self.fid_diameter_mm);
         let r = fiducial::check_frame(
             frame,
             &self.fid_search,
             self.fid_px_per_mm,
-            self.fid_diameter_mm,
+            &profile,
             self.fid_search_mm,
         );
         let (s, w, m) = r.tally;
@@ -510,16 +548,93 @@ impl ConsoleApp {
         }
     }
 
-    /// Store a grabbed frame into the preview texture + cache.
+    /// Store a grabbed frame into the preview texture + cache. When the AR
+    /// overlay (UI-2) is on, the registered design layers are blended over it.
     fn set_camera_frame(&mut self, ctx: &Context, gray: image::GrayImage) {
         let (w, h) = (gray.width() as usize, gray.height() as usize);
-        let img = ColorImage {
-            size: [w, h],
-            pixels: gray.pixels().map(|p| Color32::from_gray(p[0])).collect(),
+        let img = if self.ar_overlay {
+            self.compose_ar(&gray)
+        } else {
+            ColorImage {
+                size: [w, h],
+                pixels: gray.pixels().map(|p| Color32::from_gray(p[0])).collect(),
+            }
         };
         self.cam_tex = Some(ctx.load_texture("camera", img, TextureOptions::NEAREST));
         self.cam_note = format!("{w}×{h}");
         self.cam_last = Some(gray);
+    }
+
+    /// Load the Job-tab Gerbers into the AR layer caches (board / copper /
+    /// ablate), so the overlay can be re-blended every frame without re-parsing.
+    fn load_ar_design(&mut self) {
+        match job_shapes(&self.emit_copper, &self.emit_outline, self.offset_mm) {
+            Ok((board, copper, ablate)) => {
+                self.ar_note = format!(
+                    "design: {} board, {} copper, {} ablate region(s)",
+                    board.len(),
+                    copper.len(),
+                    ablate.len()
+                );
+                self.ar_board = board;
+                self.ar_copper = copper;
+                self.ar_ablate = ablate;
+            }
+            Err(e) => {
+                self.ar_board.clear();
+                self.ar_copper.clear();
+                self.ar_ablate.clear();
+                self.ar_note = format!("design: {e}");
+            }
+        }
+    }
+
+    /// Blend the enabled design layers over `gray`, mapping design-mm → pixels
+    /// through the fiducial homography (registered AR) when one has been
+    /// fitted, else a uniform `fid_px_per_mm` scale (a rough, unregistered
+    /// overlay). The design is placed with an identity placement, so its Gerber
+    /// coordinates go straight through the map — the same frame contract as
+    /// `register --frame`.
+    fn compose_ar(&self, gray: &image::GrayImage) -> ColorImage {
+        let (w, h) = (gray.width() as usize, gray.height() as usize);
+        let mut img = ColorImage {
+            size: [w, h],
+            pixels: gray.pixels().map(|p| Color32::from_gray(p[0])).collect(),
+        };
+        let ident = crate::place::Placement {
+            tx_mm: 0.0,
+            ty_mm: 0.0,
+            rot_deg: 0.0,
+            pivot_mm: (0.0, 0.0),
+        };
+        let hgt = self.fid_homography.as_ref();
+        let mut layer = |shapes: &[pcb_core::Poly], on: bool, color: [u8; 3], alpha: f64| {
+            if on && !shapes.is_empty() {
+                crate::place::composite_over(
+                    &mut img,
+                    shapes,
+                    &ident,
+                    self.fid_px_per_mm,
+                    hgt,
+                    color,
+                    alpha,
+                );
+            }
+        };
+        layer(&self.ar_board, self.ar_show_board, [0x30, 0x60, 0xa0], 0.30);
+        layer(
+            &self.ar_copper,
+            self.ar_show_copper,
+            [0xd0, 0xa0, 0x30],
+            0.45,
+        );
+        layer(
+            &self.ar_ablate,
+            self.ar_show_ablate,
+            [0xf0, 0x50, 0x30],
+            0.45,
+        );
+        img
     }
 
     /// Grab one frame synchronously (the "grab once" button). For Live, the
@@ -787,6 +902,45 @@ impl ConsoleApp {
         });
         ui.separator();
 
+        // AR overlay (UI-2): the registered design projected over the feed.
+        let mut ar_changed = false;
+        ui.horizontal(|ui| {
+            ar_changed |= ui
+                .checkbox(&mut self.ar_overlay, "🔲 AR overlay")
+                .on_hover_text(
+                    "Project the registered design over the camera frame using \
+                     the fiducial homography (detect fiducials first).",
+                )
+                .changed();
+            if ui.button("⤵ Load design").clicked() {
+                self.load_ar_design();
+                ar_changed = true;
+            }
+            if self.ar_overlay {
+                ar_changed |= ui.checkbox(&mut self.ar_show_board, "board").changed();
+                ar_changed |= ui.checkbox(&mut self.ar_show_copper, "copper").changed();
+                ar_changed |= ui.checkbox(&mut self.ar_show_ablate, "ablate").changed();
+            }
+        });
+        if self.ar_overlay {
+            let reg = if self.fid_homography.is_some() {
+                "registered (perspective)"
+            } else {
+                "unregistered — detect ≥4 fiducials to register"
+            };
+            ui.label(egui::RichText::new(format!("{}  ·  {reg}", self.ar_note)).weak());
+        }
+        // Re-blend a still frame when a toggle changes (live frames re-blend as
+        // they arrive).
+        if ar_changed
+            && !self.cam_live
+            && let Some(gray) = self.cam_last.take()
+        {
+            let ctx = ui.ctx().clone();
+            self.set_camera_frame(&ctx, gray);
+        }
+        ui.separator();
+
         // Live frames come from the background capture thread (non-blocking).
         let ctx = ui.ctx().clone();
         self.pump_camera(&ctx);
@@ -906,6 +1060,15 @@ impl ConsoleApp {
                      px/mm is measured from the fiducial spacing after detection.",
                 );
                 ui.end_row();
+                ui.label("profile");
+                egui::ComboBox::from_id_salt("fid-profile")
+                    .selected_text(self.fid_profile.label())
+                    .show_ui(ui, |ui| {
+                        for k in crate::fiducial::ProfileKind::ALL {
+                            ui.selectable_value(&mut self.fid_profile, k, k.label());
+                        }
+                    });
+                ui.end_row();
                 ui.label("hole ⌀ mm");
                 ui.add(
                     egui::DragValue::new(&mut self.fid_diameter_mm)
@@ -933,6 +1096,11 @@ impl ConsoleApp {
             ui.checkbox(&mut self.fid_live, "● Live").on_hover_text(
                 "Track fiducials on the live camera feed (source from the Camera tab).",
             );
+            ui.checkbox(&mut self.fid_click_place, "✚ click-to-place")
+                .on_hover_text(
+                    "Click an empty spot on the frame to add an expected fiducial \
+                     there (appends to the layout); drag markers to fine-tune.",
+                );
             if ui.button("↺ reset markers").clicked() {
                 self.fid_search.clear(); // reseeded from layout on next load/check
                 let ctx = ui.ctx().clone();
@@ -995,14 +1163,34 @@ impl ConsoleApp {
                 rect.min.y + (py as f32) / th * rect.height(),
             )
         };
+        let ppm_f = self.fid_px_per_mm; // a local copy so the closure below
+        // doesn't borrow `self`, leaving `sync_fid_markers` callable.
         let to_mm = |p: egui::Pos2| {
             let ix = (p.x - rect.min.x) / rect.width() * tw;
             let iy = (p.y - rect.min.y) / rect.height() * th;
-            (
-                ix as f64 / self.fid_px_per_mm,
-                iy as f64 / self.fid_px_per_mm,
-            )
+            (ix as f64 / ppm_f, iy as f64 / ppm_f)
         };
+
+        // Click-to-place (FLD-12): a click on empty frame appends an expected
+        // fiducial there (drag still moves existing markers). Only when a
+        // marker isn't already under the pointer, so dragging isn't hijacked.
+        if self.fid_click_place
+            && resp.clicked()
+            && let Some(pos) = resp.interact_pointer_pos()
+        {
+            let markers: Vec<(f32, f32)> = self
+                .fid_search
+                .iter()
+                .map(|&(x, y)| {
+                    let s = to_screen(x, y);
+                    (s.x, s.y)
+                })
+                .collect();
+            if fiducial::nearest_marker(&markers, (pos.x, pos.y), 20.0).is_none() {
+                let (mx, my) = to_mm(pos);
+                self.add_expected_fiducial(mx, my);
+            }
+        }
 
         // Drag: pick the nearest marker on press, move it while dragging.
         if resp.drag_started()
@@ -1579,6 +1767,117 @@ mod tests {
         assert!(app.fid_frame.ends_with("pcbforge-snapshot.png"));
         assert_eq!(app.fid_frame, app.place_frame);
         assert!(std::path::Path::new(&app.fid_frame).is_file());
+    }
+
+    /// FLD-12: click-to-place appends an expected fiducial to the layout and a
+    /// matching search marker, keeping the layout string as source of truth.
+    #[test]
+    fn click_to_place_appends_an_expected_fiducial() {
+        let mut app = ConsoleApp::new(tmp_db(), vec!["true".into()]);
+        app.fid_layout = "10,10; 60,10".into();
+        app.sync_fid_markers();
+        assert_eq!(app.fid_search.len(), 2);
+
+        app.add_expected_fiducial(60.0, 60.0);
+        assert_eq!(app.fid_search.len(), 3, "a 3rd marker appeared");
+        assert_eq!(app.fid_search[2], (60.0, 60.0), "seeded at the click");
+        assert!(
+            app.fid_layout.contains("60.0,60.0"),
+            "layout carries the added point: {}",
+            app.fid_layout
+        );
+
+        // Appending onto an empty layout doesn't produce a leading separator.
+        app.fid_layout = String::new();
+        app.add_expected_fiducial(5.0, 7.0);
+        assert_eq!(app.fid_layout.trim_start(), "5.0,7.0");
+    }
+
+    /// FLD-12: the selected profile flows into detection. A backlit frame
+    /// (bright dots on a dark field) is found with the Backlit profile but the
+    /// dark-dot matcher does not lock onto it — proving the selector is wired.
+    #[test]
+    fn profile_selector_changes_detection_polarity() {
+        let ppm = 10.0;
+        let holes = [(10.0, 10.0), (60.0, 10.0), (10.0, 60.0)];
+        // Bright blobs on a dark field: inverted polarity vs a drilled hole.
+        let img = image::GrayImage::from_fn(700, 700, |x, y| {
+            let mut v = 40.0;
+            for (mx, my) in holes {
+                let (cx, cy) = (mx * ppm, my * ppm);
+                if (((x as f64) - cx).powi(2) + ((y as f64) - cy).powi(2)).sqrt() < 0.5 * ppm {
+                    v += 170.0;
+                }
+            }
+            image::Luma([v as u8])
+        });
+
+        let backlit = fiducial::check_frame(
+            &img,
+            &holes,
+            ppm,
+            &crate::fiducial::ProfileKind::Backlit.to_profile(1.0),
+            2.0,
+        );
+        assert_eq!(backlit.tally.0, 3, "backlit finds the bright blobs");
+
+        let darkdot = fiducial::check_frame(
+            &img,
+            &holes,
+            ppm,
+            &crate::fiducial::ProfileKind::DarkDot.to_profile(1.0),
+            2.0,
+        );
+        assert!(
+            darkdot.tally.0 < 3,
+            "dark-dot matcher does not strongly lock the bright blobs: {:?}",
+            darkdot.rows
+        );
+    }
+
+    /// UI-2: the AR overlay blends the registered design over a frame. With a
+    /// homography mapping design-mm → px, a copper region lands (tinted) at the
+    /// mapped pixel; with the overlay off, the frame stays untouched gray.
+    #[test]
+    fn ar_overlay_projects_design_through_the_homography() {
+        use nalgebra::Matrix3;
+        let mut app = ConsoleApp::new(tmp_db(), vec!["true".into()]);
+        // A single 4 mm copper square centered at design (10,10) mm.
+        let mm = pcb_core::NM_PER_MM;
+        let sq = pcb_core::Poly {
+            outer: vec![
+                pcb_core::P::new(8 * mm, 8 * mm),
+                pcb_core::P::new(12 * mm, 8 * mm),
+                pcb_core::P::new(12 * mm, 12 * mm),
+                pcb_core::P::new(8 * mm, 12 * mm),
+            ],
+            holes: vec![],
+        };
+        app.ar_copper = vec![sq];
+        app.ar_show_copper = true;
+        app.ar_show_board = false;
+        app.ar_show_ablate = false;
+        // Pure 5 px/mm scale: design (10,10) mm → px (50,50).
+        app.fid_homography = Some(vision::Homography {
+            matrix: Matrix3::new(5.0, 0.0, 0.0, 0.0, 5.0, 0.0, 0.0, 0.0, 1.0),
+            residuals: vec![],
+            rms: 0.0,
+        });
+
+        let gray = image::GrayImage::from_pixel(200, 200, image::Luma([120]));
+        let over = app.compose_ar(&gray);
+        let at = |x: usize, y: usize| over.pixels[y * 200 + x];
+        assert!(at(50, 50).r() > 150, "copper tinted at the mapped center");
+        assert_eq!(
+            at(150, 150),
+            Color32::from_gray(120),
+            "far corner untouched"
+        );
+
+        // A disabled layer leaves the frame gray.
+        app.ar_show_copper = false;
+        let plain = app.compose_ar(&gray);
+        assert_eq!(plain.pixels[50 * 200 + 50], Color32::from_gray(120));
     }
 
     /// A second frame after a status refresh still lays out (state survives).

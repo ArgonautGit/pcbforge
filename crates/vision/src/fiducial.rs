@@ -92,7 +92,8 @@ pub enum FiducialProfile {
 }
 
 impl FiducialProfile {
-    fn diameter_mm(&self) -> f64 {
+    /// The target diameter on the bed, mm (common to every profile).
+    pub fn diameter_mm(&self) -> f64 {
         match *self {
             Self::Backlit { diameter_mm }
             | Self::Annulus { diameter_mm }

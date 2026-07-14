@@ -31,9 +31,9 @@ pub fn clean_path(s: &str) -> String {
 pub use app::{ConsoleApp, LogLine, default_cli_cmd, job_shapes, preview_image, run_capture};
 pub use camera::{Capture, Source, grab, list_devices};
 pub use fiducial::{
-    FidKind, FidResult, FidRow, check as fiducial_check, check_frame, parse_layout,
+    FidKind, FidResult, FidRow, ProfileKind, check as fiducial_check, check_frame, parse_layout,
 };
-pub use place::{Placement, bbox_center_mm, composite};
+pub use place::{Placement, bbox_center_mm, composite, composite_over};
 pub use preview::{Layer, rasterize};
 pub use status::{BoardStatus, StatusSnapshot, snapshot};
 pub use vision::{Homography, fit_homography};

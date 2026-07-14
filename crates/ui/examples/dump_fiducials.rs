@@ -50,7 +50,8 @@ fn main() {
         image::Luma([(bg - 85.0 * cover + n).clamp(0.0, 255.0) as u8])
     });
 
-    let r = ui::check_frame(&frame, &expected, ppm, 1.0, 2.0);
+    let profile = ui::ProfileKind::DarkDot.to_profile(1.0);
+    let r = ui::check_frame(&frame, &expected, ppm, &profile, 2.0);
     let (s, weak, m) = r.tally;
     println!("{s} strong, {weak} weak, {m} missed");
     for row in &r.rows {

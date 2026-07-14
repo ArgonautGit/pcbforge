@@ -850,3 +850,45 @@ discovered constraints here.
 - Caveat: fiducial-Live and camera-Live each open the source; on the same
   physical device that can conflict (device busy) — use one at a time. File
   sources are fine concurrently.
+
+## 2026-07-14 — UI-2 AR overlay + FLD-12 profile selector / click-to-place
+
+- **UI-2 (AR overlay):** the Camera tab gained a **🔲 AR overlay** toggle that
+  projects the *registered* design over the live/grabbed frame — the natural
+  generalization of the Place overlay (which only showed the ablate region at a
+  *manual* placement). "⤵ Load design" caches the Job-tab Gerbers as three layer
+  sets (board / copper / ablate) with per-layer checkboxes; each enabled layer
+  is blended over the frame through the shared fiducial homography (design-mm →
+  px) with an **identity** placement, so Gerber coordinates go straight through
+  the map — the same frame contract as `register --frame` (fiducials at their
+  design coords). No homography yet ⇒ it falls back to a uniform `fid_px_per_mm`
+  scale and labels itself "unregistered — detect ≥4 fiducials to register", so
+  the operator is never misled into trusting an un-registered overlay.
+- To stack layers without re-rasterizing, `place::composite` was split into a
+  `composite_over(&mut ColorImage, …)` that blends one layer in place;
+  `composite` now builds the base image and calls it once. The AR path calls it
+  per enabled layer. Verified headless: a copper square maps through a 5 px/mm
+  homography to the expected pixel (tinted), a disabled layer leaves the frame
+  gray, the far corner is untouched.
+- Scope: still an image-space overlay (camera view), not galvo coordinates —
+  absolute burn registration under tilt remains VIS-3/hardware. Drill-center
+  markers are deferred until the console ingests Excellon (only Gerbers are
+  loaded today); the three copper/ablate/board layers are a faithful design
+  projection meanwhile.
+- **FLD-12 (profile selector):** `check_frame`/`check` took a hard-wired
+  `DarkDot`; they now take a `&FiducialProfile`, and the Fiducial tab has a
+  profile combo (Dark dot / Annulus / Backlit) via a small `ProfileKind` `Copy`
+  enum that pairs with the diameter field. `FiducialProfile::diameter_mm` was
+  made `pub` so the overlay ring size derives from the chosen profile. Verified
+  the selector is wired: a bright-blob (backlit) frame is found with Backlit but
+  the dark-dot matcher does not strongly lock it.
+- **FLD-12 (click-to-place):** a **✚ click-to-place** toggle — a click on empty
+  frame (not on an existing marker) appends an expected fiducial there via
+  `add_expected_fiducial`, which edits the layout string (kept as the single
+  source of truth, so `sync_fid_markers` reconciles the ✛ set and the homography
+  correspondences follow). Dragging still fine-tunes existing markers. Verified:
+  a click appends a coord + marker, and appending onto an empty layout produces
+  no leading separator.
+- Left partial (`[~]`): the "real VIS-3 BedMap instead of a uniform scale" half
+  of FLD-12 is hardware-gated — the px↔mm map stays a uniform scale until the
+  bed homography is measured on the machine.

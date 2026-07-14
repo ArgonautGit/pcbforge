@@ -22,6 +22,46 @@ use vision::{BedMap, FiducialProfile, Miss, find_fiducials};
 /// Confidence score at or above which a detection is drawn as "strong" (green).
 pub const SCORE_OK: f64 = 0.25;
 
+/// Which [`FiducialProfile`] the operator selected, kept as a plain `Copy`
+/// enum for the UI's combo box (the vision profile carries a diameter; this
+/// pairs with the separate diameter field to build one).
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum ProfileKind {
+    /// Dark drilled hole / burned dot on a bright field (the operator default).
+    DarkDot,
+    /// Bright ablated disc inside an untouched ring (burned annulus).
+    Annulus,
+    /// Bright blob on a dark field (hole lit from below).
+    Backlit,
+}
+
+impl ProfileKind {
+    /// Build the vision [`FiducialProfile`] for this kind at `diameter_mm`.
+    pub fn to_profile(self, diameter_mm: f64) -> FiducialProfile {
+        match self {
+            ProfileKind::DarkDot => FiducialProfile::DarkDot { diameter_mm },
+            ProfileKind::Annulus => FiducialProfile::Annulus { diameter_mm },
+            ProfileKind::Backlit => FiducialProfile::Backlit { diameter_mm },
+        }
+    }
+
+    /// Short label for the combo box.
+    pub fn label(self) -> &'static str {
+        match self {
+            ProfileKind::DarkDot => "Dark dot (drilled hole)",
+            ProfileKind::Annulus => "Annulus (burned ring)",
+            ProfileKind::Backlit => "Backlit (lit from below)",
+        }
+    }
+
+    /// The three kinds, for populating the combo box.
+    pub const ALL: [ProfileKind; 3] = [
+        ProfileKind::DarkDot,
+        ProfileKind::Annulus,
+        ProfileKind::Backlit,
+    ];
+}
+
 const CYAN: Color32 = Color32::from_rgb(0x22, 0xcc, 0xdd);
 const GREEN: Color32 = Color32::from_rgb(0x40, 0xc0, 0x50);
 const AMBER: Color32 = Color32::from_rgb(0xe0, 0x90, 0x20);
@@ -96,12 +136,13 @@ fn measure_scale(found: &[DesignPx]) -> Option<f64> {
 
 /// Run detection on an in-memory frame and build the overlay + summary.
 /// `expected_mm` is the nominal fiducial layout in bed mm; `px_per_mm` is the
-/// (uniform, pre-VIS-3) bed scale; `diameter_mm` sizes the `DarkDot` profile.
+/// (uniform, pre-VIS-3) bed scale; `profile` is the operator-selected fiducial
+/// appearance (its diameter also sizes the overlay rings).
 pub fn check_frame(
     frame: &GrayImage,
     expected_mm: &[(f64, f64)],
     px_per_mm: f64,
-    diameter_mm: f64,
+    profile: &FiducialProfile,
     search_mm: f64,
 ) -> FidResult {
     let bed = BedMap::uniform_scale(px_per_mm);
@@ -109,8 +150,8 @@ pub fn check_frame(
         .iter()
         .map(|&(x, y)| Point2::new(x, y))
         .collect();
-    let profile = FiducialProfile::DarkDot { diameter_mm };
-    let results = find_fiducials(frame, &expected, search_mm, &profile, &bed);
+    let diameter_mm = profile.diameter_mm();
+    let results = find_fiducials(frame, &expected, search_mm, profile, &bed);
 
     let overlay = render_overlay(frame, &expected, &results, &bed, diameter_mm, px_per_mm);
     let (rows, tally) = summarize(expected_mm, &results);
@@ -138,7 +179,7 @@ pub fn check(
     path: &str,
     expected_mm: &[(f64, f64)],
     px_per_mm: f64,
-    diameter_mm: f64,
+    profile: &FiducialProfile,
     search_mm: f64,
 ) -> Result<FidResult, String> {
     let path = crate::clean_path(path);
@@ -155,7 +196,7 @@ pub fn check(
         &frame,
         expected_mm,
         px_per_mm,
-        diameter_mm,
+        profile,
         search_mm,
     ))
 }
@@ -391,6 +432,11 @@ mod tests {
 
     const PPM: f64 = 10.0;
 
+    /// The operator's default profile (1 mm drilled hole → dark dot).
+    fn dark() -> FiducialProfile {
+        FiducialProfile::DarkDot { diameter_mm: 1.0 }
+    }
+
     /// The operator's L-layout: all three holes found, small offsets, strong
     /// scores, and the overlay marks green at each detected center.
     #[test]
@@ -404,7 +450,7 @@ mod tests {
             .collect();
         let img = frame(700, 700, &dots, 85.0, 5.0);
 
-        let r = check_frame(&img, &expected, PPM, 1.0, 2.0);
+        let r = check_frame(&img, &expected, PPM, &dark(), 2.0);
         assert_eq!(r.tally, (3, 0, 0), "all three strong: {:?}", r.rows);
         // The measured scale recovers the true px/mm from the hole spacing,
         // regardless of the seed passed in.
@@ -438,7 +484,7 @@ mod tests {
             .collect();
         let img = frame(700, 700, &dots, 85.0, 5.0);
         // Seed 9.5 px/mm (5% low) with a generous 5 mm search window.
-        let r = check_frame(&img, &expected, 9.5, 1.0, 5.0);
+        let r = check_frame(&img, &expected, 9.5, &dark(), 5.0);
         assert_eq!(r.tally.0, 3, "all found with the off seed: {:?}", r.rows);
         let measured = r.measured_px_per_mm.unwrap();
         assert!(
@@ -452,7 +498,7 @@ mod tests {
     #[test]
     fn low_contrast_reports_a_miss_with_reason() {
         let img = frame(200, 200, &[(100.0, 100.0, 10.0)], 6.0, 6.0);
-        let r = check_frame(&img, &[(10.0, 10.0)], PPM, 1.0, 2.0);
+        let r = check_frame(&img, &[(10.0, 10.0)], PPM, &dark(), 2.0);
         assert_eq!(r.tally, (0, 0, 1));
         assert_eq!(r.rows[0].kind, FidKind::Miss);
         assert!(
@@ -474,7 +520,7 @@ mod tests {
             85.0,
             5.0,
         );
-        let r = check_frame(&img, &[(10.0, 10.0)], PPM, 1.0, 3.0);
+        let r = check_frame(&img, &[(10.0, 10.0)], PPM, &dark(), 3.0);
         assert_eq!(r.tally.0, 1, "true hole found");
         // The found row's offset must be small (locked on the true hole, not
         // the decoy 2.5 mm away).
@@ -508,7 +554,7 @@ mod tests {
 
     #[test]
     fn check_rejects_missing_path_and_bad_scale() {
-        assert!(check("", &[(1.0, 1.0)], 10.0, 1.0, 2.0).is_err());
-        assert!(check("x.png", &[(1.0, 1.0)], 0.0, 1.0, 2.0).is_err());
+        assert!(check("", &[(1.0, 1.0)], 10.0, &dark(), 2.0).is_err());
+        assert!(check("x.png", &[(1.0, 1.0)], 0.0, &dark(), 2.0).is_err());
     }
 }
