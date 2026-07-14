@@ -3,6 +3,25 @@
 Per the backlog conventions: every task records deviations from its prompt and
 discovered constraints here.
 
+## 2026-07-14 — emit frame fix (from the operator's first real emitted job)
+
+- The operator ran `pcbforge emit` on a real board and returned the output:
+  structurally perfect (37 closed paths, correct recipe), but the geometry sat
+  at y ∈ [-92.5, -80.5] — KiCad's plotted frame passed through verbatim, which
+  lands below LightBurn's origin, off the workspace.
+- Frame analysis (test-driven, after one false start): KiCad *negates* its
+  internal y-down coordinate on Gerber export, so the plotted frame is
+  **already y-up and unmirrored** — merely offset entirely negative. The first
+  fix attempt added a y-reflection; the asymmetric-triangle orientation test
+  failed and proved a flip would *introduce* a mirror. Correct fix:
+  `cam::lbrn2::normalize_frame` = pure translation of the bbox min corner to
+  (0,0). The earlier decisions note calling the gerber frame "y-down" is
+  hereby corrected: it is y-up with a negative offset.
+- Regression guards: exact-coordinate unit tests (plotted triangle keeps its
+  top vertex on top; already-positive input only translates) and an e2e
+  assertion that no emitted vertex is negative (the fixture's stroked outline
+  reaches -0.025 without normalization, so this bites even without KiCad).
+
 ## 2026-07-13 — EMIT-2 + EMIT-3 (lbrn2 emitter + `pcbforge emit`)
 
 - The operator supplied an 11th sample (`path-shape.lbrn2`, committed): a

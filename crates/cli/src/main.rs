@@ -314,6 +314,10 @@ fn emit_cmd(a: EmitArgs) -> Result<(), Box<dyn std::error::Error>> {
     if shapes.is_empty() {
         return Err("inversion produced no shapes (offset too large?)".into());
     }
+    // KiCad plots Gerbers y-up but offset into negative y (sheet position);
+    // translate the job's corner to the origin so it lands on LightBurn's
+    // workspace. Translation only — a flip would introduce a mirror.
+    let shapes = cam::lbrn2::normalize_frame(&shapes);
 
     let mut layer = EmitLayer::fill("C00", a.params, cam::lbrn2::polys_to_elems(&shapes));
     layer.interval_mm = a.interval_mm;

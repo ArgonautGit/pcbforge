@@ -97,6 +97,42 @@ impl EmitLayer {
     }
 }
 
+/// Normalize geometry into LightBurn's workspace: translate so the
+/// bounding-box min corner sits at **(0, 0)**.
+///
+/// KiCad's Gerber export negates its internal y-down sheet coordinate, so the
+/// plotted frame is **already y-up and unmirrored** — but offset entirely into
+/// negative y (and to the sheet's x position). Emitting those coordinates
+/// verbatim put the job below LightBurn's origin, off the workspace (caught on
+/// the first real board the operator emitted). Translation is the whole fix:
+/// no reflection — a flip here would *introduce* a mirror. Orientation is
+/// pinned by the asymmetric-triangle test below.
+pub fn normalize_frame(polys: &[Poly]) -> Vec<Poly> {
+    let mut pts = polys
+        .iter()
+        .flat_map(|p| p.outer.iter().chain(p.holes.iter().flatten()));
+    let Some(first) = pts.next() else {
+        return Vec::new();
+    };
+    let (mut min_x, mut min_y) = (first.x, first.y);
+    for p in pts {
+        min_x = min_x.min(p.x);
+        min_y = min_y.min(p.y);
+    }
+    let map = |p: &pcb_core::P| pcb_core::P::new(p.x - min_x, p.y - min_y);
+    polys
+        .iter()
+        .map(|p| Poly {
+            outer: p.outer.iter().map(&map).collect(),
+            holes: p
+                .holes
+                .iter()
+                .map(|h| h.iter().map(&map).collect())
+                .collect(),
+        })
+        .collect()
+}
+
 /// Each ring of `polys` (outer and holes) as a closed [`PathElem`] — the
 /// input a Fill layer wants for non-copper regions. LightBurn's fill resolves
 /// nested rings (islands/holes) itself, matching the SVG even-odd approach.
@@ -360,6 +396,66 @@ mod tests {
             doc.matches("<CutSetting").count(),
             doc.matches("</CutSetting>").count()
         );
+    }
+
+    /// The bug the operator's first real board caught: KiCad-plotted
+    /// (all-negative-Y) geometry must come out at the origin **without a
+    /// reflection** — the plotted frame is already y-up (KiCad negates its
+    /// internal y-down coordinate on export). An asymmetric triangle pins the
+    /// orientation: the board's top vertex must stay the top.
+    #[test]
+    fn normalize_frame_unmirrors_kicad_plotted_geometry() {
+        // Board-frame right triangle (0,0) (20,0) (0,10), as KiCad plots it:
+        // y_plot = y_board - 90 for a board at sheet y 80..90, x offset 100.
+        let plotted = Poly {
+            outer: vec![
+                P::new(100 * MM, -90 * MM),
+                P::new(120 * MM, -90 * MM),
+                P::new(100 * MM, -80 * MM),
+            ],
+            holes: vec![],
+        };
+        let out = normalize_frame(std::slice::from_ref(&plotted));
+        assert_eq!(out.len(), 1);
+        // Winding restored to CCW (positive shoelace) after the reflection.
+        let r = &out[0].outer;
+        let shoelace: i128 = (0..r.len())
+            .map(|i| {
+                let a = r[i];
+                let b = r[(i + 1) % r.len()];
+                a.x as i128 * b.y as i128 - b.x as i128 * a.y as i128
+            })
+            .sum();
+        assert!(shoelace > 0, "outer ring must stay CCW");
+        // Exact expected vertices: bbox min at origin, y-up, unmirrored.
+        let mut got = r.clone();
+        got.sort();
+        let mut want = vec![
+            P::new(0, 0),
+            P::new(20 * MM, 0),
+            P::new(0, 10 * MM), // the board's top-left stays the top
+        ];
+        want.sort();
+        assert_eq!(got, want);
+    }
+
+    #[test]
+    fn normalize_frame_only_translates_y_up_input() {
+        // Already y-up geometry away from the origin: translated, not flipped.
+        let poly = Poly {
+            outer: vec![
+                P::new(5 * MM, 3 * MM),
+                P::new(9 * MM, 3 * MM),
+                P::new(5 * MM, 7 * MM),
+            ],
+            holes: vec![],
+        };
+        let out = normalize_frame(std::slice::from_ref(&poly));
+        let mut got = out[0].outer.clone();
+        got.sort();
+        let mut want = vec![P::new(0, 0), P::new(4 * MM, 0), P::new(0, 4 * MM)];
+        want.sort();
+        assert_eq!(got, want);
     }
 
     #[test]

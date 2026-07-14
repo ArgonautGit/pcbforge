@@ -61,6 +61,13 @@ fn emit_writes_a_fill_layer_lbrn2() {
     // The non-copper regions became closed Path shapes.
     assert!(doc.contains("Type=\"Path\""));
     assert!(doc.contains("<PrimList>LineClosed</PrimList>"));
+    // Frame normalization: the job sits on the workspace (no negative
+    // coordinate — the fixture's stroked outline would otherwise emit
+    // V-0.025, and real KiCad exports sit entirely below y = 0).
+    assert!(
+        !doc.contains("V-"),
+        "emitted geometry must not contain negative coordinates"
+    );
 }
 
 #[test]
