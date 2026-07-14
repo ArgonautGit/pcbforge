@@ -2064,10 +2064,13 @@ version = "0.1.0"
 dependencies = [
  "cam",
  "clap",
+ "image",
  "ingest",
+ "nalgebra",
  "orchestra",
  "pcb-core",
  "testkit",
+ "vision",
 ]
 
 [[package]]

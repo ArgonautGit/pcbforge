@@ -12,5 +12,6 @@ pub mod noncopper;
 pub mod order;
 pub mod plan;
 pub mod process;
+pub mod register;
 pub mod split;
 pub mod tiles;

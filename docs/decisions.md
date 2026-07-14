@@ -663,3 +663,36 @@ discovered constraints here.
   `BedMap::uniform_scale` until VIS-3 gives the real homography (FLD-12). The
   overlay/detection code takes a real `BedMap` and live frame unchanged when
   those land.
+
+## 2026-07-14 — VIS-6 register (host-side fiducial registration, software half)
+
+- Operator asked whether emit adjusts LightBurn coordinates to the fiducials —
+  it did not. Built `pcbforge register` + `cam::register`: fit a design→machine
+  affine (via `vision::fit_affine`, VIS-5) from fiducial correspondences and
+  apply it to the emitted geometry so the job burns where the board sits.
+  `cam::register` is dependency-free (takes 6 affine coeffs, applies to Poly
+  vertices nm→mm→affine→nm); the CLI owns the nalgebra/vision fit.
+- Two input modes: `--fiducials "dx,dy=tx,ty; …"` (explicit) and `--frame +
+  --layout + --px-per-mm` (detect via VIS-4 find_fiducials, DarkDot). Misses are
+  skipped; ≥3 required; a fit whose RMS exceeds `--max-rms-mm` (default 50 µm) is
+  rejected rather than baking a bad transform; a negative-determinant
+  (reflecting) fit is refused.
+- **FRAME CONTRACT (important, documented in --help + here):** the fit is applied
+  to the **Gerber-frame** geometry with no origin normalization, so the "design"
+  side of each correspondence must be in the Gerber frame. Exporting the KiCad
+  Gerber with the drill/place-file (aux) origin makes Gerber coords = board
+  coords, so a fiducial drilled at board (10,10) is simply `10,10`. Verified:
+  identity correspondences leave geometry untouched; a pure +50,+30 translation
+  shifts every vertex exactly (e2e).
+- **Composition with galvo calibration:** a full registration is
+  `board_affine ∘ galvo_affine` (design→bed→galvo). The galvo half needs a
+  burned calibration grid (VIS-6's `calib grid`, hardware). Until it exists the
+  caller supplies correspondences already in the target/machine frame (jog the
+  pointer to each fiducial and read mm, or a workspace-calibrated camera); the
+  two affines multiply trivially when the galvo one lands. So VIS-6 is marked
+  `[~]` — register software half done, galvo grid + live ≤20µm residual gated on
+  hardware.
+- Verified: cam::register unit tests (identity/translation/rotation/holes/
+  reflection-flag) + register_e2e (identity-unchanged, translation-exact,
+  high-RMS rejected, too-few rejected, --frame detect→fit→emit, mutually-
+  exclusive inputs). 41 workspace test binaries green.

@@ -46,7 +46,7 @@ done-when. Task prompts live in `docs/backlog.md`.
 - [ ] VIS-3 — Bed homography
 - [x] VIS-4 — Fiducial detectors *(vision::find_fiducials; synthetic done-when met (<0.15 px); px↔mm parameterized as BedMap pending VIS-3; live annuli check operator-side — see decisions.md)*
 - [x] VIS-5 — Affine fit + residuals
-- [ ] VIS-6 — Burned-grid galvo calibration + register
+- [~] VIS-6 — Burned-grid galvo calibration + register *(register **software half done**: `pcbforge register` + cam::register — fit design→machine affine from fiducial correspondences (explicit or --frame-detected) and bake it into the emitted .lbrn2; RMS gate; frame contract documented. Galvo `calib grid` (burn 121 dots) + live ≤20µm residual are hardware-gated — see decisions.md)*
 - [ ] VIS-7 — TPS field correction *(stretch)*
 - [ ] VIS-8 — Clearance classifier
 - [ ] VIS-9 — Ladder wizard

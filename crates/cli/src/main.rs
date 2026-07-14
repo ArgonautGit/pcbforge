@@ -215,6 +215,65 @@ enum Command {
         #[arg(long)]
         center: bool,
     },
+    /// Fiducial-registered emit (VIS-6, host side): fit a design→machine affine
+    /// from fiducial correspondences and bake it into the emitted `.lbrn2`, so
+    /// the job burns where the physical board actually sits. Supply the
+    /// correspondences explicitly (`--fiducials`) or detect them on a camera
+    /// frame (`--frame` + `--layout` + `--px-per-mm`).
+    ///
+    /// FRAME CONTRACT: the "design" side of each correspondence must be in the
+    /// same coordinate frame as the copper Gerber (the fit is applied to the
+    /// Gerber-frame geometry, with no origin normalization). Export the Gerber
+    /// with KiCad's drill/place-file (aux) origin so Gerber coordinates equal
+    /// your board coordinates — then a fiducial drilled at board (10,10) is
+    /// simply `10,10` on the design side.
+    Register {
+        /// Copper layer Gerber.
+        #[arg(long)]
+        copper: PathBuf,
+        /// Board outline Gerber (Edge.Cuts); without it, copper bbox + margin.
+        #[arg(long)]
+        outline: Option<PathBuf>,
+        /// Output registered `.lbrn2` path.
+        #[arg(long)]
+        lbrn2: PathBuf,
+
+        /// Explicit correspondences `dx,dy=tx,ty; …` (≥3): design mm = machine
+        /// mm for each fiducial. Mutually exclusive with --frame.
+        #[arg(long)]
+        fiducials: Option<String>,
+
+        /// Camera frame (PNG/JPEG) to detect fiducials in. Needs --layout and
+        /// --px-per-mm. The design positions are --layout; the detected
+        /// positions are the machine targets.
+        #[arg(long)]
+        frame: Option<PathBuf>,
+        /// Design fiducial layout `x,y; …` mm (with --frame).
+        #[arg(long)]
+        layout: Option<String>,
+        /// Bed scale for --frame detection, px/mm (uniform until VIS-3).
+        #[arg(long)]
+        px_per_mm: Option<f64>,
+        /// Fiducial hole diameter for --frame detection, mm.
+        #[arg(long, default_value_t = 1.0)]
+        diameter_mm: f64,
+
+        /// Beam-compensation clearance around copper, mm.
+        #[arg(long, default_value_t = 0.0)]
+        offset_mm: f64,
+        /// Ablate NonConductor copper instead of keeping it.
+        #[arg(long)]
+        clear_nonconductor: bool,
+        /// Bounding-box margin when no --outline is given, mm.
+        #[arg(long, default_value_t = 1.0)]
+        margin_mm: f64,
+        /// LightBurn device name.
+        #[arg(long, default_value = lbrn2::DEFAULT_DEVICE)]
+        device: String,
+        /// Max residual RMS before the fit is rejected, mm.
+        #[arg(long, default_value_t = 0.05)]
+        max_rms_mm: f64,
+    },
 }
 
 fn main() -> ExitCode {
@@ -318,6 +377,35 @@ fn run(cli: &Cli) -> Result<(), Box<dyn std::error::Error>> {
             origin_y: *origin_y,
             center: *center,
         }),
+        Command::Register {
+            copper,
+            outline,
+            lbrn2,
+            fiducials,
+            frame,
+            layout,
+            px_per_mm,
+            diameter_mm,
+            offset_mm,
+            clear_nonconductor,
+            margin_mm,
+            device,
+            max_rms_mm,
+        } => register_cmd(RegisterArgs {
+            copper,
+            outline: outline.as_deref(),
+            lbrn2,
+            fiducials: fiducials.as_deref(),
+            frame: frame.as_deref(),
+            layout: layout.as_deref(),
+            px_per_mm: *px_per_mm,
+            diameter_mm: *diameter_mm,
+            offset_mm: *offset_mm,
+            clear_nonconductor: *clear_nonconductor,
+            margin_mm: *margin_mm,
+            device,
+            max_rms_mm: *max_rms_mm,
+        }),
     }
 }
 
@@ -339,15 +427,28 @@ struct EmitArgs<'a> {
     center: bool,
 }
 
-/// Copper Gerber → non-copper regions → LightBurn Fill layer `.lbrn2`. The
-/// FlatCAM-replacement inversion (like `noncopper`) piped straight into a
-/// press-play LightBurn file.
-fn emit_cmd(a: EmitArgs) -> Result<(), Box<dyn std::error::Error>> {
-    if !(0.0..10.0).contains(&a.offset_mm) {
-        return Err(format!("--offset-mm {} out of range [0, 10)", a.offset_mm).into());
+/// The inverted job geometry plus the inputs a preview needs.
+struct BuiltJob {
+    board: Vec<pcb_core::Poly>,
+    copper: Vec<pcb_core::Poly>,
+    /// Non-copper (to-ablate) regions in the original Gerber frame.
+    shapes: Vec<pcb_core::Poly>,
+}
+
+/// Load copper + board region and invert to the non-copper regions — the shared
+/// front half of `emit` and `register`.
+fn build_job(
+    copper_path: &std::path::Path,
+    outline: Option<&std::path::Path>,
+    offset_mm: f64,
+    clear_nonconductor: bool,
+    margin_mm: f64,
+) -> Result<BuiltJob, Box<dyn std::error::Error>> {
+    if !(0.0..10.0).contains(&offset_mm) {
+        return Err(format!("--offset-mm {offset_mm} out of range [0, 10)").into());
     }
-    let copper = load_copper(a.copper, a.clear_nonconductor)?;
-    let board = match a.outline {
+    let copper = load_copper(copper_path, clear_nonconductor)?;
+    let board = match outline {
         Some(p) => {
             let region =
                 cam::noncopper::board_region_from_outline(&ingest::gerber::load_gerber(p)?.polys);
@@ -357,23 +458,43 @@ fn emit_cmd(a: EmitArgs) -> Result<(), Box<dyn std::error::Error>> {
             region
         }
         None => {
-            let margin_nm = (a.margin_mm * NM_PER_MM as f64).round() as Nm;
+            let margin_nm = (margin_mm * NM_PER_MM as f64).round() as Nm;
             cam::noncopper::board_region_bbox(&copper.polys, margin_nm)
         }
     };
     if board.is_empty() {
         return Err("empty board region (no copper and no outline)".into());
     }
-    let offset_nm = (a.offset_mm * NM_PER_MM as f64).round() as Nm;
+    let offset_nm = (offset_mm * NM_PER_MM as f64).round() as Nm;
     let shapes = cam::noncopper::noncopper(&board, &copper.polys, offset_nm);
     if shapes.is_empty() {
         return Err("inversion produced no shapes (offset too large?)".into());
     }
+    Ok(BuiltJob {
+        board,
+        copper: copper.polys,
+        shapes,
+    })
+}
+
+/// Copper Gerber → non-copper regions → LightBurn Fill layer `.lbrn2`. The
+/// FlatCAM-replacement inversion (like `noncopper`) piped straight into a
+/// press-play LightBurn file.
+fn emit_cmd(a: EmitArgs) -> Result<(), Box<dyn std::error::Error>> {
+    let job = build_job(
+        a.copper,
+        a.outline,
+        a.offset_mm,
+        a.clear_nonconductor,
+        a.margin_mm,
+    )?;
+    let (board, shapes) = (job.board, job.shapes);
+    let copper = job.copper;
     // Preview before the workspace transform: board / kept-copper / to-ablate
     // in the original Gerber frame — the geometry relationship the operator
     // eyeballs (placement is a LightBurn concern, handled below for the job).
     if let Some(p) = a.preview {
-        cam::export::write_preview_svg(&board, &copper.polys, &shapes, p)?;
+        cam::export::write_preview_svg(&board, &copper, &shapes, p)?;
         eprintln!("preview: wrote {}", p.display());
     }
     // KiCad plots Gerbers y-up but offset into negative y (sheet position);
@@ -402,6 +523,180 @@ fn emit_cmd(a: EmitArgs) -> Result<(), Box<dyn std::error::Error>> {
     );
     println!("wrote {}", a.lbrn2.display());
     Ok(())
+}
+
+struct RegisterArgs<'a> {
+    copper: &'a std::path::Path,
+    outline: Option<&'a std::path::Path>,
+    lbrn2: &'a std::path::Path,
+    fiducials: Option<&'a str>,
+    frame: Option<&'a std::path::Path>,
+    layout: Option<&'a str>,
+    px_per_mm: Option<f64>,
+    diameter_mm: f64,
+    offset_mm: f64,
+    clear_nonconductor: bool,
+    margin_mm: f64,
+    device: &'a str,
+    max_rms_mm: f64,
+}
+
+/// Fiducial-registered emit: fit design→machine affine, bake it into the job
+/// geometry, emit at absolute machine coordinates (no origin normalization —
+/// the fit *is* the placement).
+fn register_cmd(a: RegisterArgs) -> Result<(), Box<dyn std::error::Error>> {
+    use nalgebra::Point2;
+
+    // (design_mm, machine_mm) correspondences.
+    let pairs: Vec<(Point2<f64>, Point2<f64>)> = match (a.fiducials, a.frame) {
+        (Some(_), Some(_)) => return Err("pass --fiducials OR --frame, not both".into()),
+        (Some(spec), None) => parse_correspondences(spec)?,
+        (None, Some(frame)) => detect_correspondences(
+            frame,
+            a.layout
+                .ok_or("--frame needs --layout (design fiducial positions)")?,
+            a.px_per_mm.ok_or("--frame needs --px-per-mm")?,
+            a.diameter_mm,
+        )?,
+        (None, None) => return Err("supply --fiducials or --frame to register".into()),
+    };
+    if pairs.len() < 3 {
+        return Err(format!("need ≥3 fiducial correspondences, got {}", pairs.len()).into());
+    }
+
+    let fit = vision::fit_affine(&pairs).map_err(|e| e.to_string())?;
+    eprintln!(
+        "register: fit {} fiducials, residual RMS {:.1} µm",
+        pairs.len(),
+        fit.rms * 1000.0
+    );
+    if fit.rms > a.max_rms_mm {
+        return Err(format!(
+            "fit RMS {:.1} µm exceeds --max-rms-mm {:.0} µm — bad correspondences or a mis-detection",
+            fit.rms * 1000.0,
+            a.max_rms_mm * 1000.0
+        )
+        .into());
+    }
+    let t = &fit.transform;
+    let affine = cam::register::Affine2 {
+        m: [
+            t[(0, 0)],
+            t[(0, 1)],
+            t[(0, 2)],
+            t[(1, 0)],
+            t[(1, 1)],
+            t[(1, 2)],
+        ],
+    };
+    if affine.determinant() <= 0.0 {
+        return Err(
+            "fitted transform reflects (negative determinant) — check fiducial order".into(),
+        );
+    }
+
+    let job = build_job(
+        a.copper,
+        a.outline,
+        a.offset_mm,
+        a.clear_nonconductor,
+        a.margin_mm,
+    )?;
+    // Apply the fit to the design-frame geometry → machine frame. No
+    // normalize_frame: registration places the job in absolute machine mm.
+    let placed = cam::register::transform_shapes(&job.shapes, &affine);
+
+    // Same default recipe as `emit`; the operator tunes it in LightBurn or
+    // re-runs with a richer flag set later.
+    let params = AblationParams {
+        power_pct: 20.0,
+        speed_mm_s: 1000.0,
+        frequency_khz: 30.0,
+        pulse_ns: 1,
+        passes: 1,
+    };
+    let layer = EmitLayer::fill("C00", params, cam::lbrn2::polys_to_elems(&placed));
+    cam::lbrn2::write_lbrn2(a.device, &[layer], a.lbrn2)?;
+    let rings: usize = placed.iter().map(|p| 1 + p.holes.len()).sum();
+    eprintln!(
+        "registered: {} shape(s), {rings} ring(s) at machine coordinates",
+        placed.len()
+    );
+    println!("wrote {}", a.lbrn2.display());
+    Ok(())
+}
+
+/// A (design, machine) fiducial correspondence, both in mm.
+type Corr = (nalgebra::Point2<f64>, nalgebra::Point2<f64>);
+
+/// Parse `"dx,dy=tx,ty; …"` into (design, machine) point pairs.
+fn parse_correspondences(spec: &str) -> Result<Vec<Corr>, Box<dyn std::error::Error>> {
+    use nalgebra::Point2;
+    let mut out = Vec::new();
+    for (i, entry) in spec
+        .split(';')
+        .map(str::trim)
+        .filter(|s| !s.is_empty())
+        .enumerate()
+    {
+        let (d, t) = entry
+            .split_once('=')
+            .ok_or_else(|| format!("fiducial {}: expected `dx,dy=tx,ty`, got {entry:?}", i + 1))?;
+        let p = |s: &str| -> Result<Point2<f64>, String> {
+            let (x, y) = s
+                .trim()
+                .split_once(',')
+                .ok_or_else(|| format!("fiducial {}: bad point {s:?}", i + 1))?;
+            Ok(Point2::new(
+                x.trim().parse().map_err(|_| format!("bad x in {s:?}"))?,
+                y.trim().parse().map_err(|_| format!("bad y in {s:?}"))?,
+            ))
+        };
+        out.push((p(d)?, p(t)?));
+    }
+    Ok(out)
+}
+
+/// Detect fiducials on a frame and pair each with its design position. Skips
+/// misses (the fit tolerates fewer, as long as ≥3 remain).
+fn detect_correspondences(
+    frame_path: &std::path::Path,
+    layout: &str,
+    px_per_mm: f64,
+    diameter_mm: f64,
+) -> Result<Vec<Corr>, Box<dyn std::error::Error>> {
+    use nalgebra::Point2;
+    if px_per_mm <= 0.0 {
+        return Err("--px-per-mm must be positive".into());
+    }
+    let design: Vec<Point2<f64>> = layout
+        .split(';')
+        .map(str::trim)
+        .filter(|s| !s.is_empty())
+        .map(|s| {
+            let (x, y) = s
+                .split_once(',')
+                .ok_or_else(|| format!("bad layout point {s:?}"))?;
+            Ok::<_, String>(Point2::new(
+                x.trim().parse().map_err(|_| format!("bad x in {s:?}"))?,
+                y.trim().parse().map_err(|_| format!("bad y in {s:?}"))?,
+            ))
+        })
+        .collect::<Result<_, _>>()?;
+
+    let frame = image::open(frame_path)?.to_luma8();
+    let bed = vision::BedMap::uniform_scale(px_per_mm);
+    let profile = vision::FiducialProfile::DarkDot { diameter_mm };
+    let results = vision::find_fiducials(&frame, &design, 2.0, &profile, &bed);
+
+    let mut pairs = Vec::new();
+    for (d, res) in design.iter().zip(&results) {
+        match res {
+            Ok(f) => pairs.push((*d, Point2::new(f.found_mm.x, f.found_mm.y))),
+            Err(m) => eprintln!("register: fiducial at {d:?} not detected ({m:?}) — skipping"),
+        }
+    }
+    Ok(pairs)
 }
 
 struct CutArgs<'a> {
