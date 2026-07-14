@@ -778,3 +778,24 @@ discovered constraints here.
   iterative detect→re-measure→re-detect pass (FLD-11 territory) would remove even
   that, but the current flow (Fiducial tab: adjust seed until 3 found → read
   measured → "use measured") is a clean manual loop.
+
+## 2026-07-14 — Draggable fiducial search markers
+
+- Operator: rather than getting the px/mm seed right, drag each expected marker
+  near its hole and let the detector search locally. Implemented: the Fiducial
+  tab now shows the frame as a texture with the expected markers (✛) drawn on
+  top via the egui painter (not a re-rasterized overlay), each **draggable**.
+- Decoupled the two roles the "expected" positions played: the **search center**
+  (`fid_search`, per-fiducial bed mm, draggable) is what detection searches
+  around; the **design layout** (`fid_layout`) stays fixed for registration.
+  Markers seed from the design layout on load, then the operator drags them onto
+  the real holes. Detection runs around the dragged positions.
+- Painter-over-texture (vs the rasterized overlay used elsewhere) is the right
+  call for interactivity — markers move without re-rasterizing the frame, and
+  the drag math (screen↔mm) + hit-test (`fiducial::nearest_marker`) are pure and
+  unit-tested. `check_frame` now also returns `found_px` per fiducial so the
+  view can draw detected rings via the painter.
+- Verified headless: a hole placed 3 mm off nominal is **missed** at the seeded
+  marker (out of the 2 mm window) and **found** after the marker is moved onto
+  it — the core value. Plus `nearest_marker` unit test. clippy clean (default +
+  camera); 41 workspace binaries.

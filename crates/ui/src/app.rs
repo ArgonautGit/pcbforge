@@ -69,10 +69,15 @@ pub struct ConsoleApp {
     fid_px_per_mm: f64,
     fid_diameter_mm: f64,
     fid_search_mm: f64,
-    fid_tex: Option<TextureHandle>,
     fid_note: String,
     fid_rows: Vec<FidRow>,
     fid_measured_ppm: Option<f64>,
+    // draggable search markers over the live frame
+    fid_frame_img: Option<image::GrayImage>,
+    fid_frame_tex: Option<TextureHandle>,
+    fid_search: Vec<(f64, f64)>,
+    fid_found: Vec<Option<(f64, f64)>>,
+    fid_drag: Option<usize>,
 
     // drag-to-place
     place_frame: String,
@@ -123,10 +128,14 @@ impl ConsoleApp {
             fid_px_per_mm: 10.0,
             fid_diameter_mm: 1.0,
             fid_search_mm: 2.0,
-            fid_tex: None,
-            fid_note: "Load a frame (camera grab / photo) and click “Check fiducials”.".into(),
+            fid_note: "Load a frame, drag each marker near its hole, then Check.".into(),
             fid_rows: Vec::new(),
             fid_measured_ppm: None,
+            fid_frame_img: None,
+            fid_frame_tex: None,
+            fid_search: Vec::new(),
+            fid_found: Vec::new(),
+            fid_drag: None,
             place_frame: String::new(),
             place_px_per_mm: 10.0,
             place_tx_mm: 0.0,
@@ -187,43 +196,68 @@ impl ConsoleApp {
         }
     }
 
-    /// Run VIS-4 fiducial detection on the loaded frame and build the overlay.
-    pub fn render_fiducials(&mut self, ctx: &Context) {
-        let expected = match fiducial::parse_layout(&self.fid_layout) {
-            Ok(e) => e,
+    /// Load the fiducial frame into memory + a texture and seed the search
+    /// markers from the design layout (so they start near nominal, ready to
+    /// drag onto the real holes).
+    pub fn load_fid_frame(&mut self, ctx: &Context) {
+        let img = match image::open(crate::clean_path(&self.fid_frame)) {
+            Ok(i) => i.to_luma8(),
             Err(e) => {
-                self.fid_tex = None;
-                self.fid_rows.clear();
+                self.fid_note = format!("frame: {e}");
+                return;
+            }
+        };
+        let design = match fiducial::parse_layout(&self.fid_layout) {
+            Ok(d) => d,
+            Err(e) => {
                 self.fid_note = format!("layout: {e}");
                 return;
             }
         };
-        match fiducial::check(
-            &self.fid_frame,
-            &expected,
+        // Seed markers from the design positions (bed mm) unless already sized.
+        if self.fid_search.len() != design.len() {
+            self.fid_search = design;
+            self.fid_found = vec![None; self.fid_search.len()];
+        }
+        let (w, h) = (img.width() as usize, img.height() as usize);
+        let color = ColorImage {
+            size: [w, h],
+            pixels: img.pixels().map(|p| Color32::from_gray(p[0])).collect(),
+        };
+        self.fid_frame_tex = Some(ctx.load_texture("fid-frame", color, TextureOptions::NEAREST));
+        self.fid_frame_img = Some(img);
+        self.fid_note = "drag each ✛ near its hole, then Check".into();
+    }
+
+    /// Detect around the current (draggable) search markers and record the
+    /// found positions, summary rows, and measured scale.
+    pub fn render_fiducials(&mut self, ctx: &Context) {
+        if self.fid_frame_img.is_none() {
+            self.load_fid_frame(ctx);
+        }
+        let Some(frame) = &self.fid_frame_img else {
+            return;
+        };
+        if self.fid_search.is_empty() {
+            self.fid_note = "load a frame first".into();
+            return;
+        }
+        let r = fiducial::check_frame(
+            frame,
+            &self.fid_search,
             self.fid_px_per_mm,
             self.fid_diameter_mm,
             self.fid_search_mm,
-        ) {
-            Ok(r) => {
-                let (s, w, m) = r.tally;
-                self.fid_measured_ppm = r.measured_px_per_mm;
-                let scale = match r.measured_px_per_mm {
-                    Some(p) => format!("  ·  measured {p:.2} px/mm"),
-                    None => String::new(),
-                };
-                self.fid_note = format!("{s} strong, {w} weak, {m} missed{scale}");
-                self.fid_rows = r.rows;
-                self.fid_tex =
-                    Some(ctx.load_texture("fiducials", r.overlay, TextureOptions::NEAREST));
-            }
-            Err(e) => {
-                self.fid_tex = None;
-                self.fid_rows.clear();
-                self.fid_measured_ppm = None;
-                self.fid_note = e;
-            }
-        }
+        );
+        let (s, w, m) = r.tally;
+        self.fid_measured_ppm = r.measured_px_per_mm;
+        let scale = match r.measured_px_per_mm {
+            Some(p) => format!("  ·  measured {p:.2} px/mm"),
+            None => String::new(),
+        };
+        self.fid_note = format!("{s} strong, {w} weak, {m} missed{scale}");
+        self.fid_rows = r.rows;
+        self.fid_found = r.found_px;
     }
 
     /// Current manual placement.
@@ -740,9 +774,18 @@ impl ConsoleApp {
                 ui.end_row();
             });
         ui.horizontal(|ui| {
+            if ui.button("⤵ Load frame").clicked() {
+                let ctx = ui.ctx().clone();
+                self.load_fid_frame(&ctx);
+            }
             if ui.button("🎯 Check fiducials").clicked() {
                 let ctx = ui.ctx().clone();
                 self.render_fiducials(&ctx);
+            }
+            if ui.button("↺ reset markers").clicked() {
+                self.fid_search.clear(); // reseeded from layout on next load/check
+                let ctx = ui.ctx().clone();
+                self.load_fid_frame(&ctx);
             }
             if let Some(ppm) = self.fid_measured_ppm
                 && ui
@@ -753,9 +796,9 @@ impl ConsoleApp {
                 self.fid_px_per_mm = ppm;
                 self.place_px_per_mm = ppm;
             }
-            ui.label(egui::RichText::new(&self.fid_note).weak());
         });
-        ui.weak("The typed px/mm only seeds the search; registration is anchored to the fiducial-measured scale.");
+        ui.label(egui::RichText::new(&self.fid_note).weak());
+        ui.weak("Drag each ✛ near its hole; the detector searches locally around it. The typed px/mm only seeds the search — registration is anchored to the measured scale.");
         ui.separator();
 
         for row in &self.fid_rows {
@@ -767,15 +810,94 @@ impl ConsoleApp {
             ui.colored_label(color, &row.text);
         }
         ui.separator();
-        if let Some(tex) = &self.fid_tex {
-            egui::ScrollArea::both().show(ui, |ui| {
-                ui.add(
-                    egui::Image::from_texture((tex.id(), tex.size_vec2()))
-                        .fit_to_original_size(1.0),
-                );
-            });
-        } else {
-            ui.weak("(no frame checked yet)");
+        self.fid_frame_overlay(ui);
+    }
+
+    /// The frame with draggable search markers (✛) and detected rings drawn on
+    /// top via the painter — so markers move without re-rasterizing the image.
+    fn fid_frame_overlay(&mut self, ui: &mut egui::Ui) {
+        let Some(tex) = &self.fid_frame_tex else {
+            ui.weak("(load a frame to place markers)");
+            return;
+        };
+        let (tw, th) = (tex.size()[0] as f32, tex.size()[1] as f32);
+        let resp = ui.add(
+            egui::Image::from_texture((tex.id(), egui::vec2(tw, th)))
+                .fit_to_original_size(1.0)
+                .sense(egui::Sense::click_and_drag()),
+        );
+        let rect = resp.rect;
+        let ppm = self.fid_px_per_mm as f32;
+        // bed-mm ↔ screen (via the image rect + native texture size).
+        let to_screen = |mmx: f64, mmy: f64| {
+            egui::pos2(
+                rect.min.x + (mmx as f32 * ppm) / tw * rect.width(),
+                rect.min.y + (mmy as f32 * ppm) / th * rect.height(),
+            )
+        };
+        let px_to_screen = |px: f64, py: f64| {
+            egui::pos2(
+                rect.min.x + (px as f32) / tw * rect.width(),
+                rect.min.y + (py as f32) / th * rect.height(),
+            )
+        };
+        let to_mm = |p: egui::Pos2| {
+            let ix = (p.x - rect.min.x) / rect.width() * tw;
+            let iy = (p.y - rect.min.y) / rect.height() * th;
+            (
+                ix as f64 / self.fid_px_per_mm,
+                iy as f64 / self.fid_px_per_mm,
+            )
+        };
+
+        // Drag: pick the nearest marker on press, move it while dragging.
+        if resp.drag_started()
+            && let Some(pos) = resp.interact_pointer_pos()
+        {
+            let markers: Vec<(f32, f32)> = self
+                .fid_search
+                .iter()
+                .map(|&(x, y)| {
+                    let s = to_screen(x, y);
+                    (s.x, s.y)
+                })
+                .collect();
+            self.fid_drag = fiducial::nearest_marker(&markers, (pos.x, pos.y), 30.0);
+        }
+        if resp.dragged()
+            && let (Some(i), Some(pos)) = (self.fid_drag, resp.interact_pointer_pos())
+            && i < self.fid_search.len()
+        {
+            self.fid_search[i] = to_mm(pos);
+        }
+        if resp.drag_stopped() {
+            self.fid_drag = None;
+        }
+
+        // Paint markers + detected rings.
+        let painter = ui.painter_at(rect);
+        let cyan = Color32::from_rgb(0x22, 0xcc, 0xdd);
+        let ring_r = (self.fid_diameter_mm as f32 * ppm * 0.5).max(5.0);
+        for (i, &(mx, my)) in self.fid_search.iter().enumerate() {
+            let c = to_screen(mx, my);
+            painter.line_segment(
+                [egui::pos2(c.x - 9.0, c.y), egui::pos2(c.x + 9.0, c.y)],
+                (1.5, cyan),
+            );
+            painter.line_segment(
+                [egui::pos2(c.x, c.y - 9.0), egui::pos2(c.x, c.y + 9.0)],
+                (1.5, cyan),
+            );
+            painter.circle_stroke(c, 11.0, egui::Stroke::new(1.0, cyan));
+            if let Some(Some((fx, fy))) = self.fid_found.get(i) {
+                let col = match self.fid_rows.get(i).map(|r| &r.kind) {
+                    Some(FidKind::FoundStrong) => Color32::from_rgb(0x40, 0xc0, 0x50),
+                    _ => Color32::from_rgb(0xe0, 0x90, 0x20),
+                };
+                let fc = px_to_screen(*fx, *fy);
+                painter.circle_stroke(fc, ring_r, egui::Stroke::new(2.0, col));
+                painter.circle_filled(fc, 2.0, col);
+            }
         }
     }
 
@@ -1001,6 +1123,56 @@ mod tests {
         let ctx = Context::default();
         let out = ctx.run(egui::RawInput::default(), |ctx| app.ui(ctx));
         assert!(!out.shapes.is_empty(), "place tab must render");
+    }
+
+    /// Dragging a search marker onto an off-nominal hole makes detection find
+    /// it: at the nominal design position the hole is out of the search window
+    /// (miss); after moving the marker onto the hole, it's found.
+    #[test]
+    fn dragging_marker_lets_detection_find_offset_hole() {
+        let dir = std::env::temp_dir().join(format!("ui-drag-{}", std::process::id()));
+        std::fs::create_dir_all(&dir).unwrap();
+        let path = dir.join("hole.png");
+        // One dark hole at bed (13,10) mm → px (130,100) at 10 px/mm.
+        let ppm = 10.0;
+        let (hx, hy) = (13.0 * ppm, 10.0 * ppm);
+        let img = image::GrayImage::from_fn(220, 160, |x, y| {
+            let bg = 150.0;
+            let d = (((x as f64) - hx).powi(2) + ((y as f64) - hy).powi(2)).sqrt();
+            let v = if d < 0.5 * ppm { bg - 90.0 } else { bg };
+            image::Luma([v as u8])
+        });
+        img.save(&path).unwrap();
+
+        let mut app = ConsoleApp::new(tmp_db(), vec!["true".into()]);
+        app.tab = CentralTab::Fiducials;
+        app.fid_frame = path.to_string_lossy().into();
+        app.fid_layout = "10,10".into(); // design nominal, 3 mm from the hole
+        app.fid_px_per_mm = 10.0;
+        app.fid_diameter_mm = 1.0;
+        app.fid_search_mm = 2.0;
+        let ctx = Context::default();
+
+        app.load_fid_frame(&ctx);
+        assert_eq!(
+            app.fid_search,
+            vec![(10.0, 10.0)],
+            "markers seed from design"
+        );
+
+        app.render_fiducials(&ctx);
+        assert!(
+            app.fid_found[0].is_none(),
+            "misses at nominal (hole is 3 mm off)"
+        );
+
+        // Drag the marker onto the hole.
+        app.fid_search[0] = (13.0, 10.0);
+        app.render_fiducials(&ctx);
+        assert!(
+            app.fid_found[0].is_some(),
+            "found after dragging the marker onto the hole"
+        );
     }
 
     /// The Camera tab lays out headless, a File-source grab loads a texture,

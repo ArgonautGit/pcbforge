@@ -46,12 +46,28 @@ pub struct FidRow {
 pub struct FidResult {
     pub overlay: ColorImage,
     pub rows: Vec<FidRow>,
+    /// Detected center in frame pixels per input fiducial (`None` = miss),
+    /// aligned with the input order — for drawing rings over the live frame.
+    pub found_px: Vec<Option<(f64, f64)>>,
     /// Counts for the header: (found_strong, found_weak, misses).
     pub tally: (usize, usize, usize),
     /// px/mm **measured** from the detected fiducial spacing vs their known
     /// design spacing — the true scale, independent of the seed. `None` with
     /// fewer than two detections.
     pub measured_px_per_mm: Option<f64>,
+}
+
+/// Index of the marker nearest `p`, within `max` distance — the hit-test for
+/// dragging a search marker onto its hole. Screen-space units.
+pub fn nearest_marker(markers: &[(f32, f32)], p: (f32, f32), max: f32) -> Option<usize> {
+    let mut best: Option<(usize, f32)> = None;
+    for (i, &(mx, my)) in markers.iter().enumerate() {
+        let d = ((mx - p.0).powi(2) + (my - p.1).powi(2)).sqrt();
+        if d <= max && best.is_none_or(|(_, bd)| d < bd) {
+            best = Some((i, d));
+        }
+    }
+    best.map(|(i, _)| i)
 }
 
 /// A detected fiducial as (design mm, found px).
@@ -104,9 +120,14 @@ pub fn check_frame(
         .zip(&results)
         .filter_map(|(&d, r)| r.as_ref().ok().map(|f| (d, (f.found_px.x, f.found_px.y))))
         .collect();
+    let found_px: Vec<Option<(f64, f64)>> = results
+        .iter()
+        .map(|r| r.as_ref().ok().map(|f| (f.found_px.x, f.found_px.y)))
+        .collect();
     FidResult {
         overlay,
         rows,
+        found_px,
         tally,
         measured_px_per_mm: measure_scale(&found),
     }
@@ -462,6 +483,17 @@ mod tests {
             "{:?}",
             r.rows[0].text
         );
+    }
+
+    #[test]
+    fn nearest_marker_picks_the_closest_within_range() {
+        let markers = [(10.0, 10.0), (100.0, 100.0), (12.0, 9.0)];
+        // Closest to (11,10) is index 2 (dist ~1.4) over index 0 (dist ~1.0)?
+        // index 0 is (10,10) dist 1.0; index 2 is (12,9) dist ~1.4 → index 0.
+        assert_eq!(nearest_marker(&markers, (11.0, 10.0), 30.0), Some(0));
+        // Nothing within range.
+        assert_eq!(nearest_marker(&markers, (500.0, 500.0), 30.0), None);
+        assert_eq!(nearest_marker(&[], (0.0, 0.0), 30.0), None);
     }
 
     #[test]
