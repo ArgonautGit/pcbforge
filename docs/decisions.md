@@ -503,3 +503,28 @@ discovered constraints here.
   (lighting problem, not code — per the prompt), and decoys of the wrong
   size are rejected by area/circularity gates even when closer to the
   expected position than the true hole.
+
+## 2026-07-14 — FLD-3/4/6 notes (emit-path field follow-ups)
+
+- FLD-3 (panic spam): the field-notes repro (uv_test @ offset 0.025) no longer
+  panics — the earlier DEDUPE_NM pre-dedupe removed that trigger — but a direct
+  probe proved cavalier_contours 0.7.0 still panics internally on pathological
+  collapsing offsets (`pline_view.rs:290`), and `catch_unwind` recovers the
+  value while the *default panic hook* still dumps the message + backtrace note
+  to stderr. Fix: `geom::silence_cavalier_panics()`, a `Once`-guarded hook that
+  suppresses panics whose `location().file()` is inside `cavalier_contours` and
+  forwards everything else to the previously-installed hook (so genuine panics
+  still report). Verified by a self-exec regression (`cavalier_panic_silence.rs`)
+  that re-execs the child under a pathological-offset hammer and asserts the
+  child's stderr carries a completion marker but no cavalier chatter — the only
+  reliable way to observe a process-global hook without racy fd redirection.
+- FLD-4 (anglePerPass): added `EmitLayer.fill_angle_step_deg`, emitted as
+  `<anglePerPass>` in the Fill branch when non-zero (omitted at 0, matching
+  hand-authored files). Value/units confirmed against samples/lbrn2 two-layer
+  C01 (`anglePerPass=20` beside `numPasses=25`). CLI flag `--angle-step-deg`.
+- FLD-6 (placement): `cam::lbrn2::place_frame(polys, tx, ty, center)` — bbox
+  min corner (default) or bbox center (`--center`) lands on `--origin-x/-y`.
+  Kept separate from `normalize_frame` (which stays the corner-to-origin
+  default) so existing frame tests are untouched; emit applies it only when a
+  placement flag is non-default. e2e test asserts rigid translation (extent
+  preserved) and the center-straddles-origin case.

@@ -97,9 +97,9 @@ done-when. Task prompts live in `docs/backlog.md`.
 ## WS-FLD — Field follow-ups *(from the first live burns; details in docs/field-notes.md)*
 - [ ] FLD-1 — Verify open-path `Line` primitive on first live Line-mode job (the one inferred lbrn2 field)
 - [ ] FLD-2 — Two-polyline LightBurn sample → confirm multi-shape VertID/PrimID convention
-- [ ] FLD-3 — Silence caught-panic stderr spam from the offset retry ladder
-- [ ] FLD-4 — Emit `anglePerPass` from `fill_angle_step_deg` (per-pass hatch rotation in one layer)
+- [x] FLD-3 — Silence caught-panic stderr spam from the offset retry ladder *(geom::silence_cavalier_panics filtering hook; self-exec regression test in cavalier_panic_silence.rs)*
+- [x] FLD-4 — Emit `anglePerPass` from `fill_angle_step_deg` (per-pass hatch rotation in one layer) *(EmitLayer.fill_angle_step_deg → `--angle-step-deg`; matches two-layer sample C01)*
 - [ ] FLD-5 — Board cut via LightBurn's native kerf/tabs/perforation (needs one sample with those set)
-- [ ] FLD-6 — Job placement flags (`--origin-x/--origin-y/--center`)
+- [x] FLD-6 — Job placement flags (`--origin-x/--origin-y/--center`) *(cam::lbrn2::place_frame; corner or bbox-center anchor)*
 - [ ] FLD-7 — `uv-base.lbrn2` when a UV device profile exists → UV schema delta
 - [ ] FLD-8 — Upstream cavalier_contours findings / evaluate newer release

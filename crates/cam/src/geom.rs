@@ -91,6 +91,7 @@
 //! `max(|d| / 1000, 1 nm)` before re-entering the integer world.
 
 use std::panic::{AssertUnwindSafe, catch_unwind};
+use std::sync::Once;
 
 use cavalier_contours::polyline::internal::pline_offset::create_raw_offset_polyline;
 use cavalier_contours::polyline::{PlineSource, PlineSourceMut, Polyline};
@@ -122,6 +123,35 @@ pub fn xor(a: &[Poly], b: &[Poly]) -> Vec<Poly> {
     boolean(a, b, OverlayRule::Xor)
 }
 
+/// cavalier_contours 0.7.0 panics inside its own code on some collapsing
+/// offsets (issue #79 class — observed at `pline_view.rs:290`). Every such
+/// call in this module is wrapped in [`catch_unwind`], so the panic is
+/// *recovered* and the offset just yields no loops. But the **default panic
+/// hook still fires before the unwind**, printing `thread … panicked at
+/// cavalier_contours-…/pline_view.rs` plus a backtrace note to stderr — which
+/// spams the operator during `emit`/`noncopper`/`cut` on dense boards even
+/// though nothing is actually wrong (FLD-3).
+///
+/// This installs, once and process-wide, a panic hook that swallows panics
+/// whose source location is inside `cavalier_contours` and delegates every
+/// other panic to the previously-registered hook, so genuine panics still
+/// report normally with their backtrace. Idempotent and thread-safe; called
+/// on the offset entry paths before any cavalier work runs.
+fn silence_cavalier_panics() {
+    static HOOK: Once = Once::new();
+    HOOK.call_once(|| {
+        let prev = std::panic::take_hook();
+        std::panic::set_hook(Box::new(move |info| {
+            let from_cavalier = info
+                .location()
+                .is_some_and(|l| l.file().contains("cavalier_contours"));
+            if !from_cavalier {
+                prev(info);
+            }
+        }));
+    });
+}
+
 /// Offset (morphological dilate/erode) of the region by `delta_nm`.
 ///
 /// Positive `delta_nm` grows the region outward by `delta_nm` everywhere
@@ -132,6 +162,7 @@ pub fn offset(polys: &[Poly], delta_nm: Nm) -> Vec<Poly> {
     if delta_nm == 0 {
         return boolean(polys, &[], OverlayRule::Subject);
     }
+    silence_cavalier_panics();
     let delta_mm = delta_nm as f64 / NM_PER_MM as f64;
     // Max chord-to-arc distance when flattening offset arcs, in mm.
     let arc_tol_mm = (delta_mm.abs() * 1e-3).max(1e-6);

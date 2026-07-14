@@ -191,6 +191,24 @@ enum Command {
         /// Fill scan angle, deg.
         #[arg(long, default_value_t = 0.0)]
         angle_deg: f64,
+        /// Per-pass hatch-angle increment, deg (`anglePerPass`): rotate the
+        /// fill lines by this much each pass (needs --passes > 1). 0 = off.
+        #[arg(long, default_value_t = 0.0)]
+        angle_step_deg: f64,
+
+        // --- placement (FLD-6) ---
+        /// Target x for the job, mm. By default the job's lower-left corner
+        /// lands here (0 = workspace origin); with --center the job's center
+        /// lands here.
+        #[arg(long, default_value_t = 0.0)]
+        origin_x: f64,
+        /// Target y for the job, mm. See --origin-x.
+        #[arg(long, default_value_t = 0.0)]
+        origin_y: f64,
+        /// Interpret --origin-x/-y as the job's center rather than its
+        /// lower-left corner.
+        #[arg(long)]
+        center: bool,
     },
 }
 
@@ -267,6 +285,10 @@ fn run(cli: &Cli) -> Result<(), Box<dyn std::error::Error>> {
             passes,
             interval_mm,
             angle_deg,
+            angle_step_deg,
+            origin_x,
+            origin_y,
+            center,
         } => emit_cmd(EmitArgs {
             copper,
             outline: outline.as_deref(),
@@ -284,6 +306,10 @@ fn run(cli: &Cli) -> Result<(), Box<dyn std::error::Error>> {
             },
             interval_mm: *interval_mm,
             angle_deg: *angle_deg,
+            angle_step_deg: *angle_step_deg,
+            origin_x: *origin_x,
+            origin_y: *origin_y,
+            center: *center,
         }),
     }
 }
@@ -299,6 +325,10 @@ struct EmitArgs<'a> {
     params: AblationParams,
     interval_mm: f64,
     angle_deg: f64,
+    angle_step_deg: f64,
+    origin_x: f64,
+    origin_y: f64,
+    center: bool,
 }
 
 /// Copper Gerber → non-copper regions → LightBurn Fill layer `.lbrn2`. The
@@ -335,10 +365,19 @@ fn emit_cmd(a: EmitArgs) -> Result<(), Box<dyn std::error::Error>> {
     // translate the job's corner to the origin so it lands on LightBurn's
     // workspace. Translation only — a flip would introduce a mirror.
     let shapes = cam::lbrn2::normalize_frame(&shapes);
+    // Placement: land the job's corner (or center) on the requested point.
+    let shapes = if a.origin_x != 0.0 || a.origin_y != 0.0 || a.center {
+        let tx = (a.origin_x * NM_PER_MM as f64).round() as Nm;
+        let ty = (a.origin_y * NM_PER_MM as f64).round() as Nm;
+        cam::lbrn2::place_frame(&shapes, tx, ty, a.center)
+    } else {
+        shapes
+    };
 
     let mut layer = EmitLayer::fill("C00", a.params, cam::lbrn2::polys_to_elems(&shapes));
     layer.interval_mm = a.interval_mm;
     layer.angle_deg = a.angle_deg;
+    layer.fill_angle_step_deg = a.angle_step_deg;
     cam::lbrn2::write_lbrn2(a.device, &[layer], a.lbrn2)?;
     let rings: usize = shapes.iter().map(|p| 1 + p.holes.len()).sum();
     eprintln!(

@@ -236,6 +236,84 @@ fn nonconductor_pour_is_kept_by_default() {
     );
 }
 
+/// FLD-6: placement flags translate the whole job. --origin-x/-y move the
+/// job's lower-left corner to the target point (pure translation on top of
+/// the frame normalization), and --center anchors the bbox center instead.
+#[test]
+fn placement_flags_translate_the_job() {
+    let dir = tmp("place");
+    let copper = fixture("demo-F_Cu.gbr");
+    let outline = fixture("demo-Edge_Cuts.gbr");
+    let run = |extra: &[&str], name: &str| -> Vec<(f64, f64)> {
+        let out = dir.join(name);
+        let mut args = vec![
+            "emit",
+            "--copper",
+            copper.to_str().unwrap(),
+            "--outline",
+            outline.to_str().unwrap(),
+            "--lbrn2",
+            out.to_str().unwrap(),
+        ];
+        args.extend_from_slice(extra);
+        let r = Command::new(env!("CARGO_BIN_EXE_pcbforge"))
+            .args(&args)
+            .output()
+            .expect("binary runs");
+        assert!(
+            r.status.success(),
+            "stderr: {}",
+            String::from_utf8_lossy(&r.stderr)
+        );
+        let doc = std::fs::read_to_string(&out).unwrap();
+        // All vertices across every shape.
+        doc.split('V')
+            .skip(1)
+            .filter_map(|t| {
+                let xy = t.split('c').next()?;
+                let mut it = xy.split_whitespace();
+                Some((it.next()?.parse().ok()?, it.next()?.parse().ok()?))
+            })
+            .collect()
+    };
+
+    let base = run(&[], "base.lbrn2");
+    let (bx0, by0) = base.iter().fold((f64::MAX, f64::MAX), |(mx, my), &(x, y)| {
+        (mx.min(x), my.min(y))
+    });
+    // Default: lower-left corner at the origin.
+    assert!(
+        bx0.abs() < 1e-6 && by0.abs() < 1e-6,
+        "default corner at origin"
+    );
+
+    // --origin-x/-y shifts the corner to exactly (25, 40).
+    let moved = run(&["--origin-x", "25", "--origin-y", "40"], "moved.lbrn2");
+    let (mx0, my0) = moved
+        .iter()
+        .fold((f64::MAX, f64::MAX), |(mx, my), &(x, y)| {
+            (mx.min(x), my.min(y))
+        });
+    assert!((mx0 - 25.0).abs() < 1e-6, "corner x = {mx0}, want 25");
+    assert!((my0 - 40.0).abs() < 1e-6, "corner y = {my0}, want 40");
+    // Shape is rigidly translated: extent unchanged.
+    let bw = base.iter().fold(0f64, |m, &(x, _)| m.max(x)) - bx0;
+    let mw = moved.iter().fold(0f64, |m, &(x, _)| m.max(x)) - mx0;
+    assert!((bw - mw).abs() < 1e-6, "width preserved under translation");
+
+    // --center anchors the bbox center on the origin: bbox straddles 0.
+    let centered = run(&["--center"], "centered.lbrn2");
+    let (cx0, cx1) = centered
+        .iter()
+        .fold((f64::MAX, f64::MIN), |(mn, mx), &(x, _)| {
+            (mn.min(x), mx.max(x))
+        });
+    assert!(
+        (cx0 + cx1).abs() < 1e-6,
+        "x extent must straddle 0: [{cx0}, {cx1}]"
+    );
+}
+
 #[test]
 fn emit_rejects_out_of_range_offset() {
     let out = tmp("bad").join("x.lbrn2");

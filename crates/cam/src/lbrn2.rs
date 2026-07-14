@@ -55,6 +55,12 @@ pub struct EmitLayer {
     pub interval_mm: f64,
     /// Fill scan angle, deg (emitted when non-zero).
     pub angle_deg: f64,
+    /// Per-pass hatch-angle increment, deg (`anglePerPass`; emitted when
+    /// non-zero for a Fill layer). Rotates the fill lines by this much on
+    /// each successive pass within the one layer — e.g. 20° over many passes
+    /// approximates an omni-directional rub-out. Evidence: two-layer sample
+    /// C01 (`anglePerPass=20` with `numPasses=25`).
+    pub fill_angle_step_deg: f64,
     /// Cross-hatch fill.
     pub cross_hatch: bool,
     /// Wobble (the operator's base config runs with it on).
@@ -74,6 +80,7 @@ impl EmitLayer {
             params,
             interval_mm: 0.03,
             angle_deg: 0.0,
+            fill_angle_step_deg: 0.0,
             cross_hatch: true,
             wobble: true,
             subname: Some("sublayername".into()),
@@ -89,6 +96,7 @@ impl EmitLayer {
             params,
             interval_mm: 0.03,
             angle_deg: 0.0,
+            fill_angle_step_deg: 0.0,
             cross_hatch: false,
             wobble: false,
             subname: None,
@@ -120,6 +128,53 @@ pub fn normalize_frame(polys: &[Poly]) -> Vec<Poly> {
         min_y = min_y.min(p.y);
     }
     let map = |p: &pcb_core::P| pcb_core::P::new(p.x - min_x, p.y - min_y);
+    polys
+        .iter()
+        .map(|p| Poly {
+            outer: p.outer.iter().map(&map).collect(),
+            holes: p
+                .holes
+                .iter()
+                .map(|h| h.iter().map(&map).collect())
+                .collect(),
+        })
+        .collect()
+}
+
+/// Translate `polys` so a chosen anchor lands at `(target_x_nm,
+/// target_y_nm)`. With `center = false` the anchor is the bounding-box min
+/// corner (bottom-left in LightBurn's y-up workspace, i.e. the same corner
+/// [`normalize_frame`] sends to the origin); with `center = true` it is the
+/// bounding-box center. Pure translation — orientation is untouched, so this
+/// composes after `normalize_frame` for job placement (`--origin-x/-y`,
+/// `--center`) without reintroducing the mirror that a flip would.
+///
+/// Placing the job on a known registered point (rather than always at the
+/// workspace origin) removes the manual drag before a repeat run on a
+/// calibrated pallet.
+pub fn place_frame(polys: &[Poly], target_x_nm: i64, target_y_nm: i64, center: bool) -> Vec<Poly> {
+    let mut pts = polys
+        .iter()
+        .flat_map(|p| p.outer.iter().chain(p.holes.iter().flatten()));
+    let Some(first) = pts.next() else {
+        return Vec::new();
+    };
+    let (mut min_x, mut min_y, mut max_x, mut max_y) = (first.x, first.y, first.x, first.y);
+    for p in pts {
+        min_x = min_x.min(p.x);
+        min_y = min_y.min(p.y);
+        max_x = max_x.max(p.x);
+        max_y = max_y.max(p.y);
+    }
+    // Midpoint rounds toward the corner the same way for both axes; sub-nm
+    // bias is irrelevant at the machine's µm resolution.
+    let (anchor_x, anchor_y) = if center {
+        (min_x + (max_x - min_x) / 2, min_y + (max_y - min_y) / 2)
+    } else {
+        (min_x, min_y)
+    };
+    let (dx, dy) = (target_x_nm - anchor_x, target_y_nm - anchor_y);
+    let map = |p: &pcb_core::P| pcb_core::P::new(p.x + dx, p.y + dy);
     polys
         .iter()
         .map(|p| Poly {
@@ -243,6 +298,9 @@ fn cut_setting_xml(index: u32, layer: &EmitLayer) -> String {
         field("interval", num(layer.interval_mm));
         if layer.angle_deg != 0.0 {
             field("angle", num(layer.angle_deg));
+        }
+        if layer.fill_angle_step_deg != 0.0 {
+            field("anglePerPass", num(layer.fill_angle_step_deg));
         }
     }
     if p.passes > 1 {
@@ -496,6 +554,76 @@ mod tests {
         for id in &ids {
             assert!(doc.contains(&format!("VertID=\"{id}\" PrimID=\"{id}\"")));
         }
+    }
+
+    #[test]
+    fn angle_per_pass_emitted_when_set() {
+        let mut layer = EmitLayer::fill(
+            "C01",
+            AblationParams {
+                passes: 25,
+                ..base_params()
+            },
+            Vec::new(),
+        );
+        layer.fill_angle_step_deg = 20.0;
+        let xml = cut_setting_xml(0, &layer);
+        // Matches the two-layer sample's C01: numPasses=25 + anglePerPass=20.
+        assert!(xml.contains("<anglePerPass Value=\"20\"/>"));
+        assert!(xml.contains("<numPasses Value=\"25\"/>"));
+        // Default (0) stays omitted, byte-close to hand-authored files.
+        let plain = cut_setting_xml(0, &EmitLayer::fill("C00", base_params(), Vec::new()));
+        assert!(!plain.contains("anglePerPass"));
+    }
+
+    #[test]
+    fn place_frame_corner_lands_on_target() {
+        // A 4×4 mm square with min corner at the origin.
+        let sq = Poly {
+            outer: vec![
+                P::new(0, 0),
+                P::new(4 * MM, 0),
+                P::new(4 * MM, 4 * MM),
+                P::new(0, 4 * MM),
+            ],
+            holes: vec![],
+        };
+        let out = place_frame(std::slice::from_ref(&sq), 10 * MM, 20 * MM, false);
+        let mut got = out[0].outer.clone();
+        got.sort();
+        let mut want = vec![
+            P::new(10 * MM, 20 * MM),
+            P::new(14 * MM, 20 * MM),
+            P::new(14 * MM, 24 * MM),
+            P::new(10 * MM, 24 * MM),
+        ];
+        want.sort();
+        assert_eq!(got, want, "min corner must land on the target point");
+    }
+
+    #[test]
+    fn place_frame_center_lands_on_target() {
+        // 4×4 mm square: centering on (0,0) puts the corners at ±2 mm.
+        let sq = Poly {
+            outer: vec![
+                P::new(5 * MM, 5 * MM),
+                P::new(9 * MM, 5 * MM),
+                P::new(9 * MM, 9 * MM),
+                P::new(5 * MM, 9 * MM),
+            ],
+            holes: vec![],
+        };
+        let out = place_frame(std::slice::from_ref(&sq), 0, 0, true);
+        let mut got = out[0].outer.clone();
+        got.sort();
+        let mut want = vec![
+            P::new(-2 * MM, -2 * MM),
+            P::new(2 * MM, -2 * MM),
+            P::new(2 * MM, 2 * MM),
+            P::new(-2 * MM, 2 * MM),
+        ];
+        want.sort();
+        assert_eq!(got, want, "bbox center must land on the target point");
     }
 
     #[test]

@@ -73,13 +73,15 @@ Update it whenever a live burn teaches something.
    unique-ID fix works (fourth job renders correctly in preview), but a
    LightBurn-authored file with TWO drawn polylines would confirm the
    canonical numbering (per-shape? per-type pool? gaps allowed?).
-3. **Caught-panic spam on stderr.** cavalier panics are absorbed by
-   catch_unwind but the default panic hook still prints backtraces during
-   `emit`/`noncopper` on KiCad 10 boards. Cosmetic; fix is a scoped panic
-   hook around the offset ladder (or upstreaming the fixes). Repro:
-   `pcbforge emit --copper crates/cli/tests/fixtures/uv_test-F_Cu.gbr
-   --outline crates/cli/tests/fixtures/uv_test-Edge_Cuts.gbr --offset-mm
-   0.025 --lbrn2 /tmp/x.lbrn2`.
+3. **Caught-panic spam on stderr — FIXED (FLD-3, 2026-07-14).**
+   `geom::silence_cavalier_panics()` installs a once-only panic hook that
+   swallows panics whose source is inside `cavalier_contours` and delegates
+   all others to the previous hook, so real panics still report. Note: the
+   original repro (uv_test @ 0.025) no longer triggers a panic at all — the
+   DEDUPE_NM fix removed that path — but pathological collapsing offsets still
+   panic internally (observed `pline_view.rs:290`), which is what the
+   self-exec regression `cavalier_panic_silence.rs` exercises. If cavalier is
+   ever upgraded, re-check whether the hook is still needed.
 4. **cavalier_contours 0.7.0 upstream issues we work around:** panic on
    collapsing offsets (#79), rotation-dependent results, over-pruned slices,
    panic on sub-fuzz duplicate vertices, and the empty-result-validates-
@@ -90,13 +92,15 @@ Update it whenever a live burn teaches something.
 5. **`Ellipse` shape encoding is recorded but unimplemented** (`Rx`/`Ry`,
    center in XForm — from the path-shape sample). Emitter polygonizes
    circles instead; fine for now, native ellipses would shrink files.
-6. **`anglePerPass` (two-layer sample, C01) is parsed into the schema but
-   never emitted.** CAM's per-pass hatch rotation currently expects one
-   angle per pass group; wiring `fill_angle_step_deg` → `anglePerPass`
-   would let LightBurn rotate within a single layer.
-7. **Emitted job always lands at workspace origin.** Fine for preview +
-   drag; a `--origin-x/--origin-y` (or `--center`) placement flag would
-   remove the manual move for repeat runs on a registered pallet.
+6. **`anglePerPass` — DONE (FLD-4, 2026-07-14).** `EmitLayer.fill_angle_step_deg`
+   emits `<anglePerPass>` for Fill layers (omitted when 0), exposed as
+   `--angle-step-deg`. Matches the two-layer sample's C01 (`anglePerPass=20`,
+   `numPasses=25`) — rotates the hatch by that increment each pass within one
+   layer, approximating an omni-directional rub-out.
+7. **Job placement — DONE (FLD-6, 2026-07-14).** `cam::lbrn2::place_frame`
+   translates the normalized job so its lower-left corner (or, with
+   `--center`, its bbox center) lands on `--origin-x/--origin-y`. Pure
+   translation, composes after `normalize_frame`, no mirror.
 8. **Fill grouping assumption:** nested rings on one Fill layer rely on
    LightBurn's "fill all shapes at once" grouping to resolve holes/islands.
    The operator's burns confirm their config does this; a job emitted for a
