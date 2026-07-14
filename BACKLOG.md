@@ -50,7 +50,7 @@ done-when. Task prompts live in `docs/backlog.md`.
 - [ ] VIS-7 — TPS field correction *(stretch)*
 - [ ] VIS-8 — Clearance classifier
 - [ ] VIS-9 — Ladder wizard
-- [ ] VIS-10 — Board-frame warper
+- [x] VIS-10 — Board-frame warper *(vision::to_board_frame + board_mm_to_raster; inverse-warp bilinear gather, design-mm↔raster; synthetic done-when met (<2 px); live check gated on VIS-6 — see decisions.md)*
 - [ ] VIS-11 — AprilTag pallet ID
 - [ ] VIS-12 — Red-pointer drift check
 - [ ] VIS-13 — Verification-cross measurement

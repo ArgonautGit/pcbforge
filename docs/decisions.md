@@ -528,3 +528,26 @@ discovered constraints here.
   default) so existing frame tests are untouched; emit applies it only when a
   placement flag is non-default. e2e test asserts rigid translation (extent
   preserved) and the center-straddles-origin case.
+
+## 2026-07-14 — VIS-10 notes (board-frame warper)
+
+- `to_board_frame` is a gather (inverse-map + bilinear): each design-frame
+  output pixel walks design-mm → bed-mm (board affine, VIS-5/6 registration) →
+  camera px (BedMap, VIS-3 homography) and samples. Gather, not scatter, so the
+  output has no holes; out-of-frame taps read black.
+- Reuses the pieces already built: `BedMap` (VIS-4) is the bed↔px map VIS-3
+  will populate, `fit_affine` (VIS-5) produces the board affine. VIS-10 nominally
+  depends on VIS-6 (real galvo/board registration), which needs the machine —
+  but the warp itself is calibration-agnostic (takes the affine + bed map as
+  inputs), so it's implemented and verified synthetically now; the live
+  done-when (burned annulus within 2 px of expected raster position) stays
+  operator-side.
+- Synthetic done-when mirrors the live one: a disc imaged through a realistic
+  bed map + board affine is warped back and re-detected with `find_fiducials`;
+  its recovered position sits < 2 px from `board_mm_to_raster(board_pt)`. The
+  paired `board_mm_to_raster` helper is the exact inverse of the sampling grid,
+  so callers (ORC-7 drill guide) can predict where any board coordinate should
+  appear in the warped view.
+- Axis convention documented on the module: design-frame raster is y-down like
+  every other image here; a y-up design raster (if ever wanted) should flip the
+  board affine's y, not the warper. This unblocks ORC-7 (guided drilling).
