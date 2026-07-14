@@ -214,6 +214,12 @@ enum Command {
         /// lower-left corner.
         #[arg(long)]
         center: bool,
+
+        /// Mirror the design in X for the back side of a double-sided board
+        /// (KiCad exports B.Cu in top-view coords; flipping the board
+        /// left-right needs the design mirrored to match). Winding is preserved.
+        #[arg(long)]
+        mirror_x: bool,
     },
     /// Fiducial-registered emit (VIS-6, host side): fit a design→machine affine
     /// from fiducial correspondences and bake it into the emitted `.lbrn2`, so
@@ -375,6 +381,7 @@ fn run(cli: &Cli) -> Result<(), Box<dyn std::error::Error>> {
             origin_x,
             origin_y,
             center,
+            mirror_x,
         } => emit_cmd(EmitArgs {
             copper,
             outline: outline.as_deref(),
@@ -397,6 +404,7 @@ fn run(cli: &Cli) -> Result<(), Box<dyn std::error::Error>> {
             origin_x: *origin_x,
             origin_y: *origin_y,
             center: *center,
+            mirror_x: *mirror_x,
         }),
         Command::Register {
             copper,
@@ -492,6 +500,7 @@ struct EmitArgs<'a> {
     origin_x: f64,
     origin_y: f64,
     center: bool,
+    mirror_x: bool,
 }
 
 /// The inverted job geometry plus the inputs a preview needs.
@@ -555,8 +564,17 @@ fn emit_cmd(a: EmitArgs) -> Result<(), Box<dyn std::error::Error>> {
         a.clear_nonconductor,
         a.margin_mm,
     )?;
-    let (board, shapes) = (job.board, job.shapes);
-    let copper = job.copper;
+    let (mut board, mut shapes) = (job.board, job.shapes);
+    let mut copper = job.copper;
+    // Back side: mirror the design in X (about x=0; normalize_frame re-corners
+    // it below, so the axis constant is immaterial). Winding is preserved.
+    if a.mirror_x {
+        let axis = cam::flip::MirrorAxis::VerticalX { x_mm: 0.0 };
+        board = cam::flip::mirror_job(&board, &axis);
+        copper = cam::flip::mirror_job(&copper, &axis);
+        shapes = cam::flip::mirror_job(&shapes, &axis);
+        eprintln!("mirror: design mirrored in X for the back side");
+    }
     // Preview before the workspace transform: board / kept-copper / to-ablate
     // in the original Gerber frame — the geometry relationship the operator
     // eyeballs (placement is a LightBurn concern, handled below for the job).
