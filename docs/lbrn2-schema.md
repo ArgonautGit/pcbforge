@@ -1,8 +1,9 @@
 # EMIT-1 — LightBurn `.lbrn2` schema subset (evidence-derived)
 
-Derived **by evidence only** from `samples/lbrn2/*.lbrn2` — ten projects from
-the operator's real device (`DeviceName="BSLFiber"`, LightBurn Pro 2.1.03),
-each differing from `base.lbrn2` in exactly one setting. Each field below cites
+Derived **by evidence only** from `samples/lbrn2/*.lbrn2` — eleven projects
+from the operator's real device (`DeviceName="BSLFiber"`, LightBurn Pro
+2.1.03): ten differing from `base.lbrn2` in exactly one setting, plus
+`path-shape.lbrn2` (a hand-drawn polyline establishing the `Path` encoding). Each field below cites
 the sample whose one-variable diff against `base` establishes it. This is the
 subset PCBForge's emitter (EMIT-2) needs; it is not the whole format.
 
@@ -93,14 +94,34 @@ Established (Rect only) by every sample:
   the translation `(e, f)` is the **center** (a 10×10 rect with `…35 35` is
   centered at (35, 35)). Applies to all shape types.
 
-### Gap: general polyline / path shapes (blocks full EMIT-2)
+### `Type="Path"` — arbitrary polylines (from `path-shape.lbrn2`)
 
-The samples contain only `Type="Rect"`. PCBForge toolpaths are arbitrary
-open/closed polylines (isolation contours, rub-out hatches, board-cut
-segments), which LightBurn stores as `Type="Path"` — a format **not present in
-any sample**, so it cannot be derived by evidence yet. Per the project rule
-(evidence only, no guessing), EMIT-2's geometry emitter is deferred until one
-sample containing a drawn path/polyline is provided (a closed polygon such as a
-triangle, plus one open polyline). The CutSetting/layer/project serialization
-above is complete and can be emitted and golden-checked against these samples
-now.
+The operator supplied an 11th sample containing a hand-drawn closed 5-sided
+polyline (line tool) and an ellipse:
+
+```xml
+<Shape Type="Path" CutIndex="1" VertID="0" PrimID="0">
+    <XForm>1 0 0 1 0 0</XForm>
+    <VertList>V14 45c0x1c1x1V15 53c0x1c1x1V22 53c0x1c1x1V22 47c0x1c1x1V17 49c0x1c1x1</VertList>
+    <PrimList>LineClosed</PrimList>
+</Shape>
+<Shape Type="Ellipse" CutIndex="1" Rx="7" Ry="5">
+    <XForm>1 0 0 1 38 54</XForm>
+</Shape>
+```
+
+- Unlike `Rect` (center in `XForm`), a `Path`'s `XForm` is **identity** and its
+  vertices are **absolute mm**: `V<x> <y>` per vertex.
+- The `c0x1c1x1` suffix is identical on every line vertex (a control-tag
+  constant, not geometry) — reproduced verbatim by the emitter.
+- `PrimList` is `LineClosed` for a closed polyline. The open form `Line` is
+  **inferred**, not observed (the sample shape is closed) — the one inference
+  in this schema; flag for verification on first live use of an open path.
+- `Ellipse` carries `Rx`/`Ry` with the center in `XForm` translation (Rect
+  convention). Not needed by the emitter (circles are emitted as fine
+  polygons) but recorded as evidence.
+
+This is everything EMIT-2 needs: `cam::lbrn2` emits Fill/Line layers with
+`Type="Path"` shapes and is golden-checked against these samples
+(`crates/cam/tests/lbrn2_golden.rs` asserts the emitted VertList for the
+sample's exact pentagon matches LightBurn's own bytes).

@@ -7,6 +7,7 @@ pub mod export;
 pub mod features;
 pub mod force_clear;
 pub mod geom;
+pub mod lbrn2;
 pub mod noncopper;
 pub mod order;
 pub mod plan;

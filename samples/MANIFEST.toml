@@ -38,6 +38,10 @@ path = "samples/lbrn2/passes.lbrn2"
 sha256 = "2fea03ba24d41de6125910951adb9aedd2a36adf645b56d5ef9876aeee6a3fa2"
 
 [[file]]
+path = "samples/lbrn2/path-shape.lbrn2"
+sha256 = "f41270c5c26b63fbe8f0f261788ae44e1639500f2d68b4bb20e0d4a834626f48"
+
+[[file]]
 path = "samples/lbrn2/pulse-width.lbrn2"
 sha256 = "6682097030bf003cb189a77e6661b39342b37ce8f7c6ef1c043729b462d677a3"
 

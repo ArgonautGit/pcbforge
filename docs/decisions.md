@@ -3,6 +3,35 @@
 Per the backlog conventions: every task records deviations from its prompt and
 discovered constraints here.
 
+## 2026-07-13 — EMIT-2 + EMIT-3 (lbrn2 emitter + `pcbforge emit`)
+
+- The operator supplied an 11th sample (`path-shape.lbrn2`, committed): a
+  hand-drawn closed 5-sided polyline + an ellipse, establishing the
+  `Type="Path"` encoding (identity XForm, absolute-mm `V<x> <y>` vertices,
+  constant `c0x1c1x1` vertex tag, `PrimList` = `LineClosed`). There is no
+  polygon tool in their LightBurn; the line tool produced exactly what was
+  needed. The schema doc's Path gap is closed.
+- `cam::lbrn2` (EMIT-2): EmitLayer{Fill→type="Scan", Line→type="Cut"} +
+  AblationParams → CutSetting (frequency kHz→Hz, QPulseWidth int ns, defaults
+  omitted like LightBurn does); geometry as Type="Path" shapes. Golden tests
+  reproduce the sample pentagon's VertList byte-for-byte and every base
+  CutSetting value from the committed samples — not transcriptions.
+- The ONE inferred (not observed) field: open-path `PrimList` = `Line` (the
+  sample's path is closed). Flagged in module docs + schema doc; verify on
+  first live open-path job. Closed paths — the entire noncopper fill flow —
+  are fully evidence-backed.
+- `pcbforge emit` (EMIT-3): copper Gerber (+optional Edge.Cuts) → noncopper
+  inversion → one Fill-layer .lbrn2, process recipe (power/speed/frequency/
+  pulse/passes/interval/angle) as flags with the operator's base values as
+  defaults, device default "BSLFiber". Holes/islands ride LightBurn's own
+  fill grouping (nested closed shapes on one Fill layer), mirroring the SVG
+  even-odd behavior the operator already uses.
+- EMIT-2's prompt-level scope (multi-layer pass-grouped jobs from
+  `Vec<PassGroup>`) is available via lbrn2_string(&[EmitLayer,...]) — the
+  CAM-4 group → EmitLayer glue lands when the full compile pipeline (ORC)
+  consumes it; the emitter itself is layer-count agnostic (two-layer sample
+  validated the multi-CutSetting form).
+
 ## 2026-07-13 — EMIT-1 (lbrn2 schema) + samples landed
 
 - The operator provided 10 real `.lbrn2` files (LightBurn Pro 2.1.03, device

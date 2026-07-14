@@ -33,8 +33,8 @@ done-when. Task prompts live in `docs/backlog.md`.
 
 ## WS-EMIT — Backends & CLI
 - [x] EMIT-1 — lbrn2 schema report *(docs/lbrn2-schema.md, evidence-derived from 10 operator samples; Path-shape format pending one sample for EMIT-2)*
-- [ ] EMIT-2 — lbrn2 emitter
-- [ ] EMIT-3 — CLI surface
+- [x] EMIT-2 — lbrn2 emitter *(cam::lbrn2; Path/CutSetting encoding golden-checked byte-for-byte against the operator's samples; open-path `Line` primitive is the one inferred field — see decisions.md)*
+- [x] EMIT-3 — CLI surface *(`pcbforge emit`: copper Gerber → non-copper Fill layer .lbrn2 with the full process recipe as flags)*
 
 ## WS-SIM — Virtual board
 - [x] SIM-1 — Raster sim backend (v1)

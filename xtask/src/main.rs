@@ -49,6 +49,9 @@ const EXPECTED_LBRN2: &[&str] = &[
     // here). uv-base is deferred: the operator's rig is fiber-only (BSLFiber),
     // so a UV-device variant can't be produced yet — see decisions.md.
     "global-passes.lbrn2",
+    // Hand-drawn polyline: the Type="Path" encoding evidence EMIT-2's golden
+    // test asserts against.
+    "path-shape.lbrn2",
 ];
 
 /// Name of the manifest emitted into `samples/`.
@@ -304,8 +307,11 @@ mod tests {
         assert!(report.contains("fixtures OK"), "report: {report}");
 
         let manifest = std::fs::read_to_string(tmp.path().join("samples/MANIFEST.toml")).unwrap();
-        // 2 kicad + 10 lbrn2 = 12 entries, sorted by path.
-        assert_eq!(manifest.matches("[[file]]").count(), 12);
+        // 2 kicad + every expected lbrn2 sample, sorted by path.
+        assert_eq!(
+            manifest.matches("[[file]]").count(),
+            2 + EXPECTED_LBRN2.len()
+        );
         assert!(manifest.contains("path = \"samples/kicad/alpha.kicad_pcb\""));
         assert!(manifest.contains("path = \"samples/lbrn2/base.lbrn2\""));
         // kicad sorts before lbrn2.

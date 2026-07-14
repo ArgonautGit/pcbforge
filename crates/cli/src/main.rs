@@ -16,7 +16,9 @@ use clap::{Parser, Subcommand};
 use orchestra::db::Db;
 use orchestra::engine::{self, BoardDefaults, EnvPalletSource, ExecutorRegistry, StepReport};
 use orchestra::stages::StageGraph;
-use pcb_core::{CutOpts, Machine, NM_PER_MM, Nm};
+
+use cam::lbrn2::{self, EmitLayer};
+use pcb_core::{AblationParams, CutOpts, Machine, NM_PER_MM, Nm};
 
 /// Default database path when `--db` is not given.
 const DEFAULT_DB: &str = "pcbforge.sqlite";
@@ -127,6 +129,57 @@ enum Command {
         #[arg(long, default_value = "fiber")]
         machine: String,
     },
+    /// Emit a LightBurn `.lbrn2` directly from a KiCad copper Gerber: invert to
+    /// non-copper regions and write them as a Fill layer with the given
+    /// process recipe — no SVG/DXF import step (EMIT-3).
+    Emit {
+        /// Copper layer Gerber (e.g. F_Cu.gbr).
+        #[arg(long)]
+        copper: PathBuf,
+
+        /// Board outline Gerber (Edge.Cuts); without it, copper bbox + margin.
+        #[arg(long)]
+        outline: Option<PathBuf>,
+
+        /// Output `.lbrn2` path.
+        #[arg(long)]
+        lbrn2: PathBuf,
+
+        /// Beam-compensation clearance around copper, mm (0 = exact inverse).
+        #[arg(long, default_value_t = 0.0)]
+        offset_mm: f64,
+
+        /// Bounding-box margin when no --outline is given, mm.
+        #[arg(long, default_value_t = 1.0)]
+        margin_mm: f64,
+
+        /// LightBurn device name (must match a configured device).
+        #[arg(long, default_value = lbrn2::DEFAULT_DEVICE)]
+        device: String,
+
+        // --- process recipe (see docs/lbrn2-schema.md) ---
+        /// Max power %.
+        #[arg(long, default_value_t = 20.0)]
+        power_pct: f64,
+        /// Scan speed, mm/s.
+        #[arg(long, default_value_t = 1000.0)]
+        speed_mm_s: f64,
+        /// Frequency, kHz (written to the file in Hz).
+        #[arg(long, default_value_t = 30.0)]
+        frequency_khz: f64,
+        /// MOPA Q-pulse width, ns (a fluence knob; 0 = source default).
+        #[arg(long, default_value_t = 1)]
+        pulse_ns: u32,
+        /// Fill passes.
+        #[arg(long, default_value_t = 1)]
+        passes: u32,
+        /// Fill line interval, mm.
+        #[arg(long, default_value_t = 0.03)]
+        interval_mm: f64,
+        /// Fill scan angle, deg.
+        #[arg(long, default_value_t = 0.0)]
+        angle_deg: f64,
+    },
 }
 
 fn main() -> ExitCode {
@@ -185,7 +238,95 @@ fn run(cli: &Cli) -> Result<(), Box<dyn std::error::Error>> {
             overcut_mm: *overcut_mm,
             machine,
         }),
+        Command::Emit {
+            copper,
+            outline,
+            lbrn2,
+            offset_mm,
+            margin_mm,
+            device,
+            power_pct,
+            speed_mm_s,
+            frequency_khz,
+            pulse_ns,
+            passes,
+            interval_mm,
+            angle_deg,
+        } => emit_cmd(EmitArgs {
+            copper,
+            outline: outline.as_deref(),
+            lbrn2,
+            offset_mm: *offset_mm,
+            margin_mm: *margin_mm,
+            device,
+            params: AblationParams {
+                power_pct: *power_pct,
+                speed_mm_s: *speed_mm_s,
+                frequency_khz: *frequency_khz,
+                pulse_ns: *pulse_ns,
+                passes: *passes,
+            },
+            interval_mm: *interval_mm,
+            angle_deg: *angle_deg,
+        }),
     }
+}
+
+struct EmitArgs<'a> {
+    copper: &'a std::path::Path,
+    outline: Option<&'a std::path::Path>,
+    lbrn2: &'a std::path::Path,
+    offset_mm: f64,
+    margin_mm: f64,
+    device: &'a str,
+    params: AblationParams,
+    interval_mm: f64,
+    angle_deg: f64,
+}
+
+/// Copper Gerber → non-copper regions → LightBurn Fill layer `.lbrn2`. The
+/// FlatCAM-replacement inversion (like `noncopper`) piped straight into a
+/// press-play LightBurn file.
+fn emit_cmd(a: EmitArgs) -> Result<(), Box<dyn std::error::Error>> {
+    if !(0.0..10.0).contains(&a.offset_mm) {
+        return Err(format!("--offset-mm {} out of range [0, 10)", a.offset_mm).into());
+    }
+    let copper = ingest::gerber::load_gerber(a.copper)?;
+    let board = match a.outline {
+        Some(p) => {
+            let region =
+                cam::noncopper::board_region_from_outline(&ingest::gerber::load_gerber(p)?.polys);
+            if region.is_empty() {
+                return Err(format!("outline {} encloses no area", p.display()).into());
+            }
+            region
+        }
+        None => {
+            let margin_nm = (a.margin_mm * NM_PER_MM as f64).round() as Nm;
+            cam::noncopper::board_region_bbox(&copper.polys, margin_nm)
+        }
+    };
+    if board.is_empty() {
+        return Err("empty board region (no copper and no outline)".into());
+    }
+    let offset_nm = (a.offset_mm * NM_PER_MM as f64).round() as Nm;
+    let shapes = cam::noncopper::noncopper(&board, &copper.polys, offset_nm);
+    if shapes.is_empty() {
+        return Err("inversion produced no shapes (offset too large?)".into());
+    }
+
+    let mut layer = EmitLayer::fill("C00", a.params, cam::lbrn2::polys_to_elems(&shapes));
+    layer.interval_mm = a.interval_mm;
+    layer.angle_deg = a.angle_deg;
+    cam::lbrn2::write_lbrn2(a.device, &[layer], a.lbrn2)?;
+    let rings: usize = shapes.iter().map(|p| 1 + p.holes.len()).sum();
+    eprintln!(
+        "non-copper: {} shape(s), {} ring(s) -> Fill layer",
+        shapes.len(),
+        rings
+    );
+    println!("wrote {}", a.lbrn2.display());
+    Ok(())
 }
 
 struct CutArgs<'a> {
