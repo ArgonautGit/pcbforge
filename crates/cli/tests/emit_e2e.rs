@@ -314,6 +314,41 @@ fn placement_flags_translate_the_job() {
     );
 }
 
+/// `emit --preview` writes a color SVG (board / kept-copper / to-ablate)
+/// alongside the .lbrn2, so the operator can eyeball what burns first.
+#[test]
+fn emit_writes_a_preview_svg() {
+    let dir = tmp("prev");
+    let out = dir.join("job.lbrn2");
+    let svg = dir.join("job.svg");
+    let result = Command::new(env!("CARGO_BIN_EXE_pcbforge"))
+        .args([
+            "emit",
+            "--copper",
+            fixture("uv_test-F_Cu.gbr").to_str().unwrap(),
+            "--outline",
+            fixture("uv_test-Edge_Cuts.gbr").to_str().unwrap(),
+            "--lbrn2",
+            out.to_str().unwrap(),
+            "--preview",
+            svg.to_str().unwrap(),
+        ])
+        .output()
+        .expect("binary runs");
+    assert!(
+        result.status.success(),
+        "stderr: {}",
+        String::from_utf8_lossy(&result.stderr)
+    );
+    assert!(out.is_file(), "the .lbrn2 is still written");
+    let doc = std::fs::read_to_string(&svg).expect("preview svg exists");
+    assert!(doc.contains("<svg"));
+    // The three color layers: board field, kept copper, to-ablate.
+    assert!(doc.contains("#b87333"), "kept copper is copper-colored");
+    assert!(doc.contains("#333333"), "to-ablate is dark");
+    assert!(doc.matches("<path").count() > 1, "multiple regions drawn");
+}
+
 #[test]
 fn emit_rejects_out_of_range_offset() {
     let out = tmp("bad").join("x.lbrn2");

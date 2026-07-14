@@ -151,6 +151,11 @@ enum Command {
         #[arg(long)]
         lbrn2: PathBuf,
 
+        /// Also write a color preview SVG (board / kept-copper / to-ablate) so
+        /// you can eyeball exactly what will burn before importing to LightBurn.
+        #[arg(long)]
+        preview: Option<PathBuf>,
+
         /// Beam-compensation clearance around copper, mm (0 = exact inverse).
         #[arg(long, default_value_t = 0.0)]
         offset_mm: f64,
@@ -274,6 +279,7 @@ fn run(cli: &Cli) -> Result<(), Box<dyn std::error::Error>> {
             copper,
             outline,
             lbrn2,
+            preview,
             offset_mm,
             clear_nonconductor,
             margin_mm,
@@ -293,6 +299,7 @@ fn run(cli: &Cli) -> Result<(), Box<dyn std::error::Error>> {
             copper,
             outline: outline.as_deref(),
             lbrn2,
+            preview: preview.as_deref(),
             offset_mm: *offset_mm,
             clear_nonconductor: *clear_nonconductor,
             margin_mm: *margin_mm,
@@ -318,6 +325,7 @@ struct EmitArgs<'a> {
     copper: &'a std::path::Path,
     outline: Option<&'a std::path::Path>,
     lbrn2: &'a std::path::Path,
+    preview: Option<&'a std::path::Path>,
     offset_mm: f64,
     clear_nonconductor: bool,
     margin_mm: f64,
@@ -360,6 +368,13 @@ fn emit_cmd(a: EmitArgs) -> Result<(), Box<dyn std::error::Error>> {
     let shapes = cam::noncopper::noncopper(&board, &copper.polys, offset_nm);
     if shapes.is_empty() {
         return Err("inversion produced no shapes (offset too large?)".into());
+    }
+    // Preview before the workspace transform: board / kept-copper / to-ablate
+    // in the original Gerber frame — the geometry relationship the operator
+    // eyeballs (placement is a LightBurn concern, handled below for the job).
+    if let Some(p) = a.preview {
+        cam::export::write_preview_svg(&board, &copper.polys, &shapes, p)?;
+        eprintln!("preview: wrote {}", p.display());
     }
     // KiCad plots Gerbers y-up but offset into negative y (sheet position);
     // translate the job's corner to the origin so it lands on LightBurn's
