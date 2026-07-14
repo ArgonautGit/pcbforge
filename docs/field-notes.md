@@ -113,6 +113,24 @@ Update it whenever a live burn teaches something.
    these probes when adding geometry features — they catch what renders
    can't be diffed for.
 
+## Native driver (DRV) — how to unblock it
+
+- The DRV track natively drives the B4 (BJJCZ/JCZ galvo controller) by
+  reverse-engineering its USB protocol from real captures. **Everything after
+  DRV-1 is gated on real `captures/*.pcapng` from the operator's machine** —
+  the decode is evidence-only (no filling fields by analogy to other
+  controllers), so it cannot be authored blind.
+- **DRV-1 is done and is the unblock:** `docs/capture-plan.md` (procedure + the
+  14-experiment one-variable-per-capture matrix), `tools/capture.sh` (recorder
+  → `captures/<NN>-slug.pcapng` + `MANIFEST.csv`), ready to run at the machine.
+- **Operator to do, in one session at the laser:** record the B4 USB ID/bus in
+  `RUNLOG.md` (`lsusb`), `sudo modprobe usbmon`, run the §2 dummy-capture
+  acceptance test, then walk experiments 00–13 with LightBurn driving. Commit
+  `captures/` + `RUNLOG.md`. That set is the entire input to DRV-2.
+- The container has **no USB stack**, so the script's usbmon/tshark syntax is
+  authored-not-live-verified — reconcile against `man usbmon`/`man tshark` on
+  the machine first (the plan says so at the top).
+
 ## Reproduction toolkit
 
 - Real-board fixtures: `crates/cli/tests/fixtures/uv_test-{F_Cu,Edge_Cuts}.gbr`

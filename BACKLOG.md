@@ -72,7 +72,7 @@ done-when. Task prompts live in `docs/backlog.md`.
 - [ ] UI-4 — Escalation viewer
 
 ## WS-DRV — Native drivers by USB sniffing
-- [ ] DRV-1 — Capture campaign kit *(blocked: RUNLOG.md with the B4 USB ID not yet provided; needs the machine with usbmon)*
+- [x] DRV-1 — Capture campaign kit *(docs/capture-plan.md + tools/capture.sh + captures/MANIFEST.csv; script logic mock-verified. Live acceptance (dummy usbmon capture) + real B4 captures are operator-side — no USB stack in the cloud container; RUNLOG.md USB ID still to be recorded at the machine)*
 - [ ] DRV-2 — Protocol decode
 - [ ] DRV-3 — Transport + replay harness
 - [ ] DRV-4 — Driver core against mock

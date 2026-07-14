@@ -551,3 +551,31 @@ discovered constraints here.
 - Axis convention documented on the module: design-frame raster is y-down like
   every other image here; a y-up design raster (if ever wanted) should flip the
   board affine's y, not the warper. This unblocks ORC-7 (guided drilling).
+
+## 2026-07-14 — DRV-1 notes (capture campaign kit)
+
+- Delivered the three artifacts: `docs/capture-plan.md` (operator procedure +
+  the 14-row one-variable-per-capture matrix 00–13 + safety), `tools/capture.sh`
+  (dumpcap/tshark recorder, one experiment per file, CSV manifest rows, clobber
+  guard), and `captures/` with `MANIFEST.csv` header + README. The xtask
+  fixtures validator already had the hook (`captures/` required once
+  capture-plan.md exists) — now satisfied.
+- **Verification gap, stated up front in the plan:** the cloud container has no
+  USB stack — `usbmon`, `tshark`, `lsusb`, and any usbmon interface are all
+  absent — so DRV-1's own done-when (dumpcap records a dummy run on any USB
+  device) and the `man usbmon`/`man tshark` syntax cross-check could not be
+  executed here. Instead the script's *logic* (arg validation, slug, CSV
+  comma/quote escaping, baseline/variable columns, one-file-per-experiment
+  clobber guard) was verified against a mocked `dumpcap` on PATH. The live
+  dry-run + the real B4 captures are operator-side; the plan flags the syntax
+  as needing man-page reconciliation before trust.
+- Design choices: capture the whole `usbmonN` **bus** interface (not `usbmon0`
+  all-buses, not a device display filter) so URB context survives for DRV-2's
+  differencing; device-address filtering deferred to decode. Device address is
+  called out as changing per replug (must re-check lsusb each session); bus is
+  stable per physical port. Manifest carries `baseline` + `variable` columns
+  precisely because DRV-2 differences on them; `sha256` left `-` for
+  `cargo xtask fixtures` to fill when captures are committed.
+- DRV-2..8 remain hard-blocked on the real captures (evidence-only decode —
+  the prompt forbids filling protocol fields by analogy). DRV-1 is the unblock:
+  its output is the entire input to DRV-2.
