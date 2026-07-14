@@ -639,12 +639,7 @@ impl ConsoleApp {
         self.pump_camera(&ctx);
 
         if let Some(tex) = &self.cam_tex {
-            egui::ScrollArea::both().show(ui, |ui| {
-                ui.add(
-                    egui::Image::from_texture((tex.id(), tex.size_vec2()))
-                        .fit_to_original_size(1.0),
-                );
-            });
+            ui.add(egui::Image::from_texture((tex.id(), tex.size_vec2())).shrink_to_fit());
         } else {
             ui.weak("(no frame yet)");
         }
@@ -701,15 +696,18 @@ impl ConsoleApp {
         ui.separator();
 
         if let Some(tex) = &self.place_tex {
+            let native_w = tex.size()[0] as f32;
             let img = egui::Image::from_texture((tex.id(), tex.size_vec2()))
-                .fit_to_original_size(1.0)
+                .shrink_to_fit()
                 .sense(egui::Sense::drag());
             let resp = ui.add(img);
             if resp.dragged() {
                 let d = resp.drag_delta();
-                // Screen points ≈ frame pixels at native display; px → mm.
-                self.place_tx_mm += d.x as f64 / self.place_px_per_mm;
-                self.place_ty_mm += d.y as f64 / self.place_px_per_mm;
+                // The frame is scaled to fit, so convert screen-point drag back
+                // to frame pixels (native_w / displayed_w), then to mm.
+                let scale = native_w / resp.rect.width().max(1.0);
+                self.place_tx_mm += (d.x * scale) as f64 / self.place_px_per_mm;
+                self.place_ty_mm += (d.y * scale) as f64 / self.place_px_per_mm;
                 changed = true;
             }
         } else {
@@ -725,12 +723,7 @@ impl ConsoleApp {
     fn job_view(&mut self, ui: &mut egui::Ui) {
         ui.label(egui::RichText::new(&self.preview_note).weak());
         if let Some(tex) = &self.preview_tex {
-            egui::ScrollArea::both().show(ui, |ui| {
-                ui.add(
-                    egui::Image::from_texture((tex.id(), tex.size_vec2()))
-                        .fit_to_original_size(1.0),
-                );
-            });
+            ui.add(egui::Image::from_texture((tex.id(), tex.size_vec2())).shrink_to_fit());
         } else {
             ui.weak("(no preview rendered — see the Actions panel)");
         }
@@ -823,7 +816,7 @@ impl ConsoleApp {
         let (tw, th) = (tex.size()[0] as f32, tex.size()[1] as f32);
         let resp = ui.add(
             egui::Image::from_texture((tex.id(), egui::vec2(tw, th)))
-                .fit_to_original_size(1.0)
+                .shrink_to_fit()
                 .sense(egui::Sense::click_and_drag()),
         );
         let rect = resp.rect;
