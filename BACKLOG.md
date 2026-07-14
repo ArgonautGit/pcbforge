@@ -1,6 +1,6 @@
 # PCBForge Backlog Checklist
 
-54 tasks (CAM-10 operator-added 2026-07-13). Stretch-tagged: CAM-9, VIS-7, DRV-7, RES-4. Human-executed but
+62 tasks (CAM-10 operator-added 2026-07-13; FLD-1..8 field follow-ups added 2026-07-14). Stretch-tagged: CAM-9, VIS-7, DRV-7, RES-4. Human-executed but
 agent-prepared: DRV-1's captures, DRV-5's S2–S5, QA-4's burns, every "live"
 done-when. Task prompts live in `docs/backlog.md`.
 
@@ -93,3 +93,13 @@ done-when. Task prompts live in `docs/backlog.md`.
 - [x] RES-2 — LightBurn automation surface
 - [x] RES-3 — JCZ protocol public documentation survey
 - [x] RES-4 — Consumables & floor benchmarks *(optional)*
+
+## WS-FLD — Field follow-ups *(from the first live burns; details in docs/field-notes.md)*
+- [ ] FLD-1 — Verify open-path `Line` primitive on first live Line-mode job (the one inferred lbrn2 field)
+- [ ] FLD-2 — Two-polyline LightBurn sample → confirm multi-shape VertID/PrimID convention
+- [ ] FLD-3 — Silence caught-panic stderr spam from the offset retry ladder
+- [ ] FLD-4 — Emit `anglePerPass` from `fill_angle_step_deg` (per-pass hatch rotation in one layer)
+- [ ] FLD-5 — Board cut via LightBurn's native kerf/tabs/perforation (needs one sample with those set)
+- [ ] FLD-6 — Job placement flags (`--origin-x/--origin-y/--center`)
+- [ ] FLD-7 — `uv-base.lbrn2` when a UV device profile exists → UV schema delta
+- [ ] FLD-8 — Upstream cavalier_contours findings / evaluate newer release
