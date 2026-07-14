@@ -125,8 +125,10 @@ impl ConsoleApp {
             preview_tex: None,
             preview_note: "Set a copper Gerber and click “Render preview”.".into(),
             fid_frame: String::new(),
-            // Default to the operator's drilled-hole L-layout (field photo).
-            fid_layout: "10,10; 60,10; 10,60".into(),
+            // Four fiducials (a rectangle) so a perspective homography is
+            // determinable — 3 can only fix an affine. The 4th at (60,60)
+            // completes the operator's L into a square.
+            fid_layout: "10,10; 60,10; 10,60; 60,60".into(),
             fid_px_per_mm: 10.0,
             fid_diameter_mm: 1.0,
             fid_search_mm: 2.0,
@@ -217,11 +219,8 @@ impl ConsoleApp {
                 return;
             }
         };
-        // Seed markers from the design positions (bed mm) unless already sized.
-        if self.fid_search.len() != design.len() {
-            self.fid_search = design;
-            self.fid_found = vec![None; self.fid_search.len()];
-        }
+        let _ = design;
+        self.sync_fid_markers();
         let (w, h) = (img.width() as usize, img.height() as usize);
         let color = ColorImage {
             size: [w, h],
@@ -232,9 +231,25 @@ impl ConsoleApp {
         self.fid_note = "drag each ✛ near its hole, then Check".into();
     }
 
+    /// Resize the draggable markers to match the design layout, preserving
+    /// existing (dragged) positions and seeding any new ones from the layout —
+    /// so adding a 4th coordinate makes a 4th ✛ appear without a manual reset.
+    fn sync_fid_markers(&mut self) {
+        let Ok(design) = fiducial::parse_layout(&self.fid_layout) else {
+            return;
+        };
+        let old = self.fid_search.len();
+        self.fid_search.resize(design.len(), (0.0, 0.0));
+        for (i, d) in design.iter().enumerate().skip(old) {
+            self.fid_search[i] = *d;
+        }
+        self.fid_found.resize(self.fid_search.len(), None);
+    }
+
     /// Detect around the current (draggable) search markers and record the
     /// found positions, summary rows, and measured scale.
     pub fn render_fiducials(&mut self, ctx: &Context) {
+        self.sync_fid_markers();
         if self.fid_frame_img.is_none() {
             self.load_fid_frame(ctx);
         }
@@ -849,6 +864,9 @@ impl ConsoleApp {
     /// The frame with draggable search markers (✛) and detected rings drawn on
     /// top via the painter — so markers move without re-rasterizing the image.
     fn fid_frame_overlay(&mut self, ui: &mut egui::Ui) {
+        // Keep the marker count in step with the layout field (live), so
+        // adding/removing a coordinate adds/removes a ✛.
+        self.sync_fid_markers();
         let Some(tex) = &self.fid_frame_tex else {
             ui.weak("(load a frame to place markers)");
             return;
@@ -1156,6 +1174,28 @@ mod tests {
         let ctx = Context::default();
         let out = ctx.run(egui::RawInput::default(), |ctx| app.ui(ctx));
         assert!(!out.shapes.is_empty(), "place tab must render");
+    }
+
+    /// The marker set tracks the layout field: adding a coordinate adds a
+    /// marker (seeded from the layout), removing one drops it, and existing
+    /// dragged positions are preserved.
+    #[test]
+    fn markers_follow_the_layout_field() {
+        let mut app = ConsoleApp::new(tmp_db(), vec!["true".into()]);
+        app.fid_layout = "10,10; 60,10; 10,60".into();
+        app.sync_fid_markers();
+        assert_eq!(app.fid_search.len(), 3);
+
+        app.fid_search[0] = (11.5, 9.0); // drag marker 0
+        app.fid_layout = "10,10; 60,10; 10,60; 60,60".into();
+        app.sync_fid_markers();
+        assert_eq!(app.fid_search.len(), 4, "4th marker appears");
+        assert_eq!(app.fid_search[0], (11.5, 9.0), "dragged position kept");
+        assert_eq!(app.fid_search[3], (60.0, 60.0), "4th seeded from layout");
+
+        app.fid_layout = "10,10; 60,10".into();
+        app.sync_fid_markers();
+        assert_eq!(app.fid_search.len(), 2, "removing coords drops markers");
     }
 
     /// Dragging a search marker onto an off-nominal hole makes detection find
