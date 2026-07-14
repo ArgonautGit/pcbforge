@@ -112,6 +112,12 @@ polyline (line tool) and an ellipse:
 
 - Unlike `Rect` (center in `XForm`), a `Path`'s `XForm` is **identity** and its
   vertices are **absolute mm**: `V<x> <y>` per vertex.
+- **`VertID`/`PrimID` identify the shape's vertex/primitive lists and must be
+  unique per shape.** Established by failure evidence: an emitted job whose 37
+  Path shapes all carried `VertID="0" PrimID="0"` (copied from this
+  single-path sample) burned as a fan of rays converging on shape 0's first
+  vertex — LightBurn cross-links lists that share an ID. The emitter assigns a
+  monotonically increasing ID per shape.
 - The `c0x1c1x1` suffix is identical on every line vertex (a control-tag
   constant, not geometry) — reproduced verbatim by the emitter.
 - `PrimList` is `LineClosed` for a closed polyline. The open form `Line` is

@@ -169,10 +169,16 @@ pub fn lbrn2_string(device: &str, layers: &[EmitLayer]) -> String {
     for (i, layer) in layers.iter().enumerate() {
         s.push_str(&cut_setting_xml(i as u32, layer));
     }
+    // VertID/PrimID must be unique per shape: they identify the shape's
+    // vertex/primitive lists. The operator's first burn proved that reusing
+    // an ID cross-links the lists — every ring's closing segment ran back to
+    // shape 0's first vertex, fanning burned rays from the board corner.
+    let mut shape_id = 0u32;
     for (i, layer) in layers.iter().enumerate() {
         for elem in &layer.elems {
-            if let Some(shape) = shape_xml(i as u32, elem) {
+            if let Some(shape) = shape_xml(i as u32, shape_id, elem) {
                 s.push_str(&shape);
+                shape_id += 1;
             }
         }
     }
@@ -253,7 +259,7 @@ fn cut_setting_xml(index: u32, layer: &EmitLayer) -> String {
 }
 
 /// One `Type="Path"` shape from a polyline element (skips degenerate ones).
-fn shape_xml(cut_index: u32, elem: &PathElem) -> Option<String> {
+fn shape_xml(cut_index: u32, shape_id: u32, elem: &PathElem) -> Option<String> {
     if elem.pts.len() < 2 {
         return None;
     }
@@ -264,7 +270,7 @@ fn shape_xml(cut_index: u32, elem: &PathElem) -> Option<String> {
     // Closed polyline -> LineClosed; open -> Line (open form inferred).
     let prim = if elem.closed { "LineClosed" } else { "Line" };
     Some(format!(
-        "    <Shape Type=\"Path\" CutIndex=\"{cut_index}\" VertID=\"0\" PrimID=\"0\">\n\
+        "    <Shape Type=\"Path\" CutIndex=\"{cut_index}\" VertID=\"{shape_id}\" PrimID=\"{shape_id}\">\n\
          \x20       <XForm>1 0 0 1 0 0</XForm>\n\
          \x20       <VertList>{verts}</VertList>\n\
          \x20       <PrimList>{prim}</PrimList>\n\
@@ -310,7 +316,7 @@ mod tests {
             pts: verts.iter().map(|&(x, y)| P::new(x * MM, y * MM)).collect(),
             closed: true,
         };
-        let shape = shape_xml(1, &elem).unwrap();
+        let shape = shape_xml(1, 0, &elem).unwrap();
         assert!(shape.contains(
             "<VertList>V14 45c0x1c1x1V15 53c0x1c1x1V22 53c0x1c1x1V22 47c0x1c1x1V17 49c0x1c1x1</VertList>"
         ));
@@ -367,7 +373,7 @@ mod tests {
             pts: vec![P::new(0, 0), P::new(5 * MM, 0), P::new(5 * MM, 5 * MM)],
             closed: false,
         };
-        let shape = shape_xml(0, &elem).unwrap();
+        let shape = shape_xml(0, 0, &elem).unwrap();
         assert!(shape.contains("<PrimList>Line</PrimList>"));
     }
 
@@ -456,6 +462,40 @@ mod tests {
         let mut want = vec![P::new(0, 0), P::new(4 * MM, 0), P::new(0, 4 * MM)];
         want.sort();
         assert_eq!(got, want);
+    }
+
+    /// Regression for the operator's fan-burn: every emitted shape must have
+    /// its own VertID/PrimID. Reused IDs cross-link LightBurn's vertex lists
+    /// and every ring's closing segment runs to shape 0's first vertex.
+    #[test]
+    fn every_shape_gets_unique_vert_and_prim_ids() {
+        let tri = |x: i64| PathElem {
+            kind: PathKind::Rubout(0),
+            pts: vec![
+                P::new(x * MM, 0),
+                P::new((x + 2) * MM, 0),
+                P::new(x * MM, 2 * MM),
+            ],
+            closed: true,
+        };
+        let layers = vec![
+            EmitLayer::fill("C00", base_params(), vec![tri(0), tri(5), tri(10)]),
+            EmitLayer::line("C01", base_params(), vec![tri(15)]),
+        ];
+        let doc = lbrn2_string(DEFAULT_DEVICE, &layers);
+        let mut ids: Vec<&str> = doc
+            .split("VertID=\"")
+            .skip(1)
+            .map(|s| s.split('"').next().unwrap())
+            .collect();
+        assert_eq!(ids.len(), 4, "one VertID per shape");
+        ids.sort_unstable();
+        ids.dedup();
+        assert_eq!(ids.len(), 4, "VertIDs must be unique per shape");
+        // PrimID mirrors VertID.
+        for id in &ids {
+            assert!(doc.contains(&format!("VertID=\"{id}\" PrimID=\"{id}\"")));
+        }
     }
 
     #[test]

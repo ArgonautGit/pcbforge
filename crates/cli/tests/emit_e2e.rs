@@ -70,6 +70,57 @@ fn emit_writes_a_fill_layer_lbrn2() {
     );
 }
 
+/// Regression on the operator's real KiCad 10 board (uv_test): the first burn
+/// produced a fan of rays from the board corner because all 37 Path shapes
+/// shared VertID/PrimID 0 and LightBurn cross-linked their vertex lists. The
+/// emitted file must give every shape a unique ID, sit on the workspace, and
+/// contain the expected ring count.
+#[test]
+fn uv_test_board_emits_unique_shape_ids() {
+    let out = tmp("uvtest").join("job.lbrn2");
+    let result = Command::new(env!("CARGO_BIN_EXE_pcbforge"))
+        .args([
+            "emit",
+            "--copper",
+            fixture("uv_test-F_Cu.gbr").to_str().unwrap(),
+            "--outline",
+            fixture("uv_test-Edge_Cuts.gbr").to_str().unwrap(),
+            "--offset-mm",
+            "0.025",
+            "--lbrn2",
+            out.to_str().unwrap(),
+        ])
+        .output()
+        .expect("binary runs");
+    assert!(
+        result.status.success(),
+        "stderr: {}",
+        String::from_utf8_lossy(&result.stderr)
+    );
+    let doc = std::fs::read_to_string(&out).unwrap();
+
+    let shape_count = doc.matches("Type=\"Path\"").count();
+    assert!(
+        shape_count > 30,
+        "uv_test yields many rings, got {shape_count}"
+    );
+
+    let mut vert_ids: Vec<&str> = doc
+        .split("VertID=\"")
+        .skip(1)
+        .map(|s| s.split('"').next().unwrap())
+        .collect();
+    assert_eq!(vert_ids.len(), shape_count);
+    vert_ids.sort_unstable();
+    vert_ids.dedup();
+    assert_eq!(
+        vert_ids.len(),
+        shape_count,
+        "every shape must own a unique VertID (fan-burn regression)"
+    );
+    assert!(!doc.contains("V-"), "job must sit on the workspace");
+}
+
 #[test]
 fn emit_rejects_out_of_range_offset() {
     let out = tmp("bad").join("x.lbrn2");

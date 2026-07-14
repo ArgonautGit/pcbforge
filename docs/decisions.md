@@ -3,6 +3,39 @@
 Per the backlog conventions: every task records deviations from its prompt and
 discovered constraints here.
 
+## 2026-07-14 — emit fan-burn fix: VertID/PrimID must be unique per shape
+
+- The operator burned the first emitted job on a real KiCad 10 board
+  (uv_test) and returned a photo, the LightBurn preview, the job file, and
+  the source gerbers. Symptom: a fan of rays burned from the board's
+  top-left corner across the pad field, visible identically in LightBurn's
+  own preview (so a file-interpretation defect, not a machine one).
+- Forensics: every vertex in the job file was textually clean and rendering
+  the file's geometry as intended reproduced the design perfectly — the
+  geometry was right, LightBurn's reading of it was not. The fan anchor
+  (0, 12.025) is exactly shape 0's first vertex. All 37 Path shapes carried
+  VertID="0" PrimID="0", copied verbatim from the single-path sample:
+  LightBurn treats these as vertex/primitive-list identifiers and
+  cross-links shapes that share them, so each ring's closing segment ran
+  back to the shared list's vertex 0 — a fan with one ray per shape.
+- Fix: the emitter assigns a unique, monotonically increasing VertID/PrimID
+  per shape (first shape keeps 0, so the single-shape golden byte-match vs
+  the pentagon sample is unchanged). Regression tests: unit (4 shapes → 4
+  unique IDs) and e2e on the operator's committed uv_test gerbers (>30
+  rings, all IDs unique, on-workspace).
+- The operator's KiCad 10.0.3 gerbers are committed as fixtures
+  (crates/cli/tests/fixtures/uv_test-*.gbr) — first real-user board in the
+  test suite; the parser handled the KiCad 10 dialect (named %TD.AperFunction%
+  deletes, \u escapes in .P values, NonConductor zone regions) unchanged.
+- Note: cavalier_contours prints caught-panic traces to stderr during the
+  offset retry ladder on this board (upstream #79 class; results unaffected
+  — geom's catch_unwind + winding fallback handles it). Cosmetic; a panic
+  hook silencer is a possible future nicety.
+- Remaining verification on the operator: open the re-emitted job in
+  LightBurn preview — fan gone confirms the ID semantics; if not, the next
+  evidence needed is a LightBurn-authored file containing TWO drawn
+  polylines to observe its own multi-path ID convention.
+
 ## 2026-07-14 — emit frame fix (from the operator's first real emitted job)
 
 - The operator ran `pcbforge emit` on a real board and returned the output:
