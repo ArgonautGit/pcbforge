@@ -47,6 +47,20 @@ Update it whenever a live burn teaches something.
   Sub-layers exist (one `1 Line` sub-layer observed); a disabled sub-layer
   greys its process fields — early "locked power" confusion was actually the
   fixed MOPA power field.
+- **Fiducial recipe (field photo, 2026-07-14): three 1 mm holes drilled at
+  (10,10), (60,10), (10,60) mm** — an L-layout, so orientation and mirroring
+  are unambiguous from the three points alone. They read as dark dots on
+  bright copper (`FiducialProfile::DarkDot`).
+- **Camera reality from the same photo**: capture may be a phone camera
+  (operator warns the real feed could be *lower* resolution); the copper
+  shows a strong specular glare gradient; the **honeycomb bed is covered in
+  dark holes that look exactly like the fiducials** — any detector must
+  search locally around expected positions, never globally. Prior burn
+  rectangles (with charred FR4) also sit on the blank and must not distract
+  detection.
+- The photo bytes couldn't be committed (chat vision only). When real
+  calibration shots are taken, save the files — a committed real frame is
+  the missing VIS fixture.
 
 ## Known gaps and quirks (ranked, with repro)
 

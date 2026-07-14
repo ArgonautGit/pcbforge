@@ -472,3 +472,34 @@ discovered constraints here.
   ≈ 0.16 on a 16×16 grid spread over ~143 mm) while keeping consecutive
   centroids ≈ 11-12 mm apart. The shuffle uses a hardcoded LCG seed (no `rand`
   crate, no clock) so the test is deterministic.
+
+## 2026-07-14 — VIS-4 notes (fiducial detector, built from the field photo)
+
+- The operator sent a phone photo of the real blank on the machine bed with
+  the actual fiducial recipe: **three 1 mm holes drilled at (10,10), (60,10),
+  (10,60) mm** — an L-layout that disambiguates orientation. The photo bytes
+  arrived as chat vision only and could not be committed as a fixture; the
+  synthetic test renderer reproduces its salient hazards instead (specular
+  glare gradient across bare copper, sensor noise, honeycomb-bed decoy holes
+  that look exactly like drilled fiducials).
+- VIS-4 formally depends on VIS-3 (bed homography), which needs the machine.
+  The detector is implemented now with the px↔mm mapping parameterized as
+  `BedMap` (any homogeneous 3×3, perspective-divided) so VIS-3's calibration
+  drops in unchanged; tests use scale/rotation affines. The live done-when
+  (three burned annuli + 1 mm pallet-nudge consistency) remains operator-side.
+- Pipeline deviation from the prompt's "centroid → paraboloid sub-pixel": the
+  intensity-weighted centroid over the (1-px-dilated) component IS the
+  sub-pixel estimate — it is unbiased on an anti-aliased disc — while the
+  paraboloid fit on the matched-filter response is a consistency check that
+  feeds the confidence score, not the position. Two synthetic findings drove
+  this: (a) a square weighting window let a grazing decoy blob drag the
+  centroid ~2.6 px, fixed by restricting support to the component's own
+  pixels; (b) a half-pixel bias traced to coordinate conventions, resolved by
+  adopting OpenCV's pixel-centers-at-integer-coordinates convention,
+  documented on `BedMap` — VIS-3 must use the same convention.
+- Local robust statistics (median/MAD per search window) rather than global
+  thresholds: the photo's glare gradient is board-scale, so a few-mm window
+  sees it as nearly flat. Low contrast returns `Miss::LowContrast { snr }`
+  (lighting problem, not code — per the prompt), and decoys of the wrong
+  size are rejected by area/circularity gates even when closer to the
+  expected position than the true hole.

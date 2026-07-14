@@ -44,7 +44,7 @@ done-when. Task prompts live in `docs/backlog.md`.
 - [ ] VIS-1 — Capture module
 - [ ] VIS-2 — Intrinsics calibration
 - [ ] VIS-3 — Bed homography
-- [ ] VIS-4 — Fiducial detectors
+- [x] VIS-4 — Fiducial detectors *(vision::find_fiducials; synthetic done-when met (<0.15 px); px↔mm parameterized as BedMap pending VIS-3; live annuli check operator-side — see decisions.md)*
 - [x] VIS-5 — Affine fit + residuals
 - [ ] VIS-6 — Burned-grid galvo calibration + register
 - [ ] VIS-7 — TPS field correction *(stretch)*

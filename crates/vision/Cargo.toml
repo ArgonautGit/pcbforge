@@ -7,6 +7,7 @@ license.workspace = true
 [dependencies]
 pcb-core = { workspace = true }
 nalgebra = "0.35.0"
+image = { version = "0.25", default-features = false, features = ["png"] }
 
 [dev-dependencies]
 approx = "0.5"
