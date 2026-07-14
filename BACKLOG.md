@@ -66,7 +66,7 @@ done-when. Task prompts live in `docs/backlog.md`.
 - [ ] ORC-8 — Mask-open inspection stage
 
 ## WS-UI — Operator console
-- [x] UI-1 — egui console skeleton *(crates/ui; egui-only core verified headless (17 tests incl. full-frame layout), eframe binary behind `native` (compiles here, needs a display to run). Status panel from SQLite + actions shelling `pcbforge` verbs + rasterized job preview + **Fiducial-check view (VIS-4 overlay: expected crosshairs / detected rings by confidence / miss reasons)** — both verified on real/synthetic images. Gaps: live-video panel pending VIS-1; verb output synchronous not async-streamed — see decisions.md/FLD)*
+- [x] UI-1 — egui console skeleton *(crates/ui; egui-only core verified headless (22 tests incl. per-tab full-frame layout), eframe binary behind `native`. Status panel from SQLite + actions shelling `pcbforge` (via `cargo run --bin pcbforge` so it works from a repo checkout) + three central views: **Job preview**, **Fiducial check** (VIS-4 overlay), **Place on board** (drag/rotate the circuit over the bed frame → "Etch here" bakes the placement via `register`). Gaps: live-video pending VIS-1; verb output synchronous — see decisions.md/FLD)*
 - [ ] UI-2 — AR overlay
 - [ ] UI-3 — Wizard panels
 - [ ] UI-4 — Escalation viewer

@@ -9,13 +9,15 @@
 
 mod app;
 mod fiducial;
+mod place;
 mod preview;
 mod status;
 
-pub use app::{ConsoleApp, LogLine, preview_image, run_capture};
+pub use app::{ConsoleApp, LogLine, default_cli_cmd, job_shapes, preview_image, run_capture};
 pub use fiducial::{
     FidKind, FidResult, FidRow, check as fiducial_check, check_frame, parse_layout,
 };
+pub use place::{Placement, bbox_center_mm, composite};
 pub use preview::{Layer, rasterize};
 pub use status::{BoardStatus, StatusSnapshot, snapshot};
 
@@ -23,11 +25,11 @@ pub use status::{BoardStatus, StatusSnapshot, snapshot};
 /// `eframe`) and a display with GL/X11 — headless/CI builds use the egui-only
 /// library path and its frame tests instead.
 #[cfg(feature = "native")]
-pub fn run_native(db_path: std::path::PathBuf, pcbforge_bin: String) -> eframe::Result<()> {
+pub fn run_native(db_path: std::path::PathBuf, cli_cmd: Vec<String>) -> eframe::Result<()> {
     let options = eframe::NativeOptions::default();
     eframe::run_native(
         "PCBForge console",
         options,
-        Box::new(move |_cc| Ok(Box::new(ConsoleApp::new(db_path, pcbforge_bin)))),
+        Box::new(move |_cc| Ok(Box::new(ConsoleApp::new(db_path, cli_cmd)))),
     )
 }

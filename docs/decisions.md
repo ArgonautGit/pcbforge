@@ -696,3 +696,31 @@ discovered constraints here.
   reflection-flag) + register_e2e (identity-unchanged, translation-exact,
   high-RMS rejected, too-few rejected, --frame detect→fit→emit, mutually-
   exclusive inputs). 41 workspace test binaries green.
+
+## 2026-07-14 — Console drag-to-place + CLI invocation fix
+
+- Operator request: drag a live preview of the circuit over the camera view to
+  choose where it's etched. Added a **Place-on-board** tab (ui::place): overlay
+  the job's to-ablate geometry semi-transparent over the bed frame at a
+  Placement (translate + rotate about the job bbox center); drag the overlay or
+  use x/y/rot controls; "Etch here" bakes the placement in.
+- **Reuses Phase A, no second emit path:** a manual placement *is* an affine, so
+  it's encoded as three synthetic fiducial correspondences (pivot + two unit
+  offsets, non-collinear) and shelled to `pcbforge register --fiducials`. The
+  console never re-implements the transform/emit — it drives the verified CLI.
+  Correspondences are formatted to 6 decimals so register recovers the affine to
+  ~1e-5 (unit-tested via fit_affine roundtrip).
+- Compositing is a translucent even-odd scanline fill of the placed geometry
+  over the frame → ColorImage (verifiable headless, shown via texture). Proof:
+  `dump_place` example renders the uv_test job placed at (40,30) mm rotated 15°
+  over a synthetic bed — the tilt is visible.
+- Same camera→machine calibration caveat as register (px/mm uniform scale until
+  VIS-3); the placement frame is the bed/camera frame.
+- **Operator-reported bug fixed:** the actions panel shelled `pcbforge`, absent
+  from PATH in a repo checkout. The invocation is now a command vector
+  (`cli_cmd`) defaulting to `cargo run -q --bin pcbforge --` (works from the
+  repo); `--pcbforge <path>` overrides with a prebuilt binary. run_capture takes
+  the program + prefix args.
+- Verified: place unit tests (identity/translation placement, correspondences→
+  affine roundtrip, composite footprint) + a headless Place-tab layout test. 41
+  workspace test binaries green.

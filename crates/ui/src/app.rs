@@ -29,14 +29,25 @@ pub struct LogLine {
 enum CentralTab {
     Job,
     Fiducials,
+    Place,
+}
+
+/// How to invoke the `pcbforge` CLI: `program` + fixed prefix args, before the
+/// verb's own args. Defaults to `cargo run -q --bin pcbforge --` so the console
+/// works from a repo checkout with nothing on PATH ([`default_cli_cmd`]).
+pub fn default_cli_cmd() -> Vec<String> {
+    ["cargo", "run", "-q", "--bin", "pcbforge", "--"]
+        .into_iter()
+        .map(String::from)
+        .collect()
 }
 
 /// The console application state.
 pub struct ConsoleApp {
     /// Path to the orchestra SQLite DB (`--db`).
     pub db_path: PathBuf,
-    /// The `pcbforge` binary to shell (PATH name or absolute path).
-    pub pcbforge_bin: String,
+    /// The CLI invocation: program + fixed prefix args (e.g. `cargo run … --`).
+    pub cli_cmd: Vec<String>,
     status: StatusSnapshot,
     log: Vec<LogLine>,
     tab: CentralTab,
@@ -60,17 +71,29 @@ pub struct ConsoleApp {
     fid_tex: Option<TextureHandle>,
     fid_note: String,
     fid_rows: Vec<FidRow>,
+
+    // drag-to-place
+    place_frame: String,
+    place_px_per_mm: f64,
+    place_tx_mm: f64,
+    place_ty_mm: f64,
+    place_rot_deg: f64,
+    place_job: Vec<pcb_core::Poly>,
+    place_frame_img: Option<image::GrayImage>,
+    place_pivot: (f64, f64),
+    place_tex: Option<TextureHandle>,
+    place_note: String,
 }
 
 impl ConsoleApp {
-    /// New console over `db_path`, shelling `pcbforge_bin`. Reads an initial
-    /// status snapshot immediately.
-    pub fn new(db_path: impl Into<PathBuf>, pcbforge_bin: impl Into<String>) -> Self {
+    /// New console over `db_path`, invoking the CLI via `cli_cmd` (program +
+    /// prefix args; see [`default_cli_cmd`]). Reads an initial status snapshot.
+    pub fn new(db_path: impl Into<PathBuf>, cli_cmd: Vec<String>) -> Self {
         let db_path = db_path.into();
         let status = status::snapshot(&db_path);
         Self {
             db_path,
-            pcbforge_bin: pcbforge_bin.into(),
+            cli_cmd,
             status,
             log: Vec::new(),
             tab: CentralTab::Job,
@@ -89,6 +112,16 @@ impl ConsoleApp {
             fid_tex: None,
             fid_note: "Load a frame (camera grab / photo) and click “Check fiducials”.".into(),
             fid_rows: Vec::new(),
+            place_frame: String::new(),
+            place_px_per_mm: 10.0,
+            place_tx_mm: 0.0,
+            place_ty_mm: 0.0,
+            place_rot_deg: 0.0,
+            place_job: Vec::new(),
+            place_frame_img: None,
+            place_pivot: (0.0, 0.0),
+            place_tex: None,
+            place_note: "Load a frame + job, then drag / rotate to place it on the board.".into(),
         }
     }
 
@@ -102,7 +135,7 @@ impl ConsoleApp {
     /// blocks for the duration of the verb. Returns the appended lines (for
     /// tests).
     pub fn run_verb(&mut self, args: &[String]) -> Vec<LogLine> {
-        let lines = run_capture(&self.pcbforge_bin, args);
+        let lines = run_capture(&self.cli_cmd, args);
         self.log.extend(lines.iter().cloned());
         // Cap the log so a long session doesn't grow unbounded.
         if self.log.len() > 500 {
@@ -159,6 +192,100 @@ impl ConsoleApp {
                 self.fid_note = e;
             }
         }
+    }
+
+    /// Current manual placement.
+    fn placement(&self) -> crate::place::Placement {
+        crate::place::Placement {
+            tx_mm: self.place_tx_mm,
+            ty_mm: self.place_ty_mm,
+            rot_deg: self.place_rot_deg,
+            pivot_mm: self.place_pivot,
+        }
+    }
+
+    /// Load the bed frame + job geometry into the place cache and center the
+    /// job on the frame. Uses the Job-tab Gerber paths for the geometry.
+    pub fn load_place(&mut self, ctx: &Context) {
+        let img = match image::open(self.place_frame.trim()) {
+            Ok(i) => i.to_luma8(),
+            Err(e) => {
+                self.place_note = format!("frame: {e}");
+                return;
+            }
+        };
+        let (_, _, ablate) = match job_shapes(&self.emit_copper, &self.emit_outline, self.offset_mm)
+        {
+            Ok(t) => t,
+            Err(e) => {
+                self.place_note = format!("job: {e}");
+                return;
+            }
+        };
+        self.place_pivot = crate::place::bbox_center_mm(&ablate);
+        // Start centered on the frame.
+        self.place_tx_mm = img.width() as f64 / 2.0 / self.place_px_per_mm;
+        self.place_ty_mm = img.height() as f64 / 2.0 / self.place_px_per_mm;
+        self.place_rot_deg = 0.0;
+        self.place_job = ablate;
+        self.place_frame_img = Some(img);
+        self.recompose(ctx);
+    }
+
+    /// Re-blend the placed job over the cached frame into the display texture.
+    fn recompose(&mut self, ctx: &Context) {
+        let Some(frame) = &self.place_frame_img else {
+            return;
+        };
+        if self.place_job.is_empty() {
+            return;
+        }
+        let img = crate::place::composite(
+            frame,
+            &self.place_job,
+            &self.placement(),
+            self.place_px_per_mm,
+            [0xf0, 0x50, 0x30],
+            0.55,
+        );
+        self.place_note = format!(
+            "placed at ({:.1}, {:.1}) mm, {:.0}°",
+            self.place_tx_mm, self.place_ty_mm, self.place_rot_deg
+        );
+        self.place_tex = Some(ctx.load_texture("place", img, TextureOptions::NEAREST));
+    }
+
+    /// Emit the job registered to the current manual placement by encoding it
+    /// as fiducial correspondences and shelling `pcbforge register`.
+    fn emit_at_placement(&mut self) {
+        if self.place_job.is_empty() {
+            self.log.push(LogLine {
+                text: "place: load a frame + job first".into(),
+                err: true,
+            });
+            return;
+        }
+        if self.emit_copper.trim().is_empty() {
+            self.log.push(LogLine {
+                text: "place: set a copper Gerber (Job tab) first".into(),
+                err: true,
+            });
+            return;
+        }
+        let mut args: Vec<String> = vec![
+            "register".into(),
+            "--copper".into(),
+            self.emit_copper.clone(),
+            "--lbrn2".into(),
+            self.emit_lbrn2.clone(),
+            "--fiducials".into(),
+            self.placement().correspondences(),
+        ];
+        if !self.emit_outline.trim().is_empty() {
+            args.push("--outline".into());
+            args.push(self.emit_outline.clone());
+        }
+        self.run_verb(&args);
     }
 
     /// Draw one frame. Kept separate from the `eframe::App` impl so it runs
@@ -314,11 +441,85 @@ impl ConsoleApp {
         ui.horizontal(|ui| {
             ui.selectable_value(&mut self.tab, CentralTab::Job, "🖼 Job preview");
             ui.selectable_value(&mut self.tab, CentralTab::Fiducials, "🎯 Fiducial check");
+            ui.selectable_value(&mut self.tab, CentralTab::Place, "✋ Place on board");
         });
         ui.separator();
         match self.tab {
             CentralTab::Job => self.job_view(ui),
             CentralTab::Fiducials => self.fiducial_view(ui),
+            CentralTab::Place => self.place_view(ui),
+        }
+    }
+
+    fn place_view(&mut self, ui: &mut egui::Ui) {
+        let mut changed = false;
+        egui::Grid::new("place-form")
+            .num_columns(2)
+            .spacing([8.0, 6.0])
+            .show(ui, |ui| {
+                ui.label("bed frame");
+                ui.add(egui::TextEdit::singleline(&mut self.place_frame).desired_width(240.0));
+                ui.end_row();
+                ui.label("px per mm");
+                changed |= ui
+                    .add(
+                        egui::DragValue::new(&mut self.place_px_per_mm)
+                            .speed(0.1)
+                            .range(0.1..=1000.0),
+                    )
+                    .changed();
+                ui.end_row();
+            });
+        ui.horizontal(|ui| {
+            if ui.button("⤵ Load frame + job").clicked() {
+                let ctx = ui.ctx().clone();
+                self.load_place(&ctx);
+            }
+            if ui.button("▶ Etch here (register)").clicked() {
+                self.emit_at_placement();
+            }
+        });
+        ui.horizontal(|ui| {
+            ui.label("x mm");
+            changed |= ui
+                .add(egui::DragValue::new(&mut self.place_tx_mm).speed(0.1))
+                .changed();
+            ui.label("y mm");
+            changed |= ui
+                .add(egui::DragValue::new(&mut self.place_ty_mm).speed(0.1))
+                .changed();
+            ui.label("rot°");
+            changed |= ui
+                .add(
+                    egui::DragValue::new(&mut self.place_rot_deg)
+                        .speed(0.5)
+                        .range(-180.0..=180.0),
+                )
+                .changed();
+        });
+        ui.label(egui::RichText::new(&self.place_note).weak());
+        ui.weak("Uses the Job-tab Gerbers. Drag the overlay to position; “Etch here” bakes it in via register.");
+        ui.separator();
+
+        if let Some(tex) = &self.place_tex {
+            let img = egui::Image::from_texture((tex.id(), tex.size_vec2()))
+                .fit_to_original_size(1.0)
+                .sense(egui::Sense::drag());
+            let resp = ui.add(img);
+            if resp.dragged() {
+                let d = resp.drag_delta();
+                // Screen points ≈ frame pixels at native display; px → mm.
+                self.place_tx_mm += d.x as f64 / self.place_px_per_mm;
+                self.place_ty_mm += d.y as f64 / self.place_px_per_mm;
+                changed = true;
+            }
+        } else {
+            ui.weak("(load a frame + job to place)");
+        }
+
+        if changed {
+            let ctx = ui.ctx().clone();
+            self.recompose(&ctx);
         }
     }
 
@@ -422,14 +623,25 @@ impl ConsoleApp {
     }
 }
 
-/// Shell `bin args`, capturing stdout (info) and stderr (warn) as log lines
-/// plus a header and an exit-status footer. A spawn failure is one error line.
-pub fn run_capture(bin: &str, args: &[String]) -> Vec<LogLine> {
+/// Shell `cmd[0] cmd[1..] args`, capturing stdout (info) and stderr (warn) as
+/// log lines plus a header and an exit-status footer. A spawn failure — or an
+/// empty command — is one error line.
+pub fn run_capture(cmd: &[String], args: &[String]) -> Vec<LogLine> {
+    let Some((program, prefix)) = cmd.split_first() else {
+        return vec![LogLine {
+            text: "no CLI command configured".into(),
+            err: true,
+        }];
+    };
     let mut out = vec![LogLine {
-        text: format!("$ {bin} {}", args.join(" ")),
+        text: format!("$ {} {}", cmd.join(" "), args.join(" ")),
         err: false,
     }];
-    match std::process::Command::new(bin).args(args).output() {
+    match std::process::Command::new(program)
+        .args(prefix)
+        .args(args)
+        .output()
+    {
         Ok(o) => {
             for line in String::from_utf8_lossy(&o.stdout).lines() {
                 out.push(LogLine {
@@ -449,22 +661,29 @@ pub fn run_capture(bin: &str, args: &[String]) -> Vec<LogLine> {
             });
         }
         Err(e) => out.push(LogLine {
-            text: format!("failed to run `{bin}`: {e}"),
+            text: format!("failed to run `{program}`: {e}"),
             err: true,
         }),
     }
     out
 }
 
-/// Build a preview image from Gerber paths: invert copper → non-copper (the
-/// same geometry `emit` burns) and rasterize board/copper/ablate. This is a
-/// *view* computation (pure geometry), not engine logic — the actual job is
-/// still produced by shelling `pcbforge emit`. Returns the image and a caption.
-pub fn preview_image(
+/// (board, kept-copper, to-ablate) region sets in the Gerber frame.
+pub type JobShapes = (
+    Vec<pcb_core::Poly>,
+    Vec<pcb_core::Poly>,
+    Vec<pcb_core::Poly>,
+);
+
+/// The job's board, kept-copper, and to-ablate regions in the Gerber frame —
+/// the shared geometry behind the preview and the drag-to-place overlay. A
+/// *view* computation (pure geometry via `cam::noncopper`), not engine logic;
+/// the actual job is still produced by shelling `pcbforge`.
+pub fn job_shapes(
     copper_path: &str,
     outline_path: &str,
     offset_mm: f64,
-) -> Result<(ColorImage, String), String> {
+) -> Result<JobShapes, String> {
     if copper_path.trim().is_empty() {
         return Err("set a copper Gerber path first".into());
     }
@@ -484,7 +703,18 @@ pub fn preview_image(
     }
     let offset_nm = (offset_mm * NM_PER_MM as f64).round() as Nm;
     let ablate = cam::noncopper::noncopper(&board, &copper, offset_nm);
+    Ok((board, copper, ablate))
+}
 
+/// Build a preview image from Gerber paths: invert copper → non-copper (the
+/// same geometry `emit` burns) and rasterize board/copper/ablate. Returns the
+/// image and a caption.
+pub fn preview_image(
+    copper_path: &str,
+    outline_path: &str,
+    offset_mm: f64,
+) -> Result<(ColorImage, String), String> {
+    let (board, copper, ablate) = job_shapes(copper_path, outline_path, offset_mm)?;
     let img = preview::rasterize(
         &[
             Layer {
@@ -538,14 +768,14 @@ mod tests {
 
     #[test]
     fn run_capture_captures_stdout_and_exit() {
-        let out = run_capture("echo", &["hello".into()]);
+        let out = run_capture(&["echo".into()], &["hello".into()]);
         assert!(out.iter().any(|l| l.text == "hello" && !l.err));
         assert!(out.iter().any(|l| l.text.starts_with("[exit 0]")));
     }
 
     #[test]
     fn run_capture_reports_spawn_failure() {
-        let out = run_capture("definitely-not-a-real-binary-xyz", &[]);
+        let out = run_capture(&["definitely-not-a-real-binary-xyz".into()], &[]);
         assert!(
             out.iter()
                 .any(|l| l.err && l.text.contains("failed to run"))
@@ -561,7 +791,7 @@ mod tests {
     /// with no display and no panic, and produces render output.
     #[test]
     fn app_lays_out_one_frame_headless() {
-        let mut app = ConsoleApp::new(tmp_db(), "pcbforge");
+        let mut app = ConsoleApp::new(tmp_db(), vec!["true".into()]);
         let ctx = Context::default();
         let out = ctx.run(egui::RawInput::default(), |ctx| {
             app.ui(ctx);
@@ -576,17 +806,27 @@ mod tests {
     /// The Fiducial-check tab lays out headless (form + summary + image slot).
     #[test]
     fn fiducial_tab_lays_out_headless() {
-        let mut app = ConsoleApp::new(tmp_db(), "pcbforge");
+        let mut app = ConsoleApp::new(tmp_db(), vec!["true".into()]);
         app.tab = CentralTab::Fiducials;
         let ctx = Context::default();
         let out = ctx.run(egui::RawInput::default(), |ctx| app.ui(ctx));
         assert!(!out.shapes.is_empty(), "fiducial tab must render");
     }
 
+    /// The Place-on-board tab lays out headless (form + placement controls).
+    #[test]
+    fn place_tab_lays_out_headless() {
+        let mut app = ConsoleApp::new(tmp_db(), vec!["true".into()]);
+        app.tab = CentralTab::Place;
+        let ctx = Context::default();
+        let out = ctx.run(egui::RawInput::default(), |ctx| app.ui(ctx));
+        assert!(!out.shapes.is_empty(), "place tab must render");
+    }
+
     /// A second frame after a status refresh still lays out (state survives).
     #[test]
     fn app_survives_refresh_and_relayout() {
-        let mut app = ConsoleApp::new(tmp_db(), "pcbforge");
+        let mut app = ConsoleApp::new(tmp_db(), vec!["true".into()]);
         app.refresh();
         let ctx = Context::default();
         for _ in 0..2 {

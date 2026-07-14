@@ -8,7 +8,9 @@
 #[cfg(feature = "native")]
 fn main() -> eframe::Result<()> {
     let mut db = std::path::PathBuf::from("pcbforge.sqlite");
-    let mut bin = String::from("pcbforge");
+    // Default: shell the CLI via cargo so it works from a repo checkout with
+    // nothing on PATH. --pcbforge <path> overrides with a prebuilt binary.
+    let mut cli_cmd = ui::default_cli_cmd();
     let mut args = std::env::args().skip(1);
     while let Some(a) = args.next() {
         match a.as_str() {
@@ -19,13 +21,13 @@ fn main() -> eframe::Result<()> {
             }
             "--pcbforge" => {
                 if let Some(v) = args.next() {
-                    bin = v;
+                    cli_cmd = vec![v];
                 }
             }
             _ => {}
         }
     }
-    ui::run_native(db, bin)
+    ui::run_native(db, cli_cmd)
 }
 
 #[cfg(not(feature = "native"))]
