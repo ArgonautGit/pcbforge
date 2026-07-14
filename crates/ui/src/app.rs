@@ -39,6 +39,13 @@ enum CentralTab {
     Place,
 }
 
+/// Which face of a (possibly double-sided) board the operator is working.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum Side {
+    Front,
+    Back,
+}
+
 /// How to invoke the `pcbforge` CLI: `program` + fixed prefix args, before the
 /// verb's own args. Defaults to `cargo run -q --bin pcbforge --` so the console
 /// works from a repo checkout with nothing on PATH ([`default_cli_cmd`]).
@@ -65,6 +72,15 @@ pub struct ConsoleApp {
     emit_outline: String,
     emit_lbrn2: String,
     offset_mm: f64,
+
+    // double-sided (ORC-6): back-side gerbers + flip/beam-offset params. When
+    // `side` is Back, the job is mirrored in X and the fiducial expectations
+    // carry the f-theta entry→exit parallax.
+    side: Side,
+    back_copper: String,
+    back_outline: String,
+    board_thickness_mm: f64,
+    focal_mm: f64,
 
     // job preview
     preview_tex: Option<TextureHandle>,
@@ -151,6 +167,11 @@ impl ConsoleApp {
             emit_outline: String::new(),
             emit_lbrn2: "job.lbrn2".into(),
             offset_mm: 0.0,
+            side: Side::Front,
+            back_copper: String::new(),
+            back_outline: String::new(),
+            board_thickness_mm: 1.6,
+            focal_mm: 70.0,
             preview_tex: None,
             preview_note: "Set a copper Gerber and click “Render preview”.".into(),
             fid_frame: String::new(),
@@ -251,13 +272,42 @@ impl ConsoleApp {
         }
     }
 
-    /// (Re)build the preview texture from the emit form's Gerber paths.
+    /// (Re)build the preview texture from the active side's Gerbers (the back
+    /// side is shown mirrored, exactly as it will burn).
     pub fn render_preview(&mut self, ctx: &Context) {
-        match preview_image(&self.emit_copper, &self.emit_outline, self.offset_mm) {
-            Ok((img, note)) => {
+        match self.active_job() {
+            Ok((board, copper, ablate)) => {
+                let img = preview::rasterize(
+                    &[
+                        preview::Layer {
+                            polys: &board,
+                            color: preview::BOARD,
+                        },
+                        preview::Layer {
+                            polys: &ablate,
+                            color: preview::ABLATE,
+                        },
+                        preview::Layer {
+                            polys: &copper,
+                            color: preview::COPPER,
+                        },
+                    ],
+                    preview::BOARD,
+                    40.0,
+                    900,
+                );
+                let side = match self.side {
+                    Side::Front => "front",
+                    Side::Back => "back (mirrored)",
+                };
+                self.preview_note = format!(
+                    "{side}: {} copper region(s), {} to-ablate region(s), offset {} mm",
+                    copper.len(),
+                    ablate.len(),
+                    self.offset_mm
+                );
                 self.preview_tex =
                     Some(ctx.load_texture("job-preview", img, TextureOptions::NEAREST));
-                self.preview_note = note;
             }
             Err(e) => {
                 self.preview_tex = None;
@@ -347,12 +397,15 @@ impl ConsoleApp {
     /// existing (dragged) positions and seeding any new ones from the layout —
     /// so adding a 4th coordinate makes a 4th ✛ appear without a manual reset.
     fn sync_fid_markers(&mut self) {
-        let Ok(design) = fiducial::parse_layout(&self.fid_layout) else {
+        if fiducial::parse_layout(&self.fid_layout).is_err() {
             return;
-        };
+        }
+        // Seed from the side-aware expected positions (design on the front;
+        // mirrored + beam-offset on the back).
+        let expected = self.expected_points();
         let old = self.fid_search.len();
-        self.fid_search.resize(design.len(), (0.0, 0.0));
-        for (i, d) in design.iter().enumerate().skip(old) {
+        self.fid_search.resize(expected.len(), (0.0, 0.0));
+        for (i, d) in expected.iter().enumerate().skip(old) {
             self.fid_search[i] = *d;
         }
         self.fid_found.resize(self.fid_search.len(), None);
@@ -506,6 +559,85 @@ impl ConsoleApp {
         self.place_ty_mm = ty;
     }
 
+    /// The copper/outline Gerber paths for the active side.
+    fn active_gerbers(&self) -> (&str, &str) {
+        match self.side {
+            Side::Front => (&self.emit_copper, &self.emit_outline),
+            Side::Back => (&self.back_copper, &self.back_outline),
+        }
+    }
+
+    /// The active side's (board, copper, ablate) job, mirrored in X when it's
+    /// the back side (KiCad B.Cu is top-view, so a left-right flip mirrors it).
+    fn active_job(&self) -> Result<JobShapes, String> {
+        let (copper, outline) = self.active_gerbers();
+        let (board, cu, ablate) = job_shapes(copper, outline, self.offset_mm)?;
+        Ok(match self.side {
+            Side::Front => (board, cu, ablate),
+            Side::Back => {
+                let axis = cam::flip::MirrorAxis::VerticalX { x_mm: 0.0 };
+                (
+                    cam::flip::mirror_job(&board, &axis),
+                    cam::flip::mirror_job(&cu, &axis),
+                    cam::flip::mirror_job(&ablate, &axis),
+                )
+            }
+        })
+    }
+
+    /// The flip axis + field optics for the back side, derived from the design
+    /// fiducial layout: mirror about the layout's vertical centerline and scale
+    /// the beam parallax about that centroid (a display-friendly default — the
+    /// mirror keeps the fiducials on-screen; the operator can refine the scan
+    /// center once VIS-3 gives the real bed map). `None` on the front.
+    fn back_field(&self) -> Option<(cam::flip::MirrorAxis, cam::flip::FieldParams)> {
+        if self.side != Side::Back {
+            return None;
+        }
+        let pts = fiducial::parse_layout(&self.fid_layout).ok()?;
+        let n = pts.len() as f64;
+        let cx = pts.iter().map(|p| p.0).sum::<f64>() / n;
+        let cy = pts.iter().map(|p| p.1).sum::<f64>() / n;
+        Some((
+            cam::flip::MirrorAxis::VerticalX { x_mm: cx },
+            cam::flip::FieldParams {
+                scan_center_mm: (cx, cy),
+                thickness_mm: self.board_thickness_mm,
+                focal_mm: self.focal_mm,
+            },
+        ))
+    }
+
+    /// The expected fiducial positions to display/detect, in bed mm: the raw
+    /// design layout on the front, or the mirrored + beam-offset positions on
+    /// the back (where the drilled through-holes actually appear when flipped).
+    fn expected_points(&self) -> Vec<(f64, f64)> {
+        let design = fiducial::parse_layout(&self.fid_layout).unwrap_or_default();
+        match self.back_field() {
+            None => design,
+            Some((axis, field)) => design
+                .iter()
+                .map(|&(x, y)| cam::flip::back_expected_fiducial_mm(x, y, &axis, &field))
+                .collect(),
+        }
+    }
+
+    /// Switch the working side, clearing the per-side caches so the fiducial
+    /// markers, AR design, and Place job all recompute for the new face.
+    fn set_side(&mut self, side: Side) {
+        if self.side == side {
+            return;
+        }
+        self.side = side;
+        self.fid_search.clear();
+        self.fid_found.clear();
+        self.fid_homography = None;
+        self.ar_board.clear();
+        self.ar_copper.clear();
+        self.ar_ablate.clear();
+        self.place_job.clear();
+    }
+
     /// Current manual placement.
     fn placement(&self) -> crate::place::Placement {
         crate::place::Placement {
@@ -526,8 +658,7 @@ impl ConsoleApp {
                 return;
             }
         };
-        let (_, _, ablate) = match job_shapes(&self.emit_copper, &self.emit_outline, self.offset_mm)
-        {
+        let (_, _, ablate) = match self.active_job() {
             Ok(t) => t,
             Err(e) => {
                 self.place_note = format!("job: {e}");
@@ -635,10 +766,14 @@ impl ConsoleApp {
     /// Load the Job-tab Gerbers into the AR layer caches (board / copper /
     /// ablate), so the overlay can be re-blended every frame without re-parsing.
     fn load_ar_design(&mut self) {
-        match job_shapes(&self.emit_copper, &self.emit_outline, self.offset_mm) {
+        match self.active_job() {
             Ok((board, copper, ablate)) => {
+                let side = match self.side {
+                    Side::Front => "front",
+                    Side::Back => "back (mirrored)",
+                };
                 self.ar_note = format!(
-                    "design: {} board, {} copper, {} ablate region(s)",
+                    "{side} design: {} board, {} copper, {} ablate region(s)",
                     board.len(),
                     copper.len(),
                     ablate.len()
@@ -857,6 +992,47 @@ impl ConsoleApp {
                 ui.end_row();
             });
 
+        // Double-sided (ORC-6): side selector + back-side inputs.
+        ui.separator();
+        ui.horizontal(|ui| {
+            ui.label("side");
+            let mut side = self.side;
+            ui.selectable_value(&mut side, Side::Front, "Front");
+            ui.selectable_value(&mut side, Side::Back, "Back");
+            self.set_side(side);
+        });
+        if self.side == Side::Back {
+            egui::Grid::new("back-form")
+                .num_columns(2)
+                .spacing([8.0, 6.0])
+                .show(ui, |ui| {
+                    ui.label("back copper .gbr");
+                    ui.add(egui::TextEdit::singleline(&mut self.back_copper).desired_width(180.0));
+                    ui.end_row();
+                    ui.label("back outline .gbr");
+                    ui.add(egui::TextEdit::singleline(&mut self.back_outline).desired_width(180.0));
+                    ui.end_row();
+                    ui.label("thickness mm");
+                    ui.add(
+                        egui::DragValue::new(&mut self.board_thickness_mm)
+                            .speed(0.05)
+                            .range(0.0..=10.0),
+                    );
+                    ui.end_row();
+                    ui.label("focal mm");
+                    ui.add(
+                        egui::DragValue::new(&mut self.focal_mm)
+                            .speed(1.0)
+                            .range(1.0..=1000.0),
+                    );
+                    ui.end_row();
+                });
+            ui.weak(
+                "Back mirrors the design in X; fiducial markers carry the beam \
+                 entry→exit offset (thickness/focal) so they land on the flipped holes.",
+            );
+        }
+
         ui.horizontal(|ui| {
             if ui.button("🖼 Render preview").clicked() {
                 let ctx = ui.ctx().clone();
@@ -876,9 +1052,15 @@ impl ConsoleApp {
     }
 
     fn emit_clicked(&mut self) {
-        if self.emit_copper.trim().is_empty() {
+        let (copper, outline) = self.active_gerbers();
+        let (copper, outline) = (crate::clean_path(copper), crate::clean_path(outline));
+        if copper.is_empty() {
+            let which = match self.side {
+                Side::Front => "copper Gerber",
+                Side::Back => "back copper Gerber",
+            };
             self.log.push(LogLine {
-                text: "emit: set a copper Gerber first".into(),
+                text: format!("emit: set a {which} first"),
                 err: true,
             });
             return;
@@ -886,15 +1068,19 @@ impl ConsoleApp {
         let mut args: Vec<String> = vec![
             "emit".into(),
             "--copper".into(),
-            crate::clean_path(&self.emit_copper),
+            copper,
             "--lbrn2".into(),
             crate::clean_path(&self.emit_lbrn2),
             "--offset-mm".into(),
             format!("{}", self.offset_mm),
         ];
-        if !crate::clean_path(&self.emit_outline).is_empty() {
+        if !outline.is_empty() {
             args.push("--outline".into());
-            args.push(crate::clean_path(&self.emit_outline));
+            args.push(outline);
+        }
+        // Back side: mirror the design in X to match the flipped board.
+        if self.side == Side::Back {
+            args.push("--mirror-x".into());
         }
         self.run_verb(&args);
     }
@@ -2040,6 +2226,78 @@ mod tests {
         app.drag_place_px(20.0, -30.0);
         assert!((app.place_tx_mm - (5.0 + 2.0)).abs() < 1e-9);
         assert!((app.place_ty_mm - (5.0 - 3.0)).abs() < 1e-9);
+    }
+
+    /// Double-sided: on the back, the expected fiducial positions are the
+    /// design layout mirrored about its centerline with the beam entry→exit
+    /// offset applied — matching the kernel `back_expected_fiducial_mm`.
+    #[test]
+    fn back_side_expected_points_mirror_and_offset() {
+        let mut app = ConsoleApp::new(tmp_db(), vec!["true".into()]);
+        app.fid_layout = "10,10; 60,10; 10,60; 60,60".into();
+        app.board_thickness_mm = 1.6;
+        app.focal_mm = 70.0;
+
+        // Front: expected == design.
+        assert_eq!(app.side, Side::Front);
+        assert_eq!(
+            app.expected_points(),
+            vec![(10.0, 10.0), (60.0, 10.0), (10.0, 60.0), (60.0, 60.0)]
+        );
+
+        // Back: mirror about the layout centroid (x=35) + f-theta offset.
+        app.set_side(Side::Back);
+        let axis = cam::flip::MirrorAxis::VerticalX { x_mm: 35.0 };
+        let field = cam::flip::FieldParams {
+            scan_center_mm: (35.0, 35.0),
+            thickness_mm: 1.6,
+            focal_mm: 70.0,
+        };
+        let want: Vec<(f64, f64)> = [(10.0, 10.0), (60.0, 10.0), (10.0, 60.0), (60.0, 60.0)]
+            .into_iter()
+            .map(|(x, y)| cam::flip::back_expected_fiducial_mm(x, y, &axis, &field))
+            .collect();
+        let got = app.expected_points();
+        assert_eq!(got.len(), 4);
+        for (g, w) in got.iter().zip(&want) {
+            assert!(
+                (g.0 - w.0).abs() < 1e-9 && (g.1 - w.1).abs() < 1e-9,
+                "{g:?} vs {w:?}"
+            );
+        }
+        // The left/right holes swapped sides (mirror), so hole #0 (was x=10) now
+        // sits right of center.
+        assert!(
+            got[0].0 > 35.0,
+            "left hole mirrored to the right: {:?}",
+            got[0]
+        );
+    }
+
+    /// Switching side clears the per-side caches so nothing from the front
+    /// bleeds into the back view.
+    #[test]
+    fn set_side_resets_per_side_caches() {
+        let mut app = ConsoleApp::new(tmp_db(), vec!["true".into()]);
+        app.fid_layout = "10,10; 60,10".into();
+        app.sync_fid_markers();
+        app.ar_copper = vec![pcb_core::Poly::default()];
+        assert!(!app.fid_search.is_empty());
+        app.set_side(Side::Back);
+        assert!(app.fid_search.is_empty(), "markers cleared on side switch");
+        assert!(app.ar_copper.is_empty(), "AR design cleared on side switch");
+        assert_eq!(app.side, Side::Back);
+    }
+
+    /// The Job tab lays out with the Back side selected (the back form renders).
+    #[test]
+    fn back_side_job_tab_lays_out() {
+        let mut app = ConsoleApp::new(tmp_db(), vec!["true".into()]);
+        app.set_side(Side::Back);
+        app.tab = CentralTab::Job;
+        let ctx = egui::Context::default();
+        let out = ctx.run(egui::RawInput::default(), |ctx| app.ui(ctx));
+        assert!(!out.shapes.is_empty(), "back-side job tab produced shapes");
     }
 
     /// A second frame after a status refresh still lays out (state survives).

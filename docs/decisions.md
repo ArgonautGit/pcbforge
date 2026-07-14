@@ -949,3 +949,38 @@ discovered constraints here.
   the board edge are now legible over the board; verified by rendering
   `dump_place` (curved trace + pads + outline all crisp) and by a test asserting
   the edge is ≥30 stronger than the interior fill.
+
+## 2026-07-14 — Double-sided support (ORC-6 groundwork)
+
+Operator asked for front+back Gerbers, the camera locking onto the same
+through-holes after a left-right flip, and the beam-angle parallax that puts a
+hole's back opening at a different XY. Decisions (all confirmed with the
+operator before building):
+
+- **Mirror in software, X only.** KiCad exports `B.Cu` in top-view coords, so a
+  left-right flip needs the design mirrored in X. `cam::flip::mirror_job` reflects
+  and **re-winds** each ring (reflection flips orientation; reversing restores the
+  outer-CCW/holes-CW convention). `register` still rejects reflected *fits*, so
+  the mirror is baked into the design, never the fitted affine.
+- **Analytic f-theta parallax, ~70 mm lens.** A non-telecentric f-theta sends the
+  beam to a field point at `tan θ ≈ r/f`; drilling depth `t`, the exit opening
+  sits at radius `r·(1 + t/f)` about the scan center (`entry_to_exit_mm`). At the
+  Omni X glass lens (70 mm) through 1.6 mm FR4 that is ~0.8 mm at a 35 mm field
+  radius — real, so `back_expected_fiducial_mm` = mirror(exit-offset(design)) is
+  what the detector expects on the back.
+- **Fiducials: same through-holes, dark-dot from the back.** No extra drilling;
+  the console's fiducial markers on the back are seeded from the mirror+offset
+  positions so they land on the flipped holes.
+- **Scan-center default = fiducial-layout centroid**, and the display mirror axis
+  is that centroid's vertical line (keeps the markers on-screen; a mirror about
+  x=0 would push them negative). The operator can refine the scan center once
+  VIS-3 gives the real bed map — noted as the one un-calibrated assumption.
+- **UI wiring:** a Front/Back selector in the actions panel with back-gerber +
+  thickness/focal inputs; `active_job()` feeds the (mirrored-on-back) geometry
+  to the Job preview, AR overlay, and Place tab; `emit_clicked` shells
+  `emit --mirror-x` on the back; `set_side` clears per-side caches. Surface
+  copper etch is *not* offset (only through features are) — the parallax is
+  applied to fiducial expectations, not the burned traces.
+- **Scope left for hardware:** stage-engine flip stages (ORC-6 proper), and the
+  live residual/bottom-cross acceptance. The geometry/optics kernel is pure and
+  fully unit-tested so those slot on top unchanged.
