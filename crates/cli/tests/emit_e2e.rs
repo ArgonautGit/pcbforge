@@ -156,13 +156,15 @@ fn in_fill(doc: &str, px: f64, py: f64) -> bool {
     crossings % 2 == 1
 }
 
-/// The operator's second burn left the whole right side of uv_test un-ablated:
-/// that area is a no-net zone the Gerber tags NonConductor, and it was kept as
-/// copper. By default it must now be cleared (part of the fill) — at offset 0,
-/// where no offset machinery can mask the result — and --keep-nonconductor
-/// must restore the old behavior.
+/// uv_test carries an isolated (no-net) ground pour, which the Gerber tags
+/// NonConductor. It is real, intentional copper: by default the whole pour
+/// must be KEPT and only the isolation channels ablated (the operator's
+/// third burn lost 8 of its 9 fragments to the geom ring-deletion bug —
+/// this pins the survival of a fragment that was eaten). --clear-nonconductor
+/// opts into rubbing the pour out. Probed at offset 0 and 0.025: the offset
+/// path is where the deletion lived, so both must keep the pour.
 #[test]
-fn nonconductor_zones_are_cleared_by_default() {
+fn nonconductor_pour_is_kept_by_default() {
     let dir = tmp("noncond");
     let copper = fixture("uv_test-F_Cu.gbr");
     let outline = fixture("uv_test-Edge_Cuts.gbr");
@@ -190,22 +192,47 @@ fn nonconductor_zones_are_cleared_by_default() {
         std::fs::read_to_string(&out).unwrap()
     };
 
-    // (12.5, 2.0) normalized = deep inside the right-side zone, well clear of
-    // the hex traces and their clearance bands; (16.8, 6.0) = the bare margin
-    // band between zone edge and outline (plain substrate, always fill);
-    // (3.86, 3.27) = a pad center (never fill).
-    let cleared = run(&[], "default.lbrn2");
+    // Probes (normalized mm):
+    //   (12.5, 2.0)  = deep inside the right-side pour fragment (the one that
+    //                  survived the deletion bug);
+    //   (2.0, 3.0)   = inside the bottom-left pour fragment
+    //                  (one of the eight the bug deleted);
+    //   (14.5, 7.5)  = the pour's clearance cutout around the hex trace — an
+    //                  isolation channel, always ablated;
+    //   (16.8, 6.0)  = bare margin band between pour edge and outline;
+    //   (3.86, 3.27) = a pad center (copper, never fill).
+    for (extra, name) in [
+        (&[][..], "default-0.lbrn2"),
+        (&["--offset-mm", "0.025"][..], "default-off.lbrn2"),
+    ] {
+        let doc = run(extra, name);
+        assert!(
+            !in_fill(&doc, 12.5, 2.0),
+            "{name}: right pour fragment must be kept"
+        );
+        assert!(
+            !in_fill(&doc, 2.0, 3.0),
+            "{name}: bottom-left pour fragment must be kept (ring-deletion regression)"
+        );
+        assert!(
+            in_fill(&doc, 14.5, 7.5),
+            "{name}: isolation channel is fill"
+        );
+        assert!(in_fill(&doc, 16.8, 6.0), "{name}: edge margin is fill");
+        assert!(
+            !in_fill(&doc, 3.86, 3.27),
+            "{name}: pad copper is never fill"
+        );
+    }
+
+    let cleared = run(&["--clear-nonconductor"], "cleared.lbrn2");
     assert!(
         in_fill(&cleared, 12.5, 2.0),
-        "no-net zone must be ablated by default"
+        "--clear-nonconductor must rub the pour out"
     );
-    assert!(in_fill(&cleared, 16.8, 6.0), "plain substrate is fill");
-    assert!(!in_fill(&cleared, 3.86, 3.27), "pad copper is never fill");
-
-    let kept = run(&["--keep-nonconductor"], "kept.lbrn2");
     assert!(
-        !in_fill(&kept, 12.5, 2.0),
-        "--keep-nonconductor must keep the zone as copper"
+        !in_fill(&cleared, 3.86, 3.27),
+        "pads stay copper either way"
     );
 }
 

@@ -59,10 +59,11 @@ enum Command {
         #[arg(long, default_value_t = 0.0)]
         offset_mm: f64,
 
-        /// Keep NonConductor copper (no-net zones, logos) instead of clearing
-        /// it. By default electrically dead copper is ablated with the rest.
+        /// Ablate NonConductor copper (no-net pours, logos) instead of
+        /// keeping it. By default all copper in the Gerber is kept — an
+        /// isolated ground pour is still real copper.
         #[arg(long)]
-        keep_nonconductor: bool,
+        clear_nonconductor: bool,
 
         /// Bounding-box margin when no --outline is given, mm.
         #[arg(long, default_value_t = 1.0)]
@@ -154,10 +155,11 @@ enum Command {
         #[arg(long, default_value_t = 0.0)]
         offset_mm: f64,
 
-        /// Keep NonConductor copper (no-net zones, logos) instead of clearing
-        /// it. By default electrically dead copper is ablated with the rest.
+        /// Ablate NonConductor copper (no-net pours, logos) instead of
+        /// keeping it. By default all copper in the Gerber is kept — an
+        /// isolated ground pour is still real copper.
         #[arg(long)]
-        keep_nonconductor: bool,
+        clear_nonconductor: bool,
 
         /// Bounding-box margin when no --outline is given, mm.
         #[arg(long, default_value_t = 1.0)]
@@ -210,7 +212,7 @@ fn run(cli: &Cli) -> Result<(), Box<dyn std::error::Error>> {
             copper,
             outline,
             offset_mm,
-            keep_nonconductor,
+            clear_nonconductor,
             margin_mm,
             dxf,
             svg,
@@ -219,7 +221,7 @@ fn run(cli: &Cli) -> Result<(), Box<dyn std::error::Error>> {
             copper,
             outline.as_deref(),
             *offset_mm,
-            *keep_nonconductor,
+            *clear_nonconductor,
             *margin_mm,
             dxf.as_deref(),
             svg.as_deref(),
@@ -255,7 +257,7 @@ fn run(cli: &Cli) -> Result<(), Box<dyn std::error::Error>> {
             outline,
             lbrn2,
             offset_mm,
-            keep_nonconductor,
+            clear_nonconductor,
             margin_mm,
             device,
             power_pct,
@@ -270,7 +272,7 @@ fn run(cli: &Cli) -> Result<(), Box<dyn std::error::Error>> {
             outline: outline.as_deref(),
             lbrn2,
             offset_mm: *offset_mm,
-            keep_nonconductor: *keep_nonconductor,
+            clear_nonconductor: *clear_nonconductor,
             margin_mm: *margin_mm,
             device,
             params: AblationParams {
@@ -291,7 +293,7 @@ struct EmitArgs<'a> {
     outline: Option<&'a std::path::Path>,
     lbrn2: &'a std::path::Path,
     offset_mm: f64,
-    keep_nonconductor: bool,
+    clear_nonconductor: bool,
     margin_mm: f64,
     device: &'a str,
     params: AblationParams,
@@ -306,7 +308,7 @@ fn emit_cmd(a: EmitArgs) -> Result<(), Box<dyn std::error::Error>> {
     if !(0.0..10.0).contains(&a.offset_mm) {
         return Err(format!("--offset-mm {} out of range [0, 10)", a.offset_mm).into());
     }
-    let copper = load_copper(a.copper, a.keep_nonconductor)?;
+    let copper = load_copper(a.copper, a.clear_nonconductor)?;
     let board = match a.outline {
         Some(p) => {
             let region =
@@ -583,13 +585,15 @@ fn render_cut_schedule(
     s
 }
 
-/// Load a copper Gerber for inversion. NonConductor copper (no-net zones,
-/// logos — electrically dead) is excluded by default so it gets ablated with
-/// the rest; `keep_nonconductor` keeps it as copper. Reports what was dropped
-/// so a surprising kept/cleared region is explainable from the console.
+/// Load a copper Gerber for inversion. All copper in the Gerber is kept by
+/// default — a no-net (NonConductor) pour is still real copper on the board
+/// (the operator's isolated ground pour, mistaken for clearable dead copper
+/// on the third live burn — see decisions.md). `clear_nonconductor` opts
+/// into rubbing that copper out instead. The choice is reported so a kept or
+/// cleared region is explainable from the console.
 fn load_copper(
     path: &std::path::Path,
-    keep_nonconductor: bool,
+    clear_nonconductor: bool,
 ) -> Result<pcb_core::Layer, Box<dyn std::error::Error>> {
     let att = ingest::gerber::load_gerber_x2(path)?;
     let dead = att
@@ -597,16 +601,17 @@ fn load_copper(
         .iter()
         .filter(|o| o.aper_function.as_deref() == Some("NonConductor"))
         .count();
-    if keep_nonconductor || dead == 0 {
+    if clear_nonconductor && dead > 0 {
+        eprintln!("clearing {dead} NonConductor region(s) (--clear-nonconductor)");
+        Ok(att.layer_without_nonconductor())
+    } else {
         if dead > 0 {
-            eprintln!("keeping {dead} NonConductor region(s) as copper (--keep-nonconductor)");
+            eprintln!(
+                "keeping {dead} NonConductor region(s) (no-net pour) as copper; \
+                 pass --clear-nonconductor to rub them out"
+            );
         }
         Ok(att.layer().clone())
-    } else {
-        eprintln!(
-            "clearing {dead} NonConductor region(s) (no-net zones / graphics);              pass --keep-nonconductor to keep them as copper"
-        );
-        Ok(att.layer_without_nonconductor())
     }
 }
 
@@ -617,7 +622,7 @@ fn noncopper_cmd(
     copper_path: &std::path::Path,
     outline_path: Option<&std::path::Path>,
     offset_mm: f64,
-    keep_nonconductor: bool,
+    clear_nonconductor: bool,
     margin_mm: f64,
     dxf: Option<&std::path::Path>,
     svg: Option<&std::path::Path>,
@@ -630,7 +635,7 @@ fn noncopper_cmd(
         return Err(format!("--offset-mm {offset_mm} out of range [0, 10)").into());
     }
 
-    let copper = load_copper(copper_path, keep_nonconductor)?;
+    let copper = load_copper(copper_path, clear_nonconductor)?;
     eprintln!(
         "copper: {} shape(s) from {}",
         copper.polys.len(),

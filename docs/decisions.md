@@ -3,6 +3,32 @@
 Per the backlog conventions: every task records deviations from its prompt and
 discovered constraints here.
 
+## 2026-07-14 — CORRECTION: the pour is intentional; default flipped to keep
+
+- The operator corrected the previous entry's premise: the no-net zone is an
+  **isolated ground pour, deliberately part of the design** ("It shouldn't
+  ablate the whole thing... where is that?"). Their earlier "why did it only
+  leave the right side" meant "why did only one pour fragment SURVIVE", not
+  "why wasn't the right side cleared". The clear-by-default decision below
+  was built on that misreading and is reversed: **default keeps all copper
+  in the Gerber** (a no-net pour is real copper); `--clear-nonconductor`
+  opts into dead-copper rubout. (`--keep-nonconductor` existed for one
+  commit and is gone.)
+- With the intent corrected, the third burn's real defect was the
+  geom::offset ring-deletion bug alone: at --offset-mm 0.025 it silently ate
+  8 of the 9 pour fragments (cavalier panics on KiCad 10's 1–3 nm vertex
+  stutter), leaving only the right-side fragment — exactly what the board
+  shows. That bug is fixed (dedupe + empty-result guard, previous entry);
+  the e2e now probes pour fragments at offset 0 AND 0.025 so the deletion
+  can't regress, and verifies --clear-nonconductor still rubs the pour out.
+- The expected v5 job ablates only the isolation channels + edge margin —
+  the minimal-ablation profile of the operator's original workflow — and its
+  render matches the KiCad screenshot's copper-free (black) areas.
+- Process lesson recorded: an ambiguous operator question ("why did it only
+  leave X") was resolved by guessing instead of asking, and the guess drove
+  a wrong default + wrong-direction "fix". The KiCad screenshot settled it
+  in one message. Ask when the design intent is ambiguous.
+
 ## 2026-07-14 — third live burn: NonConductor zones + two latent bugs
 
 - The operator's third burn was "almost perfect" except the board's right
