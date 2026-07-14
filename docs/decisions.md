@@ -751,3 +751,30 @@ discovered constraints here.
   that lands the frame in the Fiducial/Place tabs. clippy clean with and without
   the `camera` feature; 41 workspace test binaries green; `--features camera`
   builds (nokhwa, 31 s).
+
+## 2026-07-14 — Camera threading + fiducial-derived scale
+
+- **Camera I/O off the UI thread (operator-reported freeze):** live grabbing was
+  synchronous in `ui()`, blocking the GUI. Added `camera::Capture` — a
+  background thread that streams frames over a 1-slot channel; the UI polls
+  `latest()` each frame (non-blocking, drains to newest) and `request_repaint()`s.
+  Device capture opens the camera **once** and loops (no per-frame reopen). The
+  thread stops on `Drop`. "Grab once" stays synchronous (a deliberate one-shot).
+  Verified with a background-capture test that polls without blocking.
+- **px/mm derived from the fiducials (operator question "why type it?"):** the
+  field is only a *seed* — detection must convert the expected mm layout into
+  pixel search windows before anything is found, so it has to be roughly right
+  (tighter for far fiducials: a 60 mm hole needs the seed within ~search_mm/60).
+  After detection, `measure_scale` computes the true px/mm from the detected
+  fiducial spacing vs their known design spacing and reports it; a "use measured"
+  button adopts it for the Fiducial + Place tabs.
+- **register --frame now anchored to the fiducials, not the seed:** machine mm =
+  detected px / *measured* px/mm, so the target spacing equals the design
+  spacing and the fit is a pure rigid placement (rotation + translation, unit
+  scale). Previously a wrong seed silently scaled the emitted job. The CLI logs
+  the measured scale. Verified: seed 10 → measured 10.00, RMS 0.0; ui tests show
+  the measured scale recovers truth from an off (9.5) seed with a wide window.
+- Note: the seed still has to be close enough to *detect* far fiducials; an
+  iterative detect→re-measure→re-detect pass (FLD-11 territory) would remove even
+  that, but the current flow (Fiducial tab: adjust seed until 3 found → read
+  measured → "use measured") is a clean manual loop.

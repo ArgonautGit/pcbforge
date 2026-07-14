@@ -72,6 +72,7 @@ pub struct ConsoleApp {
     fid_tex: Option<TextureHandle>,
     fid_note: String,
     fid_rows: Vec<FidRow>,
+    fid_measured_ppm: Option<f64>,
 
     // drag-to-place
     place_frame: String,
@@ -94,6 +95,8 @@ pub struct ConsoleApp {
     cam_note: String,
     cam_last: Option<image::GrayImage>,
     cam_devices: Vec<(u32, String)>,
+    cam_capture: Option<crate::camera::Capture>,
+    cam_capture_src: Option<crate::camera::Source>,
 }
 
 impl ConsoleApp {
@@ -123,6 +126,7 @@ impl ConsoleApp {
             fid_tex: None,
             fid_note: "Load a frame (camera grab / photo) and click “Check fiducials”.".into(),
             fid_rows: Vec::new(),
+            fid_measured_ppm: None,
             place_frame: String::new(),
             place_px_per_mm: 10.0,
             place_tx_mm: 0.0,
@@ -142,6 +146,8 @@ impl ConsoleApp {
                 .into(),
             cam_last: None,
             cam_devices: crate::camera::list_devices(),
+            cam_capture: None,
+            cam_capture_src: None,
         }
     }
 
@@ -201,7 +207,12 @@ impl ConsoleApp {
         ) {
             Ok(r) => {
                 let (s, w, m) = r.tally;
-                self.fid_note = format!("{s} strong, {w} weak, {m} missed");
+                self.fid_measured_ppm = r.measured_px_per_mm;
+                let scale = match r.measured_px_per_mm {
+                    Some(p) => format!("  ·  measured {p:.2} px/mm"),
+                    None => String::new(),
+                };
+                self.fid_note = format!("{s} strong, {w} weak, {m} missed{scale}");
                 self.fid_rows = r.rows;
                 self.fid_tex =
                     Some(ctx.load_texture("fiducials", r.overlay, TextureOptions::NEAREST));
@@ -209,6 +220,7 @@ impl ConsoleApp {
             Err(e) => {
                 self.fid_tex = None;
                 self.fid_rows.clear();
+                self.fid_measured_ppm = None;
                 self.fid_note = e;
             }
         }
@@ -317,23 +329,51 @@ impl ConsoleApp {
         }
     }
 
-    /// Grab one frame from the current source into the preview texture + cache.
+    /// Store a grabbed frame into the preview texture + cache.
+    fn set_camera_frame(&mut self, ctx: &Context, gray: image::GrayImage) {
+        let (w, h) = (gray.width() as usize, gray.height() as usize);
+        let img = ColorImage {
+            size: [w, h],
+            pixels: gray.pixels().map(|p| Color32::from_gray(p[0])).collect(),
+        };
+        self.cam_tex = Some(ctx.load_texture("camera", img, TextureOptions::NEAREST));
+        self.cam_note = format!("{w}×{h}");
+        self.cam_last = Some(gray);
+    }
+
+    /// Grab one frame synchronously (the "grab once" button). For Live, the
+    /// background [`Capture`](crate::camera::Capture) thread is used instead so
+    /// I/O never blocks the GUI.
     pub fn grab_camera(&mut self, ctx: &Context) {
         match crate::camera::grab(&self.cam_source()) {
-            Ok(gray) => {
-                let (w, h) = (gray.width() as usize, gray.height() as usize);
-                let img = ColorImage {
-                    size: [w, h],
-                    pixels: gray.pixels().map(|p| Color32::from_gray(p[0])).collect(),
-                };
-                self.cam_tex = Some(ctx.load_texture("camera", img, TextureOptions::NEAREST));
-                self.cam_note = format!("{w}×{h}");
-                self.cam_last = Some(gray);
+            Ok(gray) => self.set_camera_frame(ctx, gray),
+            Err(e) => self.cam_note = e,
+        }
+    }
+
+    /// Ensure the background capture matches Live state + the current source,
+    /// and pull the newest frame from it (non-blocking).
+    fn pump_camera(&mut self, ctx: &Context) {
+        if self.cam_live {
+            let src = self.cam_source();
+            let restart = self.cam_capture.is_none() || self.cam_capture_src.as_ref() != Some(&src);
+            if restart {
+                // Dropping the old Capture stops its thread before the new one.
+                self.cam_capture = None;
+                self.cam_capture = Some(crate::camera::Capture::start(src.clone()));
+                self.cam_capture_src = Some(src);
             }
-            Err(e) => {
-                self.cam_live = false; // stop the live loop on error
-                self.cam_note = e;
+            let latest = self.cam_capture.as_ref().and_then(|c| c.latest());
+            if let Some(res) = latest {
+                match res {
+                    Ok(gray) => self.set_camera_frame(ctx, gray),
+                    Err(e) => self.cam_note = e,
+                }
             }
+            ctx.request_repaint(); // keep the loop alive
+        } else if self.cam_capture.is_some() {
+            self.cam_capture = None; // stop the thread
+            self.cam_capture_src = None;
         }
     }
 
@@ -560,12 +600,9 @@ impl ConsoleApp {
         });
         ui.separator();
 
-        // Live: re-grab every frame and keep the UI repainting.
-        if self.cam_live {
-            let ctx = ui.ctx().clone();
-            self.grab_camera(&ctx);
-            ctx.request_repaint();
-        }
+        // Live frames come from the background capture thread (non-blocking).
+        let ctx = ui.ctx().clone();
+        self.pump_camera(&ctx);
 
         if let Some(tex) = &self.cam_tex {
             egui::ScrollArea::both().show(ui, |ui| {
@@ -676,11 +713,15 @@ impl ConsoleApp {
                 ui.label("expected (x,y mm; …)");
                 ui.add(egui::TextEdit::singleline(&mut self.fid_layout).desired_width(240.0));
                 ui.end_row();
-                ui.label("px per mm");
+                ui.label("px/mm (seed)");
                 ui.add(
                     egui::DragValue::new(&mut self.fid_px_per_mm)
                         .speed(0.1)
                         .range(0.1..=1000.0),
+                )
+                .on_hover_text(
+                    "Rough scale, only used to place the search windows. The true \
+                     px/mm is measured from the fiducial spacing after detection.",
                 );
                 ui.end_row();
                 ui.label("hole ⌀ mm");
@@ -703,9 +744,18 @@ impl ConsoleApp {
                 let ctx = ui.ctx().clone();
                 self.render_fiducials(&ctx);
             }
+            if let Some(ppm) = self.fid_measured_ppm
+                && ui
+                    .button(format!("↧ use measured {ppm:.2} px/mm"))
+                    .on_hover_text("Adopt the fiducial-measured scale for this and the Place tab.")
+                    .clicked()
+            {
+                self.fid_px_per_mm = ppm;
+                self.place_px_per_mm = ppm;
+            }
             ui.label(egui::RichText::new(&self.fid_note).weak());
         });
-        ui.weak("Frame is a saved camera grab or photo; becomes the live feed with VIS-1.");
+        ui.weak("The typed px/mm only seeds the search; registration is anchored to the fiducial-measured scale.");
         ui.separator();
 
         for row in &self.fid_rows {

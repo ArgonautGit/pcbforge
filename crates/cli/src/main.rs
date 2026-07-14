@@ -685,17 +685,47 @@ fn detect_correspondences(
         .collect::<Result<_, _>>()?;
 
     let frame = image::open(frame_path)?.to_luma8();
+    // The given px_per_mm is only a SEED to place the search windows; the true
+    // scale is measured from the detected fiducial spacing below, so the
+    // registration is anchored to the fiducials — not to a guessed number.
     let bed = vision::BedMap::uniform_scale(px_per_mm);
     let profile = vision::FiducialProfile::DarkDot { diameter_mm };
     let results = vision::find_fiducials(&frame, &design, 2.0, &profile, &bed);
 
-    let mut pairs = Vec::new();
+    // Collect (design mm, detected px) for every hit.
+    let mut hits: Vec<(Point2<f64>, (f64, f64))> = Vec::new();
     for (d, res) in design.iter().zip(&results) {
         match res {
-            Ok(f) => pairs.push((*d, Point2::new(f.found_mm.x, f.found_mm.y))),
+            Ok(f) => hits.push((*d, (f.found_px.x, f.found_px.y))),
             Err(m) => eprintln!("register: fiducial at {d:?} not detected ({m:?}) — skipping"),
         }
     }
+
+    // Measured px/mm = mean over detected pairs of (pixel dist / design dist).
+    let (mut acc, mut n) = (0.0, 0u32);
+    for i in 0..hits.len() {
+        for j in (i + 1)..hits.len() {
+            let dmm = (hits[i].0 - hits[j].0).norm();
+            let dpx =
+                ((hits[i].1.0 - hits[j].1.0).powi(2) + (hits[i].1.1 - hits[j].1.1).powi(2)).sqrt();
+            if dmm > 1e-6 {
+                acc += dpx / dmm;
+                n += 1;
+            }
+        }
+    }
+    let ppm = if n > 0 { acc / n as f64 } else { px_per_mm };
+    eprintln!(
+        "register: measured {ppm:.2} px/mm from {} fiducial(s) (seed was {px_per_mm})",
+        hits.len()
+    );
+
+    // Machine mm = detected px / measured px/mm, so the target spacing equals
+    // the design spacing (unit scale) and the fit is a pure rigid placement.
+    let pairs = hits
+        .into_iter()
+        .map(|(d, (px, py))| (d, Point2::new(px / ppm, py / ppm)))
+        .collect();
     Ok(pairs)
 }
 

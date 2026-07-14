@@ -48,6 +48,34 @@ pub struct FidResult {
     pub rows: Vec<FidRow>,
     /// Counts for the header: (found_strong, found_weak, misses).
     pub tally: (usize, usize, usize),
+    /// px/mm **measured** from the detected fiducial spacing vs their known
+    /// design spacing — the true scale, independent of the seed. `None` with
+    /// fewer than two detections.
+    pub measured_px_per_mm: Option<f64>,
+}
+
+/// A detected fiducial as (design mm, found px).
+type DesignPx = ((f64, f64), (f64, f64));
+
+/// Mean px/mm over every pair of detected fiducials: pixel distance / design
+/// distance. The fiducials' design spacing is their real physical spacing, so
+/// this is the true camera scale.
+fn measure_scale(found: &[DesignPx]) -> Option<f64> {
+    let mut acc = 0.0;
+    let mut n = 0;
+    for i in 0..found.len() {
+        for j in (i + 1)..found.len() {
+            let (di, pi) = found[i];
+            let (dj, pj) = found[j];
+            let dmm = ((di.0 - dj.0).powi(2) + (di.1 - dj.1).powi(2)).sqrt();
+            let dpx = ((pi.0 - pj.0).powi(2) + (pi.1 - pj.1).powi(2)).sqrt();
+            if dmm > 1e-6 {
+                acc += dpx / dmm;
+                n += 1;
+            }
+        }
+    }
+    (n > 0).then(|| acc / n as f64)
 }
 
 /// Run detection on an in-memory frame and build the overlay + summary.
@@ -70,10 +98,17 @@ pub fn check_frame(
 
     let overlay = render_overlay(frame, &expected, &results, &bed, diameter_mm, px_per_mm);
     let (rows, tally) = summarize(expected_mm, &results);
+    // Measured scale from the detected fiducials' spacing.
+    let found: Vec<DesignPx> = expected_mm
+        .iter()
+        .zip(&results)
+        .filter_map(|(&d, r)| r.as_ref().ok().map(|f| (d, (f.found_px.x, f.found_px.y))))
+        .collect();
     FidResult {
         overlay,
         rows,
         tally,
+        measured_px_per_mm: measure_scale(&found),
     }
 }
 
@@ -350,6 +385,10 @@ mod tests {
 
         let r = check_frame(&img, &expected, PPM, 1.0, 2.0);
         assert_eq!(r.tally, (3, 0, 0), "all three strong: {:?}", r.rows);
+        // The measured scale recovers the true px/mm from the hole spacing,
+        // regardless of the seed passed in.
+        let measured = r.measured_px_per_mm.expect("scale measured");
+        assert!((measured - PPM).abs() < 0.1, "measured {measured} vs {PPM}");
 
         // Overlay carries the green found-color near each detected center.
         let [w, h] = r.overlay.size;
@@ -363,6 +402,28 @@ mod tests {
             });
             assert!(hit, "expected green mark near ({ex},{ey})");
         }
+    }
+
+    /// The measured scale recovers the true px/mm even when the seed is off:
+    /// the seed only has to be close enough to place the search windows (a wide
+    /// window here absorbs a 5% seed error), and the reported scale then comes
+    /// from the fiducial spacing, not the seed.
+    #[test]
+    fn measured_scale_recovers_truth_from_an_off_seed() {
+        let expected = [(10.0, 10.0), (60.0, 10.0), (10.0, 60.0)];
+        let dots: Vec<_> = expected
+            .iter()
+            .map(|(ex, ey)| (ex * PPM, ey * PPM, 1.0 * PPM))
+            .collect();
+        let img = frame(700, 700, &dots, 85.0, 5.0);
+        // Seed 9.5 px/mm (5% low) with a generous 5 mm search window.
+        let r = check_frame(&img, &expected, 9.5, 1.0, 5.0);
+        assert_eq!(r.tally.0, 3, "all found with the off seed: {:?}", r.rows);
+        let measured = r.measured_px_per_mm.unwrap();
+        assert!(
+            (measured - PPM).abs() < 0.1,
+            "measured {measured}, truth {PPM}"
+        );
     }
 
     /// A low-contrast frame produces a MISS row that names the SNR reason —

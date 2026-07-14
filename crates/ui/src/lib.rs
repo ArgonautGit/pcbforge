@@ -29,7 +29,7 @@ pub fn clean_path(s: &str) -> String {
 }
 
 pub use app::{ConsoleApp, LogLine, default_cli_cmd, job_shapes, preview_image, run_capture};
-pub use camera::{Source, grab, list_devices};
+pub use camera::{Capture, Source, grab, list_devices};
 pub use fiducial::{
     FidKind, FidResult, FidRow, check as fiducial_check, check_frame, parse_layout,
 };
