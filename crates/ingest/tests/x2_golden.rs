@@ -93,6 +93,36 @@ fn x2_flags_known_pads_and_nets() {
     assert!(x2.fiducials().is_empty());
 }
 
+/// A G36 region takes the aperture attributes in the dictionary when it is
+/// drawn (KiCad emits %TA.AperFunction,NonConductor*% before each no-net
+/// zone), and `layer_without_nonconductor` clears exactly that copper.
+#[test]
+fn regions_carry_the_dictionary_aperture_function() {
+    let src = "%TF.FileFunction,Copper,L1,Top*%\n%FSLAX46Y46*%\n%MOMM*%\nG04 z*\n%LPD*%\n\
+               %TA.AperFunction,Conductor*%\n%ADD10C,0.200000*%\n%TD*%\n\
+               D10*\nX1000000Y1000000D03*\n\
+               %TA.AperFunction,NonConductor*%\n\
+               G36*\nX4000000Y0D02*\nG01*\nX9000000Y0D01*\nX9000000Y5000000D01*\nX4000000Y5000000D01*\nG37*\n\
+               %TD.AperFunction*%\nM02*\n";
+    let x2 = parse_gerber_x2(src).unwrap();
+    let region = x2
+        .objects()
+        .iter()
+        .find(|o| o.aper_function.as_deref() == Some("NonConductor"))
+        .expect("the zone region must carry NonConductor");
+    assert!(region.dark);
+
+    // Excluding it removes the 5x5 zone but keeps the pad dot.
+    let full = cam::geom::area_nm2(&x2.layer().polys);
+    let without = cam::geom::area_nm2(&x2.layer_without_nonconductor().polys);
+    let zone = 25.0 * 1e12; // 5 mm x 5 mm in nm^2
+    assert!(
+        (full - without - zone).abs() / zone < 1e-3,
+        "zone area removed"
+    );
+    assert!(without > 0.0, "conductor pad kept");
+}
+
 #[test]
 fn x2_flags_a_fiducial_aperture() {
     // Hand-authored: one fiducial-pad flash. (`%TA.AperFunction,FiducialPad`.)

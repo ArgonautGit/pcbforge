@@ -193,6 +193,31 @@ impl AttributedLayer {
     pub fn fiducials(&self) -> Vec<&GerberObject> {
         self.objects.iter().filter(|o| o.is_fiducial()).collect()
     }
+
+    /// The folded layer with `NonConductor` copper excluded.
+    ///
+    /// `.AperFunction,NonConductor` (Ucamco §5.6.10) marks copper that is not
+    /// part of the electrical circuit — KiCad emits it for no-net zones and
+    /// graphic shapes on copper layers. For the isolation-ablation workflow
+    /// that copper is exactly what rub-out removes, so the inverter treats it
+    /// as clearable by default (discovered on the operator's uv_test board,
+    /// where a NonConductor zone spanned the whole right side and was wrongly
+    /// kept as copper). Objects are folded in stream order with polarity, so
+    /// with nothing excluded this equals [`layer`](Self::layer).
+    pub fn layer_without_nonconductor(&self) -> Layer {
+        let mut acc: Vec<Poly> = Vec::new();
+        for o in &self.objects {
+            if o.aper_function.as_deref() == Some("NonConductor") {
+                continue;
+            }
+            acc = if o.dark {
+                geom::union(&acc, &o.polys)
+            } else {
+                geom::difference(&acc, &o.polys)
+            };
+        }
+        Layer { polys: acc }
+    }
 }
 
 /// Read and parse a Gerber X2 file, preserving aperture/object attributes
@@ -332,11 +357,14 @@ impl<'a> Parser<'a> {
 
     fn emit(&mut self, polys: Vec<Poly>) {
         if self.track_attrs {
-            // A region (G36/G37) is not an aperture flash, so it carries no
-            // aperture function even though `current_aperture` may still be
-            // set from a prior flash.
+            // A G36/G37 region takes the aperture attributes currently in the
+            // dictionary (Ucamco §5.6: %TA% applies to subsequently created
+            // objects, not only aperture definitions) — KiCad emits
+            // %TA.AperFunction,NonConductor*% immediately before each no-net
+            // zone region for exactly this reason. A flash/stroke takes the
+            // function recorded when its D-code was defined.
             let aper_function = if self.in_region {
-                None
+                self.aper_dict.function.clone()
             } else {
                 self.current_aperture
                     .and_then(|d| self.aperture_fn.get(&d).cloned().flatten())

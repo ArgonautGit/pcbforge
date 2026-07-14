@@ -3,6 +3,46 @@
 Per the backlog conventions: every task records deviations from its prompt and
 discovered constraints here.
 
+## 2026-07-14 — third live burn: NonConductor zones + two latent bugs
+
+- The operator's third burn was "almost perfect" except the board's right
+  side was left un-ablated, and they supplied the KiCad screenshot: that area
+  is a **filled copper zone with no net** (parts are REF** placeholders).
+  KiCad plots no-net zone fill as G36 regions tagged
+  `%TA.AperFunction,NonConductor*%` — copper not part of the circuit. The
+  inverter kept it as copper; the operator expects dead copper ablated.
+- New default: `pcbforge emit`/`noncopper` clear NonConductor copper
+  (`AttributedLayer::layer_without_nonconductor`), with `--keep-nonconductor`
+  restoring pour-keeping (the old FlatCAM-style minimal-ablation workflow).
+  The console reports what was cleared/kept.
+- Investigating why my "fix verification" render looked right EXPOSED THAT
+  THE FIRST VERSION OF THE FIX WAS DEAD CODE plus two latent bugs:
+  1. **Regions carried no aperture attributes.** emit() assumed a G36 region
+     has no aperture function; per Ucamco §5.6 (%TA applies to subsequently
+     created objects) and KiCad's emit pattern, a region takes the current
+     dictionary attributes. Fixed: regions record `aper_dict.function`.
+  2. **geom::offset silently deleted rings.** KiCad 10 emits adjacent region
+     vertices 1–3 nm apart; cavalier's 10 nm position fuzz treats them as
+     "repeat position vertexes" and panics in BOTH the trimmed attempts and
+     the winding reference. ref_area became 0, an empty attempt "validated"
+     against it, and the ring vanished — which is why my offset-0.025 runs
+     happened to clear the zone (accidentally correct) while the operator's
+     offset-0 run kept it. Two fixes: consecutive vertices within 25 nm are
+     collapsed before entering cavalier (5 decades below the 1 µm chord
+     tolerance), and an empty offset result is only accepted when collapse is
+     geometrically plausible (erosion with area ≤ perimeter·|η|); if both the
+     ladder and reference fail on a non-collapsible ring, the ring is emitted
+     un-offset (conservative) rather than deleted.
+- Regression tests: geom (stuttered-vertex square survives dilate and erode),
+  ingest (hand-authored NonConductor region carries the attribute; exclusion
+  removes exactly the zone area), e2e on the operator's gerbers at offset 0
+  (zone-interior probe in fill by default, copper with --keep-nonconductor;
+  substrate always fill; pad never fill).
+- Meta-lesson recorded: the offset-0.025 "success" render was right for the
+  wrong reason; only probing the un-offset run separated the exclusion fix
+  from the accidental ring-deletion. Verify fixes at the parameter values
+  that isolate them.
+
 ## 2026-07-14 — emit fan-burn fix: VertID/PrimID must be unique per shape
 
 - The operator burned the first emitted job on a real KiCad 10 board

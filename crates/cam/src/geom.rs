@@ -305,6 +305,15 @@ fn ring_offset_loops(ring: &Ring, delta_mm: f64, arc_tol_mm: f64, out: &mut Vec<
         + 2.0 * perim
         + 1e6;
 
+    // An empty offset result can only be legitimate when the ring can
+    // actually collapse: erosion, with the whole area within |η| of the
+    // boundary (coarea bound). A dilation — or an erosion of a large ring —
+    // that comes back empty is a failure. Without this guard, cavalier
+    // panicking on both an attempt AND the reference makes ref_area 0, an
+    // empty attempt "validates" against it, and the ring is silently deleted
+    // (observed erasing a copper pour on the operator's uv_test board).
+    let collapse_plausible = eta_nm < 0.0 && a_ring <= perim * -eta_nm + budget;
+
     // Primary: trimmed parallel_offset retry ladder, validated against the
     // reference area.
     let mut ladder_all_empty = true;
@@ -319,7 +328,9 @@ fn ring_offset_loops(ring: &Ring, delta_mm: f64, arc_tol_mm: f64, out: &mut Vec<
     for start in longest_edge_starts(&canonical, RETRY_ROTATIONS) {
         let attempt = trimmed_offset(&ring_to_pline(&canonical, start), eta_mm, arc_tol_mm);
         ladder_all_empty &= attempt.is_empty();
-        if (loops_signed_area(&attempt) - ref_area).abs() <= budget {
+        if (!attempt.is_empty() || collapse_plausible)
+            && (loops_signed_area(&attempt) - ref_area).abs() <= budget
+        {
             emit(attempt, out);
             return;
         }
@@ -336,7 +347,9 @@ fn ring_offset_loops(ring: &Ring, delta_mm: f64, arc_tol_mm: f64, out: &mut Vec<
             attempt.clear();
         }
         ladder_all_empty &= attempt.is_empty();
-        if (loops_signed_area(&attempt) - ref_area).abs() <= budget {
+        if (!attempt.is_empty() || collapse_plausible)
+            && (loops_signed_area(&attempt) - ref_area).abs() <= budget
+        {
             emit(attempt, out);
             return;
         }
@@ -345,7 +358,20 @@ fn ring_offset_loops(ring: &Ring, delta_mm: f64, arc_tol_mm: f64, out: &mut Vec<
     // Nothing validated. An all-empty ladder on a collapse-plausible ring is
     // a genuine collapse (coarea bound: full collapse forces area ≤
     // perimeter·|η|); otherwise fall back to the complete winding reference.
-    if ladder_all_empty && eta_nm < 0.0 && a_ring <= perim * -eta_nm + budget {
+    if ladder_all_empty && collapse_plausible {
+        return;
+    }
+    if reference.is_empty() {
+        // Reference AND ladder both failed on a ring that cannot have
+        // collapsed — a cavalier breakdown, not geometry. Last resort: emit
+        // the ring un-offset. Dilation under-grows this one ring and erosion
+        // over-covers it — both conservative; deleting the ring (the pre-fix
+        // behavior) never is.
+        let mut l = ring_to_contour(&canonical);
+        if !ccw {
+            l.reverse();
+        }
+        out.push(l);
         return;
     }
     for p in reference {
@@ -436,11 +462,30 @@ fn loops_signed_area(loops: &[IntContour<i64>]) -> f64 {
     doubled as f64 / 2.0
 }
 
-/// Build a closed mm polyline from `ring`, starting at vertex `start`.
+/// Consecutive vertices closer than this (nm) are collapsed before entering
+/// cavalier. Its position-equality fuzz is 10 nm ([`POS_EQUAL_EPS_MM`]);
+/// KiCad 10 Gerbers contain adjacent region vertices 1–3 nm apart, which
+/// cavalier treats as "repeat position vertexes" and panics on (observed on
+/// the operator's uv_test board). 25 nm is 2.5× the fuzz and five orders of
+/// magnitude below the 1 µm chord tolerance, so dropping them is lossless.
+const DEDUPE_NM: i64 = 25;
+
+/// Build a closed mm polyline from `ring`, starting at vertex `start`,
+/// collapsing sub-[`DEDUPE_NM`] steps (including the closing wrap).
 fn ring_to_pline(ring: &Ring, start: usize) -> Polyline<f64> {
-    let mut pl = Polyline::new_closed();
+    let near = |a: &P, b: &P| (a.x - b.x).abs() <= DEDUPE_NM && (a.y - b.y).abs() <= DEDUPE_NM;
+    let mut kept: Vec<&P> = Vec::with_capacity(ring.len());
     for i in 0..ring.len() {
         let p = &ring[(start + i) % ring.len()];
+        if kept.last().is_none_or(|l| !near(l, p)) {
+            kept.push(p);
+        }
+    }
+    while kept.len() > 1 && near(kept[0], kept[kept.len() - 1]) {
+        kept.pop();
+    }
+    let mut pl = Polyline::new_closed();
+    for p in kept {
         pl.add(nm_to_mm(p.x), nm_to_mm(p.y), 0.0);
     }
     pl
@@ -656,6 +701,38 @@ mod tests {
         let o = offset(std::slice::from_ref(&p), 0);
         assert_eq!(o.len(), 1);
         assert!((area_nm2(&o) - area_nm2(&[p])).abs() < 1.0);
+    }
+
+    /// KiCad 10 emits adjacent region vertices 1–3 nm apart; cavalier panics
+    /// on them ("repeat position vertexes") and, before the dedupe +
+    /// empty-guard fixes, the whole ring silently vanished from the offset —
+    /// observed erasing a copper pour on the operator's uv_test board.
+    #[test]
+    fn near_duplicate_vertices_do_not_lose_the_ring() {
+        // A 10 mm square whose corners carry 1–3 nm stutter vertices.
+        let p = Poly {
+            outer: vec![
+                P::new(0, 0),
+                P::new(1, 0), // 1 nm from the corner
+                P::new(10 * MM, 0),
+                P::new(10 * MM, 3), // 3 nm
+                P::new(10 * MM, 10 * MM),
+                P::new(10 * MM - 2, 10 * MM), // 2 nm
+                P::new(0, 10 * MM),
+                P::new(0, 10 * MM - 1), // 1 nm
+            ],
+            holes: vec![],
+        };
+        let a0 = area_nm2(std::slice::from_ref(&p));
+        let grown = offset(std::slice::from_ref(&p), MM / 2);
+        assert!(!grown.is_empty(), "dilation must never delete the ring");
+        assert!(area_nm2(&grown) > a0, "dilation must grow the area");
+        let eroded = offset(&[p], -MM / 2);
+        assert!(
+            !eroded.is_empty(),
+            "small erosion must not delete a 10 mm ring"
+        );
+        assert!(area_nm2(&eroded) < a0);
     }
 
     #[test]
