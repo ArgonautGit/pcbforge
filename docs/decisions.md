@@ -892,3 +892,15 @@ discovered constraints here.
 - Left partial (`[~]`): the "real VIS-3 BedMap instead of a uniform scale" half
   of FLD-12 is hardware-gated — the px↔mm map stays a uniform scale until the
   bed homography is measured on the machine.
+
+### FLD-12 follow-up — click-to-place was add-only
+
+- Click-to-place could only *append* expected fiducials (on top of the 4
+  defaults), so the marker set only ever grew. Added **right-click-to-remove**:
+  a secondary click on a ✛ drops that fiducial via `remove_expected_fiducial`,
+  which deletes the matching layout token (preserving the others' exact text —
+  not a lossy reparse) and the index-aligned search/found entries, so the set
+  shrinks and survivors keep their dragged positions. Hint text now reads
+  "left-click adds, right-click removes, drag fine-tunes". Verified: removing
+  the middle of three drops its token and keeps the survivor's dragged position
+  aligned by index.

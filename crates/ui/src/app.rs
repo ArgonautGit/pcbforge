@@ -304,7 +304,43 @@ impl ConsoleApp {
         let sep = if base.is_empty() { "" } else { "; " };
         self.fid_layout = format!("{base}{sep}{mx:.1},{my:.1}");
         self.sync_fid_markers();
-        self.fid_note = format!("added fiducial at ({mx:.1}, {my:.1}) mm");
+        let n = self.fid_search.len();
+        self.fid_note = format!(
+            "added fiducial at ({mx:.1}, {my:.1}) mm  ·  {n} total (right-click a ✛ to remove)"
+        );
+    }
+
+    /// Remove expected fiducial `i` (FLD-12 click-to-place). Drops the matching
+    /// layout token — keeping the others' exact text — and the aligned search /
+    /// found entries, so the ✛ set shrinks instead of only ever growing.
+    fn remove_expected_fiducial(&mut self, i: usize) {
+        let tokens: Vec<String> = self
+            .fid_layout
+            .split(';')
+            .map(str::trim)
+            .filter(|t| !t.is_empty())
+            .map(str::to_string)
+            .collect();
+        if i >= tokens.len() {
+            return;
+        }
+        let kept: Vec<String> = tokens
+            .into_iter()
+            .enumerate()
+            .filter(|(k, _)| *k != i)
+            .map(|(_, t)| t)
+            .collect();
+        self.fid_layout = kept.join("; ");
+        if i < self.fid_search.len() {
+            self.fid_search.remove(i);
+        }
+        if i < self.fid_found.len() {
+            self.fid_found.remove(i);
+        }
+        // Lengths already match; sync is a no-op reconcile (and re-seeds only if
+        // the layout still parses).
+        self.sync_fid_markers();
+        self.fid_note = format!("removed fiducial #{i}  ·  {} left", kept.len());
     }
 
     /// Resize the draggable markers to match the design layout, preserving
@@ -1098,8 +1134,8 @@ impl ConsoleApp {
             );
             ui.checkbox(&mut self.fid_click_place, "✚ click-to-place")
                 .on_hover_text(
-                    "Click an empty spot on the frame to add an expected fiducial \
-                     there (appends to the layout); drag markers to fine-tune.",
+                    "Left-click an empty spot to add an expected fiducial; \
+                     right-click a ✛ to remove it; drag markers to fine-tune.",
                 );
             if ui.button("↺ reset markers").clicked() {
                 self.fid_search.clear(); // reseeded from layout on next load/check
@@ -1171,14 +1207,12 @@ impl ConsoleApp {
             (ix as f64 / ppm_f, iy as f64 / ppm_f)
         };
 
-        // Click-to-place (FLD-12): a click on empty frame appends an expected
-        // fiducial there (drag still moves existing markers). Only when a
-        // marker isn't already under the pointer, so dragging isn't hijacked.
-        if self.fid_click_place
-            && resp.clicked()
-            && let Some(pos) = resp.interact_pointer_pos()
-        {
-            let markers: Vec<(f32, f32)> = self
+        // Click-to-place (FLD-12): screen positions of the current markers, for
+        // hit-testing add (empty spot) vs. remove (right-click on a ✛).
+        // Materialized (not a closure) so the `&self` borrow is released before
+        // the `&mut self` add/remove calls below.
+        if self.fid_click_place {
+            let marker_px: Vec<(f32, f32)> = self
                 .fid_search
                 .iter()
                 .map(|&(x, y)| {
@@ -1186,7 +1220,20 @@ impl ConsoleApp {
                     (s.x, s.y)
                 })
                 .collect();
-            if fiducial::nearest_marker(&markers, (pos.x, pos.y), 20.0).is_none() {
+            // Right-click a marker → remove it, so the set shrinks (fixes the
+            // add-only pile-up).
+            if resp.secondary_clicked()
+                && let Some(pos) = resp.interact_pointer_pos()
+                && let Some(i) = fiducial::nearest_marker(&marker_px, (pos.x, pos.y), 20.0)
+            {
+                self.remove_expected_fiducial(i);
+            }
+            // Left-click on empty frame → append an expected fiducial there (not
+            // when a marker is under the pointer, so dragging isn't hijacked).
+            else if resp.clicked()
+                && let Some(pos) = resp.interact_pointer_pos()
+                && fiducial::nearest_marker(&marker_px, (pos.x, pos.y), 20.0).is_none()
+            {
                 let (mx, my) = to_mm(pos);
                 self.add_expected_fiducial(mx, my);
             }
@@ -1787,8 +1834,31 @@ mod tests {
             app.fid_layout
         );
 
+        // Removal shrinks the set (fixes the add-only pile-up): drop the middle
+        // marker and the aligned layout token + search/found entries go with it.
+        app.fid_layout = "10,10; 60,10; 60,60".into();
+        app.sync_fid_markers();
+        // Fine-tune the 3rd marker via drag, so we can prove removal keeps the
+        // *other* markers' dragged positions aligned by index.
+        app.fid_search[2] = (61.5, 59.0);
+        app.remove_expected_fiducial(1); // remove the (60,10) middle one
+        assert_eq!(app.fid_search.len(), 2, "one fewer marker");
+        assert!(
+            !app.fid_layout.contains("60,10"),
+            "removed token is gone: {}",
+            app.fid_layout
+        );
+        assert!(app.fid_layout.contains("10,10") && app.fid_layout.contains("60,60"));
+        assert_eq!(
+            app.fid_search[1],
+            (61.5, 59.0),
+            "the survivor's dragged position stayed aligned to its token"
+        );
+
         // Appending onto an empty layout doesn't produce a leading separator.
         app.fid_layout = String::new();
+        app.fid_search.clear();
+        app.fid_found.clear();
         app.add_expected_fiducial(5.0, 7.0);
         assert_eq!(app.fid_layout.trim_start(), "5.0,7.0");
     }
