@@ -828,3 +828,25 @@ discovered constraints here.
   measurement, the Place overlay). Absolute laser-coordinate registration under
   tilt still needs the camera↔laser/bed calibration (VIS-3, hardware) — the
   fiducial homography rectifies what the camera sees, not where the galvo burns.
+
+## 2026-07-14 — FLD-9 async verb output + FLD-11 live fiducial tracking
+
+- **FLD-9:** `run_verb` was synchronous — the GUI froze for the verb's duration.
+  Now `spawn_verb` runs the CLI on a background thread with piped stdout/stderr
+  read by two reader threads (so a full pipe can't deadlock), streaming each
+  line + an `[exit N]` footer over a channel. `run_verb` returns immediately and
+  stores a `VerbJob`; `pump_verb` (called every frame) drains lines into the log
+  and refreshes status on completion; a top-bar spinner shows "running…". One
+  verb at a time (a second is refused while one runs). Verified with self-exec
+  echo/sh tests (streams stdout+stderr, non-blocking, clears on done).
+- **FLD-11:** the Fiducial tab gained a **● Live** toggle. It reuses the camera
+  source (picked in the Camera tab) and its own `Capture` thread; each frame is
+  grabbed, shown, and re-detected around the current markers, with the measured
+  scale and (≥4) perspective homography refitting live — so the rings track the
+  holes as the board is nudged, no manual Check. Detection is local (small
+  windows) so per-frame cost is cheap. Verified with a File source of 4 holes:
+  the live loop populates found_px + fits the homography, and stops the capture
+  when Live is off.
+- Caveat: fiducial-Live and camera-Live each open the source; on the same
+  physical device that can conflict (device busy) — use one at a time. File
+  sources are fine concurrently.

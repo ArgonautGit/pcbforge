@@ -103,8 +103,8 @@ done-when. Task prompts live in `docs/backlog.md`.
 - [x] FLD-6 — Job placement flags (`--origin-x/--origin-y/--center`) *(cam::lbrn2::place_frame; corner or bbox-center anchor)*
 - [ ] FLD-7 — `uv-base.lbrn2` when a UV device profile exists → UV schema delta
 - [x] FLD-8 — Upstream cavalier_contours findings / evaluate newer release *(0.7.0 still latest; findings + minimal repros + version-bump regression gate in docs/research/cavalier-contours-findings.md)*
-- [ ] FLD-9 — Console: stream verb output incrementally (thread + channel) instead of blocking synchronous capture
+- [x] FLD-9 — Console: stream verb output incrementally (spawn_verb background thread + channel; run_verb non-blocking, running spinner)
 - [ ] FLD-10 — Console live-video panel once VIS-1 lands (replace the camera stub); wire the preview panel into UI-2's AR overlay
-- [ ] FLD-11 — Fiducial-check view: swap the file frame for the live VIS-1 feed, re-detecting each frame so the operator sees it track under a board nudge *(camera plumbing landed; wire the Snapshot bridge into live continuous detection)*
+- [x] FLD-11 — Fiducial-check view: live tracking on the camera feed (● Live re-detects each frame; reuses camera source + Capture thread; perspective refits live)
 - [ ] FLD-13 — `pcbforge cam --list/--grab` CLI verbs (VIS-1 CLI surface) reusing ui::camera or the opencv path
 - [ ] FLD-12 — Fiducial-check view: profile selector (DARK_DOT/ANNULUS/BACKLIT) + click-to-place expected fiducials; use the real VIS-3 BedMap instead of a uniform scale

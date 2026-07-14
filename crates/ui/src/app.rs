@@ -7,7 +7,13 @@
 //! without a display; the `eframe` window is a thin feature-gated wrapper
 //! (`src/main.rs`, `--features native`).
 
+use std::io::{BufRead, BufReader};
 use std::path::PathBuf;
+use std::process::{Command as StdCommand, Stdio};
+use std::sync::Arc;
+use std::sync::atomic::{AtomicBool, Ordering};
+use std::sync::mpsc::{self, Receiver};
+use std::thread;
 
 use egui::{Color32, ColorImage, Context, TextureHandle, TextureOptions};
 use pcb_core::{NM_PER_MM, Nm};
@@ -52,6 +58,7 @@ pub struct ConsoleApp {
     status: StatusSnapshot,
     log: Vec<LogLine>,
     tab: CentralTab,
+    verb_job: Option<VerbJob>,
 
     // emit form
     emit_copper: String,
@@ -80,6 +87,11 @@ pub struct ConsoleApp {
     fid_drag: Option<usize>,
     /// design/bed-mm → pixel perspective fit (≥4 fiducials); shared with Place.
     fid_homography: Option<vision::Homography>,
+    // live fiducial tracking (FLD-11): pull from the camera source, re-detect
+    // each frame.
+    fid_live: bool,
+    fid_capture: Option<crate::camera::Capture>,
+    fid_capture_src: Option<crate::camera::Source>,
 
     // drag-to-place
     place_frame: String,
@@ -118,6 +130,7 @@ impl ConsoleApp {
             status,
             log: Vec::new(),
             tab: CentralTab::Job,
+            verb_job: None,
             emit_copper: String::new(),
             emit_outline: String::new(),
             emit_lbrn2: "job.lbrn2".into(),
@@ -141,6 +154,9 @@ impl ConsoleApp {
             fid_found: Vec::new(),
             fid_drag: None,
             fid_homography: None,
+            fid_live: false,
+            fid_capture: None,
+            fid_capture_src: None,
             place_frame: String::new(),
             place_px_per_mm: 10.0,
             place_tx_mm: 0.0,
@@ -170,20 +186,43 @@ impl ConsoleApp {
         self.status = status::snapshot(&self.db_path);
     }
 
-    /// Shell `pcbforge <args>` and fold its output into the log, then refresh
-    /// status (a verb may have advanced a stage). Synchronous: the console
-    /// blocks for the duration of the verb. Returns the appended lines (for
-    /// tests).
-    pub fn run_verb(&mut self, args: &[String]) -> Vec<LogLine> {
-        let lines = run_capture(&self.cli_cmd, args);
-        self.log.extend(lines.iter().cloned());
-        // Cap the log so a long session doesn't grow unbounded.
+    /// Start `pcbforge <args>` on a background thread; its output streams into
+    /// the log via [`pump_verb`](Self::pump_verb). Non-blocking — the GUI stays
+    /// responsive. One verb at a time; a second is refused while one runs.
+    pub fn run_verb(&mut self, args: &[String]) {
+        if self.verb_job.as_ref().is_some_and(|j| !j.finished()) {
+            self.log.push(LogLine {
+                text: "a job is already running — wait for it to finish".into(),
+                err: true,
+            });
+            return;
+        }
+        self.verb_job = Some(spawn_verb(&self.cli_cmd, args));
+    }
+
+    /// Drain any streamed verb output into the log; on completion, refresh the
+    /// status snapshot. Called every frame.
+    fn pump_verb(&mut self, ctx: &Context) {
+        let Some(job) = &self.verb_job else {
+            return;
+        };
+        let (mut lines, finished) = (job.drain(), job.finished());
+        if finished {
+            lines.extend(job.drain()); // catch any stragglers after the flag
+        }
+        for l in lines {
+            self.log.push(l);
+        }
         if self.log.len() > 500 {
             let drop = self.log.len() - 500;
             self.log.drain(0..drop);
         }
-        self.refresh();
-        lines
+        if finished {
+            self.verb_job = None;
+            self.refresh();
+        } else {
+            ctx.request_repaint();
+        }
     }
 
     /// (Re)build the preview texture from the emit form's Gerber paths.
@@ -253,13 +292,66 @@ impl ConsoleApp {
         if self.fid_frame_img.is_none() {
             self.load_fid_frame(ctx);
         }
-        let Some(frame) = &self.fid_frame_img else {
+        if self.fid_frame_img.is_none() {
             return;
-        };
+        }
         if self.fid_search.is_empty() {
             self.fid_note = "load a frame first".into();
             return;
         }
+        self.detect_fiducials();
+    }
+
+    /// Live fiducial tracking: pull frames from the (camera-tab) source and
+    /// re-detect each one, so the rings track the holes as the board moves.
+    /// Uses `cam_source`, so pick the device/file in the Camera tab.
+    fn pump_fid_live(&mut self, ctx: &Context) {
+        if !self.fid_live {
+            if self.fid_capture.is_some() {
+                self.fid_capture = None;
+                self.fid_capture_src = None;
+            }
+            return;
+        }
+        let src = self.cam_source();
+        if self.fid_capture.is_none() || self.fid_capture_src.as_ref() != Some(&src) {
+            self.fid_capture = None;
+            self.fid_capture = Some(crate::camera::Capture::start(src.clone()));
+            self.fid_capture_src = Some(src);
+        }
+        let latest = self.fid_capture.as_ref().and_then(|c| c.latest());
+        if let Some(res) = latest {
+            match res {
+                Ok(gray) => {
+                    let (w, h) = (gray.width() as usize, gray.height() as usize);
+                    let color = ColorImage {
+                        size: [w, h],
+                        pixels: gray.pixels().map(|p| Color32::from_gray(p[0])).collect(),
+                    };
+                    self.fid_frame_tex =
+                        Some(ctx.load_texture("fid-frame", color, TextureOptions::NEAREST));
+                    self.fid_frame_img = Some(gray);
+                    self.sync_fid_markers();
+                    if !self.fid_search.is_empty() {
+                        self.detect_fiducials();
+                    }
+                }
+                Err(e) => {
+                    self.fid_note = e;
+                    self.fid_live = false;
+                }
+            }
+        }
+        ctx.request_repaint();
+    }
+
+    /// Run detection on the current in-memory frame around the search markers,
+    /// updating rows/found/measured/homography. Shared by the static Check and
+    /// the live-tracking loop (FLD-11).
+    fn detect_fiducials(&mut self) {
+        let Some(frame) = &self.fid_frame_img else {
+            return;
+        };
         let r = fiducial::check_frame(
             frame,
             &self.fid_search,
@@ -488,6 +580,7 @@ impl ConsoleApp {
     /// Draw one frame. Kept separate from the `eframe::App` impl so it runs
     /// under a bare `egui::Context` in tests.
     pub fn ui(&mut self, ctx: &Context) {
+        self.pump_verb(ctx);
         egui::TopBottomPanel::top("top").show(ctx, |ui| {
             ui.horizontal(|ui| {
                 ui.heading("PCBForge console");
@@ -498,6 +591,11 @@ impl ConsoleApp {
                 ui.separator();
                 ui.label("DB:");
                 ui.monospace(self.db_path.display().to_string());
+                if self.verb_job.is_some() {
+                    ui.separator();
+                    ui.spinner();
+                    ui.label("running…");
+                }
             });
         });
 
@@ -785,6 +883,8 @@ impl ConsoleApp {
     }
 
     fn fiducial_view(&mut self, ui: &mut egui::Ui) {
+        let ctx = ui.ctx().clone();
+        self.pump_fid_live(&ctx);
         egui::Grid::new("fid-form")
             .num_columns(2)
             .spacing([8.0, 6.0])
@@ -830,6 +930,9 @@ impl ConsoleApp {
                 let ctx = ui.ctx().clone();
                 self.render_fiducials(&ctx);
             }
+            ui.checkbox(&mut self.fid_live, "● Live").on_hover_text(
+                "Track fiducials on the live camera feed (source from the Camera tab).",
+            );
             if ui.button("↺ reset markers").clicked() {
                 self.fid_search.clear(); // reseeded from layout on next load/check
                 let ctx = ui.ctx().clone();
@@ -1019,6 +1122,109 @@ pub fn run_capture(cmd: &[String], args: &[String]) -> Vec<LogLine> {
     out
 }
 
+/// A CLI verb running on a background thread. Its stdout/stderr stream over the
+/// channel line-by-line so the GUI never blocks; `done` flips when the process
+/// exits. Dropping the job detaches the reader threads (they end when the
+/// child's pipes close).
+pub struct VerbJob {
+    rx: Receiver<LogLine>,
+    done: Arc<AtomicBool>,
+}
+
+impl VerbJob {
+    /// Take all output lines available since the last poll (non-blocking).
+    fn drain(&self) -> Vec<LogLine> {
+        let mut v = Vec::new();
+        while let Ok(l) = self.rx.try_recv() {
+            v.push(l);
+        }
+        v
+    }
+    fn finished(&self) -> bool {
+        self.done.load(Ordering::Relaxed)
+    }
+}
+
+/// Spawn `cmd[0] cmd[1..] args`, streaming stdout (info) and stderr (warn)
+/// lines over the returned job — without blocking the caller (FLD-9).
+pub fn spawn_verb(cmd: &[String], args: &[String]) -> VerbJob {
+    let (tx, rx) = mpsc::channel::<LogLine>();
+    let done = Arc::new(AtomicBool::new(false));
+    let done_t = done.clone();
+    let cmd = cmd.to_vec();
+    let args = args.to_vec();
+    thread::spawn(move || {
+        let _ = tx.send(LogLine {
+            text: format!("$ {} {}", cmd.join(" "), args.join(" ")),
+            err: false,
+        });
+        let Some((program, prefix)) = cmd.split_first() else {
+            let _ = tx.send(LogLine {
+                text: "no CLI command configured".into(),
+                err: true,
+            });
+            done_t.store(true, Ordering::Relaxed);
+            return;
+        };
+        let spawned = StdCommand::new(program)
+            .args(prefix)
+            .args(&args)
+            .stdout(Stdio::piped())
+            .stderr(Stdio::piped())
+            .spawn();
+        let mut child = match spawned {
+            Ok(c) => c,
+            Err(e) => {
+                let _ = tx.send(LogLine {
+                    text: format!("failed to run `{program}`: {e}"),
+                    err: true,
+                });
+                done_t.store(true, Ordering::Relaxed);
+                return;
+            }
+        };
+        // Read stdout and stderr concurrently so a full pipe can't deadlock.
+        let txo = tx.clone();
+        let ho = child.stdout.take().map(|o| {
+            thread::spawn(move || {
+                for line in BufReader::new(o).lines().map_while(Result::ok) {
+                    let _ = txo.send(LogLine {
+                        text: line,
+                        err: false,
+                    });
+                }
+            })
+        });
+        let txe = tx.clone();
+        let he = child.stderr.take().map(|e| {
+            thread::spawn(move || {
+                for line in BufReader::new(e).lines().map_while(Result::ok) {
+                    let _ = txe.send(LogLine {
+                        text: line,
+                        err: true,
+                    });
+                }
+            })
+        });
+        if let Some(h) = ho {
+            let _ = h.join();
+        }
+        if let Some(h) = he {
+            let _ = h.join();
+        }
+        let (code, ok) = match child.wait() {
+            Ok(s) => (s.code().unwrap_or(-1), s.success()),
+            Err(_) => (-1, false),
+        };
+        let _ = tx.send(LogLine {
+            text: format!("[exit {code}]"),
+            err: !ok,
+        });
+        done_t.store(true, Ordering::Relaxed);
+    });
+    VerbJob { rx, done }
+}
+
 /// (board, kept-copper, to-ablate) region sets in the Gerber frame.
 pub type JobShapes = (
     Vec<pcb_core::Poly>,
@@ -1174,6 +1380,105 @@ mod tests {
         let ctx = Context::default();
         let out = ctx.run(egui::RawInput::default(), |ctx| app.ui(ctx));
         assert!(!out.shapes.is_empty(), "place tab must render");
+    }
+
+    /// FLD-11: live tracking pulls frames from the camera source and re-detects
+    /// each one — the found rings and the perspective fit update without a
+    /// manual Check. Verified with a File source of 4 holes.
+    #[test]
+    fn live_fiducial_tracking_detects_on_the_feed() {
+        let dir = std::env::temp_dir().join(format!("ui-fidlive-{}", std::process::id()));
+        std::fs::create_dir_all(&dir).unwrap();
+        let path = dir.join("bed4.png");
+        let ppm = 10.0;
+        let holes = [(10.0, 10.0), (60.0, 10.0), (10.0, 60.0), (60.0, 60.0)];
+        let img = image::GrayImage::from_fn(700, 700, |x, y| {
+            let mut v = 150.0;
+            for (mx, my) in holes {
+                let (cx, cy) = (mx * ppm, my * ppm);
+                if (((x as f64) - cx).powi(2) + ((y as f64) - cy).powi(2)).sqrt() < 0.5 * ppm {
+                    v -= 90.0;
+                }
+            }
+            image::Luma([v as u8])
+        });
+        img.save(&path).unwrap();
+
+        let mut app = ConsoleApp::new(tmp_db(), vec!["true".into()]);
+        app.tab = CentralTab::Fiducials;
+        app.cam_use_device = false;
+        app.cam_file = path.to_string_lossy().into();
+        app.fid_layout = "10,10; 60,10; 10,60; 60,60".into();
+        app.fid_px_per_mm = ppm;
+        app.fid_live = true;
+        let ctx = Context::default();
+        for _ in 0..500 {
+            app.pump_fid_live(&ctx);
+            if app.fid_found.iter().filter(|f| f.is_some()).count() >= 4 {
+                break;
+            }
+            std::thread::sleep(std::time::Duration::from_millis(3));
+        }
+        assert!(
+            app.fid_found.iter().filter(|f| f.is_some()).count() >= 4,
+            "live tracking detected the four holes: {:?}",
+            app.fid_rows
+        );
+        assert!(
+            app.fid_homography.is_some(),
+            "perspective fitted from 4 live fiducials"
+        );
+
+        app.fid_live = false;
+        app.pump_fid_live(&ctx);
+        assert!(app.fid_capture.is_none(), "capture stops when Live is off");
+    }
+
+    /// FLD-9: a verb runs on a background thread (run_verb returns at once),
+    /// streams its output, and completing clears the job + refreshes status.
+    #[test]
+    fn run_verb_is_nonblocking_and_streams() {
+        let mut app = ConsoleApp::new(tmp_db(), vec!["echo".into()]);
+        app.run_verb(&["streamed".into()]);
+        assert!(app.verb_job.is_some(), "run_verb returned immediately");
+        let ctx = Context::default();
+        for _ in 0..500 {
+            app.pump_verb(&ctx);
+            if app.verb_job.is_none() {
+                break;
+            }
+            std::thread::sleep(std::time::Duration::from_millis(3));
+        }
+        assert!(app.verb_job.is_none(), "job completed and cleared");
+        assert!(
+            app.log.iter().any(|l| l.text == "streamed"),
+            "stdout streamed"
+        );
+        assert!(
+            app.log.iter().any(|l| l.text.starts_with("[exit 0]")),
+            "exit footer logged"
+        );
+    }
+
+    #[test]
+    fn spawn_verb_reports_stderr_and_exit() {
+        // `sh -c 'echo out; echo err 1>&2; exit 3'` exercises both streams.
+        let job = spawn_verb(
+            &["sh".into()],
+            &["-c".into(), "echo out; echo err 1>&2; exit 3".into()],
+        );
+        let mut lines = Vec::new();
+        for _ in 0..500 {
+            lines.extend(job.drain());
+            if job.finished() {
+                lines.extend(job.drain());
+                break;
+            }
+            std::thread::sleep(std::time::Duration::from_millis(3));
+        }
+        assert!(lines.iter().any(|l| l.text == "out" && !l.err));
+        assert!(lines.iter().any(|l| l.text == "err" && l.err));
+        assert!(lines.iter().any(|l| l.text.contains("[exit 3]") && l.err));
     }
 
     /// The marker set tracks the layout field: adding a coordinate adds a
