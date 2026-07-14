@@ -274,6 +274,27 @@ enum Command {
         #[arg(long, default_value_t = 0.05)]
         max_rms_mm: f64,
     },
+    /// Camera capture (VIS-1): list devices or grab a single frame. The webcam
+    /// backend needs the `camera` feature; `--file` re-reads an image path and
+    /// works everywhere (any capture app that writes a frame to disk).
+    Cam {
+        /// Enumerate available camera devices as `index: name` and exit.
+        #[arg(long)]
+        list: bool,
+
+        /// Grab one frame and write it (PNG, grayscale) to this path.
+        #[arg(long)]
+        grab: Option<PathBuf>,
+
+        /// Grab from camera device at this index (needs the `camera` feature).
+        #[arg(long)]
+        device: Option<u32>,
+
+        /// Grab by re-reading this image file instead of a device (default when
+        /// no --device is given).
+        #[arg(long)]
+        file: Option<String>,
+    },
 }
 
 fn main() -> ExitCode {
@@ -406,7 +427,53 @@ fn run(cli: &Cli) -> Result<(), Box<dyn std::error::Error>> {
             device,
             max_rms_mm: *max_rms_mm,
         }),
+        Command::Cam {
+            list,
+            grab,
+            device,
+            file,
+        } => cam_cmd(*list, grab.as_deref(), *device, file.as_deref()),
     }
+}
+
+/// `pcbforge cam` — VIS-1 capture surface over the shared `capture` crate.
+fn cam_cmd(
+    list: bool,
+    grab: Option<&std::path::Path>,
+    device: Option<u32>,
+    file: Option<&str>,
+) -> Result<(), Box<dyn std::error::Error>> {
+    if list {
+        let devices = capture::list_devices();
+        if devices.is_empty() {
+            println!(
+                "no camera devices (build with `--features camera` for webcam \
+                 enumeration, or use `--file <path>`)"
+            );
+        } else {
+            for (idx, name) in devices {
+                println!("{idx}: {name}");
+            }
+        }
+        return Ok(());
+    }
+
+    let Some(out) = grab else {
+        return Err("nothing to do — pass --list or --grab <out.png>".into());
+    };
+    let source = match (device, file) {
+        (Some(_), Some(_)) => return Err("pass --device OR --file, not both".into()),
+        (Some(i), None) => capture::Source::Device(i),
+        (None, Some(f)) => capture::Source::File(f.to_string()),
+        (None, None) => return Err("supply --device <index> or --file <path> to --grab".into()),
+    };
+    let frame = capture::grab(&source)?;
+    frame
+        .save(out)
+        .map_err(|e| format!("save {}: {e}", out.display()))?;
+    let (w, h) = frame.dimensions();
+    println!("grabbed {w}×{h} → {}", out.display());
+    Ok(())
 }
 
 struct EmitArgs<'a> {

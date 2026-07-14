@@ -904,3 +904,25 @@ discovered constraints here.
   "left-click adds, right-click removes, drag fine-tunes". Verified: removing
   the middle of three drops its token and keeps the survivor's dragged position
   aligned by index.
+
+## 2026-07-14 — FLD-13 `pcbforge cam` verbs + shared `capture` crate
+
+- FLD-13 asked for `pcbforge cam --list/--grab` "reusing ui::camera". The camera
+  code was inside `ui`, which depends on `egui` — the CLI shouldn't link the GUI
+  stack. Since the capture module and `clean_path` are already egui-free, they
+  moved into a new **`capture`** crate (deps: `image`, optional `nokhwa` behind
+  its own `camera` feature). Both `ui` and `cli` now depend on `capture` and
+  forward the `camera` feature to it (`camera = ["capture/camera"]`).
+- `ui` keeps its call sites unchanged via `use capture as camera;` at the crate
+  root (so `crate::camera::Capture` still resolves) and re-exports
+  `Capture/Source/grab/list_devices/clean_path`. Its old `src/camera.rs` and the
+  duplicate `clean_path` were deleted — one implementation now.
+- CLI surface: `pcbforge cam --list` prints `index: name` per device (or a
+  guide to the `camera` feature / a File source when none); `--grab <out.png>`
+  writes a grayscale frame from `--file <path>` (works everywhere) or
+  `--device <i>` (needs the feature). `--device` + `--file` together, or neither
+  with `--grab`, are usage errors; a device grab without the feature fails with
+  a message that names the feature. Verified end-to-end (grab a synthetic frame,
+  list, no-feature device error, usage error) and covered by `cam_e2e`.
+- Scope: the opencv capture path from VIS-1's original spec is still unbuilt —
+  the File + nokhwa sources cover the operator's setup, so it stays deferred.

@@ -1,17 +1,19 @@
-//! Camera source for the live preview (VIS-1 surfaced in the console).
+//! Camera capture (VIS-1), shared by the console (`ui`) and the CLI
+//! (`pcbforge cam`). Deliberately egui-free so the CLI can grab frames without
+//! pulling in the GUI stack.
 //!
-//! Two source kinds, so a live preview works whatever the operator's setup:
+//! Two source kinds, so capture works whatever the operator's setup:
 //!
 //! * [`Source::File`] — re-read an image file each grab. Any capture app that
-//!   writes a frame to disk (or a saved still) drives the preview; works on
-//!   every platform and is fully testable headless. This is the default.
+//!   writes a frame to disk (or a saved still) drives it; works on every
+//!   platform and is fully testable headless. This is the default.
 //! * [`Source::Device`] — open a webcam by index via `nokhwa`, behind the
 //!   `camera` cargo feature (needs a real camera + platform backend: v4l2 /
-//!   AVFoundation / MSMF). On the operator's Windows machine, build with
-//!   `--features native,camera` for a true webcam feed.
+//!   AVFoundation / MSMF). On the operator's Windows machine, build with the
+//!   `camera` feature for a true webcam feed.
 //!
 //! A grab returns a grayscale frame (the detectors and overlays work in gray);
-//! the console converts it to a texture and, in Live mode, re-grabs each frame.
+//! callers convert it to a texture / save it as needed.
 
 use std::sync::Arc;
 use std::sync::atomic::{AtomicBool, Ordering};
@@ -20,6 +22,20 @@ use std::thread::{self, JoinHandle};
 use std::time::Duration;
 
 use image::GrayImage;
+
+/// Strip surrounding single/double quotes and whitespace from a pasted file
+/// path (drag-and-drop and file managers often quote paths with spaces).
+pub fn clean_path(s: &str) -> String {
+    let t = s.trim();
+    let inner = if t.len() >= 2
+        && ((t.starts_with('"') && t.ends_with('"')) || (t.starts_with('\'') && t.ends_with('\'')))
+    {
+        &t[1..t.len() - 1]
+    } else {
+        t
+    };
+    inner.trim().to_string()
+}
 
 /// Where preview frames come from.
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -31,8 +47,8 @@ pub enum Source {
 }
 
 /// A background capture thread that continuously grabs frames from a [`Source`]
-/// and hands the newest to the UI over a 1-slot channel — so camera I/O never
-/// blocks the GUI. The UI polls [`latest`](Capture::latest) each frame; the
+/// and hands the newest to the caller over a 1-slot channel — so camera I/O
+/// never blocks the UI. The caller polls [`latest`](Capture::latest); the
 /// thread stops when the `Capture` is dropped.
 pub struct Capture {
     rx: Receiver<Result<GrayImage, String>>,
@@ -44,7 +60,7 @@ impl Capture {
     /// Spawn a capture thread for `source`.
     pub fn start(source: Source) -> Self {
         let stop = Arc::new(AtomicBool::new(false));
-        // Depth 1: the thread keeps only the freshest frame; the UI drains it.
+        // Depth 1: the thread keeps only the freshest frame; the caller drains.
         let (tx, rx) = mpsc::sync_channel::<Result<GrayImage, String>>(1);
         let stop_t = stop.clone();
         let handle = thread::spawn(move || capture_loop(source, tx, stop_t));
@@ -76,7 +92,7 @@ impl Drop for Capture {
 }
 
 /// Push `frame` into the 1-slot channel, dropping it if the slot is still full
-/// (the UI hasn't consumed the previous one) — we only ever want the latest.
+/// (the caller hasn't consumed the previous one) — we only want the latest.
 fn offer(tx: &SyncSender<Result<GrayImage, String>>, frame: Result<GrayImage, String>) -> bool {
     match tx.try_send(frame) {
         Ok(()) | Err(TrySendError::Full(_)) => true,
@@ -105,7 +121,7 @@ fn capture_loop(source: Source, tx: SyncSender<Result<GrayImage, String>>, stop:
 pub fn grab(source: &Source) -> Result<GrayImage, String> {
     match source {
         Source::File(path) => {
-            let p = crate::clean_path(path);
+            let p = clean_path(path);
             if p.is_empty() {
                 return Err("set a frame file path".into());
             }
@@ -182,7 +198,7 @@ fn device_loop(index: u32, tx: &SyncSender<Result<GrayImage, String>>, stop: &Ar
 #[cfg(not(feature = "camera"))]
 fn grab_device(_index: u32) -> Result<GrayImage, String> {
     Err(
-        "camera device support not built — rebuild with `--features native,camera`, \
+        "camera device support not built — rebuild with the `camera` feature, \
          or use a File source (any capture app that writes a frame to disk)"
             .into(),
     )
@@ -212,8 +228,17 @@ mod tests {
     use super::*;
 
     #[test]
+    fn clean_path_strips_quotes_and_whitespace() {
+        assert_eq!(clean_path("  \"/a/b c.gbr\" "), "/a/b c.gbr");
+        assert_eq!(clean_path("'/x/y.png'"), "/x/y.png");
+        assert_eq!(clean_path("/plain/path.gbr"), "/plain/path.gbr");
+        assert_eq!(clean_path("\"unbalanced"), "\"unbalanced");
+        assert_eq!(clean_path(""), "");
+    }
+
+    #[test]
     fn file_source_grabs_a_frame() {
-        let dir = std::env::temp_dir().join(format!("ui-cam-{}", std::process::id()));
+        let dir = std::env::temp_dir().join(format!("cap-cam-{}", std::process::id()));
         std::fs::create_dir_all(&dir).unwrap();
         let path = dir.join("f.png");
         image::GrayImage::from_pixel(40, 30, image::Luma([128]))
@@ -226,7 +251,7 @@ mod tests {
 
     #[test]
     fn file_source_strips_quotes() {
-        let dir = std::env::temp_dir().join(format!("ui-cam-q-{}", std::process::id()));
+        let dir = std::env::temp_dir().join(format!("cap-cam-q-{}", std::process::id()));
         std::fs::create_dir_all(&dir).unwrap();
         let path = dir.join("g.png");
         image::GrayImage::from_pixel(8, 8, image::Luma([10]))
@@ -244,7 +269,7 @@ mod tests {
 
     #[test]
     fn background_capture_delivers_frames_without_blocking() {
-        let dir = std::env::temp_dir().join(format!("ui-cap-{}", std::process::id()));
+        let dir = std::env::temp_dir().join(format!("cap-live-{}", std::process::id()));
         std::fs::create_dir_all(&dir).unwrap();
         let path = dir.join("live.png");
         image::GrayImage::from_pixel(24, 16, image::Luma([77]))
@@ -252,7 +277,6 @@ mod tests {
             .unwrap();
 
         let cap = Capture::start(Source::File(path.to_string_lossy().into()));
-        // Poll (non-blocking) until a frame arrives — the thread does the I/O.
         let mut got = None;
         for _ in 0..200 {
             if let Some(Ok(f)) = cap.latest() {
@@ -267,10 +291,9 @@ mod tests {
 
     #[test]
     fn device_without_feature_reports_how_to_enable() {
-        // Without the `camera` feature the device path explains itself.
         let r = grab(&Source::Device(0));
         #[cfg(not(feature = "camera"))]
-        assert!(r.unwrap_err().contains("--features"));
+        assert!(r.unwrap_err().contains("camera"));
         #[cfg(feature = "camera")]
         let _ = r; // with a real backend this depends on hardware
     }

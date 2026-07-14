@@ -367,6 +367,14 @@ dependencies = [
 ]
 
 [[package]]
+name = "capture"
+version = "0.1.0"
+dependencies = [
+ "image",
+ "nokhwa",
+]
+
+[[package]]
 name = "cavalier_contours"
 version = "0.7.0"
 source = "registry+https://github.com/rust-lang/crates.io-index"
@@ -2480,6 +2488,7 @@ name = "pcbforge"
 version = "0.1.0"
 dependencies = [
  "cam",
+ "capture",
  "clap",
  "image",
  "ingest",
@@ -3434,12 +3443,12 @@ name = "ui"
 version = "0.1.0"
 dependencies = [
  "cam",
+ "capture",
  "eframe",
  "egui",
  "image",
  "ingest",
  "nalgebra",
- "nokhwa",
  "orchestra",
  "pcb-core",
  "vision",

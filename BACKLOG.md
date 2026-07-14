@@ -41,7 +41,7 @@ done-when. Task prompts live in `docs/backlog.md`.
 - [ ] SIM-2 — Heightmap sim + removal model (v2)
 
 ## WS-VIS — Vision & calibration
-- [~] VIS-1 — Capture module *(console live-camera preview done: ui::camera with a File source (any capture app writing frames to disk — verified) + a real webcam backend via nokhwa behind the `camera` feature (compiles all platforms here; runs on the operator's machine). CLI `pcbforge cam --list/--grab` + the opencv path per the original spec still pending — see decisions.md)*
+- [~] VIS-1 — Capture module *(the `capture` crate: a File source (any capture app writing frames to disk — verified) + a real webcam backend via nokhwa behind the `camera` feature (compiles all platforms here; runs on the operator's machine). Consumed by both the console live preview and the CLI `pcbforge cam --list/--grab` (FLD-13). The opencv path per the original spec is the one piece still pending — see decisions.md)*
 - [ ] VIS-2 — Intrinsics calibration
 - [ ] VIS-3 — Bed homography
 - [x] VIS-4 — Fiducial detectors *(vision::find_fiducials; synthetic done-when met (<0.15 px); px↔mm parameterized as BedMap pending VIS-3; live annuli check operator-side — see decisions.md)*
@@ -106,5 +106,5 @@ done-when. Task prompts live in `docs/backlog.md`.
 - [x] FLD-9 — Console: stream verb output incrementally (spawn_verb background thread + channel; run_verb non-blocking, running spinner)
 - [ ] FLD-10 — Console live-video panel once VIS-1 lands (replace the camera stub); wire the preview panel into UI-2's AR overlay
 - [x] FLD-11 — Fiducial-check view: live tracking on the camera feed (● Live re-detects each frame; reuses camera source + Capture thread; perspective refits live)
-- [ ] FLD-13 — `pcbforge cam --list/--grab` CLI verbs (VIS-1 CLI surface) reusing ui::camera or the opencv path
+- [x] FLD-13 — `pcbforge cam --list/--grab` CLI verbs *(VIS-1 CLI surface; extracted the egui-free camera code into a shared `capture` crate so the CLI reuses it without pulling in the GUI. `pcbforge cam --list` enumerates devices; `--grab <out.png>` writes a gray frame from `--file <path>` (everywhere) or `--device <i>` (needs the `camera` feature). cam_e2e covers grab-from-file, list, no-feature device error, usage error — see decisions.md)*
 - [~] FLD-12 — Fiducial-check view: profile selector (DARK_DOT/ANNULUS/BACKLIT) + click-to-place expected fiducials *(profile combo threads a `FiducialProfile` into `check_frame`/live detection — verified a backlit frame the dark-dot matcher won't lock; “✚ click-to-place”: left-click adds an expected fiducial, right-click a ✛ removes it, drag fine-tunes (all edit the layout, the source of truth — so the set shrinks, not just grows). Still on a uniform scale — the real VIS-3 BedMap is hardware-gated — see decisions.md)*

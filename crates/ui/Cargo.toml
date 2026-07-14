@@ -6,6 +6,7 @@ license.workspace = true
 
 [dependencies]
 egui = "0.29"
+capture = { path = "../capture" }
 orchestra = { path = "../orchestra" }
 cam = { path = "../cam" }
 ingest = { path = "../ingest" }
@@ -14,13 +15,12 @@ pcb-core = { workspace = true }
 nalgebra = "0.35.0"
 image = { version = "0.25", default-features = false, features = ["png", "jpeg"] }
 eframe = { version = "0.29", optional = true, default-features = false, features = ["glow", "default_fonts"] }
-nokhwa = { version = "0.10", optional = true, features = ["input-native"] }
 
 [features]
 native = ["dep:eframe"]
-# Real webcam capture via nokhwa (needs a camera + platform backend). Off by
-# default; the File source drives the live preview everywhere without it.
-camera = ["dep:nokhwa"]
+# Real webcam capture (needs a camera + platform backend). Off by default; the
+# File source drives the live preview everywhere without it.
+camera = ["capture/camera"]
 
 [lib]
 name = "ui"

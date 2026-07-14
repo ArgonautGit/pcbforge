@@ -8,28 +8,17 @@
 //! `native` feature (see `src/main.rs`), which needs a display + GL/X11.
 
 mod app;
-mod camera;
 mod fiducial;
 mod place;
 mod preview;
 mod status;
 
-/// Strip surrounding single/double quotes and whitespace from a pasted file
-/// path (drag-and-drop and file managers often quote paths with spaces).
-pub fn clean_path(s: &str) -> String {
-    let t = s.trim();
-    let inner = if t.len() >= 2
-        && ((t.starts_with('"') && t.ends_with('"')) || (t.starts_with('\'') && t.ends_with('\'')))
-    {
-        &t[1..t.len() - 1]
-    } else {
-        t
-    };
-    inner.trim().to_string()
-}
+// Camera capture lives in the egui-free `capture` crate (shared with the CLI);
+// alias it as `camera` so `crate::camera::…` paths keep resolving.
+use capture as camera;
 
 pub use app::{ConsoleApp, LogLine, default_cli_cmd, job_shapes, preview_image, run_capture};
-pub use camera::{Capture, Source, grab, list_devices};
+pub use capture::{Capture, Source, clean_path, grab, list_devices};
 pub use fiducial::{
     FidKind, FidResult, FidRow, ProfileKind, check as fiducial_check, check_frame, parse_layout,
 };
@@ -49,17 +38,4 @@ pub fn run_native(db_path: std::path::PathBuf, cli_cmd: Vec<String>) -> eframe::
         options,
         Box::new(move |_cc| Ok(Box::new(ConsoleApp::new(db_path, cli_cmd)))),
     )
-}
-
-#[cfg(test)]
-mod clean_path_tests {
-    use super::clean_path;
-    #[test]
-    fn strips_quotes_and_whitespace() {
-        assert_eq!(clean_path("  \"/a/b c.gbr\" "), "/a/b c.gbr");
-        assert_eq!(clean_path("'/x/y.png'"), "/x/y.png");
-        assert_eq!(clean_path("/plain/path.gbr"), "/plain/path.gbr");
-        assert_eq!(clean_path("\"unbalanced"), "\"unbalanced");
-        assert_eq!(clean_path(""), "");
-    }
 }
