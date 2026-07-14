@@ -926,3 +926,16 @@ discovered constraints here.
   list, no-feature device error, usage error) and covered by `cam_e2e`.
 - Scope: the opencv capture path from VIS-1's original spec is still unbuilt —
   the File + nokhwa sources cover the operator's setup, so it stays deferred.
+
+### Place-drag follow-up — track the cursor under perspective
+
+- Dragging the Place overlay felt wrong once a perspective homography was
+  active: the old handler added a uniform mm delta to the placement translation,
+  but a uniform mm step is not a uniform pixel step on a tilted plane, so the
+  overlay slid *along* the plane instead of following the cursor. Fixed by
+  moving in pixel space: map the pivot bed-mm → px through the same homography
+  the composite uses, add the (scaled) drag delta in pixels, then invert back to
+  bed-mm (`drag_place_px`). With no homography this reduces to the original
+  ÷px_per_mm move. Verified: under a keystone homography a (dpx,dpy) drag shifts
+  the pivot's projected pixel by exactly (dpx,dpy); the uniform case still adds
+  delta÷ppm to the translation.

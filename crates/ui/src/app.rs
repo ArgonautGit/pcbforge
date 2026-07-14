@@ -475,6 +475,37 @@ impl ConsoleApp {
         };
     }
 
+    /// Move the placement so its pivot's **pixel** position shifts by
+    /// `(dpx, dpy)` frame pixels. Dragging felt wrong under perspective because
+    /// the old code added a uniform mm delta — a uniform mm step is *not* a
+    /// uniform pixel step on a tilted plane, so the overlay slid along the plane
+    /// instead of following the cursor. Here we map the pivot to pixels through
+    /// the same homography the composite uses, shift in pixels, and invert back
+    /// to bed-mm — so the geometry tracks where the mouse moves over the image.
+    fn drag_place_px(&mut self, dpx: f64, dpy: f64) {
+        let ppm = self.place_px_per_mm;
+        let inv = self.fid_homography.as_ref().and_then(|h| h.try_inverse());
+        // Forward: pivot bed-mm → pixel (perspective only if it's invertible,
+        // so the forward/back maps always agree).
+        let (px, py) = match self.fid_homography.as_ref() {
+            Some(h) if inv.is_some() => {
+                let p = h.apply(nalgebra::Point2::new(self.place_tx_mm, self.place_ty_mm));
+                (p.x, p.y)
+            }
+            _ => (self.place_tx_mm * ppm, self.place_ty_mm * ppm),
+        };
+        let (nx, ny) = (px + dpx, py + dpy);
+        let (tx, ty) = match &inv {
+            Some(i) => {
+                let p = i.apply(nalgebra::Point2::new(nx, ny));
+                (p.x, p.y)
+            }
+            None => (nx / ppm, ny / ppm),
+        };
+        self.place_tx_mm = tx;
+        self.place_ty_mm = ty;
+    }
+
     /// Current manual placement.
     fn placement(&self) -> crate::place::Placement {
         crate::place::Placement {
@@ -1046,11 +1077,12 @@ impl ConsoleApp {
             let resp = ui.add(img);
             if resp.dragged() {
                 let d = resp.drag_delta();
-                // The frame is scaled to fit, so convert screen-point drag back
-                // to frame pixels (native_w / displayed_w), then to mm.
-                let scale = native_w / resp.rect.width().max(1.0);
-                self.place_tx_mm += (d.x * scale) as f64 / self.place_px_per_mm;
-                self.place_ty_mm += (d.y * scale) as f64 / self.place_px_per_mm;
+                // The frame is scaled to fit, so convert the screen-point drag
+                // back to frame pixels (native_w / displayed_w). The move is
+                // then applied in pixel space (see drag_place_px) so the overlay
+                // tracks the cursor even when a perspective homography is active.
+                let scale = (native_w / resp.rect.width().max(1.0)) as f64;
+                self.drag_place_px(d.x as f64 * scale, d.y as f64 * scale);
                 changed = true;
             }
         } else {
@@ -1948,6 +1980,63 @@ mod tests {
         app.ar_show_copper = false;
         let plain = app.compose_ar(&gray);
         assert_eq!(plain.pixels[50 * 200 + 50], Color32::from_gray(120));
+    }
+
+    /// Place drag tracks the cursor in pixel space, even under perspective: a
+    /// drag of (dpx, dpy) frame pixels shifts the pivot's *projected pixel* by
+    /// exactly that — so the overlay follows the mouse over the image instead of
+    /// sliding along the tilted plane.
+    #[test]
+    fn place_drag_tracks_cursor_under_perspective() {
+        use nalgebra::Point2;
+        let mut app = ConsoleApp::new(tmp_db(), vec!["true".into()]);
+        // A keystone homography (bed-mm → px): top edge narrower than bottom.
+        let corr = [
+            (Point2::new(0.0, 0.0), Point2::new(180.0, 110.0)),
+            (Point2::new(60.0, 0.0), Point2::new(460.0, 110.0)),
+            (Point2::new(60.0, 50.0), Point2::new(520.0, 380.0)),
+            (Point2::new(0.0, 50.0), Point2::new(120.0, 380.0)),
+        ];
+        app.fid_homography = Some(vision::fit_homography(&corr).unwrap());
+        app.place_px_per_mm = 8.0;
+        app.place_tx_mm = 30.0;
+        app.place_ty_mm = 25.0;
+
+        let pivot = |a: &ConsoleApp| {
+            a.fid_homography
+                .as_ref()
+                .unwrap()
+                .apply(Point2::new(a.place_tx_mm, a.place_ty_mm))
+        };
+        let before = pivot(&app);
+        app.drag_place_px(12.0, -7.0);
+        let after = pivot(&app);
+        assert!(
+            (after.x - (before.x + 12.0)).abs() < 1e-6,
+            "x pixel tracked: {} vs {}",
+            after.x,
+            before.x + 12.0
+        );
+        assert!(
+            (after.y - (before.y - 7.0)).abs() < 1e-6,
+            "y pixel tracked: {} vs {}",
+            after.y,
+            before.y - 7.0
+        );
+    }
+
+    /// Without a homography the drag is the plain uniform-scale move (pixel
+    /// delta ÷ px-per-mm added to the bed-mm translation).
+    #[test]
+    fn place_drag_uniform_without_homography() {
+        let mut app = ConsoleApp::new(tmp_db(), vec!["true".into()]);
+        app.fid_homography = None;
+        app.place_px_per_mm = 10.0;
+        app.place_tx_mm = 5.0;
+        app.place_ty_mm = 5.0;
+        app.drag_place_px(20.0, -30.0);
+        assert!((app.place_tx_mm - (5.0 + 2.0)).abs() < 1e-9);
+        assert!((app.place_ty_mm - (5.0 - 3.0)).abs() < 1e-9);
     }
 
     /// A second frame after a status refresh still lays out (state survives).
