@@ -28,6 +28,7 @@ pub struct LogLine {
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 enum CentralTab {
     Job,
+    Camera,
     Fiducials,
     Place,
 }
@@ -83,6 +84,16 @@ pub struct ConsoleApp {
     place_pivot: (f64, f64),
     place_tex: Option<TextureHandle>,
     place_note: String,
+
+    // live camera
+    cam_use_device: bool,
+    cam_device: u32,
+    cam_file: String,
+    cam_live: bool,
+    cam_tex: Option<TextureHandle>,
+    cam_note: String,
+    cam_last: Option<image::GrayImage>,
+    cam_devices: Vec<(u32, String)>,
 }
 
 impl ConsoleApp {
@@ -122,6 +133,15 @@ impl ConsoleApp {
             place_pivot: (0.0, 0.0),
             place_tex: None,
             place_note: "Load a frame + job, then drag / rotate to place it on the board.".into(),
+            cam_use_device: false,
+            cam_device: 0,
+            cam_file: String::new(),
+            cam_live: false,
+            cam_tex: None,
+            cam_note: "Pick a source and press Live. Snapshot feeds the Fiducial/Place tabs."
+                .into(),
+            cam_last: None,
+            cam_devices: crate::camera::list_devices(),
         }
     }
 
@@ -207,7 +227,7 @@ impl ConsoleApp {
     /// Load the bed frame + job geometry into the place cache and center the
     /// job on the frame. Uses the Job-tab Gerber paths for the geometry.
     pub fn load_place(&mut self, ctx: &Context) {
-        let img = match image::open(self.place_frame.trim()) {
+        let img = match image::open(crate::clean_path(&self.place_frame)) {
             Ok(i) => i.to_luma8(),
             Err(e) => {
                 self.place_note = format!("frame: {e}");
@@ -275,17 +295,65 @@ impl ConsoleApp {
         let mut args: Vec<String> = vec![
             "register".into(),
             "--copper".into(),
-            self.emit_copper.clone(),
+            crate::clean_path(&self.emit_copper),
             "--lbrn2".into(),
-            self.emit_lbrn2.clone(),
+            crate::clean_path(&self.emit_lbrn2),
             "--fiducials".into(),
             self.placement().correspondences(),
         ];
-        if !self.emit_outline.trim().is_empty() {
+        if !crate::clean_path(&self.emit_outline).is_empty() {
             args.push("--outline".into());
-            args.push(self.emit_outline.clone());
+            args.push(crate::clean_path(&self.emit_outline));
         }
         self.run_verb(&args);
+    }
+
+    /// The current camera source (device or file).
+    fn cam_source(&self) -> crate::camera::Source {
+        if self.cam_use_device {
+            crate::camera::Source::Device(self.cam_device)
+        } else {
+            crate::camera::Source::File(self.cam_file.clone())
+        }
+    }
+
+    /// Grab one frame from the current source into the preview texture + cache.
+    pub fn grab_camera(&mut self, ctx: &Context) {
+        match crate::camera::grab(&self.cam_source()) {
+            Ok(gray) => {
+                let (w, h) = (gray.width() as usize, gray.height() as usize);
+                let img = ColorImage {
+                    size: [w, h],
+                    pixels: gray.pixels().map(|p| Color32::from_gray(p[0])).collect(),
+                };
+                self.cam_tex = Some(ctx.load_texture("camera", img, TextureOptions::NEAREST));
+                self.cam_note = format!("{w}×{h}");
+                self.cam_last = Some(gray);
+            }
+            Err(e) => {
+                self.cam_live = false; // stop the live loop on error
+                self.cam_note = e;
+            }
+        }
+    }
+
+    /// Save the last grabbed frame to a PNG and point the Fiducial + Place tabs
+    /// at it — the bridge from live view into detection / placement.
+    fn snapshot_to_tabs(&mut self) {
+        let Some(frame) = &self.cam_last else {
+            self.cam_note = "grab a frame first".into();
+            return;
+        };
+        let path = std::env::temp_dir().join("pcbforge-snapshot.png");
+        match frame.save(&path) {
+            Ok(()) => {
+                let p = path.to_string_lossy().into_owned();
+                self.fid_frame = p.clone();
+                self.place_frame = p;
+                self.cam_note = format!("snapshot → Fiducial + Place tabs ({})", path.display());
+            }
+            Err(e) => self.cam_note = format!("save: {e}"),
+        }
     }
 
     /// Draw one frame. Kept separate from the `eframe::App` impl so it runs
@@ -394,23 +462,8 @@ impl ConsoleApp {
         if ui.button("⏭ Next stage (pcbforge next)").clicked() {
             self.run_verb(&["next".into()]);
         }
-
         ui.separator();
-        ui.collapsing("📷 Camera", |ui| {
-            ui.weak("Live camera pending VIS-1 (capture module).");
-            let (rect, _) = ui.allocate_exact_size(
-                egui::vec2(ui.available_width(), 120.0),
-                egui::Sense::hover(),
-            );
-            ui.painter().rect_filled(rect, 4.0, Color32::from_gray(30));
-            ui.painter().text(
-                rect.center(),
-                egui::Align2::CENTER_CENTER,
-                "no camera",
-                egui::FontId::proportional(14.0),
-                Color32::from_gray(120),
-            );
-        });
+        ui.weak("Live camera → the “📷 Camera” tab.");
     }
 
     fn emit_clicked(&mut self) {
@@ -424,15 +477,15 @@ impl ConsoleApp {
         let mut args: Vec<String> = vec![
             "emit".into(),
             "--copper".into(),
-            self.emit_copper.clone(),
+            crate::clean_path(&self.emit_copper),
             "--lbrn2".into(),
-            self.emit_lbrn2.clone(),
+            crate::clean_path(&self.emit_lbrn2),
             "--offset-mm".into(),
             format!("{}", self.offset_mm),
         ];
-        if !self.emit_outline.trim().is_empty() {
+        if !crate::clean_path(&self.emit_outline).is_empty() {
             args.push("--outline".into());
-            args.push(self.emit_outline.clone());
+            args.push(crate::clean_path(&self.emit_outline));
         }
         self.run_verb(&args);
     }
@@ -440,14 +493,89 @@ impl ConsoleApp {
     fn preview_panel(&mut self, ui: &mut egui::Ui) {
         ui.horizontal(|ui| {
             ui.selectable_value(&mut self.tab, CentralTab::Job, "🖼 Job preview");
+            ui.selectable_value(&mut self.tab, CentralTab::Camera, "📷 Camera");
             ui.selectable_value(&mut self.tab, CentralTab::Fiducials, "🎯 Fiducial check");
             ui.selectable_value(&mut self.tab, CentralTab::Place, "✋ Place on board");
         });
         ui.separator();
         match self.tab {
             CentralTab::Job => self.job_view(ui),
+            CentralTab::Camera => self.camera_view(ui),
             CentralTab::Fiducials => self.fiducial_view(ui),
             CentralTab::Place => self.place_view(ui),
+        }
+    }
+
+    fn camera_view(&mut self, ui: &mut egui::Ui) {
+        ui.horizontal(|ui| {
+            ui.selectable_value(&mut self.cam_use_device, false, "File");
+            ui.selectable_value(&mut self.cam_use_device, true, "Device");
+            if self.cam_use_device && ui.button("↻ devices").clicked() {
+                self.cam_devices = crate::camera::list_devices();
+            }
+        });
+        if self.cam_use_device {
+            if self.cam_devices.is_empty() {
+                ui.weak(
+                    "No devices (build with --features native,camera for a webcam, or use File).",
+                );
+                ui.add(
+                    egui::DragValue::new(&mut self.cam_device)
+                        .range(0..=15)
+                        .prefix("index "),
+                );
+            } else {
+                egui::ComboBox::from_label("device")
+                    .selected_text(
+                        self.cam_devices
+                            .iter()
+                            .find(|(i, _)| *i == self.cam_device)
+                            .map(|(_, n)| n.clone())
+                            .unwrap_or_else(|| format!("index {}", self.cam_device)),
+                    )
+                    .show_ui(ui, |ui| {
+                        for (i, name) in &self.cam_devices {
+                            ui.selectable_value(&mut self.cam_device, *i, format!("{i}: {name}"));
+                        }
+                    });
+            }
+        } else {
+            ui.horizontal(|ui| {
+                ui.label("frame file");
+                ui.add(egui::TextEdit::singleline(&mut self.cam_file).desired_width(240.0));
+            });
+            ui.weak("Any capture app that writes a frame to disk drives the live preview.");
+        }
+
+        ui.horizontal(|ui| {
+            ui.checkbox(&mut self.cam_live, "● Live");
+            if ui.button("grab once").clicked() {
+                let ctx = ui.ctx().clone();
+                self.grab_camera(&ctx);
+            }
+            if ui.button("📸 Snapshot → Fiducial/Place").clicked() {
+                self.snapshot_to_tabs();
+            }
+            ui.label(egui::RichText::new(&self.cam_note).weak());
+        });
+        ui.separator();
+
+        // Live: re-grab every frame and keep the UI repainting.
+        if self.cam_live {
+            let ctx = ui.ctx().clone();
+            self.grab_camera(&ctx);
+            ctx.request_repaint();
+        }
+
+        if let Some(tex) = &self.cam_tex {
+            egui::ScrollArea::both().show(ui, |ui| {
+                ui.add(
+                    egui::Image::from_texture((tex.id(), tex.size_vec2()))
+                        .fit_to_original_size(1.0),
+                );
+            });
+        } else {
+            ui.weak("(no frame yet)");
         }
     }
 
@@ -684,16 +812,18 @@ pub fn job_shapes(
     outline_path: &str,
     offset_mm: f64,
 ) -> Result<JobShapes, String> {
-    if copper_path.trim().is_empty() {
+    let copper_path = crate::clean_path(copper_path);
+    let outline_path = crate::clean_path(outline_path);
+    if copper_path.is_empty() {
         return Err("set a copper Gerber path first".into());
     }
-    let copper = ingest::gerber::load_gerber(std::path::Path::new(copper_path.trim()))
+    let copper = ingest::gerber::load_gerber(std::path::Path::new(&copper_path))
         .map_err(|e| format!("copper: {}", e.msg))?
         .polys;
-    let board = if outline_path.trim().is_empty() {
+    let board = if outline_path.is_empty() {
         cam::noncopper::board_region_bbox(&copper, NM_PER_MM) // 1 mm margin
     } else {
-        let o = ingest::gerber::load_gerber(std::path::Path::new(outline_path.trim()))
+        let o = ingest::gerber::load_gerber(std::path::Path::new(&outline_path))
             .map_err(|e| format!("outline: {}", e.msg))?
             .polys;
         cam::noncopper::board_region_from_outline(&o)
@@ -821,6 +951,34 @@ mod tests {
         let ctx = Context::default();
         let out = ctx.run(egui::RawInput::default(), |ctx| app.ui(ctx));
         assert!(!out.shapes.is_empty(), "place tab must render");
+    }
+
+    /// The Camera tab lays out headless, a File-source grab loads a texture,
+    /// and Snapshot points the Fiducial + Place tabs at the saved frame.
+    #[test]
+    fn camera_grab_and_snapshot_flow() {
+        let dir = std::env::temp_dir().join(format!("ui-camflow-{}", std::process::id()));
+        std::fs::create_dir_all(&dir).unwrap();
+        let frame = dir.join("live.png");
+        image::GrayImage::from_pixel(48, 32, image::Luma([90]))
+            .save(&frame)
+            .unwrap();
+
+        let mut app = ConsoleApp::new(tmp_db(), vec!["true".into()]);
+        app.tab = CentralTab::Camera;
+        app.cam_use_device = false;
+        app.cam_file = format!("\"{}\"", frame.display()); // quoted on purpose
+        let ctx = Context::default();
+        let _ = ctx.run(egui::RawInput::default(), |ctx| app.ui(ctx));
+
+        app.grab_camera(&ctx);
+        assert!(app.cam_tex.is_some(), "grab loaded a texture");
+        assert_eq!(app.cam_last.as_ref().unwrap().dimensions(), (48, 32));
+
+        app.snapshot_to_tabs();
+        assert!(app.fid_frame.ends_with("pcbforge-snapshot.png"));
+        assert_eq!(app.fid_frame, app.place_frame);
+        assert!(std::path::Path::new(&app.fid_frame).is_file());
     }
 
     /// A second frame after a status refresh still lays out (state survives).

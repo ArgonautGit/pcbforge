@@ -41,7 +41,7 @@ done-when. Task prompts live in `docs/backlog.md`.
 - [ ] SIM-2 — Heightmap sim + removal model (v2)
 
 ## WS-VIS — Vision & calibration
-- [ ] VIS-1 — Capture module
+- [~] VIS-1 — Capture module *(console live-camera preview done: ui::camera with a File source (any capture app writing frames to disk — verified) + a real webcam backend via nokhwa behind the `camera` feature (compiles all platforms here; runs on the operator's machine). CLI `pcbforge cam --list/--grab` + the opencv path per the original spec still pending — see decisions.md)*
 - [ ] VIS-2 — Intrinsics calibration
 - [ ] VIS-3 — Bed homography
 - [x] VIS-4 — Fiducial detectors *(vision::find_fiducials; synthetic done-when met (<0.15 px); px↔mm parameterized as BedMap pending VIS-3; live annuli check operator-side — see decisions.md)*
@@ -105,5 +105,6 @@ done-when. Task prompts live in `docs/backlog.md`.
 - [x] FLD-8 — Upstream cavalier_contours findings / evaluate newer release *(0.7.0 still latest; findings + minimal repros + version-bump regression gate in docs/research/cavalier-contours-findings.md)*
 - [ ] FLD-9 — Console: stream verb output incrementally (thread + channel) instead of blocking synchronous capture
 - [ ] FLD-10 — Console live-video panel once VIS-1 lands (replace the camera stub); wire the preview panel into UI-2's AR overlay
-- [ ] FLD-11 — Fiducial-check view: swap the file frame for the live VIS-1 feed, re-detecting each frame so the operator sees it track under a board nudge
+- [ ] FLD-11 — Fiducial-check view: swap the file frame for the live VIS-1 feed, re-detecting each frame so the operator sees it track under a board nudge *(camera plumbing landed; wire the Snapshot bridge into live continuous detection)*
+- [ ] FLD-13 — `pcbforge cam --list/--grab` CLI verbs (VIS-1 CLI surface) reusing ui::camera or the opencv path
 - [ ] FLD-12 — Fiducial-check view: profile selector (DARK_DOT/ANNULUS/BACKLIT) + click-to-place expected fiducials; use the real VIS-3 BedMap instead of a uniform scale

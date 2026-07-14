@@ -724,3 +724,30 @@ discovered constraints here.
 - Verified: place unit tests (identity/translation placement, correspondences→
   affine roundtrip, composite footprint) + a headless Place-tab layout test. 41
   workspace test binaries green.
+
+## 2026-07-14 — Console: quote-tolerant paths + live camera preview
+
+- **Quoted paths (operator request):** file managers / drag-and-drop quote paths
+  with spaces. Added `ui::clean_path` (strips balanced surrounding '…' or "…"
+  plus whitespace) and applied it at every path input — Gerbers (job_shapes),
+  fiducial/place frames, emit/register args. Unit-tested.
+- **Live camera preview (VIS-1 surfaced):** new Camera tab (`ui::camera`) with
+  two source kinds so a preview works whatever the operator has:
+  - `Source::File` — re-read an image file each grab; any capture app that writes
+    a frame to disk drives it. Default, cross-platform, verified headless.
+  - `Source::Device(index)` — real webcam via **nokhwa** behind the `camera`
+    feature (v4l2/AVFoundation/MSMF). Chose nokhwa over the spec's opencv: pure
+    Rust, no system OpenCV, and it **compiled here for all three platform
+    backends** (runs on the operator's machine; no camera in the container).
+  - Live mode grabs each frame + `request_repaint()`; "Snapshot" saves the frame
+    to a PNG and points the Fiducial + Place tabs at it — the bridge from live
+    view into detection/placement.
+- **VIS-1 deviation logged:** the original spec wanted opencv videoio + a
+  `pcbforge cam --list/--grab` CLI. Delivered the *capability* in the console via
+  nokhwa instead; the CLI verbs + opencv path remain (FLD-13). VIS-1 marked
+  `[~]`. Live continuous fiducial detection off the feed is FLD-11.
+- Verified: clean_path tests, camera File-source grab (incl. quoted path),
+  device-without-feature message, and a headless Camera-tab grab→snapshot flow
+  that lands the frame in the Fiducial/Place tabs. clippy clean with and without
+  the `camera` feature; 41 workspace test binaries green; `--features camera`
+  builds (nokhwa, 31 s).

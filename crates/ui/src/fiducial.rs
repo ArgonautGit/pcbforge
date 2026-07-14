@@ -85,13 +85,14 @@ pub fn check(
     diameter_mm: f64,
     search_mm: f64,
 ) -> Result<FidResult, String> {
-    if path.trim().is_empty() {
+    let path = crate::clean_path(path);
+    if path.is_empty() {
         return Err("set a frame image path (a saved camera grab or a photo)".into());
     }
     if px_per_mm <= 0.0 {
         return Err("px per mm must be positive".into());
     }
-    let frame = image::open(path.trim())
+    let frame = image::open(&path)
         .map_err(|e| format!("open {path}: {e}"))?
         .to_luma8();
     Ok(check_frame(
