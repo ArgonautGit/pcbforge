@@ -1012,3 +1012,26 @@ operator before building):
   the runlog), and a new walk drives a double-sided board across process
   restarts through the whole bottom flow, asserting the branch, the prompt
   text, and the `ablate-bottom` emit intent.
+
+## 2026-07-14 — ORC-7 guided drilling (software half)
+
+- `pcbforge drill-guide` (cli::drillguide + verb): one invocation per step, the
+  `pcbforge next` pattern — a small text state file (v1 header, fingerprint,
+  pending index) makes the flow restart-safe, and an FNV fingerprint of the
+  ordered hole list rejects progress carried over from a *different* drill file
+  instead of silently mis-pairing indices.
+- Ordering: largest bit first (one bit change per size, the spec's
+  "largest-bit-first"), ties by (y, x) for a stable walkable path. G85 slots
+  contribute both endpoints per ING-2's documented drill-then-file workflow.
+- Confirmation: VIS-4's dark-dot detector at the bit diameter, gated at
+  ≤ `--tol-um` (default 150 µm per the spec) around the target; an undrilled or
+  misplaced hole exits non-zero and does not advance. The frame is the
+  registered view at a uniform `--px-per-mm` (pre-VIS-3 contract, same as the
+  fiducial check).
+- Overlay PNG per step (and as the final archive): confirmed holes ringed
+  green, current target crosshaired red, remaining dim; bit changes prompted
+  ("fit the 0.40 mm bit"). Verified visually and by unit + e2e tests — the e2e
+  walks a 3-hole board across process invocations including the refusal and the
+  stale-state error.
+- Live done-when (a real 20-hole board, every hole confirmed) is operator-side;
+  the ≤150 µm gate and overlay archive are exactly what that run needs.

@@ -62,7 +62,7 @@ done-when. Task prompts live in `docs/backlog.md`.
 - [x] ORC-4 — Airflow interlock *(live block-the-duct gate deferred to docs/checklists/orc-4-airflow-live.md)*
 - [ ] ORC-5 — Cross-machine handoff
 - [~] ORC-6 — Double-sided flip flow *(software half done: `cam::flip` (mirror-X + f-theta beam entry→exit parallax `r·(1+t/f)`), `pcbforge emit --mirror-x`, console **Front/Back** selector (back gerbers, thickness/focal, scan-center auto/override; mirrored job in preview/AR/Place; fiducial markers carry mirror+offset), and the **stage engine branch**: `StageKind::Flip` + `next_alt` — single-sided boards pass `flip`→`done`, double-sided (`PCBFORGE_DOUBLE_SIDED=1` bring-up signal) branch through `fiducials_bottom`→`bulk_bottom`→`iso_check_bottom`, walk-tested across restarts. The live ≤20 µm / bottom-cross ≤50 µm done-when is hardware-gated; scan-center default = fiducial centroid pending VIS-3 — see decisions.md)*
-- [ ] ORC-7 — Guided drilling
+- [~] ORC-7 — Guided drilling *(software half done: `pcbforge drill-guide` — Excellon holes ordered largest-bit-first (slots drill both ends), one invocation per step with a text state file (restart-safe, fingerprint guards stale progress), VIS-4 dark-hole confirmation gated at ≤150 µm before advancing, overlay PNG mapping confirmed/current/remaining + bit-change prompts. Unit + e2e walk (undrilled hole refuses; final archive). The live 20-hole done-when is operator-side — see decisions.md)*
 - [ ] ORC-8 — Mask-open inspection stage
 
 ## WS-UI — Operator console

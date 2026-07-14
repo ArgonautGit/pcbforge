@@ -13,6 +13,8 @@ use std::process::ExitCode;
 
 use clap::{Parser, Subcommand};
 
+mod drillguide;
+
 use orchestra::db::Db;
 use orchestra::engine::{self, BoardDefaults, EnvPalletSource, ExecutorRegistry, StepReport};
 use orchestra::stages::StageGraph;
@@ -301,6 +303,42 @@ enum Command {
         #[arg(long)]
         file: Option<String>,
     },
+    /// Guided hand-drilling (ORC-7): step through every Excellon hole largest
+    /// bit first. Each invocation confirms the previously-prompted hole on a
+    /// camera frame (a dark hole within --tol-um of target) before advancing,
+    /// and writes an overlay PNG mapping confirmed/current/remaining holes.
+    DrillGuide {
+        /// Excellon drill file (.drl).
+        #[arg(long)]
+        drills: PathBuf,
+
+        /// Registered camera frame (PNG/JPEG) to confirm the pending hole on
+        /// and to draw the overlay over. Optional on the first invocation.
+        #[arg(long)]
+        frame: Option<PathBuf>,
+
+        /// Progress state file (created on first run; delete to restart).
+        #[arg(long, default_value = "drill-guide-state.txt")]
+        state: PathBuf,
+
+        /// Overlay PNG output path.
+        #[arg(long, default_value = "drill-guide.png")]
+        overlay: PathBuf,
+
+        /// Uniform frame scale, px per mm (pre-VIS-3 contract, as in the
+        /// fiducial check).
+        #[arg(long)]
+        px_per_mm: f64,
+
+        /// Confirmation gate: detected hole center must sit within this many
+        /// µm of the target.
+        #[arg(long, default_value_t = 150.0)]
+        tol_um: f64,
+
+        /// Detector search radius around the target, mm.
+        #[arg(long, default_value_t = 1.0)]
+        search_mm: f64,
+    },
 }
 
 fn main() -> ExitCode {
@@ -441,6 +479,29 @@ fn run(cli: &Cli) -> Result<(), Box<dyn std::error::Error>> {
             device,
             file,
         } => cam_cmd(*list, grab.as_deref(), *device, file.as_deref()),
+        Command::DrillGuide {
+            drills,
+            frame,
+            state,
+            overlay,
+            px_per_mm,
+            tol_um,
+            search_mm,
+        } => {
+            let lines = drillguide::step(
+                drills,
+                frame.as_deref(),
+                state,
+                overlay,
+                *px_per_mm,
+                *tol_um,
+                *search_mm,
+            )?;
+            for l in lines {
+                println!("{l}");
+            }
+            Ok(())
+        }
     }
 }
 
