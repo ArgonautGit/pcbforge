@@ -71,13 +71,18 @@ pub fn bbox_center_mm(shapes: &[Poly]) -> (f64, f64) {
 }
 
 /// Alpha-blend the placed job over the bed `frame`. The job `shapes` (Gerber
-/// mm) are mapped through the placement to bed mm, then to pixels via
-/// `px_per_mm`, and even-odd filled in a translucent `color`.
+/// mm) are mapped through the placement to bed mm, then to pixels, and even-odd
+/// filled in a translucent `color`.
+///
+/// bed-mm → pixels uses the perspective `homography` (bed/design-mm → pixel)
+/// when the camera is tilted, so the overlay keystones onto the board in the
+/// image; otherwise it falls back to a uniform `px_per_mm` scale.
 pub fn composite(
     frame: &GrayImage,
     shapes: &[Poly],
     placement: &Placement,
     px_per_mm: f64,
+    homography: Option<&vision::Homography>,
     color: [u8; 3],
     alpha: f64,
 ) -> ColorImage {
@@ -85,13 +90,19 @@ pub fn composite(
     let mut px: Vec<Color32> = frame.pixels().map(|p| Color32::from_gray(p[0])).collect();
 
     let a = placement.affine();
-    // Gerber-nm point → bed-px.
+    // Gerber-nm point → bed-mm (placement) → bed-px (perspective or uniform).
     let to_px = |gx_nm: i64, gy_nm: i64| -> (f64, f64) {
         let x = gx_nm as f64 / NM_PER_MM as f64;
         let y = gy_nm as f64 / NM_PER_MM as f64;
         let bx = a[0] * x + a[1] * y + a[2];
         let by = a[3] * x + a[4] * y + a[5];
-        (bx * px_per_mm, by * px_per_mm)
+        match homography {
+            Some(hgt) => {
+                let p = hgt.apply(nalgebra::Point2::new(bx, by));
+                (p.x, p.y)
+            }
+            None => (bx * px_per_mm, by * px_per_mm),
+        }
     };
     let (cr, cg, cb) = (color[0] as f64, color[1] as f64, color[2] as f64);
     let blend = |dst: Color32| {
@@ -241,6 +252,33 @@ mod tests {
     }
 
     #[test]
+    fn composite_applies_perspective_homography() {
+        use nalgebra::Matrix3;
+        let frame = GrayImage::from_pixel(200, 200, image::Luma([120]));
+        let job = [sq(0, 0, MM)]; // 2 mm square centered at gerber origin
+        let p = Placement {
+            tx_mm: 10.0,
+            ty_mm: 10.0,
+            rot_deg: 0.0,
+            pivot_mm: (0.0, 0.0),
+        };
+        // Homography = a pure 8 px/mm scale (bed-mm (10,10) → px (80,80)),
+        // deliberately different from the uniform 10 px/mm fallback (→100,100).
+        let hgt = vision::Homography {
+            matrix: Matrix3::new(8.0, 0.0, 0.0, 0.0, 8.0, 0.0, 0.0, 0.0, 1.0),
+            residuals: vec![],
+            rms: 0.0,
+        };
+        let img = composite(&frame, &job, &p, 10.0, Some(&hgt), [200, 60, 60], 0.9);
+        let red = |x: usize, y: usize| img.pixels[y * 200 + x].r() > 150;
+        assert!(
+            red(80, 80),
+            "footprint sits at the homography-mapped location"
+        );
+        assert!(!red(100, 100), "not at the uniform-scale location");
+    }
+
+    #[test]
     fn composite_marks_the_placed_footprint() {
         // 100×100 px frame at 10 px/mm; place a 2 mm square's pivot at (5,5) mm
         // → px (50,50). The blended color must appear there and not at a corner.
@@ -252,7 +290,7 @@ mod tests {
             rot_deg: 0.0,
             pivot_mm: (0.0, 0.0),
         };
-        let img = composite(&frame, &job, &p, 10.0, [200, 60, 60], 0.5);
+        let img = composite(&frame, &job, &p, 10.0, None, [200, 60, 60], 0.5);
         let at = |x: usize, y: usize| img.pixels[y * 100 + x];
         // Center (50,50) is inside the placed square → reddish (r raised).
         assert!(at(50, 50).r() > 150, "footprint tinted at center");

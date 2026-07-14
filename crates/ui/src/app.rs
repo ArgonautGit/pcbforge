@@ -78,6 +78,8 @@ pub struct ConsoleApp {
     fid_search: Vec<(f64, f64)>,
     fid_found: Vec<Option<(f64, f64)>>,
     fid_drag: Option<usize>,
+    /// design/bed-mm → pixel perspective fit (≥4 fiducials); shared with Place.
+    fid_homography: Option<vision::Homography>,
 
     // drag-to-place
     place_frame: String,
@@ -136,6 +138,7 @@ impl ConsoleApp {
             fid_search: Vec::new(),
             fid_found: Vec::new(),
             fid_drag: None,
+            fid_homography: None,
             place_frame: String::new(),
             place_px_per_mm: 10.0,
             place_tx_mm: 0.0,
@@ -258,6 +261,37 @@ impl ConsoleApp {
         self.fid_note = format!("{s} strong, {w} weak, {m} missed{scale}");
         self.fid_rows = r.rows;
         self.fid_found = r.found_px;
+
+        // Perspective: with ≥4 detected fiducials, fit the design→pixel
+        // homography (a tilted camera keystones the flat board). It corrects
+        // the Place overlay and any downstream mapping; <4 can only be affine.
+        let design = fiducial::parse_layout(&self.fid_layout).unwrap_or_default();
+        let corr: Vec<_> = design
+            .iter()
+            .zip(&self.fid_found)
+            .filter_map(|(&(dx, dy), f)| {
+                f.map(|(px, py)| (nalgebra::Point2::new(dx, dy), nalgebra::Point2::new(px, py)))
+            })
+            .collect();
+        self.fid_homography = if corr.len() >= 4 {
+            match vision::fit_homography(&corr) {
+                Ok(hgt) => {
+                    self.fid_note
+                        .push_str(&format!("  ·  perspective fit (reproj {:.2} px)", hgt.rms));
+                    Some(hgt)
+                }
+                Err(e) => {
+                    self.fid_note.push_str(&format!("  ·  perspective: {e}"));
+                    None
+                }
+            }
+        } else {
+            if !corr.is_empty() {
+                self.fid_note
+                    .push_str("  ·  add a 4th fiducial for perspective");
+            }
+            None
+        };
     }
 
     /// Current manual placement.
@@ -311,11 +345,17 @@ impl ConsoleApp {
             &self.place_job,
             &self.placement(),
             self.place_px_per_mm,
+            self.fid_homography.as_ref(),
             [0xf0, 0x50, 0x30],
             0.55,
         );
+        let persp = if self.fid_homography.is_some() {
+            " · perspective"
+        } else {
+            ""
+        };
         self.place_note = format!(
-            "placed at ({:.1}, {:.1}) mm, {:.0}°",
+            "placed at ({:.1}, {:.1}) mm, {:.0}°{persp}",
             self.place_tx_mm, self.place_ty_mm, self.place_rot_deg
         );
         self.place_tex = Some(ctx.load_texture("place", img, TextureOptions::NEAREST));

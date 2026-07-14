@@ -799,3 +799,32 @@ discovered constraints here.
   marker (out of the 2 mm window) and **found** after the marker is moved onto
   it — the core value. Plus `nearest_marker` unit test. clippy clean (default +
   camera); 41 workspace binaries.
+
+## 2026-07-14 — Perspective (homography) from fiducials
+
+- Operator: the camera is tilted, so the fiducials must account for perspective.
+  Confirmed the pipeline was affine-only: detection used a uniform-scale BedMap
+  and registration fit a 2N×6 affine (translation/rotation/scale/shear) — no
+  keystone. A homography is 8 DOF and needs **≥4** non-collinear points; the
+  operator's 3-hole L-layout can only ever fix an affine, so this needs a 4th
+  fiducial (told them so).
+- Built `vision::fit_homography` — normalized DLT (Hartley) with `Homography`
+  {matrix, residuals, rms}, `apply` (perspective divide), `try_inverse`. Tests:
+  recovers a known keystone (rms<1e-9), the case that proves the point (an
+  affine fit leaves rms>0.5 where the homography is exact), inverse round-trip,
+  sub-pixel-noise robustness, too-few/degenerate errors.
+- **Solver bug caught by the visual proof:** for exactly 4 points `A` is 8×9 and
+  nalgebra's thin SVD drops the null-space vector (the 5-point tests passed, 4
+  didn't — the example rendered garbage, rms 152). Fixed by solving `A·h=0` via
+  the smallest eigenvector of `AᵀA` (always 9×9). rms→0 and the keystone renders
+  correctly.
+- Integration: the fiducial tab fits the design→pixel homography when ≥4
+  fiducials are detected (reports reprojection RMS; "add a 4th fiducial for
+  perspective" with 3), stored app-wide. `place::composite` gained an optional
+  homography — the Place overlay now keystones onto the tilted board in the
+  camera image (bed-mm→px via the homography instead of a uniform scale). Proof:
+  `dump_place … persp` renders the uv_test job warped through a keystone.
+- Honest scope: this perspective-corrects the **camera view** (detection,
+  measurement, the Place overlay). Absolute laser-coordinate registration under
+  tilt still needs the camera↔laser/bed calibration (VIS-3, hardware) — the
+  fiducial homography rectifies what the camera sees, not where the galvo burns.

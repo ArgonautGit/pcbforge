@@ -32,7 +32,32 @@ fn main() {
     };
     println!("register correspondences: {}", placement.correspondences());
 
-    let img = ui::composite(&frame, &ablate, &placement, ppm, [0xf0, 0x50, 0x30], 0.55);
+    // With a 4th arg "persp", build a keystone homography (bed-mm → px) as a
+    // tilted camera would see the bed, and warp the overlay through it.
+    let hgt = if a.get(4).map(String::as_str) == Some("persp") {
+        use nalgebra::Point2;
+        // A 60×50 mm bed rectangle imaged with a mild keystone (top edge
+        // narrower than the bottom — a camera tilted forward).
+        let corr = [
+            (Point2::new(0.0, 0.0), Point2::new(180.0, 110.0)),
+            (Point2::new(60.0, 0.0), Point2::new(460.0, 110.0)),
+            (Point2::new(60.0, 50.0), Point2::new(520.0, 380.0)),
+            (Point2::new(0.0, 50.0), Point2::new(120.0, 380.0)),
+        ];
+        Some(ui::fit_homography(&corr).expect("keystone homography"))
+    } else {
+        None
+    };
+
+    let img = ui::composite(
+        &frame,
+        &ablate,
+        &placement,
+        ppm,
+        hgt.as_ref(),
+        [0xf0, 0x50, 0x30],
+        0.55,
+    );
     let [ow, oh] = img.size;
     let mut buf = image::RgbaImage::new(ow as u32, oh as u32);
     for (i, px) in img.pixels.iter().enumerate() {

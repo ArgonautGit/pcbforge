@@ -36,6 +36,7 @@ pub use fiducial::{
 pub use place::{Placement, bbox_center_mm, composite};
 pub use preview::{Layer, rasterize};
 pub use status::{BoardStatus, StatusSnapshot, snapshot};
+pub use vision::{Homography, fit_homography};
 
 /// Launch the native windowed console. Requires the `native` feature (pulls in
 /// `eframe`) and a display with GL/X11 — headless/CI builds use the egui-only
