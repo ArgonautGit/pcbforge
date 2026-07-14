@@ -33,6 +33,29 @@ Update it whenever a live burn teaches something.
 
 ## Machine / operator facts
 
+> **CORRECTION (2026-07-14): the production laser is the ComMarker Omni X — a
+> 355 nm UV galvo, NOT a fiber MOPA.** Full research + citations in
+> `docs/research/commarker-omni-x.md`. Headlines:
+> - **355 nm UV, ~5 W** (6/12 W variants exist — confirm the unit). Cold
+>   ablation ⇒ small HAZ, minimal char, < 50 µm tolerances — this *defuses*
+>   the fiber-era char/HAZ worry. UV is well-absorbed by copper *and* FR4.
+> - Controller is still **JCZ / XY2-100** (EZCAD/BJJCZ family, loads
+>   `.cor` + `markcfg7`) — same lineage as the assumed B4 — so **the DRV USB
+>   method transfers**; retarget device B4 → Omni X, LightBurn profile
+>   **Seacad/UV** (not fiber). DRV-7's "is Seacad tractable?" is answered: yes.
+> - LightBurn: **"Seacad" device class, laser type UV, Galvo 2 as X axis,
+>   door port 1, freq 20–200 kHz, pulse 1–50 ns, LightBurn ≥ 1.3.01**, USB.
+> - **RES-4 fiber benchmarks do NOT transfer**; a UV recipe must come from the
+>   operator's own ladder (VIS-9). Emit defaults (30 kHz, 1–5 ns) sit inside the
+>   UV ranges but the "power fixed at 20 %"/MOPA framing was derived on the
+>   `BSLFiber` device and needs re-checking on the Seacad/UV profile.
+> - **RESOLVED (operator, 2026-07-14): it is the 355 nm UV Omni X, and the
+>   LightBurn device is merely *named* `BSLFiber`.** The name is a free-text
+>   label on a UV machine — do not re-open the fiber question. The emit default
+>   `DEFAULT_DEVICE = "BSLFiber"` is correct (it must match the LightBurn device
+>   name), so keep it. The UV cold-ablation facts above are load-bearing; the
+>   fiber/RES-4 model does not apply.
+
 - **MOPA fluence knobs are Q-pulse width + frequency**, not Max Power % (the
   power field sits fixed at 20 and is greyed in the operator's Cut Settings
   Editor). Peak power ≈ P_avg / (frequency × pulse_width). Operator runs

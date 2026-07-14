@@ -579,3 +579,35 @@ discovered constraints here.
 - DRV-2..8 remain hard-blocked on the real captures (evidence-only decode —
   the prompt forbids filling protocol fields by analogy). DRV-1 is the unblock:
   its output is the entire input to DRV-2.
+
+## 2026-07-14 — Machine identity correction: Omni X (UV), not B4 (fiber)
+
+- Operator corrected that the production laser is the **ComMarker Omni X**, a
+  **355 nm UV galvo**, not the "ComMarker B4" fiber MOPA the backlog/RES-4 were
+  written around. Researched with citations → `docs/research/commarker-omni-x.md`;
+  headline facts propagated to `docs/field-notes.md`.
+- Reconciling finding: the Omni X is still a **JCZ / XY2-100** controller
+  (EZCAD/BJJCZ family, `.cor` + `markcfg7`), the *same lineage* as the B4, so the
+  DRV reverse-engineering method and the DRV-1 capture kit transfer directly —
+  retarget the device (B4 → Omni X) and the LightBurn profile (fiber → Seacad/UV).
+  DRV-7's open question ("is a Seacad clean-room driver tractable?") is answered:
+  yes, it's JCZ, so DRV-7 folds into the main DRV-1..6 track rather than being a
+  stretch side-quest.
+- Process consequence: 355 nm UV is **cold ablation** — high absorption in
+  copper and FR4, small HAZ, minimal char, < 50 µm tolerances. This substantially
+  defuses the fiber-era char/HAZ concern (and the operator's earlier HAZ
+  question). But **RES-4's fiber copper-ablation benchmarks do not transfer**; a
+  UV recipe must be found empirically via the VIS-9 ladder. RES-4 should be
+  re-headed fiber-only/archival. Throughput/max-copper-thickness at 5–12 W UV is
+  unknown — do not assume industrial-depaneling tolerances at this power.
+- **Resolved same day (operator):** the machine is the 355 nm UV Omni X, and
+  its LightBurn device is merely *named* `BSLFiber` (a label on a UV machine, not
+  a fiber source). So: keep `DEFAULT_DEVICE = "BSLFiber"` (the .lbrn2 root
+  `DeviceName` must match the LightBurn device name); the UV research is
+  load-bearing; the earlier MOPA-fluence behavior belongs to the UV laser's
+  1–50 ns / 20–200 kHz regime. Asked before assuming (process lesson from the
+  NonConductor episode) — the answer flipped the wavelength question cleanly.
+- Did NOT bulk-rewrite the backlog's B4/"jcz-protocol" naming or re-head RES-4 in
+  this pass — those are broad edits worth doing deliberately; captured as a
+  follow-up rather than churned now. The DRV method still applies (Omni X is
+  JCZ/XY2-100); the naming is cosmetic.
