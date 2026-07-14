@@ -66,7 +66,7 @@ done-when. Task prompts live in `docs/backlog.md`.
 - [ ] ORC-8 — Mask-open inspection stage
 
 ## WS-UI — Operator console
-- [x] UI-1 — egui console skeleton *(crates/ui; egui-only core verified headless (11 tests incl. full-frame layout), eframe binary behind `native` (compiles here, needs a display to run). Status panel from SQLite + actions shelling `pcbforge` verbs + rasterized job preview (verified on the real board) + stubbed camera. Gaps: live-video panel pending VIS-1; verb output is synchronous-captured not async-streamed — see decisions.md/FLD)*
+- [x] UI-1 — egui console skeleton *(crates/ui; egui-only core verified headless (17 tests incl. full-frame layout), eframe binary behind `native` (compiles here, needs a display to run). Status panel from SQLite + actions shelling `pcbforge` verbs + rasterized job preview + **Fiducial-check view (VIS-4 overlay: expected crosshairs / detected rings by confidence / miss reasons)** — both verified on real/synthetic images. Gaps: live-video panel pending VIS-1; verb output synchronous not async-streamed — see decisions.md/FLD)*
 - [ ] UI-2 — AR overlay
 - [ ] UI-3 — Wizard panels
 - [ ] UI-4 — Escalation viewer
@@ -105,3 +105,5 @@ done-when. Task prompts live in `docs/backlog.md`.
 - [x] FLD-8 — Upstream cavalier_contours findings / evaluate newer release *(0.7.0 still latest; findings + minimal repros + version-bump regression gate in docs/research/cavalier-contours-findings.md)*
 - [ ] FLD-9 — Console: stream verb output incrementally (thread + channel) instead of blocking synchronous capture
 - [ ] FLD-10 — Console live-video panel once VIS-1 lands (replace the camera stub); wire the preview panel into UI-2's AR overlay
+- [ ] FLD-11 — Fiducial-check view: swap the file frame for the live VIS-1 feed, re-detecting each frame so the operator sees it track under a board nudge
+- [ ] FLD-12 — Fiducial-check view: profile selector (DARK_DOT/ANNULUS/BACKLIT) + click-to-place expected fiducials; use the real VIS-3 BedMap instead of a uniform scale

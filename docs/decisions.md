@@ -639,3 +639,27 @@ discovered constraints here.
   (`preview_image` inverts copper via `cam::noncopper`, a pure geometry
   function), which is a *view* concern, not a duplicate of the stage engine; the
   real job is still produced by shelling `pcbforge emit`.
+
+## 2026-07-14 — Console fiducial-check view (VIS-4 surfaced in UI-1)
+
+- Operator request: a preview that shows where fiducials are being detected so
+  they can confirm correctness before trusting registration. Planned in
+  docs/plans/ui-fiducial-check.md (approved), implemented in crates/ui
+  (`fiducial.rs` + a Fiducials tab in `app.rs`); no change to `vision` — VIS-4's
+  `find_fiducials` is used as-is.
+- The overlay is rasterized into an `egui::ColorImage` (cyan expected
+  crosshairs, green/amber detected rings by confidence, red ✕ + reason on
+  misses) rather than drawn with egui-painter vectors — same rationale as the
+  job preview: a ColorImage is verifiable headless (dumped to PNG, pixel-
+  asserted) and shown to the operator, and reuses the console's texture path.
+- Verified: 6 fiducial unit tests (operator L-layout all-found + green marks;
+  low-contrast → MISS row naming the SNR; a decoy 2.5 mm off is NOT marked;
+  layout parser; input guards) + a headless Fiducials-tab layout test. The
+  `dump_fiducials` example renders the overlay on a synthetic field-photo-like
+  frame (holes + glare + decoy): 3 strong, ~500 µm offsets matching the seeded
+  board nudge, decoy correctly unmarked.
+- Two pre-VIS deferrals, tracked and stated in-UI: the frame is a *file* (saved
+  grab / photo) until VIS-1 gives a live feed (FLD-11), and px↔mm is a uniform
+  `BedMap::uniform_scale` until VIS-3 gives the real homography (FLD-12). The
+  overlay/detection code takes a real `BedMap` and live frame unchanged when
+  those land.

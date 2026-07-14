@@ -8,10 +8,14 @@
 //! `native` feature (see `src/main.rs`), which needs a display + GL/X11.
 
 mod app;
+mod fiducial;
 mod preview;
 mod status;
 
 pub use app::{ConsoleApp, LogLine, preview_image, run_capture};
+pub use fiducial::{
+    FidKind, FidResult, FidRow, check as fiducial_check, check_frame, parse_layout,
+};
 pub use preview::{Layer, rasterize};
 pub use status::{BoardStatus, StatusSnapshot, snapshot};
 

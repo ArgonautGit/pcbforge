@@ -12,6 +12,7 @@ use std::path::PathBuf;
 use egui::{Color32, ColorImage, Context, TextureHandle, TextureOptions};
 use pcb_core::{NM_PER_MM, Nm};
 
+use crate::fiducial::{self, FidKind, FidRow};
 use crate::preview::{self, Layer};
 use crate::status::{self, StatusSnapshot};
 
@@ -23,6 +24,13 @@ pub struct LogLine {
     pub err: bool,
 }
 
+/// Which view the central panel shows.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum CentralTab {
+    Job,
+    Fiducials,
+}
+
 /// The console application state.
 pub struct ConsoleApp {
     /// Path to the orchestra SQLite DB (`--db`).
@@ -31,6 +39,7 @@ pub struct ConsoleApp {
     pub pcbforge_bin: String,
     status: StatusSnapshot,
     log: Vec<LogLine>,
+    tab: CentralTab,
 
     // emit form
     emit_copper: String,
@@ -38,9 +47,19 @@ pub struct ConsoleApp {
     emit_lbrn2: String,
     offset_mm: f64,
 
-    // preview
+    // job preview
     preview_tex: Option<TextureHandle>,
     preview_note: String,
+
+    // fiducial check
+    fid_frame: String,
+    fid_layout: String,
+    fid_px_per_mm: f64,
+    fid_diameter_mm: f64,
+    fid_search_mm: f64,
+    fid_tex: Option<TextureHandle>,
+    fid_note: String,
+    fid_rows: Vec<FidRow>,
 }
 
 impl ConsoleApp {
@@ -54,12 +73,22 @@ impl ConsoleApp {
             pcbforge_bin: pcbforge_bin.into(),
             status,
             log: Vec::new(),
+            tab: CentralTab::Job,
             emit_copper: String::new(),
             emit_outline: String::new(),
             emit_lbrn2: "job.lbrn2".into(),
             offset_mm: 0.0,
             preview_tex: None,
             preview_note: "Set a copper Gerber and click “Render preview”.".into(),
+            fid_frame: String::new(),
+            // Default to the operator's drilled-hole L-layout (field photo).
+            fid_layout: "10,10; 60,10; 10,60".into(),
+            fid_px_per_mm: 10.0,
+            fid_diameter_mm: 1.0,
+            fid_search_mm: 2.0,
+            fid_tex: None,
+            fid_note: "Load a frame (camera grab / photo) and click “Check fiducials”.".into(),
+            fid_rows: Vec::new(),
         }
     }
 
@@ -95,6 +124,39 @@ impl ConsoleApp {
             Err(e) => {
                 self.preview_tex = None;
                 self.preview_note = e;
+            }
+        }
+    }
+
+    /// Run VIS-4 fiducial detection on the loaded frame and build the overlay.
+    pub fn render_fiducials(&mut self, ctx: &Context) {
+        let expected = match fiducial::parse_layout(&self.fid_layout) {
+            Ok(e) => e,
+            Err(e) => {
+                self.fid_tex = None;
+                self.fid_rows.clear();
+                self.fid_note = format!("layout: {e}");
+                return;
+            }
+        };
+        match fiducial::check(
+            &self.fid_frame,
+            &expected,
+            self.fid_px_per_mm,
+            self.fid_diameter_mm,
+            self.fid_search_mm,
+        ) {
+            Ok(r) => {
+                let (s, w, m) = r.tally;
+                self.fid_note = format!("{s} strong, {w} weak, {m} missed");
+                self.fid_rows = r.rows;
+                self.fid_tex =
+                    Some(ctx.load_texture("fiducials", r.overlay, TextureOptions::NEAREST));
+            }
+            Err(e) => {
+                self.fid_tex = None;
+                self.fid_rows.clear();
+                self.fid_note = e;
             }
         }
     }
@@ -249,9 +311,19 @@ impl ConsoleApp {
     }
 
     fn preview_panel(&mut self, ui: &mut egui::Ui) {
-        ui.heading("Job preview");
-        ui.label(egui::RichText::new(&self.preview_note).weak());
+        ui.horizontal(|ui| {
+            ui.selectable_value(&mut self.tab, CentralTab::Job, "🖼 Job preview");
+            ui.selectable_value(&mut self.tab, CentralTab::Fiducials, "🎯 Fiducial check");
+        });
         ui.separator();
+        match self.tab {
+            CentralTab::Job => self.job_view(ui),
+            CentralTab::Fiducials => self.fiducial_view(ui),
+        }
+    }
+
+    fn job_view(&mut self, ui: &mut egui::Ui) {
+        ui.label(egui::RichText::new(&self.preview_note).weak());
         if let Some(tex) = &self.preview_tex {
             egui::ScrollArea::both().show(ui, |ui| {
                 ui.add(
@@ -260,7 +332,71 @@ impl ConsoleApp {
                 );
             });
         } else {
-            ui.weak("(no preview rendered)");
+            ui.weak("(no preview rendered — see the Actions panel)");
+        }
+    }
+
+    fn fiducial_view(&mut self, ui: &mut egui::Ui) {
+        egui::Grid::new("fid-form")
+            .num_columns(2)
+            .spacing([8.0, 6.0])
+            .show(ui, |ui| {
+                ui.label("frame image");
+                ui.add(egui::TextEdit::singleline(&mut self.fid_frame).desired_width(240.0));
+                ui.end_row();
+                ui.label("expected (x,y mm; …)");
+                ui.add(egui::TextEdit::singleline(&mut self.fid_layout).desired_width(240.0));
+                ui.end_row();
+                ui.label("px per mm");
+                ui.add(
+                    egui::DragValue::new(&mut self.fid_px_per_mm)
+                        .speed(0.1)
+                        .range(0.1..=1000.0),
+                );
+                ui.end_row();
+                ui.label("hole ⌀ mm");
+                ui.add(
+                    egui::DragValue::new(&mut self.fid_diameter_mm)
+                        .speed(0.05)
+                        .range(0.05..=20.0),
+                );
+                ui.end_row();
+                ui.label("search mm");
+                ui.add(
+                    egui::DragValue::new(&mut self.fid_search_mm)
+                        .speed(0.1)
+                        .range(0.1..=20.0),
+                );
+                ui.end_row();
+            });
+        ui.horizontal(|ui| {
+            if ui.button("🎯 Check fiducials").clicked() {
+                let ctx = ui.ctx().clone();
+                self.render_fiducials(&ctx);
+            }
+            ui.label(egui::RichText::new(&self.fid_note).weak());
+        });
+        ui.weak("Frame is a saved camera grab or photo; becomes the live feed with VIS-1.");
+        ui.separator();
+
+        for row in &self.fid_rows {
+            let color = match row.kind {
+                FidKind::FoundStrong => Color32::from_rgb(0x50, 0xb0, 0x60),
+                FidKind::FoundWeak => Color32::from_rgb(0xe0, 0x90, 0x20),
+                FidKind::Miss => Color32::from_rgb(0xd0, 0x50, 0x50),
+            };
+            ui.colored_label(color, &row.text);
+        }
+        ui.separator();
+        if let Some(tex) = &self.fid_tex {
+            egui::ScrollArea::both().show(ui, |ui| {
+                ui.add(
+                    egui::Image::from_texture((tex.id(), tex.size_vec2()))
+                        .fit_to_original_size(1.0),
+                );
+            });
+        } else {
+            ui.weak("(no frame checked yet)");
         }
     }
 
@@ -435,6 +571,16 @@ mod tests {
             !out.shapes.is_empty(),
             "the console must render some shapes"
         );
+    }
+
+    /// The Fiducial-check tab lays out headless (form + summary + image slot).
+    #[test]
+    fn fiducial_tab_lays_out_headless() {
+        let mut app = ConsoleApp::new(tmp_db(), "pcbforge");
+        app.tab = CentralTab::Fiducials;
+        let ctx = Context::default();
+        let out = ctx.run(egui::RawInput::default(), |ctx| app.ui(ctx));
+        assert!(!out.shapes.is_empty(), "fiducial tab must render");
     }
 
     /// A second frame after a status refresh still lays out (state survives).
