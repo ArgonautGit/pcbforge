@@ -66,7 +66,7 @@ done-when. Task prompts live in `docs/backlog.md`.
 - [ ] ORC-8 — Mask-open inspection stage
 
 ## WS-UI — Operator console
-- [ ] UI-1 — egui console skeleton
+- [x] UI-1 — egui console skeleton *(crates/ui; egui-only core verified headless (11 tests incl. full-frame layout), eframe binary behind `native` (compiles here, needs a display to run). Status panel from SQLite + actions shelling `pcbforge` verbs + rasterized job preview (verified on the real board) + stubbed camera. Gaps: live-video panel pending VIS-1; verb output is synchronous-captured not async-streamed — see decisions.md/FLD)*
 - [ ] UI-2 — AR overlay
 - [ ] UI-3 — Wizard panels
 - [ ] UI-4 — Escalation viewer
@@ -103,3 +103,5 @@ done-when. Task prompts live in `docs/backlog.md`.
 - [x] FLD-6 — Job placement flags (`--origin-x/--origin-y/--center`) *(cam::lbrn2::place_frame; corner or bbox-center anchor)*
 - [ ] FLD-7 — `uv-base.lbrn2` when a UV device profile exists → UV schema delta
 - [x] FLD-8 — Upstream cavalier_contours findings / evaluate newer release *(0.7.0 still latest; findings + minimal repros + version-bump regression gate in docs/research/cavalier-contours-findings.md)*
+- [ ] FLD-9 — Console: stream verb output incrementally (thread + channel) instead of blocking synchronous capture
+- [ ] FLD-10 — Console live-video panel once VIS-1 lands (replace the camera stub); wire the preview panel into UI-2's AR overlay

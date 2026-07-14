@@ -9,6 +9,7 @@ members = [
     "crates/drivers",
     "crates/testkit",
     "crates/cli",
+    "crates/ui",
     "xtask",
 ]
 

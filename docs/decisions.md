@@ -611,3 +611,31 @@ discovered constraints here.
   this pass — those are broad edits worth doing deliberately; captured as a
   follow-up rather than churned now. The DRV method still applies (Omni X is
   JCZ/XY2-100); the naming is cosmetic.
+
+## 2026-07-14 — UI-1 notes (egui operator console)
+
+- **Architecture forced by the environment:** the container has the GL/X11
+  runtime `.so`s but no pkg-config dev files, and no display. So the whole UI is
+  an **egui-only library** (`crates/ui`, pure Rust — compiles and is *tested*
+  headless) and the OS window is a thin **`eframe` wrapper behind the `native`
+  feature** (`src/main.rs`, bin `pcbforge-console`). egui computes real frames
+  without a display; only eframe needs one. Result: the lib + logic are fully
+  verified here, and `--features native` even *compiles* (43 s) — it just can't
+  open a window headless.
+- **Verified:** 11 tests — the scanline even-odd preview rasterizer (holes /
+  islands / layer order), the DB status snapshot (missing-DB and fresh-DB), the
+  CLI-verb runner (`run_capture` stdout+exit and spawn-failure), and two
+  **headless full-console frame** tests (`ctx.run` lays out every panel with no
+  display, asserting tessellated output). The preview panel image was dumped to
+  PNG on the real uv_test board (via the `dump_preview` example) and matches the
+  SVG preview / KiCad screenshot exactly.
+- **UI-1 done-when coverage:** current board state ✓ (status panel), Next-stage
+  shells `pcbforge next` into the log pane ✓. Two gaps left as follow-ups:
+  (a) the **live-video panel is a stub** — VIS-1 (camera) is hardware-gated
+  (FLD-10); (b) verb output is **synchronous-captured**, not incrementally
+  streamed — the console blocks for the verb's duration (FLD-9, thread+channel).
+- **Constraint honored:** the actions panel only *shells the CLI* — no engine
+  logic in the UI. The one in-process computation is the preview rasterization
+  (`preview_image` inverts copper via `cam::noncopper`, a pure geometry
+  function), which is a *view* concern, not a duplicate of the stage engine; the
+  real job is still produced by shelling `pcbforge emit`.
