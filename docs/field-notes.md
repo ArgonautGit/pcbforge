@@ -145,5 +145,6 @@ Tracked in BACKLOG.md under "WS-FLD — Field follow-ups":
   schema).
 - FLD-6: `--origin-x/--origin-y/--center` job placement flags.
 - FLD-7: `uv-base.lbrn2` when a UV device profile exists → UV schema delta.
-- FLD-8: report cavalier findings upstream (dedupe need, #79 interaction,
-  empty-validation trap) / evaluate newer cavalier_contours.
+- FLD-8: DONE (2026-07-14) — 0.7.0 is still latest; findings, minimal repros,
+  and a version-bump regression gate are in
+  `docs/research/cavalier-contours-findings.md`.

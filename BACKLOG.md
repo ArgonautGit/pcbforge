@@ -102,4 +102,4 @@ done-when. Task prompts live in `docs/backlog.md`.
 - [ ] FLD-5 — Board cut via LightBurn's native kerf/tabs/perforation (needs one sample with those set)
 - [x] FLD-6 — Job placement flags (`--origin-x/--origin-y/--center`) *(cam::lbrn2::place_frame; corner or bbox-center anchor)*
 - [ ] FLD-7 — `uv-base.lbrn2` when a UV device profile exists → UV schema delta
-- [ ] FLD-8 — Upstream cavalier_contours findings / evaluate newer release
+- [x] FLD-8 — Upstream cavalier_contours findings / evaluate newer release *(0.7.0 still latest; findings + minimal repros + version-bump regression gate in docs/research/cavalier-contours-findings.md)*
