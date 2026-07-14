@@ -21,6 +21,12 @@ use crate::stages::{StageDef, StageGraph, StageKind};
 /// Environment variable naming the pallet's AprilTag ID for the stub source.
 pub const ENV_PALLET_TAG: &str = "PCBFORGE_PALLET_TAG";
 
+/// Environment variable marking the board on the bed as double-sided, read by
+/// the bring-up [`FlipExecutor`] (`1`/`true` → the flip stage branches into the
+/// bottom-side flow). The real signal becomes a board/design attribute once the
+/// scheduler binds real designs.
+pub const ENV_DOUBLE_SIDED: &str = "PCBFORGE_DOUBLE_SIDED";
+
 /// The tag [`EnvPalletSource`] resolves to when `PCBFORGE_PALLET_TAG` is unset.
 pub const DEFAULT_PALLET_TAG: i64 = 1;
 
@@ -36,6 +42,8 @@ pub enum EngineError {
     Db(rusqlite::Error),
     /// The board sits at a stage name absent from the graph.
     UnknownStage(String),
+    /// An executor chose the alternate branch on a stage without `next_alt`.
+    NoAltSuccessor(String),
     /// The pallet tag could not be read.
     Pallet(PalletError),
 }
@@ -47,6 +55,10 @@ impl std::fmt::Display for EngineError {
             EngineError::UnknownStage(s) => {
                 write!(f, "board is at stage `{s}`, which is not in the graph")
             }
+            EngineError::NoAltSuccessor(s) => write!(
+                f,
+                "stage `{s}`'s executor branched (AdvanceAlt) but the stage has no `next_alt`"
+            ),
             EngineError::Pallet(e) => write!(f, "could not read pallet tag: {e}"),
         }
     }
@@ -57,7 +69,7 @@ impl std::error::Error for EngineError {
         match self {
             EngineError::Db(e) => Some(e),
             EngineError::Pallet(e) => Some(e),
-            EngineError::UnknownStage(_) => None,
+            EngineError::UnknownStage(_) | EngineError::NoAltSuccessor(_) => None,
         }
     }
 }
@@ -159,8 +171,11 @@ impl Default for BoardDefaults {
 /// What an executor decided after running against the current stage.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum StageOutcome {
-    /// The stage is done; advance to its successor.
+    /// The stage is done; advance to its default successor (`next`).
     Advance,
+    /// The stage is done via the branch: advance to `next_alt` (ORC-6's flip
+    /// stage entering the bottom-side flow). An error if the stage has none.
+    AdvanceAlt,
     /// The stage needs to run again (e.g. a clearance loop that has not
     /// converged); leave the board where it is.
     Stay,
@@ -246,20 +261,97 @@ impl StageExecutor for ClearanceLoopExecutor {
     }
 }
 
+/// How the [`FlipExecutor`] decides whether the board on the bed is
+/// double-sided (whether the flip stage branches into the bottom-side flow).
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum FlipMode {
+    /// Always single-sided: the flip stage passes straight through (`next`).
+    SingleSided,
+    /// Always double-sided: prompt the flip and branch (`next_alt`).
+    DoubleSided,
+    /// Read [`ENV_DOUBLE_SIDED`] (the bring-up operator signal, mirroring
+    /// [`EnvPalletSource`]): `1`/`true`/`yes` → double-sided.
+    FromEnv,
+}
+
+impl FlipMode {
+    fn is_double_sided(self) -> bool {
+        match self {
+            FlipMode::SingleSided => false,
+            FlipMode::DoubleSided => true,
+            FlipMode::FromEnv => env::var(ENV_DOUBLE_SIDED)
+                .map(|v| matches!(v.trim().to_ascii_lowercase().as_str(), "1" | "true" | "yes"))
+                .unwrap_or(false),
+        }
+    }
+}
+
+/// Flip decision stage (ORC-6). On a single-sided board it records that no
+/// flip is needed and takes the default path. On a double-sided board it
+/// prompts the physical flip and branches into the bottom-side stages,
+/// recording that bottom registration must use **mirror-aware expected
+/// coordinates**: the same drilled through-holes, mirrored across the flip
+/// axis with the beam entry→exit parallax applied (`cam::flip` /
+/// the console's Back side compute them; the operator confirms in the
+/// fiducial-check view).
+pub struct FlipExecutor {
+    pub mode: FlipMode,
+}
+
+impl StageExecutor for FlipExecutor {
+    fn run(&self, ctx: &mut StageCtx) -> Result<StageOutcome> {
+        if self.mode.is_double_sided() {
+            ctx.record(
+                "flip_prompt",
+                &json_detail(&[
+                    ("prompt", "Flip the board left-right for the back side"),
+                    (
+                        "registration",
+                        "expect the through-holes at mirror-aware coordinates \
+                         (mirror across the flip axis + beam entry-exit offset); \
+                         use the console's Back side / cam::flip to compute them",
+                    ),
+                ]),
+            )?;
+            Ok(StageOutcome::AdvanceAlt)
+        } else {
+            ctx.record(
+                "flip_skip",
+                &json_detail(&[("note", "single-sided board; no flip")]),
+            )?;
+            Ok(StageOutcome::Advance)
+        }
+    }
+}
+
 /// Maps each [`StageKind`] to its executor.
 pub struct ExecutorRegistry {
     manual: Box<dyn StageExecutor>,
     laser: Box<dyn StageExecutor>,
     clearance: Box<dyn StageExecutor>,
+    flip: Box<dyn StageExecutor>,
 }
 
 impl ExecutorRegistry {
     /// The default registry: the bring-up executors shipped in this module.
+    /// The flip decision reads [`ENV_DOUBLE_SIDED`].
     pub fn with_defaults() -> Self {
         Self {
             manual: Box::new(ManualExecutor),
             laser: Box::new(LaserExecutor),
             clearance: Box::new(ClearanceLoopExecutor),
+            flip: Box::new(FlipExecutor {
+                mode: FlipMode::FromEnv,
+            }),
+        }
+    }
+
+    /// A registry with an explicit flip decision (deterministic tests — env
+    /// vars are process-global and hazardous under parallel test runs).
+    pub fn with_flip_mode(mode: FlipMode) -> Self {
+        Self {
+            flip: Box::new(FlipExecutor { mode }),
+            ..Self::with_defaults()
         }
     }
 
@@ -269,6 +361,7 @@ impl ExecutorRegistry {
             StageKind::Manual => self.manual.as_ref(),
             StageKind::Laser => self.laser.as_ref(),
             StageKind::ClearanceLoop => self.clearance.as_ref(),
+            StageKind::Flip => self.flip.as_ref(),
         }
     }
 }
@@ -360,6 +453,23 @@ pub fn step(
     };
     board.stage_state = stage_state;
 
+    // Advance the board to `next`, writing the `stage_done` row.
+    let advance_to = |mut board: Board, next: String| -> Result<StepReport> {
+        db.append_runlog(
+            Some(board.id),
+            &stage_name,
+            "stage_done",
+            &json_detail(&[("to", &next)]),
+        )?;
+        board.stage = next.clone();
+        db.update_board(&board)?;
+        Ok(StepReport::Advanced {
+            board_id: board.id,
+            stage: stage_name.clone(),
+            to: next,
+        })
+    };
+
     match outcome {
         StageOutcome::Advance => {
             // `is_terminal` was false above, so `next` is Some here.
@@ -367,19 +477,17 @@ pub fn step(
                 .next
                 .clone()
                 .expect("non-terminal stage has a successor");
-            db.append_runlog(
-                Some(board.id),
-                &stage_name,
-                "stage_done",
-                &json_detail(&[("to", &next)]),
-            )?;
-            board.stage = next.clone();
-            db.update_board(&board)?;
-            Ok(StepReport::Advanced {
-                board_id: board.id,
-                stage: stage_name,
-                to: next,
-            })
+            advance_to(board, next)
+        }
+        StageOutcome::AdvanceAlt => {
+            // The branch path (ORC-6 flip → bottom-side flow). Unlike `next`,
+            // `next_alt` is optional, so an executor branching on a stage
+            // without one is a graph/executor mismatch — a hard error.
+            let next = def
+                .next_alt
+                .clone()
+                .ok_or_else(|| EngineError::NoAltSuccessor(stage_name.clone()))?;
+            advance_to(board, next)
         }
         StageOutcome::Stay => {
             // Persist any checkpointed resume data; stage is unchanged.

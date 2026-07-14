@@ -81,6 +81,12 @@ pub struct ConsoleApp {
     back_outline: String,
     board_thickness_mm: f64,
     focal_mm: f64,
+    /// Derive the scan center from the fiducial-layout centroid (default) —
+    /// the un-calibrated assumption pending VIS-3.
+    scan_center_auto: bool,
+    /// Explicit scan/field center in design mm, used when `scan_center_auto`
+    /// is off (the operator measures where the lens axis actually is).
+    scan_center_mm: (f64, f64),
 
     // job preview
     preview_tex: Option<TextureHandle>,
@@ -172,6 +178,8 @@ impl ConsoleApp {
             back_outline: String::new(),
             board_thickness_mm: 1.6,
             focal_mm: 70.0,
+            scan_center_auto: true,
+            scan_center_mm: (35.0, 35.0),
             preview_tex: None,
             preview_note: "Set a copper Gerber and click “Render preview”.".into(),
             fid_frame: String::new(),
@@ -585,11 +593,13 @@ impl ConsoleApp {
         })
     }
 
-    /// The flip axis + field optics for the back side, derived from the design
-    /// fiducial layout: mirror about the layout's vertical centerline and scale
-    /// the beam parallax about that centroid (a display-friendly default — the
-    /// mirror keeps the fiducials on-screen; the operator can refine the scan
-    /// center once VIS-3 gives the real bed map). `None` on the front.
+    /// The flip axis + field optics for the back side. The mirror is about the
+    /// fiducial layout's vertical centerline (a display choice — it keeps the
+    /// flipped markers on-screen). The beam parallax scales about the **scan
+    /// center**: the layout centroid by default (`scan_center_auto`, the
+    /// un-calibrated assumption pending VIS-3) or the operator-entered field
+    /// center when they've measured where the lens axis really is. `None` on
+    /// the front.
     fn back_field(&self) -> Option<(cam::flip::MirrorAxis, cam::flip::FieldParams)> {
         if self.side != Side::Back {
             return None;
@@ -598,10 +608,15 @@ impl ConsoleApp {
         let n = pts.len() as f64;
         let cx = pts.iter().map(|p| p.0).sum::<f64>() / n;
         let cy = pts.iter().map(|p| p.1).sum::<f64>() / n;
+        let scan_center = if self.scan_center_auto {
+            (cx, cy)
+        } else {
+            self.scan_center_mm
+        };
         Some((
             cam::flip::MirrorAxis::VerticalX { x_mm: cx },
             cam::flip::FieldParams {
-                scan_center_mm: (cx, cy),
+                scan_center_mm: scan_center,
                 thickness_mm: self.board_thickness_mm,
                 focal_mm: self.focal_mm,
             },
@@ -1026,10 +1041,33 @@ impl ConsoleApp {
                             .range(1.0..=1000.0),
                     );
                     ui.end_row();
+                    ui.label("scan center");
+                    ui.horizontal(|ui| {
+                        ui.checkbox(&mut self.scan_center_auto, "auto")
+                            .on_hover_text(
+                                "Use the fiducial-layout centroid as the lens axis. \
+                                 Uncheck and enter the measured field center once known \
+                                 (VIS-3 will calibrate it).",
+                            );
+                        if !self.scan_center_auto {
+                            ui.add(
+                                egui::DragValue::new(&mut self.scan_center_mm.0)
+                                    .speed(0.5)
+                                    .prefix("x "),
+                            );
+                            ui.add(
+                                egui::DragValue::new(&mut self.scan_center_mm.1)
+                                    .speed(0.5)
+                                    .prefix("y "),
+                            );
+                        }
+                    });
+                    ui.end_row();
                 });
             ui.weak(
                 "Back mirrors the design in X; fiducial markers carry the beam \
-                 entry→exit offset (thickness/focal) so they land on the flipped holes.",
+                 entry→exit offset (thickness/focal, about the scan center) so \
+                 they land on the flipped holes.",
             );
         }
 
@@ -2271,6 +2309,36 @@ mod tests {
             got[0].0 > 35.0,
             "left hole mirrored to the right: {:?}",
             got[0]
+        );
+    }
+
+    /// An explicit scan-center override changes the back-side parallax: with
+    /// the lens axis at a fiducial, that hole stops shifting while the others
+    /// shift more — matching the physics (no parallax on the optical axis).
+    #[test]
+    fn scan_center_override_moves_the_parallax_origin() {
+        let mut app = ConsoleApp::new(tmp_db(), vec!["true".into()]);
+        app.fid_layout = "10,10; 60,10; 10,60; 60,60".into();
+        app.set_side(Side::Back);
+
+        // Auto (centroid 35,35): every hole shifts off its plain mirror image.
+        let auto_pts = app.expected_points();
+
+        // Override: lens axis exactly on the first hole (10,10) → that hole's
+        // exit == entry, so its expected back position is the *pure* mirror.
+        app.scan_center_auto = false;
+        app.scan_center_mm = (10.0, 10.0);
+        let over_pts = app.expected_points();
+        let mirror_only = |x: f64, y: f64| (2.0 * 35.0 - x, y); // axis stays at centroid
+        let (mx, my) = mirror_only(10.0, 10.0);
+        assert!(
+            (over_pts[0].0 - mx).abs() < 1e-9 && (over_pts[0].1 - my).abs() < 1e-9,
+            "on-axis hole has no parallax: {:?} vs ({mx},{my})",
+            over_pts[0]
+        );
+        assert_ne!(
+            auto_pts[0], over_pts[0],
+            "moving the scan center changes the expectation"
         );
     }
 

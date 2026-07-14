@@ -984,3 +984,31 @@ operator before building):
 - **Scope left for hardware:** stage-engine flip stages (ORC-6 proper), and the
   live residual/bottom-cross acceptance. The geometry/optics kernel is pure and
   fully unit-tested so those slot on top unchanged.
+
+### ORC-6 continued — scan-center override + the stage-engine flip branch
+
+- **Scan-center field:** the back-side form gained a "scan center: auto" toggle.
+  Auto keeps the fiducial-centroid default; unchecked exposes x/y mm inputs for
+  the measured lens axis. Physics check in the test: with the axis put exactly
+  on a fiducial, that hole's expected back position collapses to the pure
+  mirror (no parallax on-axis) while the others keep their offset.
+- **Stage engine (the "branching successors reserved for ORC-6"):** `StageDef`
+  gained `next_alt` (validated: must name a real stage, and a branch stage must
+  keep its default `next`), and executors a `StageOutcome::AdvanceAlt`. New
+  `StageKind::Flip` / `FlipExecutor`: single-sided boards record `flip_skip` and
+  pass through to `done`; double-sided boards record a `flip_prompt` naming the
+  mirror-aware registration coordinates (mirror across the flip axis + beam
+  entry-exit offset; console Back side computes them) and branch into
+  `fiducials_bottom → bulk_bottom → iso_check_bottom → done`.
+- **Where "double-sided" lives:** the DB has no migration machinery (v1 stamp
+  only) and `stage_state` is executor-owned, so no schema change. Bring-up
+  signal is `PCBFORGE_DOUBLE_SIDED=1` read by the default registry's
+  FlipExecutor — the same pattern as `EnvPalletSource`/`PCBFORGE_PALLET_TAG`.
+  Tests inject `FlipMode::{SingleSided,DoubleSided}` explicitly (env is
+  process-global and hazardous under parallel tests). The real signal becomes a
+  board/design attribute (e.g. .gbrjob layer count via ING-5) once the
+  scheduler binds real designs — deliberately deferred.
+- Walk coverage: the single-sided walk now passes through `flip` (skip row in
+  the runlog), and a new walk drives a double-sided board across process
+  restarts through the whole bottom flow, asserting the branch, the prompt
+  text, and the `ablate-bottom` emit intent.

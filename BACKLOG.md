@@ -61,7 +61,7 @@ done-when. Task prompts live in `docs/backlog.md`.
 - [ ] ORC-3 — ClearanceLoop executor
 - [x] ORC-4 — Airflow interlock *(live block-the-duct gate deferred to docs/checklists/orc-4-airflow-live.md)*
 - [ ] ORC-5 — Cross-machine handoff
-- [~] ORC-6 — Double-sided flip flow *(software groundwork: `cam::flip` (mirror-X for the back + f-theta beam entry→exit parallax `r·(1+t/f)`), `pcbforge emit --mirror-x`, and a console **Front/Back** selector — back-side gerbers, thickness/focal inputs, mirrored job in the preview/AR/Place overlays, and fiducial markers carrying the mirror+offset so the camera finds the flipped through-holes. Verified headless + on a real board. Stage-engine integration + the live ≤20 µm / bottom-cross ≤50 µm done-when are hardware-gated; scan-center defaults to the fiducial centroid pending VIS-3 — see decisions.md)*
+- [~] ORC-6 — Double-sided flip flow *(software half done: `cam::flip` (mirror-X + f-theta beam entry→exit parallax `r·(1+t/f)`), `pcbforge emit --mirror-x`, console **Front/Back** selector (back gerbers, thickness/focal, scan-center auto/override; mirrored job in preview/AR/Place; fiducial markers carry mirror+offset), and the **stage engine branch**: `StageKind::Flip` + `next_alt` — single-sided boards pass `flip`→`done`, double-sided (`PCBFORGE_DOUBLE_SIDED=1` bring-up signal) branch through `fiducials_bottom`→`bulk_bottom`→`iso_check_bottom`, walk-tested across restarts. The live ≤20 µm / bottom-cross ≤50 µm done-when is hardware-gated; scan-center default = fiducial centroid pending VIS-3 — see decisions.md)*
 - [ ] ORC-7 — Guided drilling
 - [ ] ORC-8 — Mask-open inspection stage
 

@@ -7,8 +7,11 @@
 // A board advances through a DAG of stages. Each stage names its executor
 // kind and its successor(s). `start` is the entry; a stage with no successors
 // is terminal. The engine reads the current stage from the DB, runs its
-// executor, and advances to the (single, for now) successor. Branching
-// successors are reserved for the double-sided flip flow (ORC-6).
+// executor, and advances to `next` — or, when the executor branches
+// (AdvanceAlt), to `next_alt`. The one branch today is the double-sided flip
+// flow (ORC-6): after the top side clears, `flip` either finishes a
+// single-sided board (`next`) or prompts the physical flip and enters the
+// bottom-side stages (`next_alt`).
 //
 // Executor kinds:
 //   Manual       — an operator step the engine prompts for and records
@@ -18,6 +21,10 @@
 //                  just records intent).
 //   ClearanceLoop — the closed inspect/correct loop (ORC-3). Stubbed here:
 //                  the stub executor records a pass-through and advances.
+//   Flip         — the double-sided decision (ORC-6): single-sided boards
+//                  pass through to `next`; double-sided boards are prompted
+//                  to flip and branch to `next_alt` (bring-up signal:
+//                  PCBFORGE_DOUBLE_SIDED=1).
 
 Stages(
     entry: "fiducials",
@@ -37,6 +44,30 @@ Stages(
         "iso_check": (
             kind: ClearanceLoop,
             detail: "Inspect isolation and run correctives until clear",
+            machine: Some("fiber"),
+            next: Some("flip"),
+        ),
+        "flip": (
+            kind: Flip,
+            detail: "Single-sided: done. Double-sided: flip the board left-right for the back",
+            next: Some("done"),
+            next_alt: Some("fiducials_bottom"),
+        ),
+        "fiducials_bottom": (
+            kind: Manual,
+            detail: "Register the flipped board: the same through-holes at mirror-aware coordinates (mirror across the flip axis + beam entry-exit offset; the console's Back side computes them)",
+            next: Some("bulk_bottom"),
+        ),
+        "bulk_bottom": (
+            kind: Laser,
+            detail: "Fiber bulk copper clearance, bottom side (design mirrored in X)",
+            machine: Some("fiber"),
+            process: Some("ablate-bottom"),
+            next: Some("iso_check_bottom"),
+        ),
+        "iso_check_bottom": (
+            kind: ClearanceLoop,
+            detail: "Inspect bottom isolation and run correctives until clear",
             machine: Some("fiber"),
             next: Some("done"),
         ),
