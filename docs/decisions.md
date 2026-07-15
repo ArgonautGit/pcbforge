@@ -1312,3 +1312,26 @@ Added rich per-dot visual feedback, mirroring the camera-lens overlay.
   asserts `dots` populate with on-lattice mm + bounded residuals;
   `anchor_overlay_renders_the_machine_grid` drives the fixture through load →
   corners → fit → headless layout without panicking.
+
+## 2026-07-15 — Zoom/pan navigation for every image panel
+
+Operator asked to be able to zoom and navigate on any UI with an image (e.g.
+while placing markers): Ctrl+drag to pan, Ctrl+wheel to zoom.
+
+- New `imgview` module: a reusable `show(ui, tex, &mut ImageView)` that draws an
+  image with Ctrl+drag pan, Ctrl+wheel zoom about the cursor (egui `zoom_delta`
+  with a raw ctrl+scroll fallback), and Ctrl+double-click reset. Returns an
+  `ImageXform { panel, img_min, scale }` with `to_screen`/`to_native`, so panels
+  map native-px ↔ screen through the live view instead of the ad-hoc rect maths
+  each had inlined. Zoom is clamped to [1, 24]× (1 = fit); at fit the pan snaps
+  back to centred. `is_navigating(ui)` (Ctrl held) lets panels suppress their
+  marker click/drag so navigation never places or moves a marker.
+- Zoom math extracted to pure `xform_of` / `zoom_about` and unit-tested:
+  native↔screen round-trip, cursor-anchored zoom keeps the point under the
+  cursor fixed, and clamping to the limits.
+- Applied to all five image panels via a `ConsoleApp::show_image` helper (clones
+  the texture handle so it can take `&mut self`): calibration frame, fiducial
+  frame (drag/click/right-click now gated on !Ctrl), placement composite (plain
+  drag still repositions the job; Ctrl+drag pans), camera, and job preview. A
+  shared `NAV_HINT` line documents the controls under each. Overlays draw
+  through the transform and are clipped to the panel, so they track zoom/pan.

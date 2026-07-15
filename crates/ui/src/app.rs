@@ -22,6 +22,10 @@ use crate::fiducial::{self, FidKind, FidRow};
 use crate::preview::{self, Layer};
 use crate::status::{self, StatusSnapshot};
 
+/// Shared hint for image panels that support pan/zoom navigation.
+const NAV_HINT: &str =
+    "Navigate: Ctrl+drag to pan · Ctrl+wheel to zoom · Ctrl+double-click to reset.";
+
 /// One line of shelled-command output.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct LogLine {
@@ -245,6 +249,9 @@ pub struct ConsoleApp {
     /// Visual exaggeration of the per-dot anchor residual vectors in the
     /// laser-anchor overlay (residuals are sub-pixel on a good fit).
     anchor_resid_scale: f32,
+    /// Per-image-panel zoom/pan state (Ctrl+drag pan, Ctrl+wheel zoom), keyed by
+    /// a stable panel name so each image keeps its own view across frames.
+    image_views: std::collections::HashMap<&'static str, crate::imgview::ImageView>,
     /// Continuous re-anchoring against the (persistent) burned grid, so the
     /// calibration tracks the camera as it moves.
     calib_live: bool,
@@ -343,6 +350,7 @@ impl ConsoleApp {
             lens: None,
             lens_arrow_scale: 20.0,
             anchor_resid_scale: 30.0,
+            image_views: std::collections::HashMap::new(),
             calib_live: false,
             calib_capture: None,
             calib_capture_src: None,
@@ -1862,43 +1870,44 @@ impl ConsoleApp {
         ui.weak(
             "Click the 4 corner dots in order: lower-left, lower-right, upper-right, upper-left.",
         );
+        ui.weak(NAV_HINT);
         ui.separator();
         self.calib_frame_overlay(ui);
     }
 
+    /// Show `tex` in a Ctrl-pan / Ctrl-zoom image panel (see [`crate::imgview`]),
+    /// keyed by `key` so it keeps its own view. The texture handle is cloned so
+    /// this can take `&mut self` without borrowing a `self` field for `tex`.
+    fn show_image(
+        &mut self,
+        ui: &mut egui::Ui,
+        key: &'static str,
+        tex: &egui::TextureHandle,
+    ) -> (crate::imgview::ImageXform, egui::Response) {
+        let mut view = self.image_views.get(key).copied().unwrap_or_default();
+        let out = crate::imgview::show(ui, tex, &mut view);
+        self.image_views.insert(key, view);
+        out
+    }
+
     /// The grid frame with the operator's corner clicks and — in camera-lens
     /// mode after a fit — the per-dot distortion field (arrows) and correction
-    /// quality (dot color).
+    /// quality (dot color). Ctrl+drag pans, Ctrl+wheel zooms.
     fn calib_frame_overlay(&mut self, ui: &mut egui::Ui) {
-        let Some(tex) = &self.calib_frame_tex else {
+        let Some(tex) = self.calib_frame_tex.clone() else {
             ui.weak("(load a grid frame to mark corners)");
             return;
         };
-        let (tw, th) = (tex.size()[0] as f32, tex.size()[1] as f32);
-        let resp = ui.add(
-            egui::Image::from_texture((tex.id(), egui::vec2(tw, th)))
-                .shrink_to_fit()
-                .sense(egui::Sense::click()),
-        );
-        let rect = resp.rect;
-        let to_native = |p: egui::Pos2| {
-            (
-                ((p.x - rect.min.x) / rect.width() * tw) as f64,
-                ((p.y - rect.min.y) / rect.height() * th) as f64,
-            )
-        };
-        let to_screen = |px: f64, py: f64| {
-            egui::pos2(
-                rect.min.x + (px as f32) / tw * rect.width(),
-                rect.min.y + (py as f32) / th * rect.height(),
-            )
-        };
-        // A click adds the next corner (up to 4).
-        if resp.clicked()
+        let (xf, resp) = self.show_image(ui, "calib", &tex);
+        let rect = xf.panel;
+        let to_screen = |px: f64, py: f64| xf.to_screen(px, py);
+        // A click adds the next corner (up to 4) — unless navigating (Ctrl).
+        if !crate::imgview::is_navigating(ui)
+            && resp.clicked()
             && self.calib_corners.len() < 4
             && let Some(pos) = resp.interact_pointer_pos()
         {
-            self.calib_corners.push(to_native(pos));
+            self.calib_corners.push(xf.to_native(pos));
         }
         let painter = ui.painter_at(rect);
         let cyan = Color32::from_rgb(0x22, 0xcc, 0xdd);
@@ -1909,14 +1918,14 @@ impl ConsoleApp {
         if self.calib_mode == CalibMode::CameraLens
             && let Some(cal) = &self.lens
         {
-            let (sx, sy) = (rect.width() / tw, rect.height() / th);
+            let s = xf.scale;
             let scale = self.lens_arrow_scale;
             let magenta = Color32::from_rgb(0xd0, 0x50, 0xd0);
             for d in &cal.dots {
                 let base = to_screen(d.px.0, d.px.1);
                 let tip = egui::pos2(
-                    base.x + (d.distort_px.0 as f32) * scale * sx,
-                    base.y + (d.distort_px.1 as f32) * scale * sy,
+                    base.x + (d.distort_px.0 as f32) * scale * s,
+                    base.y + (d.distort_px.1 as f32) * scale * s,
                 );
                 painter.line_segment([base, tip], (1.5, magenta));
                 painter.circle_filled(tip, 2.0, magenta);
@@ -2196,8 +2205,8 @@ impl ConsoleApp {
         let ctx = ui.ctx().clone();
         self.pump_camera(&ctx);
 
-        if let Some(tex) = &self.cam_tex {
-            ui.add(egui::Image::from_texture((tex.id(), tex.size_vec2())).shrink_to_fit());
+        if let Some(tex) = self.cam_tex.clone() {
+            self.show_image(ui, "camera", &tex);
         } else {
             ui.weak("(no frame yet)");
         }
@@ -2260,22 +2269,20 @@ impl ConsoleApp {
         });
         ui.label(egui::RichText::new(&self.place_note).weak());
         ui.weak("Uses the Job-tab Gerbers. Drag the overlay to position; “Etch here” bakes it in via register.");
+        ui.weak(NAV_HINT);
         ui.separator();
 
-        if let Some(tex) = &self.place_tex {
-            let native_w = tex.size()[0] as f32;
-            let img = egui::Image::from_texture((tex.id(), tex.size_vec2()))
-                .shrink_to_fit()
-                .sense(egui::Sense::drag());
-            let resp = ui.add(img);
-            if resp.dragged() {
+        if let Some(tex) = self.place_tex.clone() {
+            let (xf, resp) = self.show_image(ui, "place", &tex);
+            // Plain drag repositions the job; Ctrl+drag pans the view instead.
+            if !crate::imgview::is_navigating(ui) && resp.dragged() {
                 let d = resp.drag_delta();
-                // The frame is scaled to fit, so convert the screen-point drag
-                // back to frame pixels (native_w / displayed_w). The move is
-                // then applied in pixel space (see drag_place_px) so the overlay
-                // tracks the cursor even when a perspective homography is active.
-                let scale = (native_w / resp.rect.width().max(1.0)) as f64;
-                self.drag_place_px(d.x as f64 * scale, d.y as f64 * scale);
+                // Convert the screen-space drag back to native frame pixels
+                // (divide by the display scale). The move is applied in pixel
+                // space (see drag_place_px) so the overlay tracks the cursor
+                // even when a perspective homography is active.
+                let s = xf.scale.max(1e-3) as f64;
+                self.drag_place_px(d.x as f64 / s, d.y as f64 / s);
                 changed = true;
             }
         } else {
@@ -2290,8 +2297,8 @@ impl ConsoleApp {
 
     fn job_view(&mut self, ui: &mut egui::Ui) {
         ui.label(egui::RichText::new(&self.preview_note).weak());
-        if let Some(tex) = &self.preview_tex {
-            ui.add(egui::Image::from_texture((tex.id(), tex.size_vec2())).shrink_to_fit());
+        if let Some(tex) = self.preview_tex.clone() {
+            self.show_image(ui, "preview", &tex);
         } else {
             ui.weak("(no preview rendered — see the Actions panel)");
         }
@@ -2404,6 +2411,7 @@ impl ConsoleApp {
         });
         ui.label(egui::RichText::new(&self.fid_note).weak());
         ui.weak("Drag each ✛ near its hole; the detector searches locally around it. The typed px/mm only seeds the search — registration is anchored to the measured scale.");
+        ui.weak(NAV_HINT);
         ui.separator();
 
         for row in &self.fid_rows {
@@ -2424,47 +2432,32 @@ impl ConsoleApp {
         // Keep the marker count in step with the layout field (live), so
         // adding/removing a coordinate adds/removes a ✛.
         self.sync_fid_markers();
-        let Some(tex) = &self.fid_frame_tex else {
+        let Some(tex) = self.fid_frame_tex.clone() else {
             ui.weak("(load a frame to place markers)");
             return;
         };
-        let (tw, th) = (tex.size()[0] as f32, tex.size()[1] as f32);
-        let resp = ui.add(
-            egui::Image::from_texture((tex.id(), egui::vec2(tw, th)))
-                .shrink_to_fit()
-                .sense(egui::Sense::click_and_drag()),
-        );
-        let rect = resp.rect;
+        let (xf, resp) = self.show_image(ui, "fiducial", &tex);
+        let rect = xf.panel;
+        let th = tex.size()[1] as f64;
         let ppm = self.fid_px_per_mm as f32;
-        // bed-mm ↔ screen (via the image rect + native texture size). Bed mm
-        // is y-up with its origin at the frame's bottom-left (the machine /
-        // Gerber frame), while image rows grow downward — hence the flip
-        // against the texture height.
-        let to_screen = |mmx: f64, mmy: f64| {
-            egui::pos2(
-                rect.min.x + (mmx as f32 * ppm) / tw * rect.width(),
-                rect.min.y + (th - mmy as f32 * ppm) / th * rect.height(),
-            )
-        };
-        let px_to_screen = |px: f64, py: f64| {
-            egui::pos2(
-                rect.min.x + (px as f32) / tw * rect.width(),
-                rect.min.y + (py as f32) / th * rect.height(),
-            )
-        };
-        let ppm_f = self.fid_px_per_mm; // a local copy so the closure below
-        // doesn't borrow `self`, leaving `sync_fid_markers` callable.
+        let ppm_f = self.fid_px_per_mm;
+        let nav = crate::imgview::is_navigating(ui);
+        // bed-mm ↔ screen: bed mm is y-up with its origin at the frame's
+        // bottom-left (machine / Gerber frame) while image rows grow downward,
+        // so flip against the native texture height, then map native px →
+        // screen through the pan/zoom transform.
+        let to_screen = |mmx: f64, mmy: f64| xf.to_screen(mmx * ppm_f, th - mmy * ppm_f);
+        let px_to_screen = |px: f64, py: f64| xf.to_screen(px, py);
         let to_mm = |p: egui::Pos2| {
-            let ix = (p.x - rect.min.x) / rect.width() * tw;
-            let iy = (p.y - rect.min.y) / rect.height() * th;
-            (ix as f64 / ppm_f, (th - iy) as f64 / ppm_f)
+            let (ix, iy) = xf.to_native(p);
+            (ix / ppm_f, (th - iy) / ppm_f)
         };
 
         // Click-to-place (FLD-12): screen positions of the current markers, for
         // hit-testing add (empty spot) vs. remove (right-click on a ✛).
         // Materialized (not a closure) so the `&self` borrow is released before
-        // the `&mut self` add/remove calls below.
-        if self.fid_click_place {
+        // the `&mut self` add/remove calls below. Suppressed while navigating.
+        if self.fid_click_place && !nav {
             let marker_px: Vec<(f32, f32)> = self
                 .fid_search
                 .iter()
@@ -2493,7 +2486,9 @@ impl ConsoleApp {
         }
 
         // Drag: pick the nearest marker on press, move it while dragging.
-        if resp.drag_started()
+        // Suppressed while navigating (Ctrl+drag pans instead).
+        if !nav
+            && resp.drag_started()
             && let Some(pos) = resp.interact_pointer_pos()
         {
             let markers: Vec<(f32, f32)> = self
@@ -2506,7 +2501,8 @@ impl ConsoleApp {
                 .collect();
             self.fid_drag = fiducial::nearest_marker(&markers, (pos.x, pos.y), 30.0);
         }
-        if resp.dragged()
+        if !nav
+            && resp.dragged()
             && let (Some(i), Some(pos)) = (self.fid_drag, resp.interact_pointer_pos())
             && i < self.fid_search.len()
         {
@@ -2519,7 +2515,7 @@ impl ConsoleApp {
         // Paint markers + detected rings.
         let painter = ui.painter_at(rect);
         let cyan = Color32::from_rgb(0x22, 0xcc, 0xdd);
-        let ring_r = (self.fid_diameter_mm as f32 * ppm * 0.5).max(5.0);
+        let ring_r = (self.fid_diameter_mm as f32 * ppm * 0.5 * xf.scale).max(5.0);
         for (i, &(mx, my)) in self.fid_search.iter().enumerate() {
             let c = to_screen(mx, my);
             painter.line_segment(

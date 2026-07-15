@@ -10,6 +10,7 @@
 mod app;
 mod calib;
 mod fiducial;
+mod imgview;
 mod place;
 mod preview;
 mod settings;
