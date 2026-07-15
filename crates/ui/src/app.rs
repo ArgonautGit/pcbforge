@@ -26,6 +26,40 @@ use crate::status::{self, StatusSnapshot};
 const NAV_HINT: &str =
     "Navigate: Ctrl+drag to pan · Ctrl+wheel to zoom · Ctrl+double-click to reset.";
 
+/// Longest-side cap for the live camera *view* texture. The full-resolution
+/// frame is always kept for calibration/detection; only the on-screen preview
+/// is downscaled to this, so streaming a 2K/4K sensor stays cheap.
+const CAM_VIEW_MAX: usize = 1280;
+
+/// Nearest-neighbour downscale of a display image so its longest side is
+/// ≤ `max_dim`. Returns the (possibly unchanged) image and the applied ratio
+/// (`new ÷ old`, `1.0` if untouched). View-only — never used on frame data.
+fn downscale_view(img: ColorImage, max_dim: usize) -> (ColorImage, f64) {
+    let (w, h) = (img.size[0], img.size[1]);
+    let longest = w.max(h);
+    if longest <= max_dim || longest == 0 {
+        return (img, 1.0);
+    }
+    let scale = max_dim as f64 / longest as f64;
+    let nw = ((w as f64 * scale).round() as usize).max(1);
+    let nh = ((h as f64 * scale).round() as usize).max(1);
+    let mut pixels = Vec::with_capacity(nw * nh);
+    for y in 0..nh {
+        let sy = (((y as f64 + 0.5) / scale) as usize).min(h - 1);
+        for x in 0..nw {
+            let sx = (((x as f64 + 0.5) / scale) as usize).min(w - 1);
+            pixels.push(img.pixels[sy * w + sx]);
+        }
+    }
+    (
+        ColorImage {
+            size: [nw, nh],
+            pixels,
+        },
+        nw as f64 / w as f64,
+    )
+}
+
 /// One line of shelled-command output.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct LogLine {
@@ -222,6 +256,10 @@ pub struct ConsoleApp {
     cam_tex: Option<TextureHandle>,
     cam_note: String,
     cam_last: Option<image::GrayImage>,
+    /// Downscale ratio (display-texture px ÷ full-res px) applied to the live
+    /// camera *view* only — `cam_last` stays full resolution for calibration
+    /// and detection. Overlays on the feed multiply by this to hit display px.
+    cam_view_scale: f64,
     cam_devices: Vec<(u32, String)>,
     /// Project the laser work area + a homography-aligned 50 mm scale onto the
     /// camera feed (only when a laser anchor calibration exists).
@@ -368,6 +406,7 @@ impl ConsoleApp {
             cam_note: "Pick a source and press Live. Snapshot feeds the Fiducial/Place tabs."
                 .into(),
             cam_last: None,
+            cam_view_scale: 1.0,
             cam_devices: crate::camera::list_devices(),
             cam_show_bed: true,
             // The galvo field (matches cam::tiles::FIELD_MM); centred on the
@@ -1335,7 +1374,9 @@ impl ConsoleApp {
     /// overlay (UI-2) is on, the registered design layers are blended over it.
     fn set_camera_frame(&mut self, ctx: &Context, gray: image::GrayImage) {
         let (w, h) = (gray.width() as usize, gray.height() as usize);
-        let img = if self.ar_overlay {
+        // Build the display image at full resolution (the AR overlay composites
+        // at full res so it stays accurate), then downscale the *view* only.
+        let full = if self.ar_overlay {
             self.compose_ar(&gray)
         } else {
             ColorImage {
@@ -1343,8 +1384,15 @@ impl ConsoleApp {
                 pixels: gray.pixels().map(|p| Color32::from_gray(p[0])).collect(),
             }
         };
-        self.cam_tex = Some(ctx.load_texture("camera", img, TextureOptions::NEAREST));
-        self.cam_note = format!("{w}×{h}");
+        let (view, scale) = downscale_view(full, CAM_VIEW_MAX);
+        self.cam_view_scale = scale;
+        self.cam_note = if scale < 1.0 {
+            format!("{w}×{h} (view {}×{})", view.size[0], view.size[1])
+        } else {
+            format!("{w}×{h}")
+        };
+        self.cam_tex = Some(ctx.load_texture("camera", view, TextureOptions::LINEAR));
+        // Keep the full-resolution frame for calibration, detection, snapshot.
         self.cam_last = Some(gray);
     }
 
@@ -2283,9 +2331,12 @@ impl ConsoleApp {
         unconfirmed: bool,
     ) {
         let painter = ui.painter_at(xf.panel);
+        // The anchor is in full-resolution camera px, but the view texture is
+        // downscaled — scale full-res px → view px before the pan/zoom xform.
+        let vs = self.cam_view_scale;
         let proj = |mx: f64, my: f64| {
             let p = inv.apply(nalgebra::Point2::new(mx, my));
-            xf.to_screen(p.x, p.y)
+            xf.to_screen(p.x * vs, p.y * vs)
         };
         let yellow = Color32::from_rgb(0xf0, 0xd0, 0x40);
         let green = Color32::from_rgb(0x30, 0xd0, 0x80);
@@ -3892,6 +3943,51 @@ mod tests {
         app.field_mm = 60.0;
         let out = ctx.run(egui::RawInput::default(), |ctx| app.ui(ctx));
         assert!(!out.shapes.is_empty(), "camera bed overlay renders");
+    }
+
+    #[test]
+    fn downscale_view_caps_longest_side_and_reports_ratio() {
+        // Below the cap: unchanged, ratio 1.0.
+        let small = ColorImage {
+            size: [100, 60],
+            pixels: vec![Color32::BLACK; 100 * 60],
+        };
+        let (out, s) = downscale_view(small, CAM_VIEW_MAX);
+        assert_eq!(out.size, [100, 60]);
+        assert!((s - 1.0).abs() < 1e-12);
+        // Above the cap: longest side capped, ratio ≈ cap/longest, pixels match.
+        let big = ColorImage {
+            size: [2560, 1440],
+            pixels: vec![Color32::WHITE; 2560 * 1440],
+        };
+        let (out, s) = downscale_view(big, 1280);
+        assert_eq!(out.size[0], 1280, "longest side capped");
+        assert!(out.size[1] <= 1280 && out.size[1] > 700);
+        assert!((s - 0.5).abs() < 0.01, "ratio ≈ 0.5, got {s}");
+        assert_eq!(out.pixels.len(), out.size[0] * out.size[1]);
+    }
+
+    /// The live *view* downscales, but `cam_last` (the calibration/detection
+    /// data) stays full resolution, and the overlay scale is recorded.
+    #[test]
+    fn camera_view_downscales_but_data_stays_full_res() {
+        let mut app = ConsoleApp::new(tmp_db(), vec!["true".into()]);
+        let ctx = Context::default();
+        app.set_camera_frame(
+            &ctx,
+            image::GrayImage::from_pixel(2560, 1440, image::Luma([120])),
+        );
+        // Data kept full-res.
+        assert_eq!(app.cam_last.as_ref().unwrap().dimensions(), (2560, 1440));
+        // View was downscaled and the ratio recorded.
+        assert!(
+            app.cam_view_scale < 1.0,
+            "view scale {}",
+            app.cam_view_scale
+        );
+        assert!((app.cam_view_scale - 0.5).abs() < 0.01);
+        let tex = app.cam_tex.as_ref().unwrap().size();
+        assert_eq!(tex[0], 1280, "view texture capped to 1280");
     }
 
     /// A second frame after a status refresh still lays out (state survives).

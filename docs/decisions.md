@@ -1371,3 +1371,23 @@ delivered frame's own width/height, and the File source accepts any-resolution
 image, so higher-resolution frames flow through detection, calibration, and the
 egui texture unchanged. Note the anchor homography is in camera-pixel space, so
 calibrate at the same resolution you stream at (now both full-res).
+
+## 2026-07-15 — Downscale the camera VIEW only; keep full-res data
+
+Follow-up to the 2K camera work: the operator wants live framing to be light,
+but everything touching calibration/detection to stay full resolution.
+
+- `set_camera_frame` now builds the display image at full res (the AR overlay
+  still composites at full res, so it stays accurate) and then downscales the
+  *view texture only* to `CAM_VIEW_MAX` (1280 px longest side) via
+  `downscale_view`, recording the applied ratio in `cam_view_scale`. `cam_last`
+  — the frame used by snapshot→Fiducial/Place, and the source for detection —
+  is stored at full resolution, untouched. The camera calibrate path grabs its
+  own full-res frames independently. Note shows both sizes (e.g.
+  "2560×1440 (view 1280×720)").
+- `draw_bed_overlay` multiplies the anchor's full-res camera px by
+  `cam_view_scale` before the pan/zoom transform, so the work area + 50 mm scale
+  still land correctly on the downscaled view.
+- Tests: `downscale_view_caps_longest_side_and_reports_ratio` (pure) and
+  `camera_view_downscales_but_data_stays_full_res` (2560×1440 → view 1280, data
+  stays 2560×1440, ratio 0.5).
