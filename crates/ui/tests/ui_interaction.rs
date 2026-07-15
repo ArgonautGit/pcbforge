@@ -46,6 +46,31 @@ fn the_refresh_button_is_present_and_clickable() {
 }
 
 #[test]
+fn calibration_frame_loads_from_a_typed_path() {
+    let mut h = console();
+    h.get_by_label("🎯 Calibrate").click();
+    h.run();
+    // The grid-frame field is labelled (labelled_by), so it's drivable: type
+    // the committed distorted-grid fixture path and load it.
+    let fixture = concat!(
+        env!("CARGO_MANIFEST_DIR"),
+        "/../../samples/calibration/grid-7x7-10mm-distorted.png"
+    );
+    let field = h.get_by_label("grid frame (optional)");
+    field.focus();
+    field.type_text(fixture);
+    h.run();
+    h.get_by_label("⤵ Load grid frame").click();
+    h.run();
+    // The real frame loaded into the calibrate view (660×660 fixture).
+    assert!(
+        h.state().debug_summary().contains("calib_frame: 660×660"),
+        "grid frame loaded via the UI:\n{}",
+        h.state().debug_summary()
+    );
+}
+
+#[test]
 fn the_accessibility_tree_exposes_labeled_widgets() {
     let h = console();
     // Buttons carry labels, so they're queryable/drivable by an agent. Use

@@ -1416,3 +1416,27 @@ and dump_* re-draws (see AGENT_DEBUGGING.md).
   (SwiftShader); transient *.new/*.diff.png gitignored.
 - dev-deps: egui_kittest (wgpu+snapshot), accesskit_consumer (tree types), egui
   (integration tests can't name normal deps).
+
+## 2026-07-15 — Test the calibration workflow; label the frame-path fields
+
+Drove the calibration workflow through the real console with the headless
+debug_driver (the recorded technique). Loading a grid frame was previously not
+drivable because the path fields were unlabelled, so:
+
+- Added `labelled_by` to the four frame-path text fields (calibrate grid frame,
+  fiducial frame, place bed frame, camera frame file). They now carry an
+  accessibility label, so the driver (and any operator using a screen reader)
+  can target them — and `type "grid frame" <path>` works.
+- Surfaced `calib_frame: WxH` in `ConsoleApp::debug_summary()` so the `state`
+  command reports whether a grid frame is loaded.
+- New `calibration_frame_loads_from_a_typed_path` interaction test drives
+  Calibrate → type the committed distorted-grid fixture path → Load, and asserts
+  the 660×660 frame loaded through the actual UI.
+
+Test result: the UI-drivable calibration path (mode switch, frame load, Fit
+guard "click all 4 corner dots (have 0)") works; corner-marking is a canvas
+click (not accesskit-drivable), and the fit + overlay are covered by the fixture
+integration tests (calibrates_from_the_distorted_grid_fixture,
+recovers_commanded_coordinates_from_a_burned_grid, anchor_overlay_renders...,
+camera_bed_overlay_renders...) plus CLI calib-grid and vision fit tests — all
+green. No bugs found.

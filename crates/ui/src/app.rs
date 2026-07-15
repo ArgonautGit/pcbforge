@@ -1598,11 +1598,16 @@ impl ConsoleApp {
             ),
             None => "none".into(),
         };
+        let calib_frame = match &self.calib_frame_img {
+            Some(g) => format!("{}×{}", g.width(), g.height()),
+            None => "none".into(),
+        };
         format!(
             "tab={:?} side={:?} calib_mode={:?}\n\
              calib_anchor: {calib}\n\
              camera_lens: {lens}\n\
              camera_frame: {cam}\n\
+             calib_frame: {calib_frame}\n\
              bed_overlay: show={} field={:.0}mm center=({:.1},{:.1})\n\
              place: x={:.2} y={:.2} rot={:.1}°\n\
              calib_grid: n={} pitch={:.2}mm corners_marked={}\n\
@@ -1880,8 +1885,9 @@ impl ConsoleApp {
                     );
                     ui.end_row();
                 }
-                ui.label("grid frame (optional)");
+                let lbl = ui.label("grid frame (optional)");
                 ui.add(egui::TextEdit::singleline(&mut self.calib_frame).desired_width(240.0))
+                    .labelled_by(lbl.id)
                     .on_hover_text(
                         "Empty = grab from the camera; a path checks a saved grid image.",
                     );
@@ -2267,8 +2273,9 @@ impl ConsoleApp {
             }
         } else {
             ui.horizontal(|ui| {
-                ui.label("frame file");
-                ui.add(egui::TextEdit::singleline(&mut self.cam_file).desired_width(240.0));
+                let lbl = ui.label("frame file");
+                ui.add(egui::TextEdit::singleline(&mut self.cam_file).desired_width(240.0))
+                    .labelled_by(lbl.id);
             });
             ui.weak("Any capture app that writes a frame to disk drives the live preview.");
         }
@@ -2479,8 +2486,9 @@ impl ConsoleApp {
             .num_columns(2)
             .spacing([8.0, 6.0])
             .show(ui, |ui| {
-                ui.label("bed frame");
-                ui.add(egui::TextEdit::singleline(&mut self.place_frame).desired_width(240.0));
+                let lbl = ui.label("bed frame");
+                ui.add(egui::TextEdit::singleline(&mut self.place_frame).desired_width(240.0))
+                    .labelled_by(lbl.id);
                 ui.end_row();
                 ui.label("out .lbrn2");
                 ui.add(egui::TextEdit::singleline(&mut self.place_lbrn2).desired_width(240.0))
@@ -2572,15 +2580,17 @@ impl ConsoleApp {
             .num_columns(2)
             .spacing([8.0, 6.0])
             .show(ui, |ui| {
-                ui.label("frame file (optional)");
+                let lbl = ui.label("frame file (optional)");
                 ui.add(egui::TextEdit::singleline(&mut self.fid_frame).desired_width(240.0))
+                    .labelled_by(lbl.id)
                     .on_hover_text(
                         "Leave empty to use the camera (source picked in the \
                          Camera tab); set a path to check a saved image instead.",
                     );
                 ui.end_row();
-                ui.label("expected (x,y mm; …)");
+                let lbl = ui.label("expected (x,y mm; …)");
                 ui.add(egui::TextEdit::singleline(&mut self.fid_layout).desired_width(240.0))
+                    .labelled_by(lbl.id)
                     .on_hover_text(
                         "Fiducial positions in board/machine mm (Gerber frame, \
                          y up). On the un-calibrated uniform scale, bed (0,0) \
