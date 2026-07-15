@@ -1035,3 +1035,20 @@ operator before building):
   stale-state error.
 - Live done-when (a real 20-hole board, every hole confirmed) is operator-side;
   the ≤150 µm gate and overlay archive are exactly what that run needs.
+
+### Fiducial check — camera-first
+
+- The fiducial check previously only read a *file* (the camera reached it via
+  ● Live or the Camera tab's snapshot button). Now the camera is the primary
+  path: a **📷 Grab & check** button pulls one frame from the camera source
+  (device or file, as picked in the Camera tab) and detects in the same click;
+  and **🎯 Check fiducials** with the frame-file field left empty falls back to
+  grabbing from the camera, so the flow needs no file paths at all. The file
+  field stays (relabelled "frame file (optional)") for checking saved images.
+- "↺ reset markers" no longer reloads the frame file (which errored when the
+  frame had come from the camera) — it just reseeds the ✛ set from the layout
+  and keeps the current frame.
+- Verified headless with a File camera source (the capture-app contract):
+  grab-and-check detects the holes in one step, Check-with-no-file reaches the
+  camera, and a dead source surfaces `camera: …` in the note instead of
+  panicking.

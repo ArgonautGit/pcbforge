@@ -335,14 +335,30 @@ impl ConsoleApp {
                 return;
             }
         };
-        let design = match fiducial::parse_layout(&self.fid_layout) {
-            Ok(d) => d,
-            Err(e) => {
-                self.fid_note = format!("layout: {e}");
-                return;
+        self.set_fid_frame(ctx, img);
+    }
+
+    /// Grab one frame from the camera (the source picked in the Camera tab —
+    /// device or file), install it as the fiducial-check frame, and detect
+    /// immediately. The one-click camera path for the fiducial check; ● Live
+    /// does the same continuously.
+    pub fn grab_fid_frame(&mut self, ctx: &Context) {
+        match crate::camera::grab(&self.cam_source()) {
+            Ok(img) => {
+                self.set_fid_frame(ctx, img);
+                self.detect_fiducials();
             }
-        };
-        let _ = design;
+            Err(e) => self.fid_note = format!("camera: {e}"),
+        }
+    }
+
+    /// Install `img` as the fiducial-check frame (texture + cache) and sync
+    /// the markers, reporting a bad layout instead of silently proceeding.
+    fn set_fid_frame(&mut self, ctx: &Context, img: image::GrayImage) {
+        if let Err(e) = fiducial::parse_layout(&self.fid_layout) {
+            self.fid_note = format!("layout: {e}");
+            return;
+        }
         self.sync_fid_markers();
         let (w, h) = (img.width() as usize, img.height() as usize);
         let color = ColorImage {
@@ -423,7 +439,13 @@ impl ConsoleApp {
     /// found positions, summary rows, and measured scale.
     pub fn render_fiducials(&mut self, ctx: &Context) {
         self.sync_fid_markers();
+        // No frame yet: pull one from the file path if set, else grab from
+        // the camera — so Check works camera-first without a file.
         if self.fid_frame_img.is_none() {
+            if crate::clean_path(&self.fid_frame).is_empty() {
+                self.grab_fid_frame(ctx);
+                return; // grab already detects (or reported the error)
+            }
             self.load_fid_frame(ctx);
         }
         if self.fid_frame_img.is_none() {
@@ -1335,8 +1357,12 @@ impl ConsoleApp {
             .num_columns(2)
             .spacing([8.0, 6.0])
             .show(ui, |ui| {
-                ui.label("frame image");
-                ui.add(egui::TextEdit::singleline(&mut self.fid_frame).desired_width(240.0));
+                ui.label("frame file (optional)");
+                ui.add(egui::TextEdit::singleline(&mut self.fid_frame).desired_width(240.0))
+                    .on_hover_text(
+                        "Leave empty to use the camera (source picked in the \
+                         Camera tab); set a path to check a saved image instead.",
+                    );
                 ui.end_row();
                 ui.label("expected (x,y mm; …)");
                 ui.add(egui::TextEdit::singleline(&mut self.fid_layout).desired_width(240.0));
@@ -1377,7 +1403,22 @@ impl ConsoleApp {
                 ui.end_row();
             });
         ui.horizontal(|ui| {
-            if ui.button("⤵ Load frame").clicked() {
+            if ui
+                .button("📷 Grab & check")
+                .on_hover_text(
+                    "Grab one frame from the camera (source picked in the \
+                     Camera tab) and run detection on it.",
+                )
+                .clicked()
+            {
+                let ctx = ui.ctx().clone();
+                self.grab_fid_frame(&ctx);
+            }
+            if ui
+                .button("⤵ Load frame")
+                .on_hover_text("Load the frame file above instead of the camera.")
+                .clicked()
+            {
                 let ctx = ui.ctx().clone();
                 self.load_fid_frame(&ctx);
             }
@@ -1394,9 +1435,10 @@ impl ConsoleApp {
                      right-click a ✛ to remove it; drag markers to fine-tune.",
                 );
             if ui.button("↺ reset markers").clicked() {
-                self.fid_search.clear(); // reseeded from layout on next load/check
-                let ctx = ui.ctx().clone();
-                self.load_fid_frame(&ctx);
+                // Reseed the ✛ set from the layout; the current frame stays.
+                self.fid_search.clear();
+                self.fid_found.clear();
+                self.sync_fid_markers();
             }
             if let Some(ppm) = self.fid_measured_ppm
                 && ui
@@ -1871,6 +1913,73 @@ mod tests {
         let ctx = Context::default();
         let out = ctx.run(egui::RawInput::default(), |ctx| app.ui(ctx));
         assert!(!out.shapes.is_empty(), "place tab must render");
+    }
+
+    /// The fiducial check runs straight off the camera: "Grab & check" pulls
+    /// one frame from the camera source (a File source here — the same
+    /// contract a capture app fulfills) and detects on it in one step, and
+    /// "Check fiducials" with no frame file falls back to the camera too.
+    #[test]
+    fn fiducial_check_grabs_from_the_camera() {
+        let dir = std::env::temp_dir().join(format!("ui-fidgrab-{}", std::process::id()));
+        std::fs::create_dir_all(&dir).unwrap();
+        let path = dir.join("cam.png");
+        let ppm = 10.0;
+        let holes = [(10.0, 10.0), (60.0, 10.0), (10.0, 60.0)];
+        let img = image::GrayImage::from_fn(700, 700, |x, y| {
+            let mut v = 170.0;
+            for (mx, my) in holes {
+                let (cx, cy) = (mx * ppm, my * ppm);
+                if (((x as f64) - cx).powi(2) + ((y as f64) - cy).powi(2)).sqrt() < 0.5 * ppm {
+                    v -= 110.0;
+                }
+            }
+            image::Luma([v as u8])
+        });
+        img.save(&path).unwrap();
+
+        let mut app = ConsoleApp::new(tmp_db(), vec!["true".into()]);
+        app.cam_use_device = false;
+        app.cam_file = path.to_string_lossy().into();
+        app.fid_layout = "10,10; 60,10; 10,60".into();
+        app.fid_px_per_mm = ppm;
+        let ctx = Context::default();
+
+        // One-click grab & check: frame installed and holes detected.
+        app.grab_fid_frame(&ctx);
+        assert!(app.fid_frame_img.is_some(), "camera frame installed");
+        assert_eq!(
+            app.fid_found.iter().filter(|f| f.is_some()).count(),
+            3,
+            "detected the three holes off the camera grab: {:?}",
+            app.fid_rows
+        );
+
+        // Check with no frame file set also reaches the camera.
+        let mut app2 = ConsoleApp::new(tmp_db(), vec!["true".into()]);
+        app2.cam_use_device = false;
+        app2.cam_file = path.to_string_lossy().into();
+        app2.fid_layout = "10,10; 60,10; 10,60".into();
+        app2.fid_px_per_mm = ppm;
+        assert!(app2.fid_frame.is_empty(), "no frame file configured");
+        app2.render_fiducials(&ctx);
+        assert_eq!(
+            app2.fid_found.iter().filter(|f| f.is_some()).count(),
+            3,
+            "Check with no file fell back to the camera: {:?}",
+            app2.fid_rows
+        );
+
+        // A dead camera source reports itself instead of panicking.
+        let mut app3 = ConsoleApp::new(tmp_db(), vec!["true".into()]);
+        app3.cam_use_device = false;
+        app3.cam_file = String::new();
+        app3.grab_fid_frame(&ctx);
+        assert!(
+            app3.fid_note.starts_with("camera:"),
+            "camera error surfaced: {}",
+            app3.fid_note
+        );
     }
 
     /// FLD-11: live tracking pulls frames from the camera source and re-detects
