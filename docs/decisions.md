@@ -1129,3 +1129,14 @@ operator before building):
   fiducial/design frame the camera homography learned, not an absolute machine
   frame — so the burned position is only correct if the board's fiducial origin
   is aligned to the machine origin (or once VIS-3 provides the bed↔machine map).
+
+### Camera orientation correction
+
+- The operator's camera is mounted upside down relative to the app's expected
+  frame (bed y-up, origin bottom-left). Added a camera **orientation** selector
+  in the Camera tab — Normal / Flip↔ / Flip↕ / Rotate 180° — applied to every
+  frame the moment it enters from the camera (one-shot grab and the live Capture
+  threads, for both the Camera tab and the fiducial check), so detection,
+  registration, and display all see the corrected image. Persisted in the
+  console settings file. Verified: Rotate180 maps a top-left pixel to the
+  bottom-right, and the choice survives a restart.

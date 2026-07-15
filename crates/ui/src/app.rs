@@ -46,6 +46,64 @@ enum Side {
     Back,
 }
 
+/// Correction applied to every camera frame for how the camera is physically
+/// mounted (e.g. installed upside down). Applied on ingest, so detection,
+/// registration, and display all see the corrected orientation.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum Orientation {
+    /// As captured.
+    Normal,
+    /// Mirror left↔right.
+    FlipH,
+    /// Mirror top↔bottom.
+    FlipV,
+    /// 180° rotation — a camera mounted upside down (both axes).
+    Rotate180,
+}
+
+impl Orientation {
+    const ALL: [Orientation; 4] = [
+        Orientation::Normal,
+        Orientation::FlipH,
+        Orientation::FlipV,
+        Orientation::Rotate180,
+    ];
+
+    fn label(self) -> &'static str {
+        match self {
+            Orientation::Normal => "Normal",
+            Orientation::FlipH => "Flip ↔ (mirror)",
+            Orientation::FlipV => "Flip ↕",
+            Orientation::Rotate180 => "Rotate 180° (upside down)",
+        }
+    }
+
+    /// Serialized token for the settings file.
+    fn token(self) -> &'static str {
+        match self {
+            Orientation::Normal => "normal",
+            Orientation::FlipH => "flip_h",
+            Orientation::FlipV => "flip_v",
+            Orientation::Rotate180 => "rotate180",
+        }
+    }
+
+    fn from_token(s: &str) -> Option<Orientation> {
+        Orientation::ALL.into_iter().find(|o| o.token() == s)
+    }
+
+    /// Apply to a grabbed frame.
+    fn apply(self, img: image::GrayImage) -> image::GrayImage {
+        use image::imageops;
+        match self {
+            Orientation::Normal => img,
+            Orientation::FlipH => imageops::flip_horizontal(&img),
+            Orientation::FlipV => imageops::flip_vertical(&img),
+            Orientation::Rotate180 => imageops::rotate180(&img),
+        }
+    }
+}
+
 /// How to invoke the `pcbforge` CLI: `program` + fixed prefix args, before the
 /// verb's own args. Defaults to `cargo run -q --bin pcbforge --` so the console
 /// works from a repo checkout with nothing on PATH ([`default_cli_cmd`]).
@@ -144,6 +202,8 @@ pub struct ConsoleApp {
     cam_use_device: bool,
     cam_device: u32,
     cam_file: String,
+    /// Orientation correction for how the camera is mounted (persisted).
+    cam_orientation: Orientation,
     cam_live: bool,
     cam_tex: Option<TextureHandle>,
     cam_note: String,
@@ -229,6 +289,7 @@ impl ConsoleApp {
             cam_use_device: false,
             cam_device: 0,
             cam_file: String::new(),
+            cam_orientation: Orientation::Normal,
             cam_live: false,
             cam_tex: None,
             cam_note: "Pick a source and press Live. Snapshot feeds the Fiducial/Place tabs."
@@ -269,6 +330,7 @@ impl ConsoleApp {
             ("fid_layout", self.fid_layout.clone()),
             ("fid_px_per_mm", self.fid_px_per_mm.to_string()),
             ("cam_file", self.cam_file.clone()),
+            ("cam_orientation", self.cam_orientation.token().to_string()),
         ])
     }
 
@@ -301,6 +363,12 @@ impl ConsoleApp {
         f64_field(&m, "focal_mm", &mut self.focal_mm);
         f64_field(&m, "place_px_per_mm", &mut self.place_px_per_mm);
         f64_field(&m, "fid_px_per_mm", &mut self.fid_px_per_mm);
+        if let Some(o) = m
+            .get("cam_orientation")
+            .and_then(|s| Orientation::from_token(s.trim()))
+        {
+            self.cam_orientation = o;
+        }
     }
 
     /// Persist the input fields if they changed since the last save. Cheap to
@@ -422,6 +490,7 @@ impl ConsoleApp {
     pub fn grab_fid_frame(&mut self, ctx: &Context) {
         match crate::camera::grab(&self.cam_source()) {
             Ok(img) => {
+                let img = self.cam_orientation.apply(img);
                 self.set_fid_frame(ctx, img);
                 self.detect_fiducials();
             }
@@ -556,6 +625,7 @@ impl ConsoleApp {
         if let Some(res) = latest {
             match res {
                 Ok(gray) => {
+                    let gray = self.cam_orientation.apply(gray);
                     let (w, h) = (gray.width() as usize, gray.height() as usize);
                     let color = ColorImage {
                         size: [w, h],
@@ -996,7 +1066,10 @@ impl ConsoleApp {
     /// I/O never blocks the GUI.
     pub fn grab_camera(&mut self, ctx: &Context) {
         match crate::camera::grab(&self.cam_source()) {
-            Ok(gray) => self.set_camera_frame(ctx, gray),
+            Ok(gray) => {
+                let gray = self.cam_orientation.apply(gray);
+                self.set_camera_frame(ctx, gray);
+            }
             Err(e) => self.cam_note = e,
         }
     }
@@ -1016,7 +1089,10 @@ impl ConsoleApp {
             let latest = self.cam_capture.as_ref().and_then(|c| c.latest());
             if let Some(res) = latest {
                 match res {
-                    Ok(gray) => self.set_camera_frame(ctx, gray),
+                    Ok(gray) => {
+                        let gray = self.cam_orientation.apply(gray);
+                        self.set_camera_frame(ctx, gray);
+                    }
                     Err(e) => self.cam_note = e,
                 }
             }
@@ -1287,6 +1363,21 @@ impl ConsoleApp {
             if self.cam_use_device && ui.button("↻ devices").clicked() {
                 self.cam_devices = crate::camera::list_devices();
             }
+            ui.separator();
+            ui.label("orient");
+            egui::ComboBox::from_id_salt("cam-orient")
+                .selected_text(self.cam_orientation.label())
+                .show_ui(ui, |ui| {
+                    for o in Orientation::ALL {
+                        ui.selectable_value(&mut self.cam_orientation, o, o.label());
+                    }
+                })
+                .response
+                .on_hover_text(
+                    "Correct how the camera is mounted (e.g. Rotate 180° if it's \
+                     installed upside down). Applied to every camera frame before \
+                     detection and registration.",
+                );
         });
         if self.cam_use_device {
             if self.cam_devices.is_empty() {
@@ -2659,6 +2750,44 @@ mod tests {
         assert_eq!(
             app.resolve_place_output("/home/nick/uv_test/uv_test-F_Cu.gbr"),
             std::path::PathBuf::from("/tmp/somewhere/job.lbrn2")
+        );
+    }
+
+    /// Camera orientation: Rotate180 maps a corner pixel to the opposite
+    /// corner (an upside-down mount), and the choice persists across restarts.
+    #[test]
+    fn camera_orientation_transforms_and_persists() {
+        // A 3×2 frame with a unique bright pixel at the top-left (0,0).
+        let mut img = image::GrayImage::from_pixel(3, 2, image::Luma([10]));
+        img.put_pixel(0, 0, image::Luma([200]));
+
+        // Rotate 180° sends (0,0) to the bottom-right (2,1).
+        let r = Orientation::Rotate180.apply(img.clone());
+        assert_eq!(r.get_pixel(2, 1)[0], 200, "top-left → bottom-right");
+        assert_eq!(r.get_pixel(0, 0)[0], 10);
+        // Flip vertical sends (0,0) to the bottom-left (0,1).
+        let v = Orientation::FlipV.apply(img.clone());
+        assert_eq!(v.get_pixel(0, 1)[0], 200);
+        // Normal is a no-op.
+        assert_eq!(
+            Orientation::Normal.apply(img.clone()).get_pixel(0, 0)[0],
+            200
+        );
+
+        // Token round-trip + persistence.
+        assert_eq!(
+            Orientation::from_token("rotate180"),
+            Some(Orientation::Rotate180)
+        );
+        let db = tmp_db();
+        let mut a = ConsoleApp::new(db.clone(), vec!["true".into()]);
+        a.cam_orientation = Orientation::Rotate180;
+        a.save_settings_if_changed();
+        let b = ConsoleApp::new(db, vec!["true".into()]);
+        assert_eq!(
+            b.cam_orientation,
+            Orientation::Rotate180,
+            "orientation survived restart"
         );
     }
 
