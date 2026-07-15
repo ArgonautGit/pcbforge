@@ -764,10 +764,34 @@ fn register_cmd(a: RegisterArgs) -> Result<(), Box<dyn std::error::Error>> {
     let layer = EmitLayer::fill("C00", params, cam::lbrn2::polys_to_elems(&placed));
     cam::lbrn2::write_lbrn2(a.device, &[layer], a.lbrn2)?;
     let rings: usize = placed.iter().map(|p| 1 + p.holes.len()).sum();
+    // Report where the job actually landed (bbox extent + center, machine mm)
+    // so the operator can confirm it matches the placement they intended —
+    // unlike `emit`, register does NOT normalize to the origin.
+    let mm = |v: pcb_core::Nm| v as f64 / NM_PER_MM as f64;
+    let mut bb: Option<(pcb_core::Nm, pcb_core::Nm, pcb_core::Nm, pcb_core::Nm)> = None;
+    for p in &placed {
+        for pt in p.outer.iter().chain(p.holes.iter().flatten()) {
+            bb = Some(match bb {
+                None => (pt.x, pt.y, pt.x, pt.y),
+                Some((x0, y0, x1, y1)) => (x0.min(pt.x), y0.min(pt.y), x1.max(pt.x), y1.max(pt.y)),
+            });
+        }
+    }
     eprintln!(
         "registered: {} shape(s), {rings} ring(s) at machine coordinates",
         placed.len()
     );
+    if let Some((x0, y0, x1, y1)) = bb {
+        eprintln!(
+            "placed at machine ({:.2}, {:.2})..({:.2}, {:.2}) mm, center ({:.2}, {:.2}) mm",
+            mm(x0),
+            mm(y0),
+            mm(x1),
+            mm(y1),
+            mm(x0 + x1) / 2.0,
+            mm(y0 + y1) / 2.0
+        );
+    }
     println!("wrote {}", a.lbrn2.display());
     Ok(())
 }

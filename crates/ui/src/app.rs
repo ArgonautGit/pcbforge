@@ -62,6 +62,11 @@ pub struct ConsoleApp {
     pub db_path: PathBuf,
     /// The CLI invocation: program + fixed prefix args (e.g. `cargo run … --`).
     pub cli_cmd: Vec<String>,
+    /// Where the input fields are persisted (beside the DB).
+    settings_path: PathBuf,
+    /// The last-saved settings blob — the fields are re-persisted only when
+    /// this changes, so typing a path survives a restart without per-frame IO.
+    last_settings: String,
     status: StatusSnapshot,
     log: Vec<LogLine>,
     tab: CentralTab,
@@ -122,6 +127,9 @@ pub struct ConsoleApp {
 
     // drag-to-place
     place_frame: String,
+    /// Output `.lbrn2` for "Etch here" — kept distinct from the Job-tab emit
+    /// output so a plain Emit can't silently clobber a registered placement.
+    place_lbrn2: String,
     place_px_per_mm: f64,
     place_tx_mm: f64,
     place_ty_mm: f64,
@@ -162,9 +170,12 @@ impl ConsoleApp {
     pub fn new(db_path: impl Into<PathBuf>, cli_cmd: Vec<String>) -> Self {
         let db_path = db_path.into();
         let status = status::snapshot(&db_path);
-        Self {
+        let settings_path = crate::settings::path_for_db(&db_path);
+        let mut app = Self {
             db_path,
             cli_cmd,
+            settings_path,
+            last_settings: String::new(),
             status,
             log: Vec::new(),
             tab: CentralTab::Job,
@@ -205,6 +216,7 @@ impl ConsoleApp {
             fid_capture: None,
             fid_capture_src: None,
             place_frame: String::new(),
+            place_lbrn2: "placed.lbrn2".into(),
             place_px_per_mm: 10.0,
             place_tx_mm: 0.0,
             place_ty_mm: 0.0,
@@ -233,6 +245,71 @@ impl ConsoleApp {
             ar_copper: Vec::new(),
             ar_ablate: Vec::new(),
             ar_note: "Load the Job-tab Gerbers, detect fiducials, then AR overlays the registered design on the feed.".into(),
+        };
+        app.load_settings();
+        app.last_settings = app.settings_blob();
+        app
+    }
+
+    /// The persisted input fields, in a fixed key order.
+    fn settings_blob(&self) -> String {
+        crate::settings::blob(&[
+            ("copper", self.emit_copper.clone()),
+            ("outline", self.emit_outline.clone()),
+            ("lbrn2", self.emit_lbrn2.clone()),
+            ("offset_mm", self.offset_mm.to_string()),
+            ("back_copper", self.back_copper.clone()),
+            ("back_outline", self.back_outline.clone()),
+            ("thickness_mm", self.board_thickness_mm.to_string()),
+            ("focal_mm", self.focal_mm.to_string()),
+            ("place_frame", self.place_frame.clone()),
+            ("place_lbrn2", self.place_lbrn2.clone()),
+            ("place_px_per_mm", self.place_px_per_mm.to_string()),
+            ("fid_frame", self.fid_frame.clone()),
+            ("fid_layout", self.fid_layout.clone()),
+            ("fid_px_per_mm", self.fid_px_per_mm.to_string()),
+            ("cam_file", self.cam_file.clone()),
+        ])
+    }
+
+    /// Overlay any saved input fields from the settings file onto the defaults.
+    fn load_settings(&mut self) {
+        let m = crate::settings::load(&self.settings_path);
+        let str_field =
+            |m: &std::collections::BTreeMap<String, String>, k: &str, dst: &mut String| {
+                if let Some(v) = m.get(k) {
+                    *dst = v.trim().to_string();
+                }
+            };
+        str_field(&m, "copper", &mut self.emit_copper);
+        str_field(&m, "outline", &mut self.emit_outline);
+        str_field(&m, "lbrn2", &mut self.emit_lbrn2);
+        str_field(&m, "back_copper", &mut self.back_copper);
+        str_field(&m, "back_outline", &mut self.back_outline);
+        str_field(&m, "place_frame", &mut self.place_frame);
+        str_field(&m, "place_lbrn2", &mut self.place_lbrn2);
+        str_field(&m, "fid_frame", &mut self.fid_frame);
+        str_field(&m, "fid_layout", &mut self.fid_layout);
+        str_field(&m, "cam_file", &mut self.cam_file);
+        let f64_field = |m: &std::collections::BTreeMap<String, String>, k: &str, dst: &mut f64| {
+            if let Some(v) = m.get(k).and_then(|s| s.trim().parse().ok()) {
+                *dst = v;
+            }
+        };
+        f64_field(&m, "offset_mm", &mut self.offset_mm);
+        f64_field(&m, "thickness_mm", &mut self.board_thickness_mm);
+        f64_field(&m, "focal_mm", &mut self.focal_mm);
+        f64_field(&m, "place_px_per_mm", &mut self.place_px_per_mm);
+        f64_field(&m, "fid_px_per_mm", &mut self.fid_px_per_mm);
+    }
+
+    /// Persist the input fields if they changed since the last save. Cheap to
+    /// call every frame — it only touches the disk on an actual edit.
+    fn save_settings_if_changed(&mut self) {
+        let blob = self.settings_blob();
+        if blob != self.last_settings {
+            let _ = std::fs::write(&self.settings_path, &blob);
+            self.last_settings = blob;
         }
     }
 
@@ -765,12 +842,13 @@ impl ConsoleApp {
             });
             return;
         }
+        let out = crate::clean_path(&self.place_lbrn2);
         let mut args: Vec<String> = vec![
             "register".into(),
             "--copper".into(),
             crate::clean_path(&self.emit_copper),
             "--lbrn2".into(),
-            crate::clean_path(&self.emit_lbrn2),
+            out.clone(),
             "--fiducials".into(),
             self.placement().correspondences(),
         ];
@@ -778,6 +856,15 @@ impl ConsoleApp {
             args.push("--outline".into());
             args.push(crate::clean_path(&self.emit_outline));
         }
+        // Make the placement explicit in the log — the register output is its
+        // own file (not the Job-tab emit), and this is the position it bakes in.
+        self.log.push(LogLine {
+            text: format!(
+                "Etch here → {out}: job placed at ({:.2}, {:.2}) mm, {:.1}°",
+                self.place_tx_mm, self.place_ty_mm, self.place_rot_deg
+            ),
+            err: false,
+        });
         self.run_verb(&args);
     }
 
@@ -976,6 +1063,10 @@ impl ConsoleApp {
             .show(ctx, |ui| self.log_panel(ui));
 
         egui::CentralPanel::default().show(ctx, |ui| self.preview_panel(ui));
+
+        // Persist the input fields after the frame's edits (no-op unless one
+        // actually changed), so the Gerber paths survive a restart.
+        self.save_settings_if_changed();
     }
 
     fn status_panel(&mut self, ui: &mut egui::Ui) {
@@ -1280,6 +1371,14 @@ impl ConsoleApp {
             .show(ui, |ui| {
                 ui.label("bed frame");
                 ui.add(egui::TextEdit::singleline(&mut self.place_frame).desired_width(240.0));
+                ui.end_row();
+                ui.label("out .lbrn2");
+                ui.add(egui::TextEdit::singleline(&mut self.place_lbrn2).desired_width(240.0))
+                    .on_hover_text(
+                        "Where \"Etch here\" writes the registered job — separate \
+                         from the Job tab's emit output so they don't overwrite \
+                         each other.",
+                    );
                 ui.end_row();
                 ui.label("px per mm");
                 changed |= ui
@@ -2497,6 +2596,28 @@ mod tests {
         let ctx = egui::Context::default();
         let out = ctx.run(egui::RawInput::default(), |ctx| app.ui(ctx));
         assert!(!out.shapes.is_empty(), "back-side job tab produced shapes");
+    }
+
+    /// Input paths persist across restarts: a second console over the same DB
+    /// picks up the Gerber paths (and neighbours) the first one saved.
+    #[test]
+    fn input_fields_persist_across_restarts() {
+        let db = tmp_db();
+        let mut a = ConsoleApp::new(db.clone(), vec!["true".into()]);
+        a.emit_copper = "/board/F_Cu.gbr".into();
+        a.emit_outline = "/board/Edge.gbr".into();
+        a.offset_mm = 0.05;
+        a.place_lbrn2 = "placed.lbrn2".into();
+        a.fid_layout = "10,10; 60,10; 10,60; 60,60".into();
+        a.save_settings_if_changed(); // what the per-frame hook does
+
+        // A fresh console over the same DB (a "restart") reloads them.
+        let b = ConsoleApp::new(db, vec!["true".into()]);
+        assert_eq!(b.emit_copper, "/board/F_Cu.gbr");
+        assert_eq!(b.emit_outline, "/board/Edge.gbr");
+        assert!((b.offset_mm - 0.05).abs() < 1e-9);
+        assert_eq!(b.place_lbrn2, "placed.lbrn2");
+        assert_eq!(b.fid_layout, "10,10; 60,10; 10,60; 60,60");
     }
 
     /// A second frame after a status refresh still lays out (state survives).

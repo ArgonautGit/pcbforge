@@ -11,6 +11,7 @@ mod app;
 mod fiducial;
 mod place;
 mod preview;
+mod settings;
 mod status;
 
 // Camera capture lives in the egui-free `capture` crate (shared with the CLI);

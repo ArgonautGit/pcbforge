@@ -1083,3 +1083,29 @@ operator before building):
   (3 mm above the bottom of a 200-row frame) and asserts the overlay row is
   `H − ty·ppm`, not the mirrored row — mid-frame-symmetric probes could never
   catch this class of bug, so several tests were rewritten off-center.
+
+### Place "Etch here" — separate output file + self-report (bug fix)
+
+- Symptom: the operator dragged the job to a spot, clicked "Etch here", and the
+  `.lbrn2` showed the job at the workspace origin, not the placement. Root cause
+  was **not** the math (register places the job correctly — proven: a placement
+  at (29.3, 39.5) mm emits geometry centred at (29.30, 39.50)), but a **silent
+  file clobber**: "Etch here" (register) and the Job-tab "Emit" both wrote
+  `job.lbrn2`, and `emit` normalizes to the origin. Whichever ran last won; the
+  operator was viewing the emit output.
+- Fix: the Place tab now has its own `out .lbrn2` field (default `placed.lbrn2`),
+  so a plain Emit can't overwrite a registered placement. "Etch here" logs the
+  placement — `Etch here → placed.lbrn2: job placed at (x, y) mm, r°` — and the
+  `register` CLI now prints the emitted geometry's machine-mm bbox + center, so
+  the placement is self-verifying (register, unlike emit, does not normalize).
+
+### Console input persistence
+
+- The console lost its Gerber paths on every restart. Added a dependency-free
+  `settings` module: a `key=value` file beside the DB
+  (`pcbforge.console-settings`) persisting copper/outline/lbrn2 + offset, the
+  back-side gerbers + thickness/focal, the place frame/output/scale, the
+  fiducial frame/layout/scale, and the camera file. Loaded over the defaults in
+  `ConsoleApp::new`; re-saved once per frame only when a field actually changed
+  (no per-frame IO otherwise). Unknown/missing keys are tolerated so the file
+  survives field churn. Verified by a restart round-trip test.
