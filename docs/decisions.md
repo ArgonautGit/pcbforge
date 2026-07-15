@@ -1357,3 +1357,17 @@ homography-aligned 50 mm scale and the laser's work area projected onto the bed.
   to the fixture grid); the 50 mm arms land exactly on the 6th grid dot,
   confirming the scale. Test `camera_bed_overlay_renders_when_calibrated` drives
   the Camera tab with a calibration + frame through a headless layout.
+
+## 2026-07-15 — Camera capture: prefer highest resolution (2K/4K)
+
+The device-capture path requested `AbsoluteHighestFrameRate`, which on a 2K/4K
+sensor negotiates a low-res high-fps mode and discards the resolution. This is a
+metric bed-vision tool — calibration, fiducials, and placement on a mostly-
+static bed — so pixels-per-mm (accuracy) matters far more than frame rate.
+Switched to `AbsoluteHighestResolution` so the full sensor is used.
+
+Nothing else caps resolution: `frame_to_gray` builds the gray image from the
+delivered frame's own width/height, and the File source accepts any-resolution
+image, so higher-resolution frames flow through detection, calibration, and the
+egui texture unchanged. Note the anchor homography is in camera-pixel space, so
+calibrate at the same resolution you stream at (now both full-res).

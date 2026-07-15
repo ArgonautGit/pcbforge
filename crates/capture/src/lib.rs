@@ -144,8 +144,13 @@ fn open_camera(index: u32) -> Result<nokhwa::Camera, String> {
     use nokhwa::Camera;
     use nokhwa::pixel_format::RgbFormat;
     use nokhwa::utils::{CameraIndex, RequestedFormat, RequestedFormatType};
+    // Prefer the sensor's highest resolution over frame rate: this is a metric
+    // bed-vision tool (calibration, fiducials, placement on a mostly-static
+    // bed), so pixels-per-mm — accuracy — matters far more than fps. On a 2K/4K
+    // camera this negotiates the full sensor mode; `AbsoluteHighestFrameRate`
+    // would instead pick a low-res high-fps mode and throw away the resolution.
     let requested =
-        RequestedFormat::new::<RgbFormat>(RequestedFormatType::AbsoluteHighestFrameRate);
+        RequestedFormat::new::<RgbFormat>(RequestedFormatType::AbsoluteHighestResolution);
     let mut cam = Camera::new(CameraIndex::Index(index), requested)
         .map_err(|e| format!("open camera {index}: {e}"))?;
     cam.open_stream().map_err(|e| format!("stream: {e}"))?;
