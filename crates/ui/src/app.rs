@@ -842,11 +842,17 @@ impl ConsoleApp {
             });
             return;
         }
-        let out = crate::clean_path(&self.place_lbrn2);
+        // Resolve the output to an ABSOLUTE path so the operator knows exactly
+        // which file to open. A bare filename (e.g. "placed.lbrn2") lands next
+        // to the copper Gerber — beside their inputs — not in the console's
+        // launch directory, which is otherwise a mystery on a GUI.
+        let copper = crate::clean_path(&self.emit_copper);
+        let out = self.resolve_place_output(&copper);
+        let out = out.to_string_lossy().into_owned();
         let mut args: Vec<String> = vec![
             "register".into(),
             "--copper".into(),
-            crate::clean_path(&self.emit_copper),
+            copper,
             "--lbrn2".into(),
             out.clone(),
             "--fiducials".into(),
@@ -856,16 +862,31 @@ impl ConsoleApp {
             args.push("--outline".into());
             args.push(crate::clean_path(&self.emit_outline));
         }
-        // Make the placement explicit in the log — the register output is its
-        // own file (not the Job-tab emit), and this is the position it bakes in.
+        // Make the placement + the exact output path explicit in the log — the
+        // register output is its own file (not the Job-tab emit), and this is
+        // the position it bakes in.
         self.log.push(LogLine {
             text: format!(
-                "Etch here → {out}: job placed at ({:.2}, {:.2}) mm, {:.1}°",
+                "Etch here → {out}\n  job placed at ({:.2}, {:.2}) mm, {:.1}° — OPEN THIS FILE (not the Job-tab emit output)",
                 self.place_tx_mm, self.place_ty_mm, self.place_rot_deg
             ),
             err: false,
         });
         self.run_verb(&args);
+    }
+
+    /// Absolute output path for "Etch here". An absolute `place_lbrn2` is used
+    /// as-is; a bare filename lands next to the copper Gerber (beside the
+    /// operator's inputs) so the written file is easy to find.
+    fn resolve_place_output(&self, copper: &str) -> PathBuf {
+        let raw = PathBuf::from(crate::clean_path(&self.place_lbrn2));
+        if raw.is_absolute() {
+            return raw;
+        }
+        match PathBuf::from(copper).parent() {
+            Some(dir) if !dir.as_os_str().is_empty() => dir.join(&raw),
+            _ => raw,
+        }
     }
 
     /// The current camera source (device or file).
@@ -1377,7 +1398,8 @@ impl ConsoleApp {
                     .on_hover_text(
                         "Where \"Etch here\" writes the registered job — separate \
                          from the Job tab's emit output so they don't overwrite \
-                         each other.",
+                         each other. A bare filename lands next to the copper \
+                         Gerber; the log prints the full path it wrote.",
                     );
                 ui.end_row();
                 ui.label("px per mm");
@@ -2618,6 +2640,26 @@ mod tests {
         assert!((b.offset_mm - 0.05).abs() < 1e-9);
         assert_eq!(b.place_lbrn2, "placed.lbrn2");
         assert_eq!(b.fid_layout, "10,10; 60,10; 10,60; 60,60");
+    }
+
+    /// "Etch here" resolves a bare output filename next to the copper Gerber
+    /// (so the operator can find it), and leaves an absolute path untouched.
+    #[test]
+    fn place_output_resolves_beside_the_copper() {
+        let mut app = ConsoleApp::new(tmp_db(), vec!["true".into()]);
+        app.place_lbrn2 = "placed.lbrn2".into();
+        let out = app.resolve_place_output("/home/nick/uv_test/uv_test-F_Cu.gbr");
+        assert_eq!(
+            out,
+            std::path::PathBuf::from("/home/nick/uv_test/placed.lbrn2"),
+            "bare name lands beside the copper input"
+        );
+        // An absolute output path is honored as given.
+        app.place_lbrn2 = "/tmp/somewhere/job.lbrn2".into();
+        assert_eq!(
+            app.resolve_place_output("/home/nick/uv_test/uv_test-F_Cu.gbr"),
+            std::path::PathBuf::from("/tmp/somewhere/job.lbrn2")
+        );
     }
 
     /// A second frame after a status refresh still lays out (state survives).

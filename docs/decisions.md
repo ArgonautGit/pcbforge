@@ -1109,3 +1109,23 @@ operator before building):
   `ConsoleApp::new`; re-saved once per frame only when a field actually changed
   (no per-frame IO otherwise). Unknown/missing keys are tolerated so the file
   survives field churn. Verified by a restart round-trip test.
+
+### Place "Etch here" — absolute output path (find-the-file follow-up)
+
+- Follow-up to the clobber fix: the operator reported the placed job "still" at
+  the origin in LightBurn. Diagnosis from the screenshot: the loaded file showed
+  Q-Pulse 2 / Pass Count 3, but `register` writes QPulseWidth=1 / passes=1 — so
+  LightBurn had a *different/stale* file open, not the freshly-written
+  `placed.lbrn2`. Confirmed the register output genuinely carries the placed
+  coordinates (identity XForm + absolute verts at the placement, matching
+  LightBurn's own `path-shape.lbrn2` sample, whose Path verts are likewise
+  absolute and non-normalized — so LightBurn preserves absolute Path positions).
+- Root cause of the confusion: `place_lbrn2` was a bare relative filename
+  written to the console's launch directory — invisible on a GUI. Fix:
+  `resolve_place_output` now writes a bare filename **next to the copper Gerber**
+  (beside the operator's inputs) and an absolute path as-is, and the log prints
+  the full path with "OPEN THIS FILE (not the Job-tab emit output)".
+- Standing limitation (unchanged, worth restating): the placement is in the
+  fiducial/design frame the camera homography learned, not an absolute machine
+  frame — so the burned position is only correct if the board's fiducial origin
+  is aligned to the machine origin (or once VIS-3 provides the bed↔machine map).
