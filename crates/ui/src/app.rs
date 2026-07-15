@@ -242,6 +242,9 @@ pub struct ConsoleApp {
     lens: Option<crate::calib::CameraCal>,
     /// Visual exaggeration of the distortion arrows in the overlay.
     lens_arrow_scale: f32,
+    /// Visual exaggeration of the per-dot anchor residual vectors in the
+    /// laser-anchor overlay (residuals are sub-pixel on a good fit).
+    anchor_resid_scale: f32,
     /// Continuous re-anchoring against the (persistent) burned grid, so the
     /// calibration tracks the camera as it moves.
     calib_live: bool,
@@ -339,6 +342,7 @@ impl ConsoleApp {
             calib_mode: CalibMode::CameraLens,
             lens: None,
             lens_arrow_scale: 20.0,
+            anchor_resid_scale: 30.0,
             calib_live: false,
             calib_capture: None,
             calib_capture_src: None,
@@ -472,6 +476,7 @@ impl ConsoleApp {
                 rms_um: 0.0,
                 found: 0,
                 total: self.calib_n * self.calib_n,
+                dots: Vec::new(),
             });
             self.calib_note =
                 "loaded last session's calibration — click ⟳ Re-anchor to re-lock to the taped grid".into();
@@ -1824,16 +1829,33 @@ impl ConsoleApp {
                             .to_string(),
                         false,
                     ),
-                    Some(c) => (
-                        format!("● anchored ({} dots, RMS {:.0} µm)", c.found, c.rms_um),
-                        true,
-                    ),
+                    Some(c) => {
+                        let worst = c.dots.iter().map(|d| d.resid_um).fold(0.0_f64, f64::max);
+                        (
+                            format!(
+                                "● anchored ({}/{} dots, RMS {:.0} µm, worst {:.0} µm)",
+                                c.found, c.total, c.rms_um, worst
+                            ),
+                            true,
+                        )
+                    }
                     None => (
                         "○ not anchored — Place uses the design frame only".to_string(),
                         false,
                     ),
                 };
                 ui.colored_label(status_color(ok), status);
+                if self.calib.as_ref().is_some_and(|c| !c.dots.is_empty()) {
+                    ui.add(
+                        egui::Slider::new(&mut self.anchor_resid_scale, 1.0..=100.0)
+                            .text("residual ×"),
+                    );
+                    ui.weak(
+                        "Blue mesh = the laser's coordinate grid seen by the camera. \
+                         Dots: green = tight, amber/red = loose; orange vectors (× exaggerated) \
+                         point commanded→detected. Hollow red squares = dots that didn't lock.",
+                    );
+                }
             }
         }
         ui.label(egui::RichText::new(&self.calib_note).weak());
@@ -1908,6 +1930,137 @@ impl ConsoleApp {
                 };
                 painter.circle_stroke(base, 4.0, egui::Stroke::new(1.5_f32, col));
             }
+        }
+
+        // Laser-anchor feedback (after a fit): the machine coordinate grid the
+        // camera reconstructs, drawn as a blue mesh over the burned dots, with
+        // the origin + axes, per-dot residual vectors (× exaggerated), and any
+        // dots that failed to lock. This makes the abstract homography visible:
+        // the operator sees exactly where the laser thinks its grid is.
+        if self.calib_mode == CalibMode::LaserAnchor
+            && let Some(cal) = &self.calib
+            && cal.found > 0
+            && let Some(mm_to_px) = cal.px_to_mm.try_inverse()
+        {
+            let grid = self.calib_grid();
+            let exagg = self.anchor_resid_scale;
+            let proj = |mx: f64, my: f64| {
+                let p = mm_to_px.apply(nalgebra::Point2::new(mx, my));
+                to_screen(p.x, p.y)
+            };
+            let green = Color32::from_rgb(0x40, 0xc0, 0x50);
+            let amber = Color32::from_rgb(0xe0, 0x90, 0x20);
+            let red = Color32::from_rgb(0xd0, 0x40, 0x40);
+            let mesh = Color32::from_rgb(0x35, 0x70, 0xb0);
+            let axis = Color32::from_rgb(0x30, 0xd0, 0x80);
+            let orange = Color32::from_rgb(0xf0, 0x90, 0x30);
+
+            // The full commanded lattice projected into the frame, as a mesh.
+            let n = grid.n;
+            let pts = grid.points();
+            let nodes: Vec<egui::Pos2> = pts.iter().map(|&(mx, my)| proj(mx, my)).collect();
+            let node = |r: usize, c: usize| nodes[r * n + c];
+            for r in 0..n {
+                for c in 0..n {
+                    if c + 1 < n {
+                        painter.line_segment([node(r, c), node(r, c + 1)], (1.0, mesh));
+                    }
+                    if r + 1 < n {
+                        painter.line_segment([node(r, c), node(r + 1, c)], (1.0, mesh));
+                    }
+                }
+            }
+
+            // Dots that never locked: a red ✕ at the commanded lattice site.
+            for &(mx, my) in &pts {
+                let detected = cal
+                    .dots
+                    .iter()
+                    .any(|d| (d.mm.0 - mx).abs() < 1e-6 && (d.mm.1 - my).abs() < 1e-6);
+                if !detected {
+                    let s = proj(mx, my);
+                    painter.line_segment(
+                        [
+                            egui::pos2(s.x - 5.0, s.y - 5.0),
+                            egui::pos2(s.x + 5.0, s.y + 5.0),
+                        ],
+                        (1.5, red),
+                    );
+                    painter.line_segment(
+                        [
+                            egui::pos2(s.x - 5.0, s.y + 5.0),
+                            egui::pos2(s.x + 5.0, s.y - 5.0),
+                        ],
+                        (1.5, red),
+                    );
+                }
+            }
+
+            // Per detected dot: quality-colored ring + an exaggerated residual
+            // vector from the commanded (predicted) site to where it was found.
+            for d in &cal.dots {
+                let det = to_screen(d.px.0, d.px.1);
+                let cmd = proj(d.mm.0, d.mm.1);
+                let tip = egui::pos2(
+                    cmd.x + (det.x - cmd.x) * exagg,
+                    cmd.y + (det.y - cmd.y) * exagg,
+                );
+                painter.line_segment([cmd, tip], (1.2, orange));
+                let col = if d.resid_um < 50.0 {
+                    green
+                } else if d.resid_um < 200.0 {
+                    amber
+                } else {
+                    red
+                };
+                painter.circle_stroke(det, 4.0, egui::Stroke::new(1.5_f32, col));
+            }
+
+            // Origin + machine axes: the laser's (0,0) and +X/+Y directions.
+            let (ox, oy) = grid.origin_mm;
+            let o = proj(ox, oy);
+            painter.circle_filled(o, 3.5, axis);
+            for (tip, label) in [
+                (proj(ox + grid.pitch_mm, oy), "+X"),
+                (proj(ox, oy + grid.pitch_mm), "+Y"),
+            ] {
+                painter.line_segment([o, tip], (2.0, axis));
+                painter.circle_filled(tip, 2.5, axis);
+                painter.text(
+                    egui::pos2(tip.x + 4.0, tip.y - 4.0),
+                    egui::Align2::LEFT_BOTTOM,
+                    label,
+                    egui::FontId::proportional(12.0),
+                    axis,
+                );
+            }
+            painter.text(
+                egui::pos2(o.x + 6.0, o.y + 6.0),
+                egui::Align2::LEFT_TOP,
+                format!("{ox:.0},{oy:.0} mm"),
+                egui::FontId::proportional(11.0),
+                axis,
+            );
+
+            // Readout, top-left of the frame.
+            let worst = cal.dots.iter().map(|d| d.resid_um).fold(0.0_f64, f64::max);
+            let txt = format!(
+                "anchor {}/{} · RMS {:.0} µm · worst {:.0} µm",
+                cal.found, cal.total, cal.rms_um, worst
+            );
+            let pos = egui::pos2(rect.min.x + 6.0, rect.min.y + 6.0);
+            painter.rect_filled(
+                egui::Rect::from_min_size(pos, egui::vec2(9.0 * txt.len() as f32, 18.0)),
+                3.0_f32,
+                Color32::from_black_alpha(150),
+            );
+            painter.text(
+                egui::pos2(pos.x + 3.0, pos.y + 2.0),
+                egui::Align2::LEFT_TOP,
+                txt,
+                egui::FontId::monospace(12.0),
+                Color32::WHITE,
+            );
         }
 
         for (i, &(px, py)) in self.calib_corners.iter().enumerate() {
@@ -3417,6 +3570,7 @@ mod tests {
             rms_um: 12.0,
             found: 49,
             total: 49,
+            dots: Vec::new(),
         });
         let machine = app.place_homography().unwrap();
         assert!(
@@ -3445,6 +3599,7 @@ mod tests {
             rms_um: 20.0,
             found: 49,
             total: 49,
+            dots: Vec::new(),
         });
         a.save_settings_if_changed();
 
@@ -3514,6 +3669,39 @@ mod tests {
         let ctx = Context::default();
         let out = ctx.run(egui::RawInput::default(), |ctx| app.ui(ctx));
         assert!(!out.shapes.is_empty(), "calibrate tab renders");
+    }
+
+    /// The laser-anchor overlay draws the reconstructed machine grid without
+    /// panicking: load the burned-grid fixture, mark corners, fit, then lay out
+    /// the Calibrate tab in LaserAnchor mode with per-dot feedback present.
+    #[test]
+    fn anchor_overlay_renders_the_machine_grid() {
+        let mut app = ConsoleApp::new(tmp_db(), vec!["true".into()]);
+        app.tab = CentralTab::Calibrate;
+        app.calib_mode = CalibMode::LaserAnchor;
+        app.calib_n = 7;
+        app.calib_pitch_mm = 10.0;
+        app.calib_dot_mm = 2.0;
+        app.calib_frame = concat!(
+            env!("CARGO_MANIFEST_DIR"),
+            "/../../samples/calibration/grid-7x7-10mm-distorted.png"
+        )
+        .into();
+        let ctx = Context::default();
+        app.calibrate_load_frame(&ctx);
+        // Corner dots from the fixture's JSON sidecar (LL, LR, UR, UL).
+        app.calib_corners = vec![
+            (42.506, 632.64),
+            (620.163, 618.878),
+            (606.277, 39.892),
+            (43.744, 41.83),
+        ];
+        app.calibrate_fit();
+        let cal = app.calib.as_ref().expect("anchored");
+        assert!(cal.found >= 40, "anchor located the grid: {}", cal.found);
+        assert_eq!(cal.dots.len(), cal.found, "per-dot feedback present");
+        let out = ctx.run(egui::RawInput::default(), |ctx| app.ui(ctx));
+        assert!(!out.shapes.is_empty(), "anchor overlay renders the mesh");
     }
 
     /// A second frame after a status refresh still lays out (state survives).

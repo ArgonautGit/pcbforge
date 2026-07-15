@@ -53,6 +53,19 @@ impl GridSpec {
     }
 }
 
+/// One detected burned-grid dot's anchor feedback for the overlay: where it was
+/// detected in the frame, the commanded machine mm it corresponds to, and how
+/// far the fitted anchor lands from that commanded point (µm).
+#[derive(Debug, Clone, Copy)]
+pub struct AnchorDot {
+    /// Where the dot was detected in the camera frame (px).
+    pub px: (f64, f64),
+    /// The commanded machine coordinate this dot was burned at (mm).
+    pub mm: (f64, f64),
+    /// Residual of the fitted anchor at this dot: `|px_to_mm(px) − mm|`, µm.
+    pub resid_um: f64,
+}
+
 /// A fitted camera→laser calibration.
 #[derive(Debug, Clone)]
 pub struct Calibration {
@@ -63,6 +76,9 @@ pub struct Calibration {
     /// Dots detected vs commanded.
     pub found: usize,
     pub total: usize,
+    /// Per detected dot, for the overlay (empty for a restored-seed calibration
+    /// that hasn't been re-anchored to a live frame yet).
+    pub dots: Vec<AnchorDot>,
 }
 
 /// A detected dot as `(found_px, grid_mm)`.
@@ -129,11 +145,26 @@ fn refit(
     }
     let px_to_mm = fit_homography(&pairs).map_err(|e| format!("grid fit: {e}"))?;
     let rms_um = px_to_mm.rms * 1000.0;
+    // Per-dot anchor residual for the overlay: how far each detected dot lands
+    // from its commanded machine coordinate once mapped through the fit.
+    let dots: Vec<AnchorDot> = pairs
+        .iter()
+        .map(|(fpx, mm)| {
+            let got = px_to_mm.apply(*fpx);
+            let resid_um = ((got.x - mm.x).powi(2) + (got.y - mm.y).powi(2)).sqrt() * 1000.0;
+            AnchorDot {
+                px: (fpx.x, fpx.y),
+                mm: (mm.x, mm.y),
+                resid_um,
+            }
+        })
+        .collect();
     Ok(Calibration {
         px_to_mm,
         rms_um,
         found,
         total,
+        dots,
     })
 }
 
@@ -385,6 +416,20 @@ mod tests {
             cal.total
         );
         assert!(cal.rms_um < 200.0, "tight fit: {} µm", cal.rms_um);
+
+        // Per-dot anchor feedback populates (one entry per detected dot), each
+        // carries the commanded mm it maps to, and residuals are small on this
+        // clean fit — this is what the overlay draws.
+        assert_eq!(cal.dots.len(), cal.found, "one AnchorDot per detected dot");
+        let worst = cal.dots.iter().map(|d| d.resid_um).fold(0.0_f64, f64::max);
+        assert!(worst < 400.0, "worst dot residual {worst:.0} µm");
+        // Every dot's commanded mm sits on the 10 mm lattice.
+        assert!(
+            cal.dots
+                .iter()
+                .all(|d| (d.mm.0 % 10.0).abs() < 1e-6 && (d.mm.1 % 10.0).abs() < 1e-6),
+            "dot mm are on the commanded lattice"
+        );
 
         // A pixel we didn't feed in: the center dot (commanded (30,30)) maps
         // back to ~(30,30) mm.

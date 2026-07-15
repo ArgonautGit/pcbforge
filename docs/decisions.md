@@ -1289,3 +1289,26 @@ it runs), added a synthetic distorted camera frame and an end-to-end test gate.
   from disk, calibrates, and asserts all 49 dots recover at <60 µm RMS while
   >5 px of barrel distortion is present — so a regression that breaks the lens
   fit fails CI. Measured: 49/49 dots, ~25 µm RMS, 10.4 px raw distortion.
+
+## 2026-07-15 — Laser-anchor overlay: make the machine grid visible
+
+The laser-anchor step (② burned grid → camera-px→commanded-mm homography) gave
+only a text RMS, so the operator couldn't see whether/where the anchor locked.
+Added rich per-dot visual feedback, mirroring the camera-lens overlay.
+
+- `calib::Calibration` now carries `dots: Vec<AnchorDot>` — per detected dot,
+  its detected px, the commanded mm it maps to, and the fitted residual (µm).
+  Populated in `refit` (so a fresh Fit, a Re-anchor, and Live anchor all get
+  it); an empty vec for a restored-seed calibration until it's re-anchored.
+- Console overlay (LaserAnchor mode, `calib_frame_overlay`): projects the full
+  commanded lattice through the fit's inverse and draws it as a blue mesh (the
+  reconstructed machine coordinate grid over the burned dots), a green origin +
+  +X/+Y axes, a residual-quality ring per detected dot, an exaggerated orange
+  commanded→detected vector (new `anchor_resid_scale` slider), and a red ✕ for
+  unlocked dots. Status line gained worst-dot µm; an inline legend explains the
+  colors. Radial vectors visibly flag lens/galvo curvature a homography can't fit.
+- `dump_anchor_overlay` example renders the overlay to a PNG for eyeballing/docs
+  (reuses the distorted fixture). Tests: `recovers_commanded_coordinates_…` now
+  asserts `dots` populate with on-lattice mm + bounded residuals;
+  `anchor_overlay_renders_the_machine_grid` drives the fixture through load →
+  corners → fit → headless layout without panicking.

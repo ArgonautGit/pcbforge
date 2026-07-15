@@ -72,3 +72,20 @@ environments with a working Pillow.
 Step ② (**Laser anchor**) uses a grid you *burn* with the laser and tape down as
 the persistent anchor — there's no static sample for it because it's produced by
 the machine. Emit one with `pcbforge calib-grid …`.
+
+After a fit, the console draws the anchor as an overlay on the grid frame: a
+**blue mesh** = the machine coordinate grid the camera reconstructs, a **green**
+origin + `+X`/`+Y` axes, a per-dot ring colored by residual (green tight,
+amber/red loose), an **orange residual vector** (× exaggerated) pointing
+commanded→detected, and a red ✕ for any dot that failed to lock. A readout shows
+`found/total`, RMS, and worst-dot µm. Systematic outward (radial) vectors mean
+the anchor is fighting lens/galvo curvature a flat homography can't model — run
+the camera-lens step first, or characterize the galvo.
+
+Preview it on the distorted fixture (rings come up red there because that image
+carries barrel a homography-only anchor can't correct — the feedback flagging it
+is the point):
+
+```
+cargo run -p ui --example dump_anchor_overlay -- anchor.png
+```
