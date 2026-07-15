@@ -1249,3 +1249,23 @@ Fix: suffix the four affected width literals with `_f32` in
 `crates/ui/src/app.rs` (the calibration/fiducial overlay strokes). Non-literal
 widths and tuple `(w, color)` stroke forms are already concrete `f32` and
 unaffected. No behavior change — purely making the intended type explicit.
+
+## 2026-07-15 — Printable camera-lens calibration grid sample
+
+Added a reusable printed reference for the camera-lens calibration step so the
+grid workflow can be tested/used without hand-drawing a target each time.
+
+- `samples/calibration/grid-7x7-10mm.svg`: a 7×7 dot lattice at 10 mm nominal
+  pitch (2 mm `DarkDot`-profile dots), laid out in the machine frame
+  (lower-left origin, +X right, +Y up) with corners numbered 1→2→3→4 in the
+  console's click order, an origin axis marker, and a caliper dimension line
+  across the bottom row. Sized in real mm (A4) so it prints dimensionally exact.
+- `tools/gen_calib_grid.py`: deterministic, dependency-free generator
+  (`--n/--pitch/--dot/--page`) so the grid can be reproduced at other pitches or
+  on Letter stock; same args → byte-identical SVG.
+- `samples/calibration/README.md`: how to print (100%, measure the true pitch
+  with calipers since printers scale) and how it feeds step ①; notes the step ②
+  burned grid is machine-produced via `pcbforge calib-grid`.
+
+The fixtures manifest only tracks `samples/kicad` + `samples/lbrn2`, so this new
+subtree needs no manifest regeneration.

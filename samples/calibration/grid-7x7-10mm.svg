@@ -1,0 +1,99 @@
+<svg xmlns="http://www.w3.org/2000/svg" width="210mm" height="297mm" viewBox="0 0 210 297">
+<rect x="0" y="0" width="210" height="297" fill="#ffffff"/>
+<g fill="#000000">
+<circle cx="75" cy="116" r="1"/>
+<circle cx="85" cy="116" r="1"/>
+<circle cx="95" cy="116" r="1"/>
+<circle cx="105" cy="116" r="1"/>
+<circle cx="115" cy="116" r="1"/>
+<circle cx="125" cy="116" r="1"/>
+<circle cx="135" cy="116" r="1"/>
+<circle cx="75" cy="106" r="1"/>
+<circle cx="85" cy="106" r="1"/>
+<circle cx="95" cy="106" r="1"/>
+<circle cx="105" cy="106" r="1"/>
+<circle cx="115" cy="106" r="1"/>
+<circle cx="125" cy="106" r="1"/>
+<circle cx="135" cy="106" r="1"/>
+<circle cx="75" cy="96" r="1"/>
+<circle cx="85" cy="96" r="1"/>
+<circle cx="95" cy="96" r="1"/>
+<circle cx="105" cy="96" r="1"/>
+<circle cx="115" cy="96" r="1"/>
+<circle cx="125" cy="96" r="1"/>
+<circle cx="135" cy="96" r="1"/>
+<circle cx="75" cy="86" r="1"/>
+<circle cx="85" cy="86" r="1"/>
+<circle cx="95" cy="86" r="1"/>
+<circle cx="105" cy="86" r="1"/>
+<circle cx="115" cy="86" r="1"/>
+<circle cx="125" cy="86" r="1"/>
+<circle cx="135" cy="86" r="1"/>
+<circle cx="75" cy="76" r="1"/>
+<circle cx="85" cy="76" r="1"/>
+<circle cx="95" cy="76" r="1"/>
+<circle cx="105" cy="76" r="1"/>
+<circle cx="115" cy="76" r="1"/>
+<circle cx="125" cy="76" r="1"/>
+<circle cx="135" cy="76" r="1"/>
+<circle cx="75" cy="66" r="1"/>
+<circle cx="85" cy="66" r="1"/>
+<circle cx="95" cy="66" r="1"/>
+<circle cx="105" cy="66" r="1"/>
+<circle cx="115" cy="66" r="1"/>
+<circle cx="125" cy="66" r="1"/>
+<circle cx="135" cy="66" r="1"/>
+<circle cx="75" cy="56" r="1"/>
+<circle cx="85" cy="56" r="1"/>
+<circle cx="95" cy="56" r="1"/>
+<circle cx="105" cy="56" r="1"/>
+<circle cx="115" cy="56" r="1"/>
+<circle cx="125" cy="56" r="1"/>
+<circle cx="135" cy="56" r="1"/>
+</g>
+<g fill="none" stroke="#c01818" stroke-width="0.35">
+<circle cx="75" cy="116" r="3.2"/>
+<line x1="70.2" y1="116" x2="79.8" y2="116"/>
+<line x1="75" y1="111.2" x2="75" y2="120.8"/>
+<circle cx="135" cy="116" r="3.2"/>
+<line x1="130.2" y1="116" x2="139.8" y2="116"/>
+<line x1="135" y1="111.2" x2="135" y2="120.8"/>
+<circle cx="135" cy="56" r="3.2"/>
+<line x1="130.2" y1="56" x2="139.8" y2="56"/>
+<line x1="135" y1="51.2" x2="135" y2="60.8"/>
+<circle cx="75" cy="56" r="3.2"/>
+<line x1="70.2" y1="56" x2="79.8" y2="56"/>
+<line x1="75" y1="51.2" x2="75" y2="60.8"/>
+</g>
+<g fill="#c01818" font-family="sans-serif" font-size="3.2" font-weight="bold">
+<text x="68.2" y="124.2">1</text>
+<text x="141" y="124.2">2</text>
+<text x="141" y="47.8">3</text>
+<text x="68.2" y="47.8">4</text>
+</g>
+<g stroke="#1858c0" stroke-width="0.5" fill="#1858c0">
+<line x1="75" y1="116" x2="84" y2="116"/>
+<polygon points="84,116 82.4,115.1 82.4,116.9"/>
+<line x1="75" y1="116" x2="75" y2="107"/>
+<polygon points="75,107 74.1,108.6 75.9,108.6"/>
+</g>
+<g fill="#1858c0" font-family="sans-serif" font-size="3">
+<text x="84.8" y="117.1">+X</text>
+<text x="70.4" y="106.2">+Y</text>
+</g>
+<g stroke="#000000" stroke-width="0.3" fill="none">
+<line x1="75" y1="126" x2="135" y2="126"/>
+<line x1="75" y1="124" x2="75" y2="128"/>
+<line x1="75" y1="117" x2="75" y2="128"/>
+<line x1="135" y1="124" x2="135" y2="128"/>
+<line x1="135" y1="117" x2="135" y2="128"/>
+</g>
+<text x="105" y="130.6" text-anchor="middle" font-family="sans-serif" font-size="3">60 mm nominal across 7 dots (6 x 10 mm) &#8212; measure with calipers</text>
+<g font-family="sans-serif" fill="#000000">
+<text x="16" y="16" font-size="5" font-weight="bold">PCBForge camera-lens calibration grid</text>
+<text x="16" y="23" font-size="3.2">7 x 7 dots &#183; nominal 10 mm pitch &#183; 2 mm dots</text>
+<text x="16" y="29" font-size="3">PRINT AT 100% / ACTUAL SIZE — turn OFF 'fit to page' / 'scale to fit'.</text>
+<text x="16" y="33.4" font-size="3">Measure the span below with calipers; enter the TRUE pitch in the console (printers scale ~1-2%).</text>
+<text x="16" y="37.8" font-size="3">Tape flat to the bed, image it, click corners 1→2→3→4, then Fit.</text>
+</g>
+</svg>
