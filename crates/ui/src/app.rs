@@ -1686,9 +1686,12 @@ impl ConsoleApp {
         }
     }
 
-    /// Export the copper + outline Gerbers from the KiCad project (via
-    /// kicad-cli) and fill the copper/outline fields. Runs inline — kicad-cli
-    /// takes a moment, so the window pauses briefly.
+    /// Export the copper + outline Gerbers from the KiCad project by shelling
+    /// `pcbforge gerbers` in the **background** (the export can take a second or
+    /// two — the window must not freeze). The output paths are deterministic
+    /// (`<board dir>/pcbforge-gerbers/{copper,outline}.gbr`), so the fields are
+    /// filled immediately; the files appear when the background job finishes,
+    /// whose progress/errors stream to the Log.
     fn gerbers_from_kicad(&mut self) {
         let proj = crate::clean_path(&self.kicad_project);
         if proj.trim().is_empty() {
@@ -1702,6 +1705,7 @@ impl ConsoleApp {
             Side::Front => ("F.Cu", "Edge.Cuts"),
             Side::Back => ("B.Cu", "Edge.Cuts"),
         };
+        // Resolve the board just to place the output dir; the CLI re-resolves it.
         let board = match ingest::kicad_cli::resolve_board(std::path::Path::new(&proj)) {
             Ok(b) => b,
             Err(e) => {
@@ -1716,40 +1720,31 @@ impl ConsoleApp {
             .parent()
             .map(|p| p.join("pcbforge-gerbers"))
             .unwrap_or_else(|| PathBuf::from("pcbforge-gerbers"));
-        let cli = match ingest::kicad_cli::KicadCli::discover() {
-            Ok(c) => c,
-            Err(e) => {
-                self.log.push(LogLine {
-                    text: format!("gerbers: {e}"),
-                    err: true,
-                });
-                return;
+        let copper = out_dir.join("copper.gbr").display().to_string();
+        let outline = out_dir.join("outline.gbr").display().to_string();
+        match self.side {
+            Side::Front => {
+                self.emit_copper = copper;
+                self.emit_outline = outline;
             }
-        };
-        match cli.export_job_gerbers(&board, &out_dir, copper_layer, outline_layer) {
-            Ok((copper, outline)) => {
-                let (cs, os) = (copper.display().to_string(), outline.display().to_string());
-                match self.side {
-                    Side::Front => {
-                        self.emit_copper = cs.clone();
-                        self.emit_outline = os.clone();
-                    }
-                    Side::Back => {
-                        self.back_copper = cs.clone();
-                        self.back_outline = os.clone();
-                    }
-                }
-                self.preview_note = format!("exported {copper_layer} + {outline_layer} from KiCad");
-                self.log.push(LogLine {
-                    text: format!("gerbers: wrote {cs} + {os}"),
-                    err: false,
-                });
+            Side::Back => {
+                self.back_copper = copper;
+                self.back_outline = outline;
             }
-            Err(e) => self.log.push(LogLine {
-                text: format!("gerbers: {e}"),
-                err: true,
-            }),
         }
+        self.run_verb(&[
+            "gerbers".into(),
+            "--project".into(),
+            proj,
+            "--out".into(),
+            out_dir.display().to_string(),
+            "--copper-layer".into(),
+            copper_layer.into(),
+            "--outline-layer".into(),
+            outline_layer.into(),
+        ]);
+        self.preview_note =
+            format!("exporting {copper_layer} + {outline_layer} from KiCad… (see Log)");
     }
 
     fn actions_panel(&mut self, ui: &mut egui::Ui) {

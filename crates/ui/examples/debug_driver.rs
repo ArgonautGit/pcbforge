@@ -29,10 +29,17 @@ fn main() {
         }
     };
 
-    // A fresh app each run (deterministic replay). Temp DB, `true` as the verb
-    // command so shelling a CLI verb is a harmless no-op.
+    // A fresh app each run (deterministic replay). Temp DB. The verb command
+    // is `true` (shelling a CLI verb is a harmless no-op) unless PCBFORGE_CLI
+    // names a real binary — set it to drive actual verbs, e.g. the KiCad Gerber
+    // export: `PCBFORGE_CLI=./target/debug/pcbforge`.
     let db = std::env::temp_dir().join("pcbforge-debug-driver.sqlite");
-    let app = ConsoleApp::new(db, vec!["true".to_string()]);
+    let cli_cmd = std::env::var("PCBFORGE_CLI")
+        .ok()
+        .map(|s| s.split_whitespace().map(String::from).collect::<Vec<_>>())
+        .filter(|v| !v.is_empty())
+        .unwrap_or_else(|| vec!["true".to_string()]);
+    let app = ConsoleApp::new(db, cli_cmd);
     let mut harness = Harness::builder()
         .with_size(egui::vec2(1280.0, 820.0))
         .build_state(|ctx, app: &mut ConsoleApp| app.ui(ctx), app);

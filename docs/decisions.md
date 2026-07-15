@@ -1465,3 +1465,23 @@ existing ING-6 kicad-cli invoker.
   `gerbers_from_kicad_fills_the_copper_and_outline_fields` (drives the real
   button — kicad-cli is present here so it exports). Generated `pcbforge-gerbers/`
   is gitignored. Also labelled the copper/outline/frame fields for drivability.
+
+## 2026-07-15 — KiCad Gerber export runs in the background (non-blocking)
+
+The "⚙ Gerbers from KiCad" button previously called kicad-cli inline, freezing
+the console for the ~1-2 s export. Moved it onto the existing background verb
+runner:
+
+- `gerbers_from_kicad` now resolves the board (cheap, for the output dir),
+  pre-fills the copper/outline fields with the deterministic output paths
+  (`<board dir>/pcbforge-gerbers/{copper,outline}.gbr`), and shells
+  `pcbforge gerbers …` via `run_verb` (thread + channel, non-blocking). The
+  files appear when the job finishes; its progress/errors stream to the Log.
+  Back side passes `--copper-layer B.Cu`.
+- The UI interaction test is now deterministic (no kicad-cli needed): the fields
+  are pre-set synchronously, so it asserts `copper=copper.gbr` immediately. The
+  actual export is covered by the CLI `gerbers_e2e` tests.
+- `debug_driver` gained a `PCBFORGE_CLI` env override so it can drive *real*
+  verbs (e.g. `PCBFORGE_CLI=./target/debug/pcbforge`) instead of the `true`
+  no-op. Confirmed the button pre-fills the fields instantly (non-blocking) and
+  that the shelled `pcbforge gerbers` command produces the files at those paths.
