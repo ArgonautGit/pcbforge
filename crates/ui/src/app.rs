@@ -567,6 +567,13 @@ impl ConsoleApp {
     /// to bed-mm — so the geometry tracks where the mouse moves over the image.
     fn drag_place_px(&mut self, dpx: f64, dpy: f64) {
         let ppm = self.place_px_per_mm;
+        // Uniform fallback flip line: bed y is y-up from the frame's bottom
+        // (the machine frame); image rows grow downward.
+        let frame_h = self
+            .place_frame_img
+            .as_ref()
+            .map(|f| f.height() as f64)
+            .unwrap_or(0.0);
         let inv = self.fid_homography.as_ref().and_then(|h| h.try_inverse());
         // Forward: pivot bed-mm → pixel (perspective only if it's invertible,
         // so the forward/back maps always agree).
@@ -575,7 +582,7 @@ impl ConsoleApp {
                 let p = h.apply(nalgebra::Point2::new(self.place_tx_mm, self.place_ty_mm));
                 (p.x, p.y)
             }
-            _ => (self.place_tx_mm * ppm, self.place_ty_mm * ppm),
+            _ => (self.place_tx_mm * ppm, frame_h - self.place_ty_mm * ppm),
         };
         let (nx, ny) = (px + dpx, py + dpy);
         let (tx, ty) = match &inv {
@@ -583,7 +590,7 @@ impl ConsoleApp {
                 let p = i.apply(nalgebra::Point2::new(nx, ny));
                 (p.x, p.y)
             }
-            None => (nx / ppm, ny / ppm),
+            None => (nx / ppm, (frame_h - ny) / ppm),
         };
         self.place_tx_mm = tx;
         self.place_ty_mm = ty;
@@ -1365,7 +1372,12 @@ impl ConsoleApp {
                     );
                 ui.end_row();
                 ui.label("expected (x,y mm; …)");
-                ui.add(egui::TextEdit::singleline(&mut self.fid_layout).desired_width(240.0));
+                ui.add(egui::TextEdit::singleline(&mut self.fid_layout).desired_width(240.0))
+                    .on_hover_text(
+                        "Fiducial positions in board/machine mm (Gerber frame, \
+                         y up). On the un-calibrated uniform scale, bed (0,0) \
+                         is the bottom-left of the camera frame.",
+                    );
                 ui.end_row();
                 ui.label("px/mm (seed)");
                 ui.add(
@@ -1484,11 +1496,14 @@ impl ConsoleApp {
         );
         let rect = resp.rect;
         let ppm = self.fid_px_per_mm as f32;
-        // bed-mm ↔ screen (via the image rect + native texture size).
+        // bed-mm ↔ screen (via the image rect + native texture size). Bed mm
+        // is y-up with its origin at the frame's bottom-left (the machine /
+        // Gerber frame), while image rows grow downward — hence the flip
+        // against the texture height.
         let to_screen = |mmx: f64, mmy: f64| {
             egui::pos2(
                 rect.min.x + (mmx as f32 * ppm) / tw * rect.width(),
-                rect.min.y + (mmy as f32 * ppm) / th * rect.height(),
+                rect.min.y + (th - mmy as f32 * ppm) / th * rect.height(),
             )
         };
         let px_to_screen = |px: f64, py: f64| {
@@ -1502,7 +1517,7 @@ impl ConsoleApp {
         let to_mm = |p: egui::Pos2| {
             let ix = (p.x - rect.min.x) / rect.width() * tw;
             let iy = (p.y - rect.min.y) / rect.height() * th;
-            (ix as f64 / ppm_f, iy as f64 / ppm_f)
+            (ix as f64 / ppm_f, (th - iy) as f64 / ppm_f)
         };
 
         // Click-to-place (FLD-12): screen positions of the current markers, for
@@ -1929,7 +1944,7 @@ mod tests {
         let img = image::GrayImage::from_fn(700, 700, |x, y| {
             let mut v = 170.0;
             for (mx, my) in holes {
-                let (cx, cy) = (mx * ppm, my * ppm);
+                let (cx, cy) = (mx * ppm, 700.0 - my * ppm); // bed y-up
                 if (((x as f64) - cx).powi(2) + ((y as f64) - cy).powi(2)).sqrt() < 0.5 * ppm {
                     v -= 110.0;
                 }
@@ -1995,7 +2010,7 @@ mod tests {
         let img = image::GrayImage::from_fn(700, 700, |x, y| {
             let mut v = 150.0;
             for (mx, my) in holes {
-                let (cx, cy) = (mx * ppm, my * ppm);
+                let (cx, cy) = (mx * ppm, 700.0 - my * ppm); // bed y-up
                 if (((x as f64) - cx).powi(2) + ((y as f64) - cy).powi(2)).sqrt() < 0.5 * ppm {
                     v -= 90.0;
                 }
@@ -2111,9 +2126,10 @@ mod tests {
         let dir = std::env::temp_dir().join(format!("ui-drag-{}", std::process::id()));
         std::fs::create_dir_all(&dir).unwrap();
         let path = dir.join("hole.png");
-        // One dark hole at bed (13,10) mm → px (130,100) at 10 px/mm.
+        // One dark hole at bed (13,10) mm → px (130, 160−100=60) at 10 px/mm
+        // (bed y-up from the frame's bottom-left).
         let ppm = 10.0;
-        let (hx, hy) = (13.0 * ppm, 10.0 * ppm);
+        let (hx, hy) = (13.0 * ppm, 160.0 - 10.0 * ppm);
         let img = image::GrayImage::from_fn(220, 160, |x, y| {
             let bg = 150.0;
             let d = (((x as f64) - hx).powi(2) + ((y as f64) - hy).powi(2)).sqrt();
@@ -2239,7 +2255,7 @@ mod tests {
         let img = image::GrayImage::from_fn(700, 700, |x, y| {
             let mut v = 40.0;
             for (mx, my) in holes {
-                let (cx, cy) = (mx * ppm, my * ppm);
+                let (cx, cy) = (mx * ppm, 700.0 - my * ppm); // bed y-up
                 if (((x as f64) - cx).powi(2) + ((y as f64) - cy).powi(2)).sqrt() < 0.5 * ppm {
                     v += 170.0;
                 }
@@ -2361,18 +2377,24 @@ mod tests {
         );
     }
 
-    /// Without a homography the drag is the plain uniform-scale move (pixel
-    /// delta ÷ px-per-mm added to the bed-mm translation).
+    /// Without a homography the drag is the plain uniform-scale move — with
+    /// bed y **up** (machine frame): dragging the mouse up (−dpy, toward the
+    /// top of the image) *increases* the bed-mm y of the placement.
     #[test]
     fn place_drag_uniform_without_homography() {
         let mut app = ConsoleApp::new(tmp_db(), vec!["true".into()]);
         app.fid_homography = None;
         app.place_px_per_mm = 10.0;
+        app.place_frame_img = Some(image::GrayImage::from_pixel(100, 100, image::Luma([120])));
         app.place_tx_mm = 5.0;
         app.place_ty_mm = 5.0;
         app.drag_place_px(20.0, -30.0);
         assert!((app.place_tx_mm - (5.0 + 2.0)).abs() < 1e-9);
-        assert!((app.place_ty_mm - (5.0 - 3.0)).abs() < 1e-9);
+        assert!(
+            (app.place_ty_mm - (5.0 + 3.0)).abs() < 1e-9,
+            "mouse up = bed y up: {}",
+            app.place_ty_mm
+        );
     }
 
     /// Double-sided: on the back, the expected fiducial positions are the

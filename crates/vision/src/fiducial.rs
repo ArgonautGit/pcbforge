@@ -57,6 +57,19 @@ impl BedMap {
             .expect("nonzero scale is invertible")
     }
 
+    /// Axis-aligned camera at `px_per_mm` with the **y axis flipped**: bed
+    /// (0,0) is the image's bottom-left and bed y grows upward, matching the
+    /// machine/Gerber y-up convention, while pixel rows grow downward
+    /// (`py = frame_h_px − y_mm·px_per_mm`). This is the right uniform map
+    /// for a camera image of the bed — [`BedMap::uniform_scale`] conflates
+    /// image rows with bed y and silently mirrors the frame.
+    pub fn uniform_scale_y_flip(px_per_mm: f64, frame_h_px: f64) -> Self {
+        let s = 1.0 / px_per_mm;
+        // mm_from_px: x = px/s⁻¹, y = (H − py)/px_per_mm.
+        let m = Matrix3::new(s, 0.0, 0.0, 0.0, -s, frame_h_px * s, 0.0, 0.0, 1.0);
+        Self::new(m).expect("nonzero scale is invertible")
+    }
+
     /// Map a pixel position to bed mm.
     pub fn px_to_mm(&self, p: Point2<f64>) -> Point2<f64> {
         self.mm_from_px.transform_point(&p)
@@ -500,6 +513,22 @@ fn disc_ring_contrast(win: &Window, center: (f64, f64), dot_px: f64) -> f64 {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    /// The y-flipped uniform map puts bed (0,0) at the image's bottom-left
+    /// and round-trips px↔mm exactly.
+    #[test]
+    fn uniform_scale_y_flip_maps_bottom_left_origin() {
+        let bed = BedMap::uniform_scale_y_flip(10.0, 480.0);
+        // Bed origin → bottom-left pixel row (y = H).
+        let p = bed.mm_to_px(Point2::new(0.0, 0.0));
+        assert!((p.x - 0.0).abs() < 1e-9 && (p.y - 480.0).abs() < 1e-9);
+        // 10 mm up from the bed origin → 100 px above the bottom.
+        let q = bed.mm_to_px(Point2::new(5.0, 10.0));
+        assert!((q.x - 50.0).abs() < 1e-9 && (q.y - 380.0).abs() < 1e-9);
+        // Round trip.
+        let r = bed.px_to_mm(q);
+        assert!((r.x - 5.0).abs() < 1e-9 && (r.y - 10.0).abs() < 1e-9);
+    }
 
     /// xorshift64* — deterministic noise without a rand dependency.
     struct Rng(u64);

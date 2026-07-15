@@ -116,6 +116,9 @@ pub fn composite_over(
 
     let a = placement.affine();
     // Gerber-nm point → bed-mm (placement) → bed-px (perspective or uniform).
+    // The uniform fallback flips y: bed mm is y-up from the frame's bottom
+    // (the machine/Gerber frame), image rows grow downward. A homography
+    // learned its orientation from real correspondences, so it maps as-is.
     let to_px = |gx_nm: i64, gy_nm: i64| -> (f64, f64) {
         let x = gx_nm as f64 / NM_PER_MM as f64;
         let y = gy_nm as f64 / NM_PER_MM as f64;
@@ -126,7 +129,7 @@ pub fn composite_over(
                 let p = hgt.apply(nalgebra::Point2::new(bx, by));
                 (p.x, p.y)
             }
-            None => (bx * px_per_mm, by * px_per_mm),
+            None => (bx * px_per_mm, h as f64 - by * px_per_mm),
         }
     };
     let rgb = (color[0] as f64, color[1] as f64, color[2] as f64);
@@ -384,6 +387,35 @@ mod tests {
             at(50, 50).r()
         );
         assert_eq!(at(5, 5), Color32::from_gray(120), "far corner untouched");
+    }
+
+    /// The regression behind "the .lbrn2 doesn't match where I placed it":
+    /// bed mm is y-up (machine frame) while image rows grow downward, so the
+    /// overlay must draw a placement at ty mm at pixel row `H − ty·ppm` — the
+    /// same physical spot `register` emits at machine y = ty. An asymmetric
+    /// placement (ty well below mid-frame) catches any y-frame conflation
+    /// that symmetric mid-frame probes cannot.
+    #[test]
+    fn overlay_row_matches_machine_y_up() {
+        let frame = GrayImage::from_pixel(100, 200, image::Luma([120]));
+        let job = [sq(0, 0, MM)]; // 2 mm square at the gerber origin
+        let p = Placement {
+            tx_mm: 5.0,
+            ty_mm: 3.0, // 3 mm up from the machine origin — near the BOTTOM
+            rot_deg: 0.0,
+            pivot_mm: (0.0, 0.0),
+        };
+        let img = composite(&frame, &job, &p, 10.0, None, [200, 60, 60], 0.9);
+        let red = |x: usize, y: usize| img.pixels[y * 100 + x].r() > 150;
+        // 3 mm up @10 px/mm in a 200-row frame → rows 160..180 (near the
+        // bottom); probe the crisp left-edge outline at (40, 170).
+        assert!(red(40, 170), "overlay sits 3 mm above the frame bottom");
+        // NOT around row 30 — where the old y-down conflation drew it (near
+        // the top), mirrored from where the machine would burn.
+        assert!(
+            !(20..45).any(|y| (35..65).any(|x| red(x, y))),
+            "no footprint at the mirrored y-down position"
+        );
     }
 
     #[test]

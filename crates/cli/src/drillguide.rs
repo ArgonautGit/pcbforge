@@ -145,7 +145,9 @@ pub fn check_hole(
     tol_um: f64,
     search_mm: f64,
 ) -> Result<f64, String> {
-    let bed = BedMap::uniform_scale(px_per_mm);
+    // y-flipped: drill coordinates are y-up (Gerber frame); image rows grow
+    // downward, so bed (0,0) is the frame's bottom-left.
+    let bed = BedMap::uniform_scale_y_flip(px_per_mm, frame.height() as f64);
     let profile = FiducialProfile::DarkDot {
         diameter_mm: target.d_mm,
     };
@@ -187,7 +189,8 @@ pub fn render_overlay(
     });
     for (i, t) in holes.iter().enumerate() {
         let cx = (t.x_mm * px_per_mm).round() as i32;
-        let cy = (t.y_mm * px_per_mm).round() as i32;
+        // Drill y is y-up (Gerber); image rows grow downward.
+        let cy = (frame.height() as f64 - t.y_mm * px_per_mm).round() as i32;
         let r = ((t.d_mm * px_per_mm * 0.5) as i32 + 4).max(6);
         let color = match i.cmp(&pending) {
             std::cmp::Ordering::Less => GREEN,
@@ -488,8 +491,9 @@ mod tests {
                 })
             })
         };
-        assert!(has(GREEN, 50, 50), "confirmed hole ringed green");
-        assert!(has(RED, 150, 50), "current target red");
-        assert!(has(DIM, 100, 150), "remaining hole dim");
+        // Drill y is y-up: y_mm=5 → pixel row 220−50 = 170; y_mm=15 → 70.
+        assert!(has(GREEN, 50, 170), "confirmed hole ringed green");
+        assert!(has(RED, 150, 170), "current target red");
+        assert!(has(DIM, 100, 70), "remaining hole dim");
     }
 }

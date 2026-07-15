@@ -125,6 +125,8 @@ fn too_few_fiducials_is_rejected() {
 #[test]
 fn frame_detection_path_fits_and_emits() {
     // 10 px/mm; holes at machine mm (13,10),(28,10),(13,25) → px centers.
+    // Machine/bed mm is y-up with the origin at the frame's bottom-left, so
+    // the pixel row is flipped against the frame height.
     let ppm = 10.0f64;
     let holes = [(13.0, 10.0), (28.0, 10.0), (13.0, 25.0)];
     let (w, h) = (400u32, 320u32);
@@ -133,7 +135,7 @@ fn frame_detection_path_fits_and_emits() {
         let bg = 140.0 + 70.0 * (x as f64 + y as f64) / (w + h) as f64;
         let mut v = bg;
         for (mx, my) in holes {
-            let (cx, cy) = (mx * ppm, my * ppm);
+            let (cx, cy) = (mx * ppm, h as f64 - my * ppm);
             let mut cover = 0.0;
             for sy in 0..4 {
                 for sx in 0..4 {

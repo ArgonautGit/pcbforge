@@ -12,7 +12,11 @@
 //!
 //! The frame is a file for now (a saved camera grab or a phone photo); it
 //! becomes the live VIS-1 feed later with no change to this code. Until VIS-3
-//! provides the real bed homography, the px↔mm map is a uniform scale.
+//! provides the real bed homography, the px↔mm map is a uniform scale with
+//! the **y axis flipped**: bed (0,0) is the frame's bottom-left and bed y
+//! grows upward, matching the machine/Gerber y-up frame (image rows grow
+//! downward — mapping them to bed y directly would mirror every position
+//! handed to `register`, which is what the machine burns).
 
 use egui::{Color32, ColorImage};
 use image::GrayImage;
@@ -145,7 +149,8 @@ pub fn check_frame(
     profile: &FiducialProfile,
     search_mm: f64,
 ) -> FidResult {
-    let bed = BedMap::uniform_scale(px_per_mm);
+    // y-flipped: bed (0,0) = frame bottom-left, bed y up (machine frame).
+    let bed = BedMap::uniform_scale_y_flip(px_per_mm, frame.height() as f64);
     let expected: Vec<Point2<f64>> = expected_mm
         .iter()
         .map(|&(x, y)| Point2::new(x, y))
@@ -432,6 +437,12 @@ mod tests {
 
     const PPM: f64 = 10.0;
 
+    /// Bed mm → image pixel row under the y-flipped uniform map (bed origin
+    /// at the frame's bottom-left, bed y up — the machine/Gerber frame).
+    fn py(frame_h: u32, y_mm: f64) -> f64 {
+        frame_h as f64 - y_mm * PPM
+    }
+
     /// The operator's default profile (1 mm drilled hole → dark dot).
     fn dark() -> FiducialProfile {
         FiducialProfile::DarkDot { diameter_mm: 1.0 }
@@ -442,11 +453,11 @@ mod tests {
     #[test]
     fn operator_layout_all_found_and_marked_green() {
         let expected = [(10.0, 10.0), (60.0, 10.0), (10.0, 60.0)];
-        // Board nudged ~0.4 mm off nominal.
+        // Board nudged ~0.4 mm off nominal (bed mm, y-up).
         let (dx, dy) = (0.4, -0.3);
         let dots: Vec<_> = expected
             .iter()
-            .map(|(ex, ey)| ((ex + dx) * PPM, (ey + dy) * PPM, 1.0 * PPM))
+            .map(|(ex, ey)| ((ex + dx) * PPM, py(700, ey + dy), 1.0 * PPM))
             .collect();
         let img = frame(700, 700, &dots, 85.0, 5.0);
 
@@ -462,7 +473,7 @@ mod tests {
         let green = Color32::from_rgb(0x40, 0xc0, 0x50);
         for (ex, ey) in expected {
             let cx = ((ex + dx) * PPM) as usize;
-            let cy = ((ey + dy) * PPM) as usize;
+            let cy = py(700, ey + dy) as usize;
             let hit = (cy.saturating_sub(8)..(cy + 8).min(h)).any(|y| {
                 (cx.saturating_sub(8)..(cx + 8).min(w))
                     .any(|x| r.overlay.pixels[y * w + x] == green)
@@ -480,7 +491,7 @@ mod tests {
         let expected = [(10.0, 10.0), (60.0, 10.0), (10.0, 60.0)];
         let dots: Vec<_> = expected
             .iter()
-            .map(|(ex, ey)| (ex * PPM, ey * PPM, 1.0 * PPM))
+            .map(|(ex, ey)| (ex * PPM, py(700, *ey), 1.0 * PPM))
             .collect();
         let img = frame(700, 700, &dots, 85.0, 5.0);
         // Seed 9.5 px/mm (5% low) with a generous 5 mm search window.
@@ -512,11 +523,12 @@ mod tests {
     /// fiducial — the detection stays on the true hole (VIS-4's local search).
     #[test]
     fn decoy_is_not_marked_as_the_fiducial() {
-        let true_c = (100.0, 100.0);
+        // Expected bed (10,10) mm → image (100, py(220,10)=120) px.
+        let true_c = (100.0, py(220, 10.0));
         let img = frame(
             220,
             220,
-            &[(true_c.0, true_c.1, 10.0), (125.0, 100.0, 10.0)],
+            &[(true_c.0, true_c.1, 10.0), (125.0, true_c.1, 10.0)],
             85.0,
             5.0,
         );

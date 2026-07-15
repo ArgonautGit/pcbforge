@@ -33,8 +33,10 @@ M30
 ";
 
 /// A camera frame (10 px/mm, 250×250) showing exactly `drilled` as dark holes.
+/// Drill mm is y-up (Gerber frame): pixel row = frame height − y·ppm.
 fn write_frame(path: &Path, drilled: &[(f64, f64, f64)]) {
     const PPM: f64 = 10.0;
+    const H: f64 = 250.0;
     let img = image::GrayImage::from_fn(250, 250, |x, y| {
         let mut cover = 0.0;
         for sy in 0..4 {
@@ -42,7 +44,7 @@ fn write_frame(path: &Path, drilled: &[(f64, f64, f64)]) {
                 let px = x as f64 + (sx as f64 + 0.5) / 4.0 - 0.5;
                 let py = y as f64 + (sy as f64 + 0.5) / 4.0 - 0.5;
                 if drilled.iter().any(|&(hx, hy, d)| {
-                    ((px - hx * PPM).powi(2) + (py - hy * PPM).powi(2)).sqrt() < d * PPM / 2.0
+                    ((px - hx * PPM).powi(2) + (py - (H - hy * PPM)).powi(2)).sqrt() < d * PPM / 2.0
                 }) {
                     cover += 1.0_f64 / 16.0;
                 }

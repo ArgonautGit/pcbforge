@@ -834,7 +834,10 @@ fn detect_correspondences(
     // The given px_per_mm is only a SEED to place the search windows; the true
     // scale is measured from the detected fiducial spacing below, so the
     // registration is anchored to the fiducials — not to a guessed number.
-    let bed = vision::BedMap::uniform_scale(px_per_mm);
+    // y-flipped: bed (0,0) = frame bottom-left, bed y up (machine frame) —
+    // mapping image rows to bed y directly would make the design→machine fit
+    // a reflection, which the negative-determinant gate rejects.
+    let bed = vision::BedMap::uniform_scale_y_flip(px_per_mm, frame.height() as f64);
     let profile = vision::FiducialProfile::DarkDot { diameter_mm };
     let results = vision::find_fiducials(&frame, &design, 2.0, &profile, &bed);
 
@@ -866,11 +869,14 @@ fn detect_correspondences(
         hits.len()
     );
 
-    // Machine mm = detected px / measured px/mm, so the target spacing equals
-    // the design spacing (unit scale) and the fit is a pure rigid placement.
+    // Machine mm = detected px / measured px/mm — with y flipped against the
+    // frame height (machine y up, image rows down) — so the target spacing
+    // equals the design spacing (unit scale) and the fit is a pure rigid
+    // placement, not a reflection.
+    let frame_h = frame.height() as f64;
     let pairs = hits
         .into_iter()
-        .map(|(d, (px, py))| (d, Point2::new(px / ppm, py / ppm)))
+        .map(|(d, (px, py))| (d, Point2::new(px / ppm, (frame_h - py) / ppm)))
         .collect();
     Ok(pairs)
 }

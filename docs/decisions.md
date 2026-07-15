@@ -1052,3 +1052,34 @@ operator before building):
   grab-and-check detects the holes in one step, Check-with-no-file reaches the
   camera, and a dead source surfaces `camera: …` in the note instead of
   panicking.
+
+## 2026-07-15 — Place/etch y-frame fix (operator: "the .lbrn2 doesn't match where I placed it")
+
+- Root cause: two frame conventions were conflated in every **uniform-scale
+  fallback**. LightBurn's workspace is y-up (evidence-pinned by the
+  asymmetric-triangle test and validated on real burns), but the console
+  derived bed mm from camera pixels, whose rows grow **downward** — so
+  "Etch here" emitted y as distance-from-the-image-top while the machine reads
+  distance-from-the-bed-bottom: the burn landed vertically mirrored from the
+  screen placement, with the on-screen overlay also mirrored vs reality.
+  Confirming smell: `register --frame`'s detected correspondences fit a
+  *reflecting* affine (y-up design → y-down pixels), which the
+  negative-determinant gate would reject outright.
+- The **homography path was already correct** — it learns its orientation from
+  data (the operator's y-up fiducial layout ↔ detected pixels), so placements
+  made with ≥4 detected fiducials were unaffected. Only the no-homography
+  fallback conflated frames.
+- Fix: one convention everywhere — **bed mm is y-up with its origin at the
+  frame's bottom-left**, flipped against the frame height only at the image
+  boundary (`py = H − y·ppm`). New `BedMap::uniform_scale_y_flip` used by the
+  fiducial check, `register --frame` (both detection and the machine-mm
+  conversion), `drill-guide`, the Place/AR composite fallback, the Place drag
+  fallback, and the fiducial tab's marker screen mapping. Homography branches
+  untouched.
+- Operator-visible change: bed/layout y is now measured **up from the bottom
+  edge of the camera frame** (matching Gerber/machine y), the Place overlay
+  renders un-mirrored (as the machine burns it), and mouse-up = bed-y-up.
+- Regression pin: `overlay_row_matches_machine_y_up` places asymmetrically
+  (3 mm above the bottom of a 200-row frame) and asserts the overlay row is
+  `H − ty·ppm`, not the mirrored row — mid-frame-symmetric probes could never
+  catch this class of bug, so several tests were rewritten off-center.

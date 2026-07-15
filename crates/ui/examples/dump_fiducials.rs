@@ -12,16 +12,17 @@ fn main() {
     let ppm = 10.0_f64; // px per mm
 
     // Operator L-layout at (10,10)/(60,10)/(10,60) mm, board nudged ~0.4 mm,
-    // plus a same-size decoy hole 2.5 mm from the first fiducial.
+    // plus a same-size decoy hole 2.5 mm from the first fiducial. Bed mm is
+    // y-up from the frame's bottom-left; pixel rows grow downward.
+    let (w, h) = (720u32, 720u32);
+    let flip = |y_mm: f64| h as f64 - y_mm * ppm;
     let expected = [(10.0, 10.0), (60.0, 10.0), (10.0, 60.0)];
     let (dx, dy) = (0.4, -0.3);
     let mut dots: Vec<(f64, f64, f64)> = expected
         .iter()
-        .map(|(ex, ey)| ((ex + dx) * ppm, (ey + dy) * ppm, 1.0 * ppm))
+        .map(|(ex, ey)| ((ex + dx) * ppm, flip(ey + dy), 1.0 * ppm))
         .collect();
-    dots.push(((10.0 + dx) * ppm + 25.0, (10.0 + dy) * ppm, 1.0 * ppm)); // decoy
-
-    let (w, h) = (720u32, 720u32);
+    dots.push(((10.0 + dx) * ppm + 25.0, flip(10.0 + dy), 1.0 * ppm)); // decoy
     let mut seed = 1u64;
     let frame = image::GrayImage::from_fn(w, h, |x, y| {
         // glare gradient
