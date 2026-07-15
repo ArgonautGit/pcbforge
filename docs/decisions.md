@@ -1440,3 +1440,28 @@ integration tests (calibrates_from_the_distorted_grid_fixture,
 recovers_commanded_coordinates_from_a_burned_grid, anchor_overlay_renders...,
 camera_bed_overlay_renders...) plus CLI calib-grid and vision fit tests — all
 green. No bugs found.
+
+## 2026-07-15 — Point at a KiCad project → auto-produce the Gerbers it needs
+
+The pipeline consumed copper.gbr + outline.gbr but the operator had to produce
+them by hand in KiCad. Now the program produces them from a project via the
+existing ING-6 kicad-cli invoker.
+
+- `ingest::kicad_cli::export_job_gerbers(board, out_dir, copper_layer,
+  outline_layer)`: exports the conductor + outline on separate calls (so the
+  layer→file mapping is unambiguous) and moves each plotted file to a stable
+  name — `copper.gbr` / `outline.gbr`. `resolve_board` accepts a `.kicad_pcb`
+  *or* a project directory containing exactly one board.
+- CLI `pcbforge gerbers --project <.kicad_pcb|dir> --out <dir>
+  [--copper-layer F.Cu] [--outline-layer Edge.Cuts]`: prints `board/copper/
+  outline` paths for a script or the console to pick up. Verified end-to-end:
+  gerbers → emit consumes them → valid job.lbrn2.
+- Console Job tab: a labelled "KiCad project" field + "⚙ Gerbers from KiCad"
+  button that runs the export next to the board (`pcbforge-gerbers/`) and fills
+  the copper/outline fields (back side → B.Cu). Front-side default F.Cu +
+  Edge.Cuts; runs inline (a brief pause). Persisted across restarts.
+- Tests: ingest `export_job_gerbers_writes_stable_names` + `resolve_board_*`;
+  CLI `gerbers_e2e` (2, self-skip without kicad-cli); UI interaction
+  `gerbers_from_kicad_fills_the_copper_and_outline_fields` (drives the real
+  button — kicad-cli is present here so it exports). Generated `pcbforge-gerbers/`
+  is gitignored. Also labelled the copper/outline/frame fields for drivability.

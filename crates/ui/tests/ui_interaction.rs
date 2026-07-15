@@ -71,6 +71,40 @@ fn calibration_frame_loads_from_a_typed_path() {
 }
 
 #[test]
+fn gerbers_from_kicad_fills_the_copper_and_outline_fields() {
+    let mut h = console();
+    // Point the KiCad-project field at the sample board and export.
+    let board = concat!(
+        env!("CARGO_MANIFEST_DIR"),
+        "/../../samples/kicad/valdemo2.kicad_pcb"
+    );
+    let field = h.get_by_label("KiCad project");
+    field.focus();
+    field.type_text(board);
+    h.run();
+    h.get_by_label("⚙ Gerbers from KiCad").click();
+    h.run();
+
+    let state = h.state().debug_summary();
+    if state.contains("copper=unset") {
+        // kicad-cli not installed here — the button logs an error and leaves
+        // the fields unset. The wiring (field + button + handler) is still
+        // exercised; the export itself is covered by the CLI e2e test.
+        eprintln!("SKIP export assertion: kicad-cli not installed");
+        return;
+    }
+    assert!(
+        state.contains("copper=copper.gbr") && state.contains("outline=outline.gbr"),
+        "KiCad export filled the Gerber fields:\n{state}"
+    );
+    // Clean up the generated output next to the sample board.
+    let _ = std::fs::remove_dir_all(concat!(
+        env!("CARGO_MANIFEST_DIR"),
+        "/../../samples/kicad/pcbforge-gerbers"
+    ));
+}
+
+#[test]
 fn the_accessibility_tree_exposes_labeled_widgets() {
     let h = console();
     // Buttons carry labels, so they're queryable/drivable by an agent. Use

@@ -179,6 +179,9 @@ pub struct ConsoleApp {
     verb_job: Option<VerbJob>,
 
     // emit form
+    /// A KiCad `.kicad_pcb` or project directory; the ⚙ button exports its
+    /// copper + outline Gerbers (via kicad-cli) into the copper/outline fields.
+    kicad_project: String,
     emit_copper: String,
     emit_outline: String,
     emit_lbrn2: String,
@@ -333,6 +336,7 @@ impl ConsoleApp {
             log: Vec::new(),
             tab: CentralTab::Job,
             verb_job: None,
+            kicad_project: String::new(),
             emit_copper: String::new(),
             emit_outline: String::new(),
             emit_lbrn2: "job.lbrn2".into(),
@@ -433,6 +437,7 @@ impl ConsoleApp {
     /// The persisted input fields, in a fixed key order.
     fn settings_blob(&self) -> String {
         crate::settings::blob(&[
+            ("kicad_project", self.kicad_project.clone()),
             ("copper", self.emit_copper.clone()),
             ("outline", self.emit_outline.clone()),
             ("lbrn2", self.emit_lbrn2.clone()),
@@ -485,6 +490,7 @@ impl ConsoleApp {
                     *dst = v.trim().to_string();
                 }
             };
+        str_field(&m, "kicad_project", &mut self.kicad_project);
         str_field(&m, "copper", &mut self.emit_copper);
         str_field(&m, "outline", &mut self.emit_outline);
         str_field(&m, "lbrn2", &mut self.emit_lbrn2);
@@ -1602,8 +1608,28 @@ impl ConsoleApp {
             Some(g) => format!("{}×{}", g.width(), g.height()),
             None => "none".into(),
         };
+        let base = |s: &str| {
+            std::path::Path::new(s)
+                .file_name()
+                .map(|f| f.to_string_lossy().into_owned())
+                .unwrap_or_else(|| "unset".into())
+        };
+        let gerbers = format!(
+            "copper={} outline={}",
+            if self.emit_copper.trim().is_empty() {
+                "unset".into()
+            } else {
+                base(&self.emit_copper)
+            },
+            if self.emit_outline.trim().is_empty() {
+                "unset".into()
+            } else {
+                base(&self.emit_outline)
+            }
+        );
         format!(
             "tab={:?} side={:?} calib_mode={:?}\n\
+             gerbers: {gerbers}\n\
              calib_anchor: {calib}\n\
              camera_lens: {lens}\n\
              camera_frame: {cam}\n\
@@ -1660,20 +1686,111 @@ impl ConsoleApp {
         }
     }
 
+    /// Export the copper + outline Gerbers from the KiCad project (via
+    /// kicad-cli) and fill the copper/outline fields. Runs inline — kicad-cli
+    /// takes a moment, so the window pauses briefly.
+    fn gerbers_from_kicad(&mut self) {
+        let proj = crate::clean_path(&self.kicad_project);
+        if proj.trim().is_empty() {
+            self.log.push(LogLine {
+                text: "gerbers: set a KiCad project path first".into(),
+                err: true,
+            });
+            return;
+        }
+        let (copper_layer, outline_layer) = match self.side {
+            Side::Front => ("F.Cu", "Edge.Cuts"),
+            Side::Back => ("B.Cu", "Edge.Cuts"),
+        };
+        let board = match ingest::kicad_cli::resolve_board(std::path::Path::new(&proj)) {
+            Ok(b) => b,
+            Err(e) => {
+                self.log.push(LogLine {
+                    text: format!("gerbers: {e}"),
+                    err: true,
+                });
+                return;
+            }
+        };
+        let out_dir = board
+            .parent()
+            .map(|p| p.join("pcbforge-gerbers"))
+            .unwrap_or_else(|| PathBuf::from("pcbforge-gerbers"));
+        let cli = match ingest::kicad_cli::KicadCli::discover() {
+            Ok(c) => c,
+            Err(e) => {
+                self.log.push(LogLine {
+                    text: format!("gerbers: {e}"),
+                    err: true,
+                });
+                return;
+            }
+        };
+        match cli.export_job_gerbers(&board, &out_dir, copper_layer, outline_layer) {
+            Ok((copper, outline)) => {
+                let (cs, os) = (copper.display().to_string(), outline.display().to_string());
+                match self.side {
+                    Side::Front => {
+                        self.emit_copper = cs.clone();
+                        self.emit_outline = os.clone();
+                    }
+                    Side::Back => {
+                        self.back_copper = cs.clone();
+                        self.back_outline = os.clone();
+                    }
+                }
+                self.preview_note = format!("exported {copper_layer} + {outline_layer} from KiCad");
+                self.log.push(LogLine {
+                    text: format!("gerbers: wrote {cs} + {os}"),
+                    err: false,
+                });
+            }
+            Err(e) => self.log.push(LogLine {
+                text: format!("gerbers: {e}"),
+                err: true,
+            }),
+        }
+    }
+
     fn actions_panel(&mut self, ui: &mut egui::Ui) {
         ui.heading("Actions");
         ui.label(egui::RichText::new("These shell the `pcbforge` CLI.").weak());
         ui.separator();
 
+        egui::Grid::new("kicad-form")
+            .num_columns(2)
+            .spacing([8.0, 6.0])
+            .show(ui, |ui| {
+                let l = ui.label("KiCad project");
+                ui.add(egui::TextEdit::singleline(&mut self.kicad_project).desired_width(180.0))
+                    .labelled_by(l.id)
+                    .on_hover_text(
+                        "A .kicad_pcb file or a project directory containing one. \
+                         ⚙ exports its copper + outline Gerbers via kicad-cli.",
+                    );
+                ui.end_row();
+            });
+        if ui
+            .button("⚙ Gerbers from KiCad")
+            .on_hover_text(
+                "Run kicad-cli to export copper.gbr + outline.gbr and fill the fields below.",
+            )
+            .clicked()
+        {
+            self.gerbers_from_kicad();
+        }
+
         egui::Grid::new("emit-form")
             .num_columns(2)
             .spacing([8.0, 6.0])
             .show(ui, |ui| {
-                ui.label("copper .gbr");
-                ui.add(egui::TextEdit::singleline(&mut self.emit_copper).desired_width(180.0));
+                let l = ui.label("copper .gbr");
+                ui.add(egui::TextEdit::singleline(&mut self.emit_copper).desired_width(180.0))
+                    .labelled_by(l.id);
                 ui.end_row();
-                ui.label("outline .gbr");
-                ui.add(egui::TextEdit::singleline(&mut self.emit_outline).desired_width(180.0));
+                let l = ui.label("outline .gbr");
+                ui.add(egui::TextEdit::singleline(&mut self.emit_outline).desired_width(180.0))
+                    .labelled_by(l.id);
                 ui.end_row();
                 ui.label("out .lbrn2");
                 ui.add(egui::TextEdit::singleline(&mut self.emit_lbrn2).desired_width(180.0));

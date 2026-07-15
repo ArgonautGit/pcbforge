@@ -363,6 +363,26 @@ enum Command {
         #[arg(long, default_value_t = 1.0)]
         search_mm: f64,
     },
+    /// Export the copper + outline Gerbers a job needs from a KiCad project,
+    /// via kicad-cli. Point it at a `.kicad_pcb` (or a project directory with
+    /// one) and it writes `copper.gbr` + `outline.gbr` into `--out`.
+    Gerbers {
+        /// KiCad board (`.kicad_pcb`) or a project directory containing one.
+        #[arg(long)]
+        project: PathBuf,
+
+        /// Output directory for `copper.gbr` + `outline.gbr`.
+        #[arg(long, default_value = ".")]
+        out: PathBuf,
+
+        /// Copper layer to export as the conductor.
+        #[arg(long, default_value = "F.Cu")]
+        copper_layer: String,
+
+        /// Outline layer to export as the board edge.
+        #[arg(long, default_value = "Edge.Cuts")]
+        outline_layer: String,
+    },
 }
 
 fn main() -> ExitCode {
@@ -534,11 +554,37 @@ fn run(cli: &Cli) -> Result<(), Box<dyn std::error::Error>> {
             }
             Ok(())
         }
+        Command::Gerbers {
+            project,
+            out,
+            copper_layer,
+            outline_layer,
+        } => gerbers_cmd(project, out, copper_layer, outline_layer),
     }
 }
 
 /// `pcbforge cam` — VIS-1 capture surface over the shared `capture` crate.
 /// `pcbforge calib-grid` — emit an n×n grid of dots at commanded coords.
+/// `pcbforge gerbers` — point at a KiCad project and export the copper +
+/// outline Gerbers the rest of the pipeline consumes.
+fn gerbers_cmd(
+    project: &std::path::Path,
+    out: &std::path::Path,
+    copper_layer: &str,
+    outline_layer: &str,
+) -> Result<(), Box<dyn std::error::Error>> {
+    use ingest::kicad_cli::{KicadCli, resolve_board};
+    let cli = KicadCli::discover()?;
+    let board = resolve_board(project)?;
+    let (copper, outline) = cli.export_job_gerbers(&board, out, copper_layer, outline_layer)?;
+    // Print in a parseable `key: path` form so the console (or a script) can
+    // pick the two Gerbers up and feed them to `emit`/`noncopper`.
+    println!("board: {}", board.display());
+    println!("copper: {}", copper.display());
+    println!("outline: {}", outline.display());
+    Ok(())
+}
+
 fn calib_grid_cmd(
     out: &std::path::Path,
     n: usize,

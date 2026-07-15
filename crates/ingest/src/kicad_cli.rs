@@ -171,6 +171,53 @@ impl KicadCli {
         Ok(files)
     }
 
+    /// Export the two Gerbers a job needs — the conductor and the board
+    /// outline — from `board`, writing them into `out_dir` under stable names
+    /// (`copper.gbr`, `outline.gbr`) regardless of kicad-cli's own naming.
+    /// Each layer is exported on its own call so the mapping is unambiguous.
+    /// Returns `(copper, outline)`.
+    pub fn export_job_gerbers(
+        &self,
+        board: &Path,
+        out_dir: &Path,
+        copper_layer: &str,
+        outline_layer: &str,
+    ) -> Result<(PathBuf, PathBuf), KicadCliError> {
+        std::fs::create_dir_all(out_dir).ok();
+        let copper = self.export_one_gerber(board, copper_layer, out_dir, "copper.gbr")?;
+        let outline = self.export_one_gerber(board, outline_layer, out_dir, "outline.gbr")?;
+        Ok((copper, outline))
+    }
+
+    /// Export a single `layer` and move the plotted file to `out_dir/dest_name`.
+    fn export_one_gerber(
+        &self,
+        board: &Path,
+        layer: &str,
+        out_dir: &Path,
+        dest_name: &str,
+    ) -> Result<PathBuf, KicadCliError> {
+        let plotted = self.export_gerbers(board, &[layer], out_dir)?;
+        let src = plotted
+            .into_iter()
+            .next()
+            .ok_or_else(|| KicadCliError::UnexpectedOutput {
+                command: format!("kicad-cli pcb export gerbers --layers {layer}"),
+                detail: "no plotted file for the layer".into(),
+            })?;
+        let dest = out_dir.join(dest_name);
+        if src != dest {
+            // rename within a dir usually works; fall back to copy across fs.
+            std::fs::rename(&src, &dest)
+                .or_else(|_| std::fs::copy(&src, &dest).map(|_| ()))
+                .map_err(|e| KicadCliError::UnexpectedOutput {
+                    command: format!("move {} -> {}", src.display(), dest.display()),
+                    detail: e.to_string(),
+                })?;
+        }
+        Ok(dest)
+    }
+
     /// Export one layer as a board-area-only, black-and-white SVG (the form
     /// the golden raster comparisons consume).
     pub fn export_svg(
@@ -252,6 +299,39 @@ impl KicadCli {
     }
 }
 
+/// Resolve a user-supplied path to a `.kicad_pcb` board file: a board file is
+/// returned as-is; a directory is searched for exactly one `*.kicad_pcb`
+/// (so the program can be pointed at a KiCad *project*, not just a board).
+pub fn resolve_board(path: &Path) -> Result<PathBuf, KicadCliError> {
+    if path.is_file() {
+        return Ok(path.to_path_buf());
+    }
+    if path.is_dir() {
+        let mut boards: Vec<PathBuf> = std::fs::read_dir(path)
+            .map_err(|e| KicadCliError::NotFound(format!("{}: {e}", path.display())))?
+            .flatten()
+            .map(|e| e.path())
+            .filter(|p| p.extension().is_some_and(|x| x == "kicad_pcb"))
+            .collect();
+        boards.sort();
+        return match boards.len() {
+            1 => Ok(boards.remove(0)),
+            0 => Err(KicadCliError::NotFound(format!(
+                "no .kicad_pcb in {}",
+                path.display()
+            ))),
+            n => Err(KicadCliError::UnexpectedOutput {
+                command: format!("resolve board in {}", path.display()),
+                detail: format!("{n} .kicad_pcb files — name the one you want"),
+            }),
+        };
+    }
+    Err(KicadCliError::NotFound(format!(
+        "{} is not a file or directory",
+        path.display()
+    )))
+}
+
 /// True when `kicad-cli` is usable here — for tests that self-skip.
 pub fn available() -> bool {
     KicadCli::discover().is_ok()
@@ -301,6 +381,42 @@ mod tests {
         assert!(!drills.is_empty());
         let drl = std::fs::read_to_string(&drills[0]).unwrap();
         assert!(drl.starts_with("M48"), "Excellon header expected");
+    }
+
+    #[test]
+    fn export_job_gerbers_writes_stable_names() {
+        if !available() {
+            eprintln!("SKIP: kicad-cli not installed");
+            return;
+        }
+        let cli = KicadCli::discover().unwrap();
+        let board = repo_root().join("samples/kicad/valdemo2.kicad_pcb");
+        let dir = tmp_dir("job-gerbers");
+        let (copper, outline) = cli
+            .export_job_gerbers(&board, &dir, "F.Cu", "Edge.Cuts")
+            .unwrap();
+        assert_eq!(copper, dir.join("copper.gbr"));
+        assert_eq!(outline, dir.join("outline.gbr"));
+        assert!(copper.is_file() && outline.is_file());
+        // Both are real Gerber output (G-code-ish `%` header).
+        assert!(std::fs::read_to_string(&copper).unwrap().contains('%'));
+    }
+
+    #[test]
+    fn resolve_board_takes_a_file_or_a_project_dir() {
+        // A board file resolves to itself.
+        let board = repo_root().join("samples/kicad/valdemo2.kicad_pcb");
+        assert_eq!(resolve_board(&board).unwrap(), board);
+        // The samples/kicad dir has >1 board → ambiguous, a named error.
+        let dir = repo_root().join("samples/kicad");
+        assert!(resolve_board(&dir).is_err());
+        // A dir with exactly one board resolves to it.
+        let one = tmp_dir("one-board");
+        let only = one.join("proj.kicad_pcb");
+        std::fs::copy(&board, &only).unwrap();
+        assert_eq!(resolve_board(&one).unwrap(), only);
+        // A missing path errors.
+        assert!(resolve_board(Path::new("/no/such/path")).is_err());
     }
 
     #[test]
