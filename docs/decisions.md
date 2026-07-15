@@ -1140,3 +1140,34 @@ operator before building):
   registration, and display all see the corrected image. Persisted in the
   console settings file. Verified: Rotate180 maps a top-left pixel to the
   bottom-right, and the choice survives a restart.
+
+## 2026-07-14 — Camera→laser calibration (VIS-3, console)
+
+Operator report: a job placed on the board burned at a different spot. Diagnosis
+was not a placement bug — the software is self-consistent (the AR overlay shows
+the design where you dropped it, and `register` emits those coordinates) — but
+the **missing camera→laser link**. Fiducials tie the design to the board; nothing
+tied the camera to the laser, so a placement in the fiducial/design frame isn't
+in the machine's commanded frame, and the burn is offset by however the board
+sits. Confirmed with the operator (burn a grid; 60 mm/10 mm 7×7; camera moves →
+recal each session).
+
+- **`pcbforge calib-grid`** emits an n×n grid of small filled squares at known
+  commanded coordinates (default 7×7 @ 10 mm, dot 0.4 mm). The operator burns it.
+- **`ui::calib::fit_camera_to_machine`** (kernel): from the burned-grid frame +
+  the four hand-marked corner dots, an initial corner homography predicts every
+  dot's pixel; `vision::find_fiducials` (dark-dot) refines each locally; the full
+  set re-fits a **camera-px → commanded-mm homography** (perspective — absorbs
+  the tilted camera). Synthetic-grid test recovers commanded coords < 200 µm
+  through a keystone.
+- **Console Calibrate tab**: generate grid → load burned frame (camera or file)
+  → click the 4 corners (LL, LR, UR, UL) → Fit. Status shows dots/RMS.
+- **Place integration**: `place_homography()` returns the calibration's inverse
+  (machine-mm → px) when calibrated, else the fiducial homography. So drag +
+  composite + `register` all work in **true machine coordinates** once
+  calibrated; the Place note says "machine mm (calibrated)" vs "design frame".
+- **Session-scoped**: the calibration is NOT persisted (the operator's camera
+  moves between jobs) — recalibrate each session; the tab flags "not calibrated".
+- Test-isolation fix uncovered here: `tmp_db()` returned a per-process shared
+  path, so the new settings sidecar bled input fields between tests — made it
+  unique per call.

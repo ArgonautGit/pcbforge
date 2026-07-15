@@ -35,6 +35,7 @@ pub struct LogLine {
 enum CentralTab {
     Job,
     Camera,
+    Calibrate,
     Fiducials,
     Place,
 }
@@ -212,6 +213,22 @@ pub struct ConsoleApp {
     cam_capture: Option<crate::camera::Capture>,
     cam_capture_src: Option<crate::camera::Source>,
 
+    // camera→laser calibration (VIS-3/VIS-6). Session-scoped: the operator's
+    // camera moves between jobs, so this is not persisted — recalibrate each
+    // session. `calib` present ⇒ the Place tab works in true machine mm.
+    calib: Option<crate::calib::Calibration>,
+    calib_n: usize,
+    calib_pitch_mm: f64,
+    calib_dot_mm: f64,
+    calib_grid_out: String,
+    calib_frame: String,
+    calib_frame_img: Option<image::GrayImage>,
+    calib_frame_tex: Option<TextureHandle>,
+    /// Clicked corner-dot pixel positions (native image px), in order
+    /// lower-left, lower-right, upper-right, upper-left — up to 4.
+    calib_corners: Vec<(f64, f64)>,
+    calib_note: String,
+
     // AR overlay (UI-2): project the registered design over the camera frame
     // through the fiducial homography, with per-layer toggles.
     ar_overlay: bool,
@@ -290,6 +307,16 @@ impl ConsoleApp {
             cam_device: 0,
             cam_file: String::new(),
             cam_orientation: Orientation::Normal,
+            calib: None,
+            calib_n: 7,
+            calib_pitch_mm: 10.0,
+            calib_dot_mm: 0.4,
+            calib_grid_out: "calib-grid.lbrn2".into(),
+            calib_frame: String::new(),
+            calib_frame_img: None,
+            calib_frame_tex: None,
+            calib_corners: Vec::new(),
+            calib_note: "Generate a grid, burn it, image it, click the 4 corner dots (LL, LR, UR, UL), then Fit.".into(),
             cam_live: false,
             cam_tex: None,
             cam_note: "Pick a source and press Live. Snapshot feeds the Fiducial/Place tabs."
@@ -721,10 +748,13 @@ impl ConsoleApp {
             .as_ref()
             .map(|f| f.height() as f64)
             .unwrap_or(0.0);
-        let inv = self.fid_homography.as_ref().and_then(|h| h.try_inverse());
-        // Forward: pivot bed-mm → pixel (perspective only if it's invertible,
+        // Placement works in the calibrated machine frame when available, else
+        // the fiducial design frame (see place_homography).
+        let hom = self.place_homography();
+        let inv = hom.as_ref().and_then(|h| h.try_inverse());
+        // Forward: pivot target-mm → pixel (perspective only if it's invertible,
         // so the forward/back maps always agree).
-        let (px, py) = match self.fid_homography.as_ref() {
+        let (px, py) = match hom.as_ref() {
             Some(h) if inv.is_some() => {
                 let p = h.apply(nalgebra::Point2::new(self.place_tx_mm, self.place_ty_mm));
                 (p.x, p.y)
@@ -874,22 +904,27 @@ impl ConsoleApp {
         if self.place_job.is_empty() {
             return;
         }
+        let hom = self.place_homography();
         let img = crate::place::composite(
             frame,
             &self.place_job,
             &self.placement(),
             self.place_px_per_mm,
-            self.fid_homography.as_ref(),
+            hom.as_ref(),
             [0xf0, 0x50, 0x30],
             0.55,
         );
-        let persp = if self.fid_homography.is_some() {
-            " · perspective"
+        // Which frame the placement coordinates live in — machine (calibrated)
+        // vs the design frame — so the operator knows if the burn is absolute.
+        let frame_note = if self.calib.is_some() {
+            " · machine mm (calibrated)"
+        } else if self.fid_homography.is_some() {
+            " · design frame (perspective; not machine-calibrated)"
         } else {
-            ""
+            " · design frame (uncalibrated)"
         };
         self.place_note = format!(
-            "placed at ({:.1}, {:.1}) mm, {:.0}°{persp}",
+            "placed at ({:.1}, {:.1}) mm, {:.0}°{frame_note}",
             self.place_tx_mm, self.place_ty_mm, self.place_rot_deg
         );
         self.place_tex = Some(ctx.load_texture("place", img, TextureOptions::NEAREST));
@@ -956,6 +991,119 @@ impl ConsoleApp {
         match PathBuf::from(copper).parent() {
             Some(dir) if !dir.as_os_str().is_empty() => dir.join(&raw),
             _ => raw,
+        }
+    }
+
+    /// The grid spec from the calibrate form.
+    fn calib_grid(&self) -> crate::calib::GridSpec {
+        crate::calib::GridSpec {
+            origin_mm: (0.0, 0.0),
+            pitch_mm: self.calib_pitch_mm,
+            n: self.calib_n,
+        }
+    }
+
+    /// Emit the calibration dot grid by shelling `pcbforge calib-grid` — the
+    /// operator burns it, then images it back.
+    fn calibrate_generate_grid(&mut self) {
+        let out = crate::clean_path(&self.calib_grid_out);
+        if out.is_empty() {
+            self.calib_note = "set an output path for the grid".into();
+            return;
+        }
+        self.run_verb(&[
+            "calib-grid".into(),
+            "--out".into(),
+            out,
+            "--n".into(),
+            self.calib_n.to_string(),
+            "--pitch-mm".into(),
+            format!("{}", self.calib_pitch_mm),
+            "--dot-mm".into(),
+            format!("{}", self.calib_dot_mm),
+        ]);
+    }
+
+    /// Load the burned-grid frame — from the camera (source picked in the
+    /// Camera tab) when the frame path is empty, else from that file — and
+    /// clear any prior corner clicks.
+    fn calibrate_load_frame(&mut self, ctx: &Context) {
+        let img = if crate::clean_path(&self.calib_frame).is_empty() {
+            match crate::camera::grab(&self.cam_source()) {
+                Ok(g) => self.cam_orientation.apply(g),
+                Err(e) => {
+                    self.calib_note = format!("camera: {e}");
+                    return;
+                }
+            }
+        } else {
+            match image::open(crate::clean_path(&self.calib_frame)) {
+                Ok(i) => i.to_luma8(),
+                Err(e) => {
+                    self.calib_note = format!("frame: {e}");
+                    return;
+                }
+            }
+        };
+        let (w, h) = (img.width() as usize, img.height() as usize);
+        let color = ColorImage {
+            size: [w, h],
+            pixels: img.pixels().map(|p| Color32::from_gray(p[0])).collect(),
+        };
+        self.calib_frame_tex =
+            Some(ctx.load_texture("calib-frame", color, TextureOptions::NEAREST));
+        self.calib_frame_img = Some(img);
+        self.calib_corners.clear();
+        self.calib_note =
+            "click the 4 corner dots: lower-left, lower-right, upper-right, upper-left".into();
+    }
+
+    /// Fit the camera→laser calibration from the 4 clicked corners.
+    fn calibrate_fit(&mut self) {
+        let Some(frame) = &self.calib_frame_img else {
+            self.calib_note = "load the burned-grid frame first".into();
+            return;
+        };
+        if self.calib_corners.len() != 4 {
+            self.calib_note = format!(
+                "click all 4 corner dots (have {}) — LL, LR, UR, UL",
+                self.calib_corners.len()
+            );
+            return;
+        }
+        let corners: [(f64, f64); 4] = [
+            self.calib_corners[0],
+            self.calib_corners[1],
+            self.calib_corners[2],
+            self.calib_corners[3],
+        ];
+        match crate::calib::fit_camera_to_machine(
+            frame,
+            corners,
+            &self.calib_grid(),
+            self.calib_dot_mm,
+        ) {
+            Ok(cal) => {
+                self.calib_note = format!(
+                    "calibrated: {}/{} dots, RMS {:.0} µm — Place now burns in machine coordinates",
+                    cal.found, cal.total, cal.rms_um
+                );
+                self.calib = Some(cal);
+            }
+            Err(e) => {
+                self.calib = None;
+                self.calib_note = format!("fit failed: {e}");
+            }
+        }
+    }
+
+    /// The homography mapping placement target-mm → camera px for the Place
+    /// tab: the **camera→laser calibration** (machine mm) when calibrated, else
+    /// the fiducial homography (design frame only, not machine-accurate).
+    fn place_homography(&self) -> Option<vision::Homography> {
+        match &self.calib {
+            Some(c) => c.px_to_mm.try_inverse(),
+            None => self.fid_homography.clone(),
         }
     }
 
@@ -1344,15 +1492,153 @@ impl ConsoleApp {
         ui.horizontal(|ui| {
             ui.selectable_value(&mut self.tab, CentralTab::Job, "🖼 Job preview");
             ui.selectable_value(&mut self.tab, CentralTab::Camera, "📷 Camera");
-            ui.selectable_value(&mut self.tab, CentralTab::Fiducials, "🎯 Fiducial check");
+            ui.selectable_value(&mut self.tab, CentralTab::Calibrate, "🎯 Calibrate");
+            ui.selectable_value(&mut self.tab, CentralTab::Fiducials, "◎ Fiducial check");
             ui.selectable_value(&mut self.tab, CentralTab::Place, "✋ Place on board");
         });
         ui.separator();
         match self.tab {
             CentralTab::Job => self.job_view(ui),
             CentralTab::Camera => self.camera_view(ui),
+            CentralTab::Calibrate => self.calibrate_view(ui),
             CentralTab::Fiducials => self.fiducial_view(ui),
             CentralTab::Place => self.place_view(ui),
+        }
+    }
+
+    fn calibrate_view(&mut self, ui: &mut egui::Ui) {
+        ui.label(
+            egui::RichText::new(
+                "Camera→laser calibration: burn a dot grid at known coordinates, image it, \
+             and mark the corners so the console learns where the laser burns in the camera view.",
+            )
+            .weak(),
+        );
+        egui::Grid::new("calib-form")
+            .num_columns(2)
+            .spacing([8.0, 6.0])
+            .show(ui, |ui| {
+                ui.label("dots per side");
+                ui.add(egui::DragValue::new(&mut self.calib_n).range(2..=15));
+                ui.end_row();
+                ui.label("pitch mm");
+                ui.add(
+                    egui::DragValue::new(&mut self.calib_pitch_mm)
+                        .speed(0.5)
+                        .range(1.0..=50.0),
+                );
+                ui.end_row();
+                ui.label("dot ⌀ mm");
+                ui.add(
+                    egui::DragValue::new(&mut self.calib_dot_mm)
+                        .speed(0.05)
+                        .range(0.05..=5.0),
+                );
+                ui.end_row();
+                ui.label("grid out .lbrn2");
+                ui.add(egui::TextEdit::singleline(&mut self.calib_grid_out).desired_width(240.0));
+                ui.end_row();
+                ui.label("grid frame (optional)");
+                ui.add(egui::TextEdit::singleline(&mut self.calib_frame).desired_width(240.0))
+                    .on_hover_text(
+                        "Empty = grab from the camera; a path checks a saved grid image.",
+                    );
+                ui.end_row();
+            });
+        ui.horizontal(|ui| {
+            if ui
+                .button("① Generate grid")
+                .on_hover_text("Emit the dot grid to burn.")
+                .clicked()
+            {
+                self.calibrate_generate_grid();
+            }
+            if ui.button("② Load burned grid").clicked() {
+                let ctx = ui.ctx().clone();
+                self.calibrate_load_frame(&ctx);
+            }
+            if ui.button("④ Fit").clicked() {
+                self.calibrate_fit();
+            }
+            if ui.button("↺ clear corners").clicked() {
+                self.calib_corners.clear();
+            }
+        });
+        let status = match &self.calib {
+            Some(c) => format!(
+                "● calibrated ({} dots, RMS {:.0} µm) — resets on restart",
+                c.found, c.rms_um
+            ),
+            None => "○ not calibrated — Place uses the design frame only".to_string(),
+        };
+        ui.colored_label(
+            if self.calib.is_some() {
+                Color32::from_rgb(0x50, 0xb0, 0x60)
+            } else {
+                Color32::from_rgb(0xe0, 0x90, 0x20)
+            },
+            status,
+        );
+        ui.label(egui::RichText::new(&self.calib_note).weak());
+        ui.weak(
+            "③ Click the 4 corner dots in order: lower-left, lower-right, upper-right, upper-left.",
+        );
+        ui.separator();
+        self.calib_frame_overlay(ui);
+    }
+
+    /// The burned-grid frame with the operator's corner clicks (numbered).
+    fn calib_frame_overlay(&mut self, ui: &mut egui::Ui) {
+        let Some(tex) = &self.calib_frame_tex else {
+            ui.weak("(load a burned-grid frame to mark corners)");
+            return;
+        };
+        let (tw, th) = (tex.size()[0] as f32, tex.size()[1] as f32);
+        let resp = ui.add(
+            egui::Image::from_texture((tex.id(), egui::vec2(tw, th)))
+                .shrink_to_fit()
+                .sense(egui::Sense::click()),
+        );
+        let rect = resp.rect;
+        let to_native = |p: egui::Pos2| {
+            (
+                ((p.x - rect.min.x) / rect.width() * tw) as f64,
+                ((p.y - rect.min.y) / rect.height() * th) as f64,
+            )
+        };
+        let to_screen = |px: f64, py: f64| {
+            egui::pos2(
+                rect.min.x + (px as f32) / tw * rect.width(),
+                rect.min.y + (py as f32) / th * rect.height(),
+            )
+        };
+        // A click adds the next corner (up to 4).
+        if resp.clicked()
+            && self.calib_corners.len() < 4
+            && let Some(pos) = resp.interact_pointer_pos()
+        {
+            self.calib_corners.push(to_native(pos));
+        }
+        let painter = ui.painter_at(rect);
+        let cyan = Color32::from_rgb(0x22, 0xcc, 0xdd);
+        for (i, &(px, py)) in self.calib_corners.iter().enumerate() {
+            let c = to_screen(px, py);
+            painter.circle_stroke(c, 9.0, egui::Stroke::new(2.0, cyan));
+            painter.line_segment(
+                [egui::pos2(c.x - 12.0, c.y), egui::pos2(c.x + 12.0, c.y)],
+                (1.0, cyan),
+            );
+            painter.line_segment(
+                [egui::pos2(c.x, c.y - 12.0), egui::pos2(c.x, c.y + 12.0)],
+                (1.0, cyan),
+            );
+            painter.text(
+                egui::pos2(c.x + 10.0, c.y - 10.0),
+                egui::Align2::LEFT_BOTTOM,
+                ["LL", "LR", "UR", "UL"][i],
+                egui::FontId::proportional(13.0),
+                cyan,
+            );
         }
     }
 
@@ -2080,7 +2366,16 @@ mod tests {
     use super::*;
 
     fn tmp_db() -> PathBuf {
-        let dir = std::env::temp_dir().join(format!("ui-app-{}", std::process::id()));
+        // Unique per call so each console gets its own settings sidecar
+        // (`*.console-settings`) — a shared path would bleed persisted input
+        // fields between tests.
+        use std::sync::atomic::{AtomicU64, Ordering};
+        static N: AtomicU64 = AtomicU64::new(0);
+        let dir = std::env::temp_dir().join(format!(
+            "ui-app-{}-{}",
+            std::process::id(),
+            N.fetch_add(1, Ordering::Relaxed)
+        ));
         std::fs::create_dir_all(&dir).unwrap();
         dir.join("t.sqlite")
     }
@@ -2789,6 +3084,59 @@ mod tests {
             Orientation::Rotate180,
             "orientation survived restart"
         );
+    }
+
+    /// The Place tab uses the camera→laser calibration when present (machine
+    /// frame), and falls back to the fiducial homography otherwise.
+    #[test]
+    fn place_uses_calibration_when_present() {
+        use nalgebra::Matrix3;
+        let mut app = ConsoleApp::new(tmp_db(), vec!["true".into()]);
+        // No calibration, no fiducial fit → no placement homography.
+        assert!(app.place_homography().is_none());
+
+        // A fiducial fit alone → design frame.
+        app.fid_homography = Some(vision::Homography {
+            matrix: Matrix3::new(9.0, 0.0, 0.0, 0.0, 9.0, 0.0, 0.0, 0.0, 1.0),
+            residuals: vec![],
+            rms: 0.0,
+        });
+        let design = app.place_homography().unwrap();
+        assert!(
+            (design.matrix[(0, 0)] - 9.0).abs() < 1e-9,
+            "fiducial homography used"
+        );
+
+        // A calibration wins: place_homography is the calibration's inverse
+        // (machine-mm → px), independent of the fiducial fit.
+        app.calib = Some(crate::calib::Calibration {
+            // px_to_mm = 0.1 (10 px/mm); inverse = 10 (mm→px).
+            px_to_mm: vision::Homography {
+                matrix: Matrix3::new(0.1, 0.0, 0.0, 0.0, 0.1, 0.0, 0.0, 0.0, 1.0),
+                residuals: vec![],
+                rms: 0.0,
+            },
+            rms_um: 12.0,
+            found: 49,
+            total: 49,
+        });
+        let machine = app.place_homography().unwrap();
+        assert!(
+            (machine.matrix[(0, 0)] - 10.0).abs() < 1e-6,
+            "calibration inverse (mm→px) used: {}",
+            machine.matrix[(0, 0)]
+        );
+    }
+
+    /// The Calibrate tab lays out headless, including corner clicks.
+    #[test]
+    fn calibrate_tab_lays_out() {
+        let mut app = ConsoleApp::new(tmp_db(), vec!["true".into()]);
+        app.tab = CentralTab::Calibrate;
+        app.calib_corners = vec![(10.0, 90.0), (90.0, 90.0), (90.0, 10.0), (10.0, 10.0)];
+        let ctx = Context::default();
+        let out = ctx.run(egui::RawInput::default(), |ctx| app.ui(ctx));
+        assert!(!out.shapes.is_empty(), "calibrate tab renders");
     }
 
     /// A second frame after a status refresh still lays out (state survives).

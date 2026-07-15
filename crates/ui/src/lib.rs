@@ -8,6 +8,7 @@
 //! `native` feature (see `src/main.rs`), which needs a display + GL/X11.
 
 mod app;
+mod calib;
 mod fiducial;
 mod place;
 mod preview;

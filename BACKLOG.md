@@ -43,7 +43,7 @@ done-when. Task prompts live in `docs/backlog.md`.
 ## WS-VIS — Vision & calibration
 - [~] VIS-1 — Capture module *(the `capture` crate: a File source (any capture app writing frames to disk — verified) + a real webcam backend via nokhwa behind the `camera` feature (compiles all platforms here; runs on the operator's machine). Consumed by both the console live preview and the CLI `pcbforge cam --list/--grab` (FLD-13). The opencv path per the original spec is the one piece still pending — see decisions.md)*
 - [ ] VIS-2 — Intrinsics calibration
-- [ ] VIS-3 — Bed homography
+- [~] VIS-3 — Bed homography *(console camera→laser calibration: `pcbforge calib-grid` emits an n×n dot grid at known commanded coords; the operator burns + images it, clicks the 4 corners, and `ui::calib::fit_camera_to_machine` fits a camera-px→commanded-mm homography (perspective, absorbs a tilted camera) — reusing VIS-4 dark-dot detection + `fit_homography`. The Place tab then places/etches in true machine coordinates. Session-scoped (camera moves). The printed-grid `pcbforge calib bed` variant + LM refine per the original spec still pending — see decisions.md)*
 - [x] VIS-4 — Fiducial detectors *(vision::find_fiducials; synthetic done-when met (<0.15 px); px↔mm parameterized as BedMap pending VIS-3; live annuli check operator-side — see decisions.md)*
 - [x] VIS-5 — Affine fit + residuals
 - [~] VIS-6 — Burned-grid galvo calibration + register *(register **software half done**: `pcbforge register` + cam::register — fit design→machine affine from fiducial correspondences (explicit or --frame-detected) and bake it into the emitted .lbrn2; RMS gate; frame contract documented. Galvo `calib grid` (burn 121 dots) + live ≤20µm residual are hardware-gated — see decisions.md)*

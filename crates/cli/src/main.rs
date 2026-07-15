@@ -282,6 +282,30 @@ enum Command {
         #[arg(long, default_value_t = 0.05)]
         max_rms_mm: f64,
     },
+    /// Emit a calibration dot grid `.lbrn2` for camera→laser calibration: an
+    /// n×n lattice of small filled squares at known commanded coordinates.
+    /// Burn it, image it with the PCBForge camera, and the console fits the
+    /// camera↔laser transform so a placement burns where you put it.
+    CalibGrid {
+        /// Output `.lbrn2` path.
+        #[arg(long)]
+        out: PathBuf,
+        /// Dots per side (n×n).
+        #[arg(long, default_value_t = 7)]
+        n: usize,
+        /// Grid pitch, mm.
+        #[arg(long, default_value_t = 10.0)]
+        pitch_mm: f64,
+        /// Lower-left dot's commanded position, mm (as "x,y").
+        #[arg(long, default_value = "0,0")]
+        origin: String,
+        /// Dot side length, mm.
+        #[arg(long, default_value_t = 0.4)]
+        dot_mm: f64,
+        /// LightBurn device name.
+        #[arg(long, default_value = lbrn2::DEFAULT_DEVICE)]
+        device: String,
+    },
     /// Camera capture (VIS-1): list devices or grab a single frame. The webcam
     /// backend needs the `camera` feature; `--file` re-reads an image path and
     /// works everywhere (any capture app that writes a frame to disk).
@@ -473,6 +497,14 @@ fn run(cli: &Cli) -> Result<(), Box<dyn std::error::Error>> {
             device,
             max_rms_mm: *max_rms_mm,
         }),
+        Command::CalibGrid {
+            out,
+            n,
+            pitch_mm,
+            origin,
+            dot_mm,
+            device,
+        } => calib_grid_cmd(out, *n, *pitch_mm, origin, *dot_mm, device),
         Command::Cam {
             list,
             grab,
@@ -506,6 +538,64 @@ fn run(cli: &Cli) -> Result<(), Box<dyn std::error::Error>> {
 }
 
 /// `pcbforge cam` — VIS-1 capture surface over the shared `capture` crate.
+/// `pcbforge calib-grid` — emit an n×n grid of dots at commanded coords.
+fn calib_grid_cmd(
+    out: &std::path::Path,
+    n: usize,
+    pitch_mm: f64,
+    origin: &str,
+    dot_mm: f64,
+    device: &str,
+) -> Result<(), Box<dyn std::error::Error>> {
+    if n < 2 {
+        return Err("--n must be at least 2".into());
+    }
+    if pitch_mm <= 0.0 || dot_mm <= 0.0 {
+        return Err("--pitch-mm and --dot-mm must be positive".into());
+    }
+    let (ox, oy) = origin
+        .split_once(',')
+        .and_then(|(a, b)| Some((a.trim().parse::<f64>().ok()?, b.trim().parse::<f64>().ok()?)))
+        .ok_or_else(|| format!("--origin must be \"x,y\", got {origin:?}"))?;
+
+    let mm = |v: f64| (v * NM_PER_MM as f64).round() as Nm;
+    let half = mm(dot_mm / 2.0);
+    let mut dots: Vec<pcb_core::Poly> = Vec::with_capacity(n * n);
+    for row in 0..n {
+        for col in 0..n {
+            let (cx, cy) = (
+                mm(ox + col as f64 * pitch_mm),
+                mm(oy + row as f64 * pitch_mm),
+            );
+            dots.push(pcb_core::Poly {
+                outer: vec![
+                    pcb_core::P::new(cx - half, cy - half),
+                    pcb_core::P::new(cx + half, cy - half),
+                    pcb_core::P::new(cx + half, cy + half),
+                    pcb_core::P::new(cx - half, cy + half),
+                ],
+                holes: vec![],
+            });
+        }
+    }
+    // A modest fill recipe; the operator tunes power for a clean dark dot.
+    let params = AblationParams {
+        power_pct: 20.0,
+        speed_mm_s: 1000.0,
+        frequency_khz: 30.0,
+        pulse_ns: 1,
+        passes: 1,
+    };
+    let layer = EmitLayer::fill("CAL", params, lbrn2::polys_to_elems(&dots));
+    lbrn2::write_lbrn2(device, &[layer], out)?;
+    let span = (n - 1) as f64 * pitch_mm;
+    eprintln!(
+        "calib grid: {n}×{n} dots, {pitch_mm} mm pitch, from ({ox}, {oy}) over {span}×{span} mm"
+    );
+    println!("wrote {}", out.display());
+    Ok(())
+}
+
 fn cam_cmd(
     list: bool,
     grab: Option<&std::path::Path>,
