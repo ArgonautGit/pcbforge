@@ -1269,3 +1269,23 @@ grid workflow can be tested/used without hand-drawing a target each time.
 
 The fixtures manifest only tracks `samples/kicad` + `samples/lbrn2`, so this new
 subtree needs no manifest regeneration.
+
+## 2026-07-15 — Distorted-grid calibration test fixture
+
+To verify the camera-lens calibration actually recovers geometry (not just that
+it runs), added a synthetic distorted camera frame and an end-to-end test gate.
+
+- `samples/calibration/grid-7x7-10mm-distorted.png`: the 7×7 / 10 mm grid imaged
+  through a known perspective (tilted camera) + 5% radial barrel distortion,
+  rendered as dark dots on a light, vignetted, mildly noisy field. Sidecar
+  `…-distorted.json` records the distortion params, the four corner-dot pixels
+  (GridSpec::corners_mm order), and every mm→px pair as ground truth.
+- `crates/ui/examples/gen_distorted_grid.rs`: deterministic Rust generator
+  (reuses the `image` crate) that writes the PNG + JSON and self-checks by
+  running `fit_camera_lens` on its own output — prints found/RMS and the raw
+  distortion magnitude. `tools/gen_distorted_grid.py` is an optional Pillow
+  variant of the same math.
+- `calibrates_from_the_distorted_grid_fixture` test: loads the committed PNG
+  from disk, calibrates, and asserts all 49 dots recover at <60 µm RMS while
+  >5 px of barrel distortion is present — so a regression that breaks the lens
+  fit fails CI. Measured: 49/49 dots, ~25 µm RMS, 10.4 px raw distortion.

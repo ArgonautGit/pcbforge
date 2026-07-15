@@ -546,4 +546,51 @@ mod tests {
         let corners = [(10.0, 10.0), (190.0, 10.0), (190.0, 190.0), (10.0, 190.0)];
         assert!(fit_camera_to_machine(&img, corners, &grid, 1.0).is_err());
     }
+
+    /// End-to-end gate: load the committed distorted-grid fixture (a real PNG
+    /// rendered by the `gen_distorted_grid` example — perspective + 5% barrel)
+    /// and confirm the camera-lens calibration recovers all 49 dots to a tight
+    /// RMS. This proves the calibration works on an on-disk image, not just an
+    /// in-memory render.
+    #[test]
+    fn calibrates_from_the_distorted_grid_fixture() {
+        let path = concat!(
+            env!("CARGO_MANIFEST_DIR"),
+            "/../../samples/calibration/grid-7x7-10mm-distorted.png"
+        );
+        let img = image::open(path)
+            .expect("distorted-grid fixture present")
+            .to_luma8();
+        let grid = GridSpec {
+            origin_mm: (0.0, 0.0),
+            pitch_mm: 10.0,
+            n: 7,
+        };
+        // The four corner dots (lower-left, lower-right, upper-right,
+        // upper-left) as recorded in the fixture's JSON sidecar.
+        let corners = [
+            (42.506, 632.64),
+            (620.163, 618.878),
+            (606.277, 39.892),
+            (43.744, 41.83),
+        ];
+        let cal = fit_camera_lens(&img, corners, &grid, 2.0).expect("calibrate fixture");
+        assert_eq!(cal.found, 49, "all dots detected");
+        assert!(
+            cal.lens.rms_um < 60.0,
+            "recovered RMS {:.1} µm too high",
+            cal.lens.rms_um
+        );
+        // The raw barrel the fit had to absorb is well above its residual —
+        // proving the fixture carries distortion a homography couldn't model.
+        let max_distort = cal
+            .dots
+            .iter()
+            .map(|d| (d.distort_px.0.powi(2) + d.distort_px.1.powi(2)).sqrt())
+            .fold(0.0_f64, f64::max);
+        assert!(
+            max_distort > 5.0,
+            "fixture should carry real distortion: {max_distort:.1} px"
+        );
+    }
 }

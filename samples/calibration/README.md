@@ -36,6 +36,37 @@ python3 tools/gen_calib_grid.py --n 7 --pitch 10.0 --dot 2.0 --page A4 \
 
 `--n` dots per side, `--pitch` mm, `--dot` mm, `--page A4|Letter`.
 
+## `grid-7x7-10mm-distorted.png` — distorted camera view (calibration test)
+
+A synthetic camera frame for **testing that the camera-lens calibration
+actually recovers true geometry**. It's the same 7×7 / 10 mm grid pushed through
+a known **perspective** (a slightly tilted camera) plus a **5% radial barrel
+distortion** about the image centre — the curvature a homography can't model —
+rendered as dark dots on a light, vignetted, mildly noisy field so the
+`DarkDot` detector behaves as it would on real optics.
+
+`grid-7x7-10mm-distorted.json` is the ground-truth sidecar: image size, the
+distortion parameters, the four corner-dot pixels in `GridSpec::corners_mm`
+order (lower-left, lower-right, upper-right, upper-left), and every
+`mm → distorted-px` pair.
+
+Feeding the PNG + those four corners into `ui::calib::fit_camera_lens` recovers
+all 49 dots at **~25 µm RMS**, while ~10 px of barrel distortion is present that
+a perspective-only fit would leave uncorrected. This is exercised automatically
+by the `calibrates_from_the_distorted_grid_fixture` test, so a regression that
+breaks the lens fit fails CI.
+
+Regenerate (also prints the recovered accuracy as a self-check):
+
+```
+cargo run -p ui --example gen_distorted_grid
+```
+
+Adjust the grid/distortion constants at the top of
+`crates/ui/examples/gen_distorted_grid.rs` (e.g. a stronger `BARREL_K`) to make
+a harder test. A pure-Python variant lives in `tools/gen_distorted_grid.py` for
+environments with a working Pillow.
+
 ## Burned grid (step ②)
 
 Step ② (**Laser anchor**) uses a grid you *burn* with the laser and tape down as
