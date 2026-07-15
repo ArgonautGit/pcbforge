@@ -63,44 +63,31 @@ pub struct Calibration {
     pub total: usize,
 }
 
-/// Fit the camera→laser homography from a frame of the burned grid and the
-/// four hand-marked corner-dot pixel positions (same order as
-/// [`GridSpec::corners_mm`]). `dot_mm` sizes the dark-dot detector.
-pub fn fit_camera_to_machine(
+/// Detect the grid dots using `mm_to_px_seed` (commanded-mm → px) to place the
+/// local search windows, and fit the final camera-px → commanded-mm homography.
+/// The seed is the corner homography for a fresh fit, or the previous
+/// calibration for a re-anchor.
+fn refit(
     frame: &GrayImage,
-    corners_px: [(f64, f64); 4],
+    mm_to_px_seed: &Homography,
     grid: &GridSpec,
     dot_mm: f64,
 ) -> Result<Calibration, String> {
-    if grid.n < 2 {
-        return Err("grid must be at least 2×2".into());
-    }
-    // 1. Initial commanded-mm → px homography from the four corners.
-    let corner_pairs: Vec<(Point2<f64>, Point2<f64>)> = grid
-        .corners_mm()
-        .iter()
-        .zip(corners_px.iter())
-        .map(|(&(mx, my), &(px, py))| (Point2::new(mx, my), Point2::new(px, py)))
-        .collect();
-    let mm_to_px = fit_homography(&corner_pairs).map_err(|e| format!("corner fit: {e}"))?;
-
-    // 2. Build a BedMap (mm↔px) from that initial fit and refine every dot
-    //    locally with the dark-dot detector, searching ~0.4·pitch around each
-    //    predicted spot (so windows don't overlap).
-    let mm_from_px: Matrix3<f64> = mm_to_px
+    let mm_from_px: Matrix3<f64> = mm_to_px_seed
         .matrix
         .try_inverse()
-        .ok_or("initial corner homography is singular")?;
-    let bed = BedMap::new(mm_from_px).ok_or("initial bed map is singular")?;
+        .ok_or("seed homography is singular")?;
+    let bed = BedMap::new(mm_from_px).ok_or("seed bed map is singular")?;
     let commanded = grid.points();
     let expected: Vec<Point2<f64>> = commanded.iter().map(|&(x, y)| Point2::new(x, y)).collect();
     let profile = FiducialProfile::DarkDot {
         diameter_mm: dot_mm,
     };
+    // ~0.4·pitch so windows don't overlap, but at least the dot size. This also
+    // bounds how far the camera may drift between re-anchors and still lock on.
     let search_mm = (grid.pitch_mm * 0.4).max(dot_mm);
     let results = find_fiducials(frame, &expected, search_mm, &profile, &bed);
 
-    // 3. Collect (found_px, commanded_mm) and fit the final px → mm homography.
     let pairs: Vec<(Point2<f64>, Point2<f64>)> = commanded
         .iter()
         .zip(&results)
@@ -111,7 +98,7 @@ pub fn fit_camera_to_machine(
     if found < 4 {
         return Err(format!(
             "only {found}/{total} grid dots detected — need ≥4 (check the frame, \
-             the corner clicks, and the dot size)"
+             the seed, and the dot size; a big camera move needs a fresh corner fit)"
         ));
     }
     let px_to_mm = fit_homography(&pairs).map_err(|e| format!("grid fit: {e}"))?;
@@ -124,9 +111,101 @@ pub fn fit_camera_to_machine(
     })
 }
 
+/// Fit the camera→laser homography from a frame of the burned grid and the
+/// four hand-marked corner-dot pixel positions (same order as
+/// [`GridSpec::corners_mm`]). `dot_mm` sizes the dark-dot detector.
+pub fn fit_camera_to_machine(
+    frame: &GrayImage,
+    corners_px: [(f64, f64); 4],
+    grid: &GridSpec,
+    dot_mm: f64,
+) -> Result<Calibration, String> {
+    if grid.n < 2 {
+        return Err("grid must be at least 2×2".into());
+    }
+    // Initial commanded-mm → px homography from the four corners, then refine
+    // every dot and re-fit.
+    let corner_pairs: Vec<(Point2<f64>, Point2<f64>)> = grid
+        .corners_mm()
+        .iter()
+        .zip(corners_px.iter())
+        .map(|(&(mx, my), &(px, py))| (Point2::new(mx, my), Point2::new(px, py)))
+        .collect();
+    let seed = fit_homography(&corner_pairs).map_err(|e| format!("corner fit: {e}"))?;
+    refit(frame, &seed, grid, dot_mm)
+}
+
+/// Re-anchor an existing calibration to a fresh frame — no corner clicks. Uses
+/// the previous calibration to place the search windows, so as long as the
+/// burned grid is still in view and the camera hasn't jumped more than ~0.4·
+/// pitch, it re-locks the dots and re-fits, absorbing camera drift. A bigger
+/// move fails and needs a fresh corner fit ([`fit_camera_to_machine`]).
+pub fn re_anchor(
+    frame: &GrayImage,
+    previous: &Calibration,
+    grid: &GridSpec,
+    dot_mm: f64,
+) -> Result<Calibration, String> {
+    let mm_to_px = Homography {
+        matrix: previous
+            .px_to_mm
+            .matrix
+            .try_inverse()
+            .ok_or("calibration is singular")?,
+        residuals: Vec::new(),
+        rms: 0.0,
+    };
+    refit(frame, &mm_to_px, grid, dot_mm)
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    /// Render the grid as anti-aliased dark discs on a bright field, through
+    /// `mm_to_px` (commanded-mm → px) with dots ~`dot_mm`·10 px across.
+    fn render_grid(
+        grid: &GridSpec,
+        mm_to_px: &Homography,
+        dot_mm: f64,
+        w: u32,
+        h: u32,
+    ) -> GrayImage {
+        let centers: Vec<(f64, f64, f64)> = grid
+            .points()
+            .iter()
+            .map(|&(mx, my)| {
+                let p = mm_to_px.apply(Point2::new(mx, my));
+                (p.x, p.y, dot_mm * 10.0)
+            })
+            .collect();
+        GrayImage::from_fn(w, h, |x, y| {
+            let mut cover = 0.0;
+            for sy in 0..4 {
+                for sx in 0..4 {
+                    let px = x as f64 + (sx as f64 + 0.5) / 4.0 - 0.5;
+                    let py = y as f64 + (sy as f64 + 0.5) / 4.0 - 0.5;
+                    if centers.iter().any(|&(cx, cy, r)| {
+                        ((px - cx).powi(2) + (py - cy).powi(2)).sqrt() < r / 2.0
+                    }) {
+                        cover += 1.0 / 16.0;
+                    }
+                }
+            }
+            image::Luma([(210.0 - 150.0 * cover) as u8])
+        })
+    }
+
+    /// (commanded-mm, pixel) corner pair.
+    type MmPx = ((f64, f64), (f64, f64));
+
+    fn homog(pairs: &[MmPx]) -> Homography {
+        let p: Vec<_> = pairs
+            .iter()
+            .map(|&((mx, my), (px, py))| (Point2::new(mx, my), Point2::new(px, py)))
+            .collect();
+        fit_homography(&p).unwrap()
+    }
 
     #[test]
     fn grid_points_and_corners() {
@@ -222,6 +301,68 @@ mod tests {
             "center maps to ~(30,30): ({:.3},{:.3})",
             back.x,
             back.y
+        );
+    }
+
+    /// Camera drift: fit at pose A, then the camera shifts ~2 mm (the grid
+    /// moves in the image); re-anchoring from the pose-A calibration re-locks
+    /// the dots and recovers correct commanded coordinates — no corner clicks.
+    #[test]
+    fn re_anchor_absorbs_a_camera_shift() {
+        let grid = GridSpec {
+            origin_mm: (0.0, 0.0),
+            pitch_mm: 10.0,
+            n: 7,
+        };
+        let dot_mm = 1.5;
+        // Pose A: 10 px/mm, grid at image (30..630, 30..630).
+        let a = homog(&[
+            ((0.0, 0.0), (30.0, 30.0)),
+            ((60.0, 0.0), (630.0, 30.0)),
+            ((60.0, 60.0), (630.0, 630.0)),
+            ((0.0, 60.0), (30.0, 630.0)),
+        ]);
+        let img_a = render_grid(&grid, &a, dot_mm, 680, 680);
+        let corners_a = grid.corners_mm().map(|(mx, my)| {
+            (
+                a.apply(Point2::new(mx, my)).x,
+                a.apply(Point2::new(mx, my)).y,
+            )
+        });
+        let cal_a = fit_camera_to_machine(&img_a, corners_a, &grid, dot_mm).expect("fit A");
+
+        // Pose B: the camera shifted, so the grid sits ~20 px (2 mm) right and
+        // ~12 px down — well within the ~4 mm search window.
+        let b = homog(&[
+            ((0.0, 0.0), (50.0, 42.0)),
+            ((60.0, 0.0), (650.0, 42.0)),
+            ((60.0, 60.0), (650.0, 642.0)),
+            ((0.0, 60.0), (50.0, 642.0)),
+        ]);
+        let img_b = render_grid(&grid, &b, dot_mm, 680, 680);
+
+        // Re-anchor from cal_A onto frame B — no corner clicks.
+        let cal_b = re_anchor(&img_b, &cal_a, &grid, dot_mm).expect("re-anchor B");
+        assert!(cal_b.found >= 45, "re-locked most dots: {}", cal_b.found);
+        assert!(cal_b.rms_um < 200.0, "tight re-fit: {} µm", cal_b.rms_um);
+
+        // The re-anchored map reads the new frame correctly: dot (30,30) mm,
+        // now at pose-B pixels, maps back to ~(30,30).
+        let c = b.apply(Point2::new(30.0, 30.0));
+        let back = cal_b.px_to_mm.apply(c);
+        assert!(
+            (back.x - 30.0).abs() < 0.3 && (back.y - 30.0).abs() < 0.3,
+            "re-anchored center ~(30,30): ({:.3},{:.3})",
+            back.x,
+            back.y
+        );
+        // And the STALE pose-A calibration would have been wrong on frame B:
+        let stale = cal_a.px_to_mm.apply(c);
+        assert!(
+            (stale.x - 30.0).abs() > 1.0 || (stale.y - 30.0).abs() > 1.0,
+            "stale calibration is visibly off ({:.2},{:.2}) — re-anchor was needed",
+            stale.x,
+            stale.y
         );
     }
 

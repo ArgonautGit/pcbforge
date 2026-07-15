@@ -1171,3 +1171,36 @@ recal each session).
 - Test-isolation fix uncovered here: `tmp_db()` returned a per-process shared
   path, so the new settings sidecar bled input fields between tests — made it
   unique per call.
+
+### Calibration robustness — re-anchor against the persistent grid
+
+- Operator asked: doesn't the static calibration assume the camera never moves?
+  Yes — a single fit is valid only in the pose it was taken, and nothing
+  detected drift. Fix: treat the **burned grid as a persistent bed reference**
+  and re-fit against it, so camera movement is absorbed rather than silently
+  wrong.
+- `calib::re_anchor(frame, previous, grid, dot_mm)`: reuses the previous
+  calibration to seed the dot search windows, re-detects, and re-fits — no
+  corner clicks. Works as long as the grid is still in view and the camera
+  hasn't jumped more than ~0.4·pitch (a bigger move fails and needs a fresh
+  corner Fit). `fit_camera_to_machine` and `re_anchor` now share one `refit`
+  core (seed → find_fiducials → fit_homography).
+- Console: **⟳ Re-anchor** (one-click re-fit from a fresh frame) and **● Live
+  anchor** (continuous per-frame re-fit via a Capture thread) on the Calibrate
+  tab. The workflow becomes: leave the grid on the bed, place the board so ≥4
+  dots stay visible, and the mapping tracks the camera live.
+- Verified: fit at pose A, shift the camera ~2 mm, and re-anchor recovers
+  correct commanded coordinates while the *stale* pose-A calibration is proven
+  visibly off (so the re-anchor was genuinely needed).
+
+### Calibration persistence — the taped-grid reference
+
+- Operator's chosen workflow: a sheet of paper taped to the bed, burned with the
+  calibration grid, re-anchored to until it's replaced. Since the paper (and its
+  known machine coordinates) persist across sessions, the calibration is now
+  **persisted** (reversing the earlier session-scoped decision): the px→mm
+  matrix + grid params (n / pitch / dot / out) are saved in the console settings
+  file. On restart the fit is restored as a **re-anchor seed** and shown as
+  "◐ loaded last session — Re-anchor to re-lock to the taped grid" (found==0 ⇒
+  unconfirmed); one ⟳ Re-anchor re-locks it to the paper (or a fresh corner Fit
+  if the camera jumped too far). Verified the matrix round-trips across restart.

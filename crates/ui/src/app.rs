@@ -227,6 +227,11 @@ pub struct ConsoleApp {
     /// Clicked corner-dot pixel positions (native image px), in order
     /// lower-left, lower-right, upper-right, upper-left — up to 4.
     calib_corners: Vec<(f64, f64)>,
+    /// Continuous re-anchoring against the (persistent) burned grid, so the
+    /// calibration tracks the camera as it moves.
+    calib_live: bool,
+    calib_capture: Option<crate::camera::Capture>,
+    calib_capture_src: Option<crate::camera::Source>,
     calib_note: String,
 
     // AR overlay (UI-2): project the registered design over the camera frame
@@ -316,6 +321,9 @@ impl ConsoleApp {
             calib_frame_img: None,
             calib_frame_tex: None,
             calib_corners: Vec::new(),
+            calib_live: false,
+            calib_capture: None,
+            calib_capture_src: None,
             calib_note: "Generate a grid, burn it, image it, click the 4 corner dots (LL, LR, UR, UL), then Fit.".into(),
             cam_live: false,
             cam_tex: None,
@@ -358,6 +366,26 @@ impl ConsoleApp {
             ("fid_px_per_mm", self.fid_px_per_mm.to_string()),
             ("cam_file", self.cam_file.clone()),
             ("cam_orientation", self.cam_orientation.token().to_string()),
+            ("calib_n", self.calib_n.to_string()),
+            ("calib_pitch_mm", self.calib_pitch_mm.to_string()),
+            ("calib_dot_mm", self.calib_dot_mm.to_string()),
+            ("calib_grid_out", self.calib_grid_out.clone()),
+            // The calibration matrix (px→mm, row-major) — the operator's grid
+            // is taped to the bed and persists, so we keep the fit as a
+            // re-anchor seed across restarts (Re-anchor re-locks it).
+            (
+                "calib_matrix",
+                self.calib
+                    .as_ref()
+                    .map(|c| {
+                        let m = &c.px_to_mm.matrix;
+                        (0..9)
+                            .map(|i| m[(i / 3, i % 3)].to_string())
+                            .collect::<Vec<_>>()
+                            .join(" ")
+                    })
+                    .unwrap_or_default(),
+            ),
         ])
     }
 
@@ -390,11 +418,45 @@ impl ConsoleApp {
         f64_field(&m, "focal_mm", &mut self.focal_mm);
         f64_field(&m, "place_px_per_mm", &mut self.place_px_per_mm);
         f64_field(&m, "fid_px_per_mm", &mut self.fid_px_per_mm);
+        f64_field(&m, "calib_pitch_mm", &mut self.calib_pitch_mm);
+        f64_field(&m, "calib_dot_mm", &mut self.calib_dot_mm);
+        str_field(&m, "calib_grid_out", &mut self.calib_grid_out);
         if let Some(o) = m
             .get("cam_orientation")
             .and_then(|s| Orientation::from_token(s.trim()))
         {
             self.cam_orientation = o;
+        }
+        if let Some(v) = m
+            .get("calib_n")
+            .and_then(|s| s.trim().parse::<usize>().ok())
+        {
+            self.calib_n = v.clamp(2, 15);
+        }
+        // The taped grid persists on the bed, so restore the last calibration
+        // as a re-anchor seed (found=0 ⇒ "loaded, unconfirmed" until the
+        // operator Re-anchors to the paper).
+        if let Some(vals) = m.get("calib_matrix").map(|s| {
+            s.split_whitespace()
+                .filter_map(|t| t.parse::<f64>().ok())
+                .collect::<Vec<_>>()
+        }) && vals.len() == 9
+        {
+            let mat = nalgebra::Matrix3::new(
+                vals[0], vals[1], vals[2], vals[3], vals[4], vals[5], vals[6], vals[7], vals[8],
+            );
+            self.calib = Some(crate::calib::Calibration {
+                px_to_mm: vision::Homography {
+                    matrix: mat,
+                    residuals: Vec::new(),
+                    rms: 0.0,
+                },
+                rms_um: 0.0,
+                found: 0,
+                total: self.calib_n * self.calib_n,
+            });
+            self.calib_note =
+                "loaded last session's calibration — click ⟳ Re-anchor to re-lock to the taped grid".into();
         }
     }
 
@@ -1097,6 +1159,83 @@ impl ConsoleApp {
         }
     }
 
+    /// Re-anchor the existing calibration to a fresh camera frame — no corner
+    /// clicks. Absorbs camera drift as long as the burned grid is still in view
+    /// and the move was small; a big jump fails and needs a fresh corner fit.
+    fn calibrate_re_anchor(&mut self) {
+        let Some(prev) = self.calib.clone() else {
+            self.calib_note = "no calibration yet — do a full Fit first".into();
+            return;
+        };
+        let grid = self.calib_grid();
+        let dot = self.calib_dot_mm;
+        match crate::camera::grab(&self.cam_source()) {
+            Ok(g) => {
+                let frame = self.cam_orientation.apply(g);
+                match crate::calib::re_anchor(&frame, &prev, &grid, dot) {
+                    Ok(cal) => {
+                        self.calib_note = format!(
+                            "re-anchored: {}/{} dots, RMS {:.0} µm",
+                            cal.found, cal.total, cal.rms_um
+                        );
+                        self.calib = Some(cal);
+                    }
+                    Err(e) => {
+                        self.calib_note = format!("re-anchor failed: {e} — re-Fit the corners")
+                    }
+                }
+            }
+            Err(e) => self.calib_note = format!("camera: {e}"),
+        }
+    }
+
+    /// Continuous re-anchoring: while ● Live anchor is on, re-fit the
+    /// calibration from the camera every frame so the mapping tracks the camera
+    /// as it moves (the burned grid must stay in view). Stops the capture when
+    /// off.
+    fn pump_calib_live(&mut self, ctx: &Context) {
+        if !self.calib_live {
+            if self.calib_capture.is_some() {
+                self.calib_capture = None;
+                self.calib_capture_src = None;
+            }
+            return;
+        }
+        let Some(prev) = self.calib.clone() else {
+            self.calib_live = false;
+            self.calib_note = "calibrate once (Fit) before live anchoring".into();
+            return;
+        };
+        let src = self.cam_source();
+        if self.calib_capture.is_none() || self.calib_capture_src.as_ref() != Some(&src) {
+            self.calib_capture = None;
+            self.calib_capture = Some(crate::camera::Capture::start(src.clone()));
+            self.calib_capture_src = Some(src);
+        }
+        if let Some(Ok(g)) = self.calib_capture.as_ref().and_then(|c| c.latest()) {
+            let frame = self.cam_orientation.apply(g);
+            let (w, h) = (frame.width() as usize, frame.height() as usize);
+            let color = ColorImage {
+                size: [w, h],
+                pixels: frame.pixels().map(|p| Color32::from_gray(p[0])).collect(),
+            };
+            self.calib_frame_tex =
+                Some(ctx.load_texture("calib-frame", color, TextureOptions::NEAREST));
+            match crate::calib::re_anchor(&frame, &prev, &self.calib_grid(), self.calib_dot_mm) {
+                Ok(cal) => {
+                    self.calib_note = format!(
+                        "live: {}/{} dots, RMS {:.0} µm",
+                        cal.found, cal.total, cal.rms_um
+                    );
+                    self.calib = Some(cal);
+                }
+                Err(e) => self.calib_note = format!("live anchor lost the grid: {e}"),
+            }
+            self.calib_frame_img = Some(frame);
+        }
+        ctx.request_repaint();
+    }
+
     /// The homography mapping placement target-mm → camera px for the Place
     /// tab: the **camera→laser calibration** (machine mm) when calibrated, else
     /// the fiducial homography (design frame only, not machine-accurate).
@@ -1507,10 +1646,13 @@ impl ConsoleApp {
     }
 
     fn calibrate_view(&mut self, ui: &mut egui::Ui) {
+        let ctx = ui.ctx().clone();
+        self.pump_calib_live(&ctx);
         ui.label(
             egui::RichText::new(
                 "Camera→laser calibration: burn a dot grid at known coordinates, image it, \
-             and mark the corners so the console learns where the laser burns in the camera view.",
+             and mark the corners so the console learns where the laser burns in the camera view. \
+             Leave the grid on the bed and use Re-anchor / ● Live to track the camera as it moves.",
             )
             .weak(),
         );
@@ -1564,15 +1706,45 @@ impl ConsoleApp {
                 self.calib_corners.clear();
             }
         });
-        let status = match &self.calib {
-            Some(c) => format!(
-                "● calibrated ({} dots, RMS {:.0} µm) — resets on restart",
-                c.found, c.rms_um
+        ui.horizontal(|ui| {
+            if ui
+                .add_enabled(self.calib.is_some(), egui::Button::new("⟳ Re-anchor"))
+                .on_hover_text(
+                    "Re-fit from a fresh camera frame without re-clicking corners — \
+                     corrects for the camera having moved (the grid must still be in view).",
+                )
+                .clicked()
+            {
+                self.calibrate_re_anchor();
+            }
+            ui.add_enabled_ui(self.calib.is_some(), |ui| {
+                ui.checkbox(&mut self.calib_live, "● Live anchor")
+                    .on_hover_text(
+                        "Continuously re-anchor every frame so the calibration tracks the \
+                     camera as it moves. Keep the burned grid in view.",
+                    );
+            });
+            if self.calib_live {
+                ui.spinner();
+            }
+        });
+        // Three states: unconfirmed (loaded from disk, found==0), live, none.
+        let (status, ok) = match &self.calib {
+            Some(c) if c.found == 0 => (
+                "◐ loaded last session — ⟳ Re-anchor to re-lock to the taped grid".to_string(),
+                false,
             ),
-            None => "○ not calibrated — Place uses the design frame only".to_string(),
+            Some(c) => (
+                format!("● calibrated ({} dots, RMS {:.0} µm)", c.found, c.rms_um),
+                true,
+            ),
+            None => (
+                "○ not calibrated — Place uses the design frame only".to_string(),
+                false,
+            ),
         };
         ui.colored_label(
-            if self.calib.is_some() {
+            if ok {
                 Color32::from_rgb(0x50, 0xb0, 0x60)
             } else {
                 Color32::from_rgb(0xe0, 0x90, 0x20)
@@ -3126,6 +3298,39 @@ mod tests {
             "calibration inverse (mm→px) used: {}",
             machine.matrix[(0, 0)]
         );
+    }
+
+    /// The calibration (the taped-grid fit) persists across restarts as a
+    /// re-anchor seed: the matrix survives, restored as "unconfirmed"
+    /// (found==0) until the operator re-anchors.
+    #[test]
+    fn calibration_persists_as_a_reanchor_seed() {
+        use nalgebra::Matrix3;
+        let db = tmp_db();
+        let mut a = ConsoleApp::new(db.clone(), vec!["true".into()]);
+        a.calib_n = 7;
+        a.calib_pitch_mm = 10.0;
+        a.calib = Some(crate::calib::Calibration {
+            px_to_mm: vision::Homography {
+                matrix: Matrix3::new(0.1, 0.0, 1.0, 0.0, 0.1, 2.0, 0.0, 0.0, 1.0),
+                residuals: vec![],
+                rms: 0.0,
+            },
+            rms_um: 20.0,
+            found: 49,
+            total: 49,
+        });
+        a.save_settings_if_changed();
+
+        let b = ConsoleApp::new(db, vec!["true".into()]);
+        let cal = b.calib.expect("calibration restored");
+        assert_eq!(cal.found, 0, "restored as unconfirmed until re-anchored");
+        assert!((cal.px_to_mm.matrix[(0, 0)] - 0.1).abs() < 1e-12);
+        assert!(
+            (cal.px_to_mm.matrix[(0, 2)] - 1.0).abs() < 1e-12,
+            "translation survived"
+        );
+        assert_eq!(b.calib_n, 7);
     }
 
     /// The Calibrate tab lays out headless, including corner clicks.
