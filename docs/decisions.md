@@ -1335,3 +1335,25 @@ while placing markers): Ctrl+drag to pan, Ctrl+wheel to zoom.
   drag still repositions the job; Ctrl+drag pans), camera, and job preview. A
   shared `NAV_HINT` line documents the controls under each. Overlays draw
   through the transform and are clipped to the panel, so they track zoom/pan.
+
+## 2026-07-15 — Camera bed overlay: work area + 50 mm scale
+
+Operator wants, whenever the camera view is up and the camera is calibrated, a
+homography-aligned 50 mm scale and the laser's work area projected onto the bed.
+
+- `ConsoleApp::draw_bed_overlay`: when the Camera tab has a frame and a laser
+  anchor exists, project through the anchor (machine-mm → camera-px, then the
+  pan/zoom transform) and draw: the laser work-area square, a 50 mm L-scale (one
+  arm on +X, one on +Y, capped + labelled — perspective-correct because it goes
+  through the same homography), and the machine origin + axes. All clipped to
+  the panel, so it tracks zoom/pan. A caveat line shows when the calibration is
+  a restored (unconfirmed) seed.
+- Controls (Camera tab, only when calibrated): a "⧉ Work area + 50 mm scale"
+  toggle plus field size + centre (mm) drag values. Field defaults to 140 mm
+  (the galvo field, matching cam::tiles::FIELD_MM) centred on the machine origin
+  — suits a centre-origin galvo; the operator nudges size/centre to match their
+  device while watching the overlay. All four persist across restarts.
+- `dump_bed_overlay` example renders the overlay to a PNG (frames a 60 mm field
+  to the fixture grid); the 50 mm arms land exactly on the 6th grid dot,
+  confirming the scale. Test `camera_bed_overlay_renders_when_calibrated` drives
+  the Camera tab with a calibration + frame through a headless layout.

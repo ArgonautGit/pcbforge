@@ -223,6 +223,14 @@ pub struct ConsoleApp {
     cam_note: String,
     cam_last: Option<image::GrayImage>,
     cam_devices: Vec<(u32, String)>,
+    /// Project the laser work area + a homography-aligned 50 mm scale onto the
+    /// camera feed (only when a laser anchor calibration exists).
+    cam_show_bed: bool,
+    /// Laser work-area (galvo field) side length in machine mm and its centre —
+    /// what gets projected through the anchor. Default is the galvo field.
+    field_mm: f32,
+    field_cx_mm: f32,
+    field_cy_mm: f32,
     cam_capture: Option<crate::camera::Capture>,
     cam_capture_src: Option<crate::camera::Source>,
 
@@ -361,6 +369,12 @@ impl ConsoleApp {
                 .into(),
             cam_last: None,
             cam_devices: crate::camera::list_devices(),
+            cam_show_bed: true,
+            // The galvo field (matches cam::tiles::FIELD_MM); centred on the
+            // machine origin by default, which suits a centre-origin galvo.
+            field_mm: 140.0,
+            field_cx_mm: 0.0,
+            field_cy_mm: 0.0,
             cam_capture: None,
             cam_capture_src: None,
             ar_overlay: false,
@@ -400,6 +414,10 @@ impl ConsoleApp {
             ("calib_pitch_mm", self.calib_pitch_mm.to_string()),
             ("calib_dot_mm", self.calib_dot_mm.to_string()),
             ("calib_grid_out", self.calib_grid_out.clone()),
+            ("cam_show_bed", self.cam_show_bed.to_string()),
+            ("field_mm", self.field_mm.to_string()),
+            ("field_cx_mm", self.field_cx_mm.to_string()),
+            ("field_cy_mm", self.field_cy_mm.to_string()),
             // The calibration matrix (px→mm, row-major) — the operator's grid
             // is taped to the bed and persists, so we keep the fit as a
             // re-anchor seed across restarts (Re-anchor re-locks it).
@@ -451,6 +469,17 @@ impl ConsoleApp {
         f64_field(&m, "calib_pitch_mm", &mut self.calib_pitch_mm);
         f64_field(&m, "calib_dot_mm", &mut self.calib_dot_mm);
         str_field(&m, "calib_grid_out", &mut self.calib_grid_out);
+        let f32_field = |m: &std::collections::BTreeMap<String, String>, k: &str, dst: &mut f32| {
+            if let Some(v) = m.get(k).and_then(|s| s.trim().parse().ok()) {
+                *dst = v;
+            }
+        };
+        f32_field(&m, "field_mm", &mut self.field_mm);
+        f32_field(&m, "field_cx_mm", &mut self.field_cx_mm);
+        f32_field(&m, "field_cy_mm", &mut self.field_cy_mm);
+        if let Some(v) = m.get("cam_show_bed").and_then(|s| s.trim().parse().ok()) {
+            self.cam_show_bed = v;
+        }
         if let Some(o) = m
             .get("cam_orientation")
             .and_then(|s| Orientation::from_token(s.trim()))
@@ -2201,14 +2230,148 @@ impl ConsoleApp {
         }
         ui.separator();
 
+        // Bed overlay (VIS): work area + a homography-aligned 50 mm scale,
+        // available once the laser anchor is calibrated.
+        if self.calib.is_some() {
+            ui.horizontal(|ui| {
+                ui.checkbox(&mut self.cam_show_bed, "⧉ Work area + 50 mm scale")
+                    .on_hover_text(
+                        "Project the laser's work area and a homography-aligned 50 mm \
+                         ruler onto the bed, using the laser-anchor calibration.",
+                    );
+                if self.cam_show_bed {
+                    ui.label("field mm");
+                    ui.add(
+                        egui::DragValue::new(&mut self.field_mm)
+                            .speed(1.0)
+                            .range(10.0..=400.0),
+                    );
+                    ui.label("center x");
+                    ui.add(egui::DragValue::new(&mut self.field_cx_mm).speed(0.5));
+                    ui.label("y");
+                    ui.add(egui::DragValue::new(&mut self.field_cy_mm).speed(0.5));
+                }
+            });
+            ui.separator();
+        }
+
         // Live frames come from the background capture thread (non-blocking).
         let ctx = ui.ctx().clone();
         self.pump_camera(&ctx);
 
         if let Some(tex) = self.cam_tex.clone() {
-            self.show_image(ui, "camera", &tex);
+            let (xf, _) = self.show_image(ui, "camera", &tex);
+            if self.cam_show_bed
+                && let Some(cal) = &self.calib
+                && let Some(inv) = cal.px_to_mm.try_inverse()
+            {
+                self.draw_bed_overlay(ui, xf, &inv, cal.found == 0);
+            }
         } else {
             ui.weak("(no frame yet)");
+        }
+    }
+
+    /// Draw the laser work area and a 50 mm scale onto the camera feed, both
+    /// projected through the anchor (`inv` maps machine-mm → camera-px) and then
+    /// the pan/zoom transform, so they stay glued to the bed as the view moves.
+    fn draw_bed_overlay(
+        &self,
+        ui: &egui::Ui,
+        xf: crate::imgview::ImageXform,
+        inv: &vision::Homography,
+        unconfirmed: bool,
+    ) {
+        let painter = ui.painter_at(xf.panel);
+        let proj = |mx: f64, my: f64| {
+            let p = inv.apply(nalgebra::Point2::new(mx, my));
+            xf.to_screen(p.x, p.y)
+        };
+        let yellow = Color32::from_rgb(0xf0, 0xd0, 0x40);
+        let green = Color32::from_rgb(0x30, 0xd0, 0x80);
+        let white = Color32::WHITE;
+
+        // Work-area square, centred on (field_cx, field_cy).
+        let f = self.field_mm as f64;
+        let (cx, cy) = (self.field_cx_mm as f64, self.field_cy_mm as f64);
+        let h = f / 2.0;
+        let sq = [
+            (cx - h, cy - h),
+            (cx + h, cy - h),
+            (cx + h, cy + h),
+            (cx - h, cy + h),
+        ];
+        let sp: Vec<egui::Pos2> = sq.iter().map(|&(x, y)| proj(x, y)).collect();
+        for i in 0..4 {
+            painter.line_segment([sp[i], sp[(i + 1) % 4]], (2.0, yellow));
+        }
+        let topmid = egui::pos2((sp[2].x + sp[3].x) * 0.5, (sp[2].y + sp[3].y) * 0.5);
+        painter.text(
+            topmid,
+            egui::Align2::CENTER_BOTTOM,
+            format!("work area {f:.0} mm"),
+            egui::FontId::proportional(13.0),
+            yellow,
+        );
+
+        // 50 mm scale as an L at the work-area's lower-left corner: one arm along
+        // machine +X, one along +Y, each capped and labelled — perspective-
+        // correct at that spot because it goes through the same homography.
+        let base = (cx - h, cy - h);
+        let b = proj(base.0, base.1);
+        for (end, label, up) in [
+            (proj(base.0 + 50.0, base.1), "50 mm", false),
+            (proj(base.0, base.1 + 50.0), "50 mm", true),
+        ] {
+            painter.line_segment([b, end], (2.5, white));
+            // End caps, perpendicular to the arm in screen space.
+            let d = end - b;
+            let len = d.length().max(1.0);
+            let perp = egui::vec2(-d.y, d.x) / len * 5.0;
+            painter.line_segment([b - perp, b + perp], (2.0, white));
+            painter.line_segment([end - perp, end + perp], (2.0, white));
+            let mid = egui::pos2((b.x + end.x) * 0.5, (b.y + end.y) * 0.5);
+            let align = if up {
+                egui::Align2::RIGHT_CENTER
+            } else {
+                egui::Align2::CENTER_TOP
+            };
+            painter.text(mid, align, label, egui::FontId::proportional(12.0), white);
+        }
+
+        // Machine origin + axes (clipped to the panel if off to the side).
+        let o = proj(0.0, 0.0);
+        painter.circle_filled(o, 3.0, green);
+        for (end, label, align) in [
+            (proj(20.0, 0.0), "+X", egui::Align2::LEFT_CENTER),
+            (proj(0.0, 20.0), "+Y", egui::Align2::CENTER_BOTTOM),
+        ] {
+            painter.line_segment([o, end], (2.0, green));
+            painter.circle_filled(end, 2.0, green);
+            painter.text(
+                egui::pos2(end.x + 2.0, end.y),
+                align,
+                label,
+                egui::FontId::proportional(12.0),
+                green,
+            );
+        }
+        painter.text(
+            egui::pos2(o.x + 5.0, o.y + 4.0),
+            egui::Align2::LEFT_TOP,
+            "0,0",
+            egui::FontId::proportional(11.0),
+            green,
+        );
+
+        if unconfirmed {
+            painter.text(
+                egui::pos2(xf.panel.min.x + 6.0, xf.panel.max.y - 6.0),
+                egui::Align2::LEFT_BOTTOM,
+                "⚠ calibration from last session — re-anchor to confirm the scale",
+                egui::FontId::proportional(12.0),
+                yellow,
+            );
         }
     }
 
@@ -3698,6 +3861,37 @@ mod tests {
         assert_eq!(cal.dots.len(), cal.found, "per-dot feedback present");
         let out = ctx.run(egui::RawInput::default(), |ctx| app.ui(ctx));
         assert!(!out.shapes.is_empty(), "anchor overlay renders the mesh");
+    }
+
+    /// The camera bed overlay (work area + 50 mm scale) draws without panicking
+    /// when a calibration is present and a frame is loaded.
+    #[test]
+    fn camera_bed_overlay_renders_when_calibrated() {
+        use nalgebra::Matrix3;
+        let mut app = ConsoleApp::new(tmp_db(), vec!["true".into()]);
+        app.tab = CentralTab::Camera;
+        let ctx = Context::default();
+        // A frame in the camera panel.
+        app.set_camera_frame(
+            &ctx,
+            image::GrayImage::from_pixel(200, 150, image::Luma([180])),
+        );
+        // A laser anchor: camera-px → mm at 10 px/mm.
+        app.calib = Some(crate::calib::Calibration {
+            px_to_mm: vision::Homography {
+                matrix: Matrix3::new(0.1, 0.0, 0.0, 0.0, 0.1, 0.0, 0.0, 0.0, 1.0),
+                residuals: vec![],
+                rms: 0.0,
+            },
+            rms_um: 10.0,
+            found: 49,
+            total: 49,
+            dots: Vec::new(),
+        });
+        app.cam_show_bed = true;
+        app.field_mm = 60.0;
+        let out = ctx.run(egui::RawInput::default(), |ctx| app.ui(ctx));
+        assert!(!out.shapes.is_empty(), "camera bed overlay renders");
     }
 
     /// A second frame after a status refresh still lays out (state survives).
