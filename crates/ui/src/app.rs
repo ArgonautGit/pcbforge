@@ -1577,6 +1577,53 @@ impl ConsoleApp {
         self.save_settings_if_changed();
     }
 
+    /// A concise snapshot of the debuggable app state, for the headless
+    /// `debug_driver`'s `state` command (see AGENT_DEBUGGING.md). Curated rather
+    /// than a full `Debug` — textures and channels aren't useful to print.
+    pub fn debug_summary(&self) -> String {
+        let calib = match &self.calib {
+            Some(c) => format!("{}/{} dots, RMS {:.0}µm", c.found, c.total, c.rms_um),
+            None => "none".into(),
+        };
+        let lens = match &self.lens {
+            Some(c) => format!("{} dots, RMS {:.0}µm", c.found, c.lens.rms_um),
+            None => "none".into(),
+        };
+        let cam = match &self.cam_last {
+            Some(g) => format!(
+                "{}×{} (view ×{:.3})",
+                g.width(),
+                g.height(),
+                self.cam_view_scale
+            ),
+            None => "none".into(),
+        };
+        format!(
+            "tab={:?} side={:?} calib_mode={:?}\n\
+             calib_anchor: {calib}\n\
+             camera_lens: {lens}\n\
+             camera_frame: {cam}\n\
+             bed_overlay: show={} field={:.0}mm center=({:.1},{:.1})\n\
+             place: x={:.2} y={:.2} rot={:.1}°\n\
+             calib_grid: n={} pitch={:.2}mm corners_marked={}\n\
+             fiducials: {} markers",
+            self.tab,
+            self.side,
+            self.calib_mode,
+            self.cam_show_bed,
+            self.field_mm,
+            self.field_cx_mm,
+            self.field_cy_mm,
+            self.place_tx_mm,
+            self.place_ty_mm,
+            self.place_rot_deg,
+            self.calib_n,
+            self.calib_pitch_mm,
+            self.calib_corners.len(),
+            self.fid_search.len(),
+        )
+    }
+
     fn status_panel(&mut self, ui: &mut egui::Ui) {
         ui.heading("Status");
         if let Some(err) = &self.status.error {

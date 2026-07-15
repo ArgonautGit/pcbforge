@@ -1391,3 +1391,28 @@ but everything touching calibration/detection to stay full resolution.
 - Tests: `downscale_view_caps_longest_side_and_reports_ratio` (pure) and
   `camera_view_downscales_but_data_stays_full_res` (2560×1440 → view 1280, data
   stays 2560×1440, ratio 0.5).
+
+## 2026-07-15 — Headless UI debug driver (egui_kittest) + egui 0.30 bump
+
+Added the ability to drive and screenshot the real console UI headlessly, so UI
+work can be verified against the actual app instead of ctx.run shape-assertions
+and dump_* re-draws (see AGENT_DEBUGGING.md).
+
+- Bumped egui/eframe 0.29→0.30 (clean, zero code changes) so `egui_kittest`
+  0.30 could be added. (Latest 0.35 was declined for now: it removes the
+  ctx-based panel API and would force a native-eframe rewrite that can't be
+  compiled in the headless sandbox.) ColorImage etc. unchanged at 0.30.
+- `crates/ui/examples/debug_driver.rs`: reads a script (stdin/file), steps the
+  real `ConsoleApp` via a kittest `Harness`, and runs `tree` (a11y dump),
+  `state`, `click`, `type`, `set`, `key`, `step`, `settle`, `screenshot`
+  (wgpu → PNG, graceful ERR without a GPU). Label match is exact-then-substring,
+  first-of-many (the query_by_* singular forms panic on >1 match).
+- `ConsoleApp::debug_summary()` — curated state for the `state` command.
+- `scripts/headless-gpu.sh`: finds a software Vulkan ICD (SwiftShader bundled
+  with Chromium → lavapipe → software GL) for screenshots/snapshots.
+- Tests: `tests/ui_interaction.rs` (headless, no GPU — tab switching, button
+  drivability, a11y labels) run under `cargo test`; `tests/ui_snapshots.rs`
+  (wgpu pixel baselines) are `#[ignore]`d. Baselines in tests/snapshots/*.png
+  (SwiftShader); transient *.new/*.diff.png gitignored.
+- dev-deps: egui_kittest (wgpu+snapshot), accesskit_consumer (tree types), egui
+  (integration tests can't name normal deps).

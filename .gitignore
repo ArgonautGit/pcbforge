@@ -1,1 +1,5 @@
 /target
+
+# egui_kittest transient snapshot artifacts (baselines *.png are committed)
+crates/ui/tests/snapshots/*.new.png
+crates/ui/tests/snapshots/*.diff.png
