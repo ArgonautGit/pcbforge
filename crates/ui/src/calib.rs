@@ -16,7 +16,9 @@
 
 use image::GrayImage;
 use nalgebra::{Matrix3, Point2};
-use vision::{BedMap, FiducialProfile, Homography, find_fiducials, fit_homography};
+use vision::{
+    BedMap, FiducialProfile, Homography, LensMap, find_fiducials, fit_homography, fit_lens,
+};
 
 /// The commanded dot grid the operator burns: an `n×n` lattice at `pitch_mm`
 /// starting from `origin_mm` (the lower-left dot), in machine mm.
@@ -63,16 +65,18 @@ pub struct Calibration {
     pub total: usize,
 }
 
-/// Detect the grid dots using `mm_to_px_seed` (commanded-mm → px) to place the
-/// local search windows, and fit the final camera-px → commanded-mm homography.
-/// The seed is the corner homography for a fresh fit, or the previous
-/// calibration for a re-anchor.
-fn refit(
+/// A detected dot as `(found_px, grid_mm)`.
+type DotPair = (Point2<f64>, Point2<f64>);
+
+/// Detect every grid dot: `mm_to_px_seed` (grid-mm → px) places the local
+/// search windows, `find_fiducials` refines each. Returns the pairs for the
+/// dots that locked, plus the commanded total.
+fn detect_grid_dots(
     frame: &GrayImage,
     mm_to_px_seed: &Homography,
     grid: &GridSpec,
     dot_mm: f64,
-) -> Result<Calibration, String> {
+) -> Result<(Vec<DotPair>, usize), String> {
     let mm_from_px: Matrix3<f64> = mm_to_px_seed
         .matrix
         .try_inverse()
@@ -87,13 +91,35 @@ fn refit(
     // bounds how far the camera may drift between re-anchors and still lock on.
     let search_mm = (grid.pitch_mm * 0.4).max(dot_mm);
     let results = find_fiducials(frame, &expected, search_mm, &profile, &bed);
-
     let pairs: Vec<(Point2<f64>, Point2<f64>)> = commanded
         .iter()
         .zip(&results)
         .filter_map(|(&(mx, my), r)| r.as_ref().ok().map(|f| (f.found_px, Point2::new(mx, my))))
         .collect();
-    let total = commanded.len();
+    Ok((pairs, commanded.len()))
+}
+
+/// Corner homography (grid-mm → px) from the four hand-marked corner dots.
+fn corner_seed(corners_px: [(f64, f64); 4], grid: &GridSpec) -> Result<Homography, String> {
+    let pairs: Vec<(Point2<f64>, Point2<f64>)> = grid
+        .corners_mm()
+        .iter()
+        .zip(corners_px.iter())
+        .map(|(&(mx, my), &(px, py))| (Point2::new(mx, my), Point2::new(px, py)))
+        .collect();
+    fit_homography(&pairs).map_err(|e| format!("corner fit: {e}"))
+}
+
+/// Detect the grid dots via a seed and fit the final camera-px → commanded-mm
+/// **homography** (the laser anchor). The seed is the corner homography for a
+/// fresh fit, or the previous calibration for a re-anchor.
+fn refit(
+    frame: &GrayImage,
+    mm_to_px_seed: &Homography,
+    grid: &GridSpec,
+    dot_mm: f64,
+) -> Result<Calibration, String> {
+    let (pairs, total) = detect_grid_dots(frame, mm_to_px_seed, grid, dot_mm)?;
     let found = pairs.len();
     if found < 4 {
         return Err(format!(
@@ -106,6 +132,74 @@ fn refit(
     Ok(Calibration {
         px_to_mm,
         rms_um,
+        found,
+        total,
+    })
+}
+
+// ---- camera lens distortion (printed grid) --------------------------------
+
+/// One dot's calibration feedback for the overlay: where it was detected, the
+/// lens **distortion** it exhibits (detected − perspective-predicted, px), and
+/// how well the polynomial fit corrected it (µm).
+#[derive(Debug, Clone, Copy)]
+pub struct LensDot {
+    pub px: (f64, f64),
+    /// Detected px minus where a pure-perspective (homography) model predicts —
+    /// i.e. the lens distortion at this dot, in pixels. Drawn as an arrow.
+    pub distort_px: (f64, f64),
+    /// Post-fit residual of the polynomial lens map at this dot, µm.
+    pub resid_um: f64,
+}
+
+/// The camera lens calibration: the metric map plus per-dot feedback.
+#[derive(Debug, Clone)]
+pub struct CameraCal {
+    pub lens: LensMap,
+    pub dots: Vec<LensDot>,
+    pub found: usize,
+    pub total: usize,
+}
+
+/// Fit the camera lens-distortion map from a frame of the **printed** reference
+/// grid (known `grid` geometry) and the four hand-marked corner dots. Also
+/// computes the per-dot distortion field for visual feedback.
+pub fn fit_camera_lens(
+    frame: &GrayImage,
+    corners_px: [(f64, f64); 4],
+    grid: &GridSpec,
+    dot_mm: f64,
+) -> Result<CameraCal, String> {
+    let seed = corner_seed(corners_px, grid)?;
+    let (pairs, total) = detect_grid_dots(frame, &seed, grid, dot_mm)?;
+    let found = pairs.len();
+    if found < 10 {
+        return Err(format!(
+            "only {found}/{total} grid dots detected — the lens fit needs ≥10 \
+             (check the printed grid, the corner clicks, and the dot size)"
+        ));
+    }
+    // Perspective-only model over the same points, to show the distortion the
+    // polynomial had to absorb (grid-mm → px).
+    let persp = fit_homography(&pairs.iter().map(|&(px, mm)| (mm, px)).collect::<Vec<_>>())
+        .map_err(|e| format!("perspective ref: {e}"))?;
+    let lens = fit_lens(&pairs).map_err(|e| format!("lens fit: {e}"))?;
+
+    let dots: Vec<LensDot> = pairs
+        .iter()
+        .zip(&lens.residuals)
+        .map(|(&(px, mm), &(_, _, resid_um))| {
+            let pred = persp.apply(mm);
+            LensDot {
+                px: (px.x, px.y),
+                distort_px: (px.x - pred.x, px.y - pred.y),
+                resid_um,
+            }
+        })
+        .collect();
+    Ok(CameraCal {
+        lens,
+        dots,
         found,
         total,
     })
@@ -363,6 +457,80 @@ mod tests {
             "stale calibration is visibly off ({:.2},{:.2}) — re-anchor was needed",
             stale.x,
             stale.y
+        );
+    }
+
+    /// The camera lens fit locks the printed grid, corrects the barrel
+    /// distortion to a low residual, and reports a non-trivial distortion
+    /// field (arrows) for the operator to see.
+    #[test]
+    fn camera_lens_fit_corrects_barrel_and_reports_distortion() {
+        let grid = GridSpec {
+            origin_mm: (0.0, 0.0),
+            pitch_mm: 10.0,
+            n: 7,
+        };
+        let dot_mm = 1.5;
+        // Perspective ~10 px/mm plus 4% barrel about the image center.
+        let base = homog(&[
+            ((0.0, 0.0), (40.0, 40.0)),
+            ((60.0, 0.0), (640.0, 40.0)),
+            ((60.0, 60.0), (640.0, 640.0)),
+            ((0.0, 60.0), (40.0, 640.0)),
+        ]);
+        let distort = |p: Point2<f64>| {
+            let (cx, cy) = (340.0, 340.0);
+            let (du, dv) = (p.x - cx, p.y - cy);
+            let r2 = (du * du + dv * dv) / (340.0 * 340.0);
+            let k = 0.04;
+            Point2::new(cx + du * (1.0 + k * r2), cy + dv * (1.0 + k * r2))
+        };
+        let centers: Vec<(f64, f64, f64)> = grid
+            .points()
+            .iter()
+            .map(|&(mx, my)| {
+                let p = distort(base.apply(Point2::new(mx, my)));
+                (p.x, p.y, dot_mm * 10.0)
+            })
+            .collect();
+        let (w, h) = (700u32, 700u32);
+        let img = GrayImage::from_fn(w, h, |x, y| {
+            let mut cover = 0.0;
+            for sy in 0..4 {
+                for sx in 0..4 {
+                    let px = x as f64 + (sx as f64 + 0.5) / 4.0 - 0.5;
+                    let py = y as f64 + (sy as f64 + 0.5) / 4.0 - 0.5;
+                    if centers.iter().any(|&(cx, cy, r)| {
+                        ((px - cx).powi(2) + (py - cy).powi(2)).sqrt() < r / 2.0
+                    }) {
+                        cover += 1.0 / 16.0;
+                    }
+                }
+            }
+            image::Luma([(210.0 - 150.0 * cover) as u8])
+        });
+        let corners_px = grid.corners_mm().map(|(mx, my)| {
+            let p = distort(base.apply(Point2::new(mx, my)));
+            (p.x, p.y)
+        });
+
+        let cal = fit_camera_lens(&img, corners_px, &grid, dot_mm).expect("lens fit");
+        assert!(cal.found >= 45, "locked most dots: {}", cal.found);
+        assert!(
+            cal.lens.rms_um < 60.0,
+            "corrected RMS {} µm",
+            cal.lens.rms_um
+        );
+        // The distortion field is real: at least one corner dot deviates several
+        // px from the perspective model (that's the barrel we corrected).
+        let max_distort = cal
+            .dots
+            .iter()
+            .map(|d| (d.distort_px.0.powi(2) + d.distort_px.1.powi(2)).sqrt())
+            .fold(0.0, f64::max);
+        assert!(
+            max_distort > 3.0,
+            "shows the barrel field: {max_distort:.1} px"
         );
     }
 

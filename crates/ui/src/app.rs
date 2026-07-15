@@ -47,6 +47,15 @@ enum Side {
     Back,
 }
 
+/// Which calibration the operator is doing on the Calibrate tab.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum CalibMode {
+    /// Printed reference grid → lens-distortion map (camera becomes a ruler).
+    CameraLens,
+    /// Burned grid → the laser anchor (camera-px → commanded machine mm).
+    LaserAnchor,
+}
+
 /// Correction applied to every camera frame for how the camera is physically
 /// mounted (e.g. installed upside down). Applied on ingest, so detection,
 /// registration, and display all see the corrected orientation.
@@ -227,6 +236,12 @@ pub struct ConsoleApp {
     /// Clicked corner-dot pixel positions (native image px), in order
     /// lower-left, lower-right, upper-right, upper-left — up to 4.
     calib_corners: Vec<(f64, f64)>,
+    /// Camera lens-distortion map (from the printed reference grid) + per-dot
+    /// feedback. Session-scoped like the anchor, but far more stable.
+    calib_mode: CalibMode,
+    lens: Option<crate::calib::CameraCal>,
+    /// Visual exaggeration of the distortion arrows in the overlay.
+    lens_arrow_scale: f32,
     /// Continuous re-anchoring against the (persistent) burned grid, so the
     /// calibration tracks the camera as it moves.
     calib_live: bool,
@@ -321,6 +336,9 @@ impl ConsoleApp {
             calib_frame_img: None,
             calib_frame_tex: None,
             calib_corners: Vec::new(),
+            calib_mode: CalibMode::CameraLens,
+            lens: None,
+            lens_arrow_scale: 20.0,
             calib_live: false,
             calib_capture: None,
             calib_capture_src: None,
@@ -1123,7 +1141,7 @@ impl ConsoleApp {
     /// Fit the camera→laser calibration from the 4 clicked corners.
     fn calibrate_fit(&mut self) {
         let Some(frame) = &self.calib_frame_img else {
-            self.calib_note = "load the burned-grid frame first".into();
+            self.calib_note = "load the grid frame first".into();
             return;
         };
         if self.calib_corners.len() != 4 {
@@ -1139,22 +1157,38 @@ impl ConsoleApp {
             self.calib_corners[2],
             self.calib_corners[3],
         ];
-        match crate::calib::fit_camera_to_machine(
-            frame,
-            corners,
-            &self.calib_grid(),
-            self.calib_dot_mm,
-        ) {
-            Ok(cal) => {
-                self.calib_note = format!(
-                    "calibrated: {}/{} dots, RMS {:.0} µm — Place now burns in machine coordinates",
-                    cal.found, cal.total, cal.rms_um
-                );
-                self.calib = Some(cal);
+        let grid = self.calib_grid();
+        let dot = self.calib_dot_mm;
+        match self.calib_mode {
+            CalibMode::CameraLens => {
+                match crate::calib::fit_camera_lens(frame, corners, &grid, dot) {
+                    Ok(cal) => {
+                        self.calib_note = format!(
+                            "lens fit: {}/{} dots, RMS {:.0} µm, worst {:.0} µm — camera is now a metric ruler",
+                            cal.found, cal.total, cal.lens.rms_um, cal.lens.max_um
+                        );
+                        self.lens = Some(cal);
+                    }
+                    Err(e) => {
+                        self.lens = None;
+                        self.calib_note = format!("lens fit failed: {e}");
+                    }
+                }
             }
-            Err(e) => {
-                self.calib = None;
-                self.calib_note = format!("fit failed: {e}");
+            CalibMode::LaserAnchor => {
+                match crate::calib::fit_camera_to_machine(frame, corners, &grid, dot) {
+                    Ok(cal) => {
+                        self.calib_note = format!(
+                            "anchor: {}/{} dots, RMS {:.0} µm — Place now burns in machine coordinates",
+                            cal.found, cal.total, cal.rms_um
+                        );
+                        self.calib = Some(cal);
+                    }
+                    Err(e) => {
+                        self.calib = None;
+                        self.calib_note = format!("anchor fit failed: {e}");
+                    }
+                }
             }
         }
     }
@@ -1648,14 +1682,31 @@ impl ConsoleApp {
     fn calibrate_view(&mut self, ui: &mut egui::Ui) {
         let ctx = ui.ctx().clone();
         self.pump_calib_live(&ctx);
-        ui.label(
-            egui::RichText::new(
-                "Camera→laser calibration: burn a dot grid at known coordinates, image it, \
-             and mark the corners so the console learns where the laser burns in the camera view. \
-             Leave the grid on the bed and use Re-anchor / ● Live to track the camera as it moves.",
-            )
-            .weak(),
-        );
+        ui.horizontal(|ui| {
+            ui.label("step");
+            ui.selectable_value(
+                &mut self.calib_mode,
+                CalibMode::CameraLens,
+                "① Camera lens (printed grid)",
+            );
+            ui.selectable_value(
+                &mut self.calib_mode,
+                CalibMode::LaserAnchor,
+                "② Laser anchor (burned grid)",
+            );
+        });
+        match self.calib_mode {
+            CalibMode::CameraLens => ui.label(egui::RichText::new(
+                "Correct the camera lens: print a dot grid, tape it to the bed, image it, mark the \
+                 4 corners, and Fit. Enter the MEASURED printed pitch (calipers) so distances are true. \
+                 The arrows show the lens distortion; the color shows how well it was corrected.",
+            ).weak()),
+            CalibMode::LaserAnchor => ui.label(egui::RichText::new(
+                "Anchor to the laser: burn a dot grid at known coordinates, leave it taped down, image it, \
+                 mark the 4 corners, and Fit. Re-anchor / ● Live re-lock to that fixed grid as the camera \
+                 moves — so the camera always knows where the laser's coordinates are.",
+            ).weak()),
+        };
         egui::Grid::new("calib-form")
             .num_columns(2)
             .spacing([8.0, 6.0])
@@ -1663,11 +1714,19 @@ impl ConsoleApp {
                 ui.label("dots per side");
                 ui.add(egui::DragValue::new(&mut self.calib_n).range(2..=15));
                 ui.end_row();
-                ui.label("pitch mm");
+                ui.label(if self.calib_mode == CalibMode::CameraLens {
+                    "measured pitch mm"
+                } else {
+                    "pitch mm"
+                });
                 ui.add(
                     egui::DragValue::new(&mut self.calib_pitch_mm)
-                        .speed(0.5)
+                        .speed(0.1)
                         .range(1.0..=50.0),
+                )
+                .on_hover_text(
+                    "Camera mode: the pitch you MEASURED on the printed sheet with calipers — \
+                     printers scale, so measure it. Laser mode: the commanded pitch you burned.",
                 );
                 ui.end_row();
                 ui.label("dot ⌀ mm");
@@ -1677,9 +1736,13 @@ impl ConsoleApp {
                         .range(0.05..=5.0),
                 );
                 ui.end_row();
-                ui.label("grid out .lbrn2");
-                ui.add(egui::TextEdit::singleline(&mut self.calib_grid_out).desired_width(240.0));
-                ui.end_row();
+                if self.calib_mode == CalibMode::LaserAnchor {
+                    ui.label("grid out .lbrn2");
+                    ui.add(
+                        egui::TextEdit::singleline(&mut self.calib_grid_out).desired_width(240.0),
+                    );
+                    ui.end_row();
+                }
                 ui.label("grid frame (optional)");
                 ui.add(egui::TextEdit::singleline(&mut self.calib_frame).desired_width(240.0))
                     .on_hover_text(
@@ -1688,81 +1751,105 @@ impl ConsoleApp {
                 ui.end_row();
             });
         ui.horizontal(|ui| {
-            if ui
-                .button("① Generate grid")
-                .on_hover_text("Emit the dot grid to burn.")
-                .clicked()
+            if self.calib_mode == CalibMode::LaserAnchor
+                && ui
+                    .button("① Generate grid")
+                    .on_hover_text("Emit the dot grid to burn.")
+                    .clicked()
             {
                 self.calibrate_generate_grid();
             }
-            if ui.button("② Load burned grid").clicked() {
+            if ui.button("⤵ Load grid frame").clicked() {
                 let ctx = ui.ctx().clone();
                 self.calibrate_load_frame(&ctx);
             }
-            if ui.button("④ Fit").clicked() {
+            if ui.button("🎯 Fit").clicked() {
                 self.calibrate_fit();
             }
             if ui.button("↺ clear corners").clicked() {
                 self.calib_corners.clear();
             }
         });
-        ui.horizontal(|ui| {
-            if ui
-                .add_enabled(self.calib.is_some(), egui::Button::new("⟳ Re-anchor"))
-                .on_hover_text(
-                    "Re-fit from a fresh camera frame without re-clicking corners — \
-                     corrects for the camera having moved (the grid must still be in view).",
-                )
-                .clicked()
-            {
-                self.calibrate_re_anchor();
-            }
-            ui.add_enabled_ui(self.calib.is_some(), |ui| {
-                ui.checkbox(&mut self.calib_live, "● Live anchor")
-                    .on_hover_text(
-                        "Continuously re-anchor every frame so the calibration tracks the \
-                     camera as it moves. Keep the burned grid in view.",
+
+        // Mode-specific status + controls.
+        match self.calib_mode {
+            CalibMode::CameraLens => {
+                let (status, ok) = match &self.lens {
+                    Some(c) => (
+                        format!(
+                            "● lens calibrated ({} dots, RMS {:.0} µm, worst {:.0} µm)",
+                            c.found, c.lens.rms_um, c.lens.max_um
+                        ),
+                        true,
+                    ),
+                    None => (
+                        "○ lens not calibrated — the camera isn't a metric ruler yet".to_string(),
+                        false,
+                    ),
+                };
+                ui.colored_label(status_color(ok), status);
+                if self.lens.is_some() {
+                    ui.add(
+                        egui::Slider::new(&mut self.lens_arrow_scale, 1.0..=100.0)
+                            .text("distortion arrow ×"),
                     );
-            });
-            if self.calib_live {
-                ui.spinner();
+                }
             }
-        });
-        // Three states: unconfirmed (loaded from disk, found==0), live, none.
-        let (status, ok) = match &self.calib {
-            Some(c) if c.found == 0 => (
-                "◐ loaded last session — ⟳ Re-anchor to re-lock to the taped grid".to_string(),
-                false,
-            ),
-            Some(c) => (
-                format!("● calibrated ({} dots, RMS {:.0} µm)", c.found, c.rms_um),
-                true,
-            ),
-            None => (
-                "○ not calibrated — Place uses the design frame only".to_string(),
-                false,
-            ),
-        };
-        ui.colored_label(
-            if ok {
-                Color32::from_rgb(0x50, 0xb0, 0x60)
-            } else {
-                Color32::from_rgb(0xe0, 0x90, 0x20)
-            },
-            status,
-        );
+            CalibMode::LaserAnchor => {
+                ui.horizontal(|ui| {
+                    if ui
+                        .add_enabled(self.calib.is_some(), egui::Button::new("⟳ Re-anchor"))
+                        .on_hover_text(
+                            "Re-fit from a fresh camera frame without re-clicking corners — \
+                             corrects for the camera having moved (grid must still be in view).",
+                        )
+                        .clicked()
+                    {
+                        self.calibrate_re_anchor();
+                    }
+                    ui.add_enabled_ui(self.calib.is_some(), |ui| {
+                        ui.checkbox(&mut self.calib_live, "● Live anchor")
+                            .on_hover_text(
+                                "Continuously re-anchor every frame so the calibration tracks the \
+                             camera as it moves. Keep the burned grid in view.",
+                            );
+                    });
+                    if self.calib_live {
+                        ui.spinner();
+                    }
+                });
+                let (status, ok) = match &self.calib {
+                    Some(c) if c.found == 0 => (
+                        "◐ loaded last session — ⟳ Re-anchor to re-lock to the taped grid"
+                            .to_string(),
+                        false,
+                    ),
+                    Some(c) => (
+                        format!("● anchored ({} dots, RMS {:.0} µm)", c.found, c.rms_um),
+                        true,
+                    ),
+                    None => (
+                        "○ not anchored — Place uses the design frame only".to_string(),
+                        false,
+                    ),
+                };
+                ui.colored_label(status_color(ok), status);
+            }
+        }
         ui.label(egui::RichText::new(&self.calib_note).weak());
         ui.weak(
-            "③ Click the 4 corner dots in order: lower-left, lower-right, upper-right, upper-left.",
+            "Click the 4 corner dots in order: lower-left, lower-right, upper-right, upper-left.",
         );
         ui.separator();
         self.calib_frame_overlay(ui);
     }
 
-    /// The burned-grid frame with the operator's corner clicks (numbered).
+    /// The grid frame with the operator's corner clicks and — in camera-lens
+    /// mode after a fit — the per-dot distortion field (arrows) and correction
+    /// quality (dot color).
     fn calib_frame_overlay(&mut self, ui: &mut egui::Ui) {
         let Some(tex) = &self.calib_frame_tex else {
-            ui.weak("(load a burned-grid frame to mark corners)");
+            ui.weak("(load a grid frame to mark corners)");
             return;
         };
         let (tw, th) = (tex.size()[0] as f32, tex.size()[1] as f32);
@@ -1793,6 +1880,36 @@ impl ConsoleApp {
         }
         let painter = ui.painter_at(rect);
         let cyan = Color32::from_rgb(0x22, 0xcc, 0xdd);
+
+        // Lens feedback (camera mode, after a fit): a magenta arrow per dot
+        // showing the distortion it exhibited (exaggerated ×scale), and a dot
+        // colored by how well the polynomial corrected it.
+        if self.calib_mode == CalibMode::CameraLens
+            && let Some(cal) = &self.lens
+        {
+            let (sx, sy) = (rect.width() / tw, rect.height() / th);
+            let scale = self.lens_arrow_scale;
+            let magenta = Color32::from_rgb(0xd0, 0x50, 0xd0);
+            for d in &cal.dots {
+                let base = to_screen(d.px.0, d.px.1);
+                let tip = egui::pos2(
+                    base.x + (d.distort_px.0 as f32) * scale * sx,
+                    base.y + (d.distort_px.1 as f32) * scale * sy,
+                );
+                painter.line_segment([base, tip], (1.5, magenta));
+                painter.circle_filled(tip, 2.0, magenta);
+                // Correction quality: green < 30 µm, amber < 100, red beyond.
+                let col = if d.resid_um < 30.0 {
+                    Color32::from_rgb(0x40, 0xc0, 0x50)
+                } else if d.resid_um < 100.0 {
+                    Color32::from_rgb(0xe0, 0x90, 0x20)
+                } else {
+                    Color32::from_rgb(0xd0, 0x40, 0x40)
+                };
+                painter.circle_stroke(base, 4.0, egui::Stroke::new(1.5, col));
+            }
+        }
+
         for (i, &(px, py)) in self.calib_corners.iter().enumerate() {
             let c = to_screen(px, py);
             painter.circle_stroke(c, 9.0, egui::Stroke::new(2.0, cyan));
@@ -2517,6 +2634,15 @@ pub fn preview_image(
         ablate.len(),
     );
     Ok((img, note))
+}
+
+/// Green when a calibration step is satisfied, amber otherwise.
+fn status_color(ok: bool) -> Color32 {
+    if ok {
+        Color32::from_rgb(0x50, 0xb0, 0x60)
+    } else {
+        Color32::from_rgb(0xe0, 0x90, 0x20)
+    }
 }
 
 fn short_path(p: &str) -> String {
@@ -3331,6 +3457,52 @@ mod tests {
             "translation survived"
         );
         assert_eq!(b.calib_n, 7);
+    }
+
+    /// Camera-lens calibration through the console: a printed-grid frame + 4
+    /// corner clicks → a lens fit with per-dot distortion feedback; and the
+    /// tab lays out with the arrows drawn.
+    #[test]
+    fn camera_lens_calibration_flow() {
+        let grid = crate::calib::GridSpec {
+            origin_mm: (0.0, 0.0),
+            pitch_mm: 10.0,
+            n: 7,
+        };
+        // A frame of a printed grid with mild barrel (reuse the pattern).
+        let ppm = 10.0;
+        let dot = 1.5;
+        let pts = grid.points();
+        let img = image::GrayImage::from_fn(700, 700, |x, y| {
+            let dark = pts.iter().any(|&(mx, my)| {
+                let (cx, cy) = (mx * ppm + 40.0, my * ppm + 40.0);
+                (((x as f64) - cx).powi(2) + ((y as f64) - cy).powi(2)).sqrt() < 0.5 * dot * ppm
+            });
+            image::Luma([if dark { 40 } else { 210 }])
+        });
+        let mut app = ConsoleApp::new(tmp_db(), vec!["true".into()]);
+        app.tab = CentralTab::Calibrate;
+        app.calib_mode = CalibMode::CameraLens;
+        app.calib_n = 7;
+        app.calib_pitch_mm = 10.0;
+        app.calib_dot_mm = dot;
+        app.calib_frame_img = Some(img);
+        // Corner clicks at the four grid corners (px = mm*ppm + 40).
+        app.calib_corners = vec![(40.0, 40.0), (640.0, 40.0), (640.0, 640.0), (40.0, 640.0)];
+        app.calibrate_fit();
+        let lens = app.lens.as_ref().expect("lens fit produced");
+        assert!(lens.found >= 45, "locked most dots: {}", lens.found);
+        assert!(
+            lens.lens.rms_um < 60.0,
+            "corrected RMS {} µm",
+            lens.lens.rms_um
+        );
+        assert_eq!(lens.dots.len(), lens.found, "per-dot feedback present");
+
+        // The tab renders (with the distortion arrows) headless.
+        let ctx = Context::default();
+        let out = ctx.run(egui::RawInput::default(), |ctx| app.ui(ctx));
+        assert!(!out.shapes.is_empty());
     }
 
     /// The Calibrate tab lays out headless, including corner clicks.

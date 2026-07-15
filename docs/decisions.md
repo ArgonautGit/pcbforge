@@ -1204,3 +1204,32 @@ recal each session).
   "◐ loaded last session — Re-anchor to re-lock to the taped grid" (found==0 ⇒
   unconfirmed); one ⟳ Re-anchor re-locks it to the paper (or a fresh corner Fit
   if the camera jumped too far). Verified the matrix round-trips across restart.
+
+## 2026-07-14 — Camera lens-distortion calibration (VIS-2)
+
+Operator's point: a homography only models a flat plane under perspective — it
+can't represent the camera lens's barrel/pincushion *curvature*, and a burned
+grid conflates camera + galvo distortion (circular). To get dimensionally
+accurate geometry you must (1) make the camera a metric ruler with an
+independent known-geometry reference, then (2) characterize the galvo against
+it. This lands step (1); the operator chose a **printed** reference grid.
+
+- `vision::fit_lens` (kernel): a bi-cubic 2-D polynomial `pixel ↔ true-mm`
+  (normalized, least-squares), fit both directions from `(pixel, known-mm)`
+  correspondences. Absorbs perspective *and* lens curvature. Tests: a realistic
+  4% barrel fits < 30 µm RMS while a homography over the same points is > 300 µm
+  (proving the polynomial was necessary); px↔mm round-trips.
+- `ui::calib::fit_camera_lens`: reuses the grid-dot detection (corner seed →
+  find_fiducials), fits the lens, and computes a per-dot **distortion field**
+  (detected − perspective-predicted, px) + post-fit residual for the overlay.
+- Console **Calibrate** tab is now two steps: **① Camera lens (printed grid)**
+  and **② Laser anchor (burned grid)**. Camera mode: print grid, tape it, image,
+  click 4 corners, Fit — enter the *measured* printed pitch (calipers) since
+  printers scale. Visual feedback: magenta arrows per dot show the lens
+  distortion (radial = barrel), rings colored by correction quality (green
+  < 30 µm), RMS/worst readout, adjustable arrow exaggeration. `dump_lens`
+  renders the textbook barrel field.
+- Scope/next: full OpenCV 3-D intrinsics (multi-pose) are unnecessary for a
+  fixed planar bed — one planar polynomial rectifies the view. Next is using
+  this metric camera to characterize the galvo (VIS-6) and pre-warp emitted
+  geometry (VIS-7/DRV-8) for dimensional accuracy.
