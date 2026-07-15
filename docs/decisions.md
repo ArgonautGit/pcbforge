@@ -1233,3 +1233,19 @@ it. This lands step (1); the operator chose a **printed** reference grid.
   fixed planar bed — one planar polynomial rectifies the view. Next is using
   this metric camera to characterize the galvo (VIS-6) and pre-warp emitted
   geometry (VIS-7/DRV-8) for dimensional accuracy.
+
+## 2026-07-15 — CI fix: float-literal f32 fallback in Stroke::new
+
+CI (GitHub Actions, `dtolnay/rust-toolchain@stable`) had been failing on every
+recent commit at the clippy step — before it ever reached `cargo test`. Root
+cause: the newer stable Rust on CI enables `float_literal_f32_fallback`
+(rust-lang/rust#154024), which errors under `-D warnings` when a bare float
+literal falls back to `f32`. `egui::Stroke::new(width: impl Into<f32>, …)` with
+a literal `1.5`/`2.0`/`1.0` triggers it: the literal has no `f64: Into<f32>`
+path, so it silently resolves to `f32`. The local toolchain (rustc 1.94.1,
+2026-03-25) predates the lint and cannot reproduce it.
+
+Fix: suffix the four affected width literals with `_f32` in
+`crates/ui/src/app.rs` (the calibration/fiducial overlay strokes). Non-literal
+widths and tuple `(w, color)` stroke forms are already concrete `f32` and
+unaffected. No behavior change — purely making the intended type explicit.

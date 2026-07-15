@@ -1906,13 +1906,13 @@ impl ConsoleApp {
                 } else {
                     Color32::from_rgb(0xd0, 0x40, 0x40)
                 };
-                painter.circle_stroke(base, 4.0, egui::Stroke::new(1.5, col));
+                painter.circle_stroke(base, 4.0, egui::Stroke::new(1.5_f32, col));
             }
         }
 
         for (i, &(px, py)) in self.calib_corners.iter().enumerate() {
             let c = to_screen(px, py);
-            painter.circle_stroke(c, 9.0, egui::Stroke::new(2.0, cyan));
+            painter.circle_stroke(c, 9.0, egui::Stroke::new(2.0_f32, cyan));
             painter.line_segment(
                 [egui::pos2(c.x - 12.0, c.y), egui::pos2(c.x + 12.0, c.y)],
                 (1.0, cyan),
@@ -2377,14 +2377,14 @@ impl ConsoleApp {
                 [egui::pos2(c.x, c.y - 9.0), egui::pos2(c.x, c.y + 9.0)],
                 (1.5, cyan),
             );
-            painter.circle_stroke(c, 11.0, egui::Stroke::new(1.0, cyan));
+            painter.circle_stroke(c, 11.0, egui::Stroke::new(1.0_f32, cyan));
             if let Some(Some((fx, fy))) = self.fid_found.get(i) {
                 let col = match self.fid_rows.get(i).map(|r| &r.kind) {
                     Some(FidKind::FoundStrong) => Color32::from_rgb(0x40, 0xc0, 0x50),
                     _ => Color32::from_rgb(0xe0, 0x90, 0x20),
                 };
                 let fc = px_to_screen(*fx, *fy);
-                painter.circle_stroke(fc, ring_r, egui::Stroke::new(2.0, col));
+                painter.circle_stroke(fc, ring_r, egui::Stroke::new(2.0_f32, col));
                 painter.circle_filled(fc, 2.0, col);
             }
         }
