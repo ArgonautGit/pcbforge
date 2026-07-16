@@ -281,6 +281,16 @@ enum Command {
         /// Max residual RMS before the fit is rejected, mm.
         #[arg(long, default_value_t = 0.05)]
         max_rms_mm: f64,
+
+        /// Laser field-distortion correction file (from the console's ③ Laser-
+        /// field calibration). When given, every emitted vertex is pre-distorted
+        /// physical→commanded so the beam cancels the galvo/f-theta field error;
+        /// edges are densified so the pre-curvature is preserved.
+        #[arg(long)]
+        field_map: Option<PathBuf>,
+        /// Edge densification for --field-map, mm (smaller = finer curve).
+        #[arg(long, default_value_t = 0.5)]
+        field_seg_mm: f64,
     },
     /// Emit a calibration dot grid `.lbrn2` for camera→laser calibration: an
     /// n×n lattice of small filled squares at known commanded coordinates.
@@ -504,6 +514,8 @@ fn run(cli: &Cli) -> Result<(), Box<dyn std::error::Error>> {
             margin_mm,
             device,
             max_rms_mm,
+            field_map,
+            field_seg_mm,
         } => register_cmd(RegisterArgs {
             copper,
             outline: outline.as_deref(),
@@ -518,6 +530,8 @@ fn run(cli: &Cli) -> Result<(), Box<dyn std::error::Error>> {
             margin_mm: *margin_mm,
             device,
             max_rms_mm: *max_rms_mm,
+            field_map: field_map.as_deref(),
+            field_seg_mm: *field_seg_mm,
         }),
         Command::CalibGrid {
             out,
@@ -828,6 +842,8 @@ struct RegisterArgs<'a> {
     margin_mm: f64,
     device: &'a str,
     max_rms_mm: f64,
+    field_map: Option<&'a std::path::Path>,
+    field_seg_mm: f64,
 }
 
 /// Fiducial-registered emit: fit design→machine affine, bake it into the job
@@ -893,7 +909,22 @@ fn register_cmd(a: RegisterArgs) -> Result<(), Box<dyn std::error::Error>> {
     )?;
     // Apply the fit to the design-frame geometry → machine frame. No
     // normalize_frame: registration places the job in absolute machine mm.
-    let placed = cam::register::transform_shapes(&job.shapes, &affine);
+    // With a field-correction map, additionally pre-distort every vertex
+    // (physical→commanded) so the beam cancels the laser's field distortion.
+    let placed = match a.field_map {
+        None => cam::register::transform_shapes(&job.shapes, &affine),
+        Some(path) => {
+            let field = vision::FieldMap::parse(&std::fs::read_to_string(path)?)
+                .map_err(|e| format!("field map {}: {e}", path.display()))?;
+            eprintln!(
+                "register: field correction on (fit RMS {:.1} µm, worst {:.1} µm), edges ≤{:.2} mm",
+                field.rms_um, field.max_um, a.field_seg_mm
+            );
+            cam::register::transform_shapes_field(&job.shapes, &affine, a.field_seg_mm, |x, y| {
+                field.precompensate(x, y)
+            })
+        }
+    };
 
     // Same default recipe as `emit`; the operator tunes it in LightBurn or
     // re-runs with a richer flag set later.

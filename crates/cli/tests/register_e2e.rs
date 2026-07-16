@@ -180,6 +180,80 @@ fn frame_detection_path_fits_and_emits() {
     assert!(!verts(&doc).is_empty(), "job has geometry");
 }
 
+/// `--field-map` bakes the laser field pre-distortion into the emit: the
+/// geometry is densified (subdivision) and every vertex is pre-warped, so the
+/// output differs from the affine-only baseline. The correction math itself is
+/// unit-tested in `vision`; this proves the CLI wiring applies it.
+#[test]
+fn field_map_predistorts_and_subdivides_the_emit() {
+    use nalgebra::Point2;
+
+    // A field-correction file fit from a known pincushion about (130,-85),
+    // the region the identity-placed fixture geometry occupies.
+    let field_center = (130.0, -85.0);
+    let laser = |cx: f64, cy: f64| {
+        let (du, dv) = (cx - field_center.0, cy - field_center.1);
+        let r2 = (du * du + dv * dv) / (70.0 * 70.0);
+        let f = 1.0 + 0.03 * r2;
+        (field_center.0 + du * f, field_center.1 + dv * f)
+    };
+    let mut pairs = Vec::new();
+    for r in 0..7 {
+        for c in 0..7 {
+            let cmd = (80.0 + c as f64 * 16.0, -130.0 + r as f64 * 16.0);
+            let phys = laser(cmd.0, cmd.1);
+            pairs.push((Point2::new(phys.0, phys.1), Point2::new(cmd.0, cmd.1)));
+        }
+    }
+    let field = vision::fit_field(&pairs).expect("fit field");
+    let map_path = tmp("field").join("field.txt");
+    std::fs::write(&map_path, field.serialize()).unwrap();
+
+    let corr = "131,-92=131,-92; 146,-92=146,-92; 131,-81=131,-81";
+    let (ok_base, base_doc, _) = register(&["--fiducials", corr], "fld-base.lbrn2");
+    assert!(ok_base);
+    let (ok, doc, stderr) = register(
+        &[
+            "--fiducials",
+            corr,
+            "--field-map",
+            map_path.to_str().unwrap(),
+            "--field-seg-mm",
+            "1.0",
+        ],
+        "fld.lbrn2",
+    );
+    assert!(ok, "field-map register succeeds; stderr: {stderr}");
+    assert!(
+        stderr.contains("field correction on"),
+        "stderr reports the correction: {stderr}"
+    );
+
+    let base = verts(&base_doc);
+    let warped = verts(&doc);
+    assert!(
+        warped.len() > base.len(),
+        "edges densified: {} → {} vertices",
+        base.len(),
+        warped.len()
+    );
+    // The pre-distortion actually moved geometry: the warped bbox differs from
+    // the affine-only baseline by a measurable amount (not a silent no-op).
+    let bbox = |v: &[(f64, f64)]| {
+        v.iter().fold(
+            (f64::MAX, f64::MAX, f64::MIN, f64::MIN),
+            |(x0, y0, x1, y1), &(x, y)| (x0.min(x), y0.min(y), x1.max(x), y1.max(y)),
+        )
+    };
+    let (bx0, by0, bx1, by1) = bbox(&base);
+    let (wx0, wy0, wx1, wy1) = bbox(&warped);
+    let shift = (bx0 - wx0).abs() + (by0 - wy0).abs() + (bx1 - wx1).abs() + (by1 - wy1).abs();
+    assert!(
+        shift > 0.01,
+        "pre-distortion shifts the geometry: {shift:.4} mm"
+    );
+}
+
 #[test]
 fn frame_and_fiducials_are_mutually_exclusive() {
     let (ok, _, stderr) = register(
