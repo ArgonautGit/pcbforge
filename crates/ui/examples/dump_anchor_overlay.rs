@@ -33,7 +33,8 @@ fn main() {
         (606.277, 39.892),
         (43.744, 41.83),
     ];
-    let cal = ui::fit_camera_to_machine(&img, corners, &grid, 2.0).expect("anchor fit");
+    let cal = ui::fit_camera_to_machine(&img, corners, &grid, 2.0, ui::DotKind::Dark)
+        .expect("anchor fit");
     let worst = cal.dots.iter().map(|d| d.resid_um).fold(0.0_f64, f64::max);
     eprintln!(
         "anchor {}/{} dots, RMS {:.0} µm, worst {:.0} µm",

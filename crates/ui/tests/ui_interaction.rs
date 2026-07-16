@@ -96,6 +96,28 @@ fn gerbers_from_kicad_fills_the_copper_and_outline_fields() {
 }
 
 #[test]
+fn the_dot_contrast_toggle_switches_detection_polarity() {
+    let mut h = console();
+    h.get_by_label("🎯 Calibrate").click();
+    h.run();
+    // Defaults to dark-on-light (printed grids, dark-anodized burns).
+    assert!(
+        h.state().debug_summary().contains("contrast=dark-on-light"),
+        "default polarity is dark:\n{}",
+        h.state().debug_summary()
+    );
+    // Switching to bright-on-dark is what lets an ablated (light-on-dark) burn
+    // anchor — the operator's 0/49 case.
+    h.get_by_label("◎ bright-on-dark").click();
+    h.run();
+    assert!(
+        h.state().debug_summary().contains("contrast=bright-on-dark"),
+        "toggled to bright:\n{}",
+        h.state().debug_summary()
+    );
+}
+
+#[test]
 fn the_accessibility_tree_exposes_labeled_widgets() {
     let h = console();
     // Buttons carry labels, so they're queryable/drivable by an agent. Use

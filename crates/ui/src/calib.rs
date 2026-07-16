@@ -20,6 +20,42 @@ use vision::{
     BedMap, FiducialProfile, Homography, LensMap, find_fiducials, fit_homography, fit_lens,
 };
 
+/// How the grid dots read against their background. A **printed** reference
+/// grid and a burn that darkens the surface (dark-anodized plate) are
+/// dark-on-light; an **ablated** mark that brightens a dark surface — or a
+/// backlit hole — is bright-on-dark. The operator's ComMarker burns on the
+/// dark plate came out light-on-dark, so the anchor step needs `Bright`.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
+pub enum DotKind {
+    /// Dark dot on a bright field (printed grid, dark-anodized burn).
+    #[default]
+    Dark,
+    /// Bright dot on a dark field (ablated mark, backlit hole).
+    Bright,
+}
+
+impl DotKind {
+    /// The detector profile for this polarity at `dot_mm` diameter.
+    fn profile(self, dot_mm: f64) -> FiducialProfile {
+        match self {
+            DotKind::Dark => FiducialProfile::DarkDot {
+                diameter_mm: dot_mm,
+            },
+            DotKind::Bright => FiducialProfile::Backlit {
+                diameter_mm: dot_mm,
+            },
+        }
+    }
+
+    /// A short human label for status lines.
+    pub fn label(self) -> &'static str {
+        match self {
+            DotKind::Dark => "dark-on-light",
+            DotKind::Bright => "bright-on-dark",
+        }
+    }
+}
+
 /// The commanded dot grid the operator burns: an `n×n` lattice at `pitch_mm`
 /// starting from `origin_mm` (the lower-left dot), in machine mm.
 #[derive(Debug, Clone, Copy, PartialEq)]
@@ -92,6 +128,7 @@ fn detect_grid_dots(
     mm_to_px_seed: &Homography,
     grid: &GridSpec,
     dot_mm: f64,
+    kind: DotKind,
 ) -> Result<(Vec<DotPair>, usize), String> {
     let mm_from_px: Matrix3<f64> = mm_to_px_seed
         .matrix
@@ -100,9 +137,7 @@ fn detect_grid_dots(
     let bed = BedMap::new(mm_from_px).ok_or("seed bed map is singular")?;
     let commanded = grid.points();
     let expected: Vec<Point2<f64>> = commanded.iter().map(|&(x, y)| Point2::new(x, y)).collect();
-    let profile = FiducialProfile::DarkDot {
-        diameter_mm: dot_mm,
-    };
+    let profile = kind.profile(dot_mm);
     // ~0.4·pitch so windows don't overlap, but at least the dot size. This also
     // bounds how far the camera may drift between re-anchors and still lock on.
     let search_mm = (grid.pitch_mm * 0.4).max(dot_mm);
@@ -134,8 +169,9 @@ fn refit(
     mm_to_px_seed: &Homography,
     grid: &GridSpec,
     dot_mm: f64,
+    kind: DotKind,
 ) -> Result<Calibration, String> {
-    let (pairs, total) = detect_grid_dots(frame, mm_to_px_seed, grid, dot_mm)?;
+    let (pairs, total) = detect_grid_dots(frame, mm_to_px_seed, grid, dot_mm, kind)?;
     let found = pairs.len();
     if found < 4 {
         return Err(format!(
@@ -200,9 +236,10 @@ pub fn fit_camera_lens(
     corners_px: [(f64, f64); 4],
     grid: &GridSpec,
     dot_mm: f64,
+    kind: DotKind,
 ) -> Result<CameraCal, String> {
     let seed = corner_seed(corners_px, grid)?;
-    let (pairs, total) = detect_grid_dots(frame, &seed, grid, dot_mm)?;
+    let (pairs, total) = detect_grid_dots(frame, &seed, grid, dot_mm, kind)?;
     let found = pairs.len();
     if found < 10 {
         return Err(format!(
@@ -238,12 +275,14 @@ pub fn fit_camera_lens(
 
 /// Fit the camera→laser homography from a frame of the burned grid and the
 /// four hand-marked corner-dot pixel positions (same order as
-/// [`GridSpec::corners_mm`]). `dot_mm` sizes the dark-dot detector.
+/// [`GridSpec::corners_mm`]). `dot_mm` sizes the detector and `kind` selects
+/// its polarity (an ablated light-on-dark burn needs [`DotKind::Bright`]).
 pub fn fit_camera_to_machine(
     frame: &GrayImage,
     corners_px: [(f64, f64); 4],
     grid: &GridSpec,
     dot_mm: f64,
+    kind: DotKind,
 ) -> Result<Calibration, String> {
     if grid.n < 2 {
         return Err("grid must be at least 2×2".into());
@@ -257,7 +296,7 @@ pub fn fit_camera_to_machine(
         .map(|(&(mx, my), &(px, py))| (Point2::new(mx, my), Point2::new(px, py)))
         .collect();
     let seed = fit_homography(&corner_pairs).map_err(|e| format!("corner fit: {e}"))?;
-    refit(frame, &seed, grid, dot_mm)
+    refit(frame, &seed, grid, dot_mm, kind)
 }
 
 /// Re-anchor an existing calibration to a fresh frame — no corner clicks. Uses
@@ -270,6 +309,7 @@ pub fn re_anchor(
     previous: &Calibration,
     grid: &GridSpec,
     dot_mm: f64,
+    kind: DotKind,
 ) -> Result<Calibration, String> {
     let mm_to_px = Homography {
         matrix: previous
@@ -280,7 +320,7 @@ pub fn re_anchor(
         residuals: Vec::new(),
         rms: 0.0,
     };
-    refit(frame, &mm_to_px, grid, dot_mm)
+    refit(frame, &mm_to_px, grid, dot_mm, kind)
 }
 
 #[cfg(test)]
@@ -408,7 +448,8 @@ mod tests {
             (p.x, p.y)
         });
 
-        let cal = fit_camera_to_machine(&img, corners_px, &grid, dot_mm).expect("fit");
+        let cal =
+            fit_camera_to_machine(&img, corners_px, &grid, dot_mm, DotKind::Dark).expect("fit");
         assert!(
             cal.found >= 45,
             "detected most dots: {}/{}",
@@ -468,7 +509,8 @@ mod tests {
                 a.apply(Point2::new(mx, my)).y,
             )
         });
-        let cal_a = fit_camera_to_machine(&img_a, corners_a, &grid, dot_mm).expect("fit A");
+        let cal_a =
+            fit_camera_to_machine(&img_a, corners_a, &grid, dot_mm, DotKind::Dark).expect("fit A");
 
         // Pose B: the camera shifted, so the grid sits ~20 px (2 mm) right and
         // ~12 px down — well within the ~4 mm search window.
@@ -481,7 +523,7 @@ mod tests {
         let img_b = render_grid(&grid, &b, dot_mm, 680, 680);
 
         // Re-anchor from cal_A onto frame B — no corner clicks.
-        let cal_b = re_anchor(&img_b, &cal_a, &grid, dot_mm).expect("re-anchor B");
+        let cal_b = re_anchor(&img_b, &cal_a, &grid, dot_mm, DotKind::Dark).expect("re-anchor B");
         assert!(cal_b.found >= 45, "re-locked most dots: {}", cal_b.found);
         assert!(cal_b.rms_um < 200.0, "tight re-fit: {} µm", cal_b.rms_um);
 
@@ -502,6 +544,74 @@ mod tests {
             "stale calibration is visibly off ({:.2},{:.2}) — re-anchor was needed",
             stale.x,
             stale.y
+        );
+    }
+
+    /// An **ablated** grid images as bright dots on a dark plate. With the
+    /// default `DotKind::Dark` the detector finds nothing; `DotKind::Bright`
+    /// recovers the commanded coordinates — this is the burned-grid case the
+    /// operator hit (0/49 detected until the polarity was switched).
+    #[test]
+    fn bright_on_dark_needs_the_bright_polarity() {
+        let grid = GridSpec {
+            origin_mm: (0.0, 0.0),
+            pitch_mm: 10.0,
+            n: 7,
+        };
+        let dot_mm = 1.5;
+        let mm_to_px = homog(&[
+            ((0.0, 0.0), (40.0, 640.0)),
+            ((60.0, 0.0), (640.0, 640.0)),
+            ((60.0, 60.0), (640.0, 40.0)),
+            ((0.0, 60.0), (40.0, 40.0)),
+        ]);
+        // Bright ablated discs (~230) on a dark plate (~40) — inverse polarity
+        // of `render_grid`.
+        let centers: Vec<(f64, f64, f64)> = grid
+            .points()
+            .iter()
+            .map(|&(mx, my)| {
+                let p = mm_to_px.apply(Point2::new(mx, my));
+                (p.x, p.y, dot_mm * 10.0)
+            })
+            .collect();
+        let img = GrayImage::from_fn(700, 700, |x, y| {
+            let mut cover = 0.0;
+            for sy in 0..4 {
+                for sx in 0..4 {
+                    let px = x as f64 + (sx as f64 + 0.5) / 4.0 - 0.5;
+                    let py = y as f64 + (sy as f64 + 0.5) / 4.0 - 0.5;
+                    if centers.iter().any(|&(cx, cy, r)| {
+                        ((px - cx).powi(2) + (py - cy).powi(2)).sqrt() < r / 2.0
+                    }) {
+                        cover += 1.0 / 16.0;
+                    }
+                }
+            }
+            image::Luma([(40.0 + 190.0 * cover) as u8])
+        });
+        let corners_px = grid.corners_mm().map(|(mx, my)| {
+            let p = mm_to_px.apply(Point2::new(mx, my));
+            (p.x, p.y)
+        });
+
+        // Dark detector on a bright-on-dark grid finds nothing usable.
+        assert!(
+            fit_camera_to_machine(&img, corners_px, &grid, dot_mm, DotKind::Dark).is_err(),
+            "dark polarity should fail on an ablated (bright-on-dark) grid"
+        );
+        // Bright detector locks the ablated dots and fits.
+        let cal = fit_camera_to_machine(&img, corners_px, &grid, dot_mm, DotKind::Bright)
+            .expect("bright fit");
+        assert!(cal.found >= 45, "locked most dots: {}", cal.found);
+        assert!(cal.rms_um < 200.0, "tight fit: {} µm", cal.rms_um);
+        let center_px = mm_to_px.apply(Point2::new(30.0, 30.0));
+        let back = cal.px_to_mm.apply(center_px);
+        assert!(
+            (back.x - 30.0).abs() < 0.3 && (back.y - 30.0).abs() < 0.3,
+            "center maps to ~(30,30): ({:.3},{:.3})",
+            back.x,
+            back.y
         );
     }
 
@@ -559,7 +669,8 @@ mod tests {
             (p.x, p.y)
         });
 
-        let cal = fit_camera_lens(&img, corners_px, &grid, dot_mm).expect("lens fit");
+        let cal =
+            fit_camera_lens(&img, corners_px, &grid, dot_mm, DotKind::Dark).expect("lens fit");
         assert!(cal.found >= 45, "locked most dots: {}", cal.found);
         assert!(
             cal.lens.rms_um < 60.0,
@@ -589,7 +700,7 @@ mod tests {
         // A blank frame → nothing detected.
         let img = GrayImage::from_pixel(200, 200, image::Luma([200]));
         let corners = [(10.0, 10.0), (190.0, 10.0), (190.0, 190.0), (10.0, 190.0)];
-        assert!(fit_camera_to_machine(&img, corners, &grid, 1.0).is_err());
+        assert!(fit_camera_to_machine(&img, corners, &grid, 1.0, DotKind::Dark).is_err());
     }
 
     /// End-to-end gate: load the committed distorted-grid fixture (a real PNG
@@ -619,7 +730,8 @@ mod tests {
             (606.277, 39.892),
             (43.744, 41.83),
         ];
-        let cal = fit_camera_lens(&img, corners, &grid, 2.0).expect("calibrate fixture");
+        let cal =
+            fit_camera_lens(&img, corners, &grid, 2.0, DotKind::Dark).expect("calibrate fixture");
         assert_eq!(cal.found, 49, "all dots detected");
         assert!(
             cal.lens.rms_um < 60.0,

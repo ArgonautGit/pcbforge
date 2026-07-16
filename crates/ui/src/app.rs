@@ -307,6 +307,10 @@ pub struct ConsoleApp {
     calib_n: usize,
     calib_pitch_mm: f64,
     calib_dot_mm: f64,
+    /// Dot polarity for detection: printed grids read dark-on-light, an ablated
+    /// burn on the dark plate reads bright-on-dark. Persisted so the operator's
+    /// material choice survives a restart.
+    calib_dot_kind: crate::calib::DotKind,
     calib_grid_out: String,
     calib_frame: String,
     calib_frame_img: Option<image::GrayImage>,
@@ -417,6 +421,7 @@ impl ConsoleApp {
             calib_n: 7,
             calib_pitch_mm: 10.0,
             calib_dot_mm: 0.4,
+            calib_dot_kind: crate::calib::DotKind::Dark,
             calib_grid_out: "calib-grid.lbrn2".into(),
             calib_frame: String::new(),
             calib_frame_img: None,
@@ -483,6 +488,13 @@ impl ConsoleApp {
             ("calib_n", self.calib_n.to_string()),
             ("calib_pitch_mm", self.calib_pitch_mm.to_string()),
             ("calib_dot_mm", self.calib_dot_mm.to_string()),
+            (
+                "calib_dot_kind",
+                match self.calib_dot_kind {
+                    crate::calib::DotKind::Dark => "dark".to_string(),
+                    crate::calib::DotKind::Bright => "bright".to_string(),
+                },
+            ),
             ("calib_grid_out", self.calib_grid_out.clone()),
             ("cam_show_bed", self.cam_show_bed.to_string()),
             ("field_mm", self.field_mm.to_string()),
@@ -545,6 +557,12 @@ impl ConsoleApp {
         f64_field(&m, "fid_px_per_mm", &mut self.fid_px_per_mm);
         f64_field(&m, "calib_pitch_mm", &mut self.calib_pitch_mm);
         f64_field(&m, "calib_dot_mm", &mut self.calib_dot_mm);
+        if let Some(v) = m.get("calib_dot_kind") {
+            self.calib_dot_kind = match v.trim() {
+                "bright" => crate::calib::DotKind::Bright,
+                _ => crate::calib::DotKind::Dark,
+            };
+        }
         str_field(&m, "calib_grid_out", &mut self.calib_grid_out);
         let f32_field = |m: &std::collections::BTreeMap<String, String>, k: &str, dst: &mut f32| {
             if let Some(v) = m.get(k).and_then(|s| s.trim().parse().ok()) {
@@ -1308,9 +1326,10 @@ impl ConsoleApp {
         ];
         let grid = self.calib_grid();
         let dot = self.calib_dot_mm;
+        let kind = self.calib_dot_kind;
         match self.calib_mode {
             CalibMode::CameraLens => {
-                match crate::calib::fit_camera_lens(frame, corners, &grid, dot) {
+                match crate::calib::fit_camera_lens(frame, corners, &grid, dot, kind) {
                     Ok(cal) => {
                         self.calib_note = format!(
                             "lens fit: {}/{} dots, RMS {:.0} µm, worst {:.0} µm — camera is now a metric ruler",
@@ -1325,7 +1344,7 @@ impl ConsoleApp {
                 }
             }
             CalibMode::LaserAnchor => {
-                match crate::calib::fit_camera_to_machine(frame, corners, &grid, dot) {
+                match crate::calib::fit_camera_to_machine(frame, corners, &grid, dot, kind) {
                     Ok(cal) => {
                         self.calib_note = format!(
                             "anchor: {}/{} dots, RMS {:.0} µm — Place now burns in machine coordinates",
@@ -1353,10 +1372,11 @@ impl ConsoleApp {
         };
         let grid = self.calib_grid();
         let dot = self.calib_dot_mm;
+        let kind = self.calib_dot_kind;
         match crate::camera::grab(&self.cam_source()) {
             Ok(g) => {
                 let frame = self.cam_orientation.apply(g);
-                match crate::calib::re_anchor(&frame, &prev, &grid, dot) {
+                match crate::calib::re_anchor(&frame, &prev, &grid, dot, kind) {
                     Ok(cal) => {
                         self.calib_note = format!(
                             "re-anchored: {}/{} dots, RMS {:.0} µm",
@@ -1406,7 +1426,13 @@ impl ConsoleApp {
             };
             self.calib_frame_tex =
                 Some(ctx.load_texture("calib-frame", color, TextureOptions::NEAREST));
-            match crate::calib::re_anchor(&frame, &prev, &self.calib_grid(), self.calib_dot_mm) {
+            match crate::calib::re_anchor(
+                &frame,
+                &prev,
+                &self.calib_grid(),
+                self.calib_dot_mm,
+                self.calib_dot_kind,
+            ) {
                 Ok(cal) => {
                     self.calib_note = format!(
                         "live: {}/{} dots, RMS {:.0} µm",
@@ -1711,7 +1737,7 @@ impl ConsoleApp {
              calib_frame: {calib_frame}\n\
              bed_overlay: show={} field={:.0}mm center=({:.1},{:.1})\n\
              place: x={:.2} y={:.2} rot={:.1}°\n\
-             calib_grid: n={} pitch={:.2}mm corners_marked={}\n\
+             calib_grid: n={} pitch={:.2}mm dot={:.2}mm contrast={} corners_marked={}\n\
              fiducials: {} markers",
             self.tab,
             self.side,
@@ -1725,6 +1751,8 @@ impl ConsoleApp {
             self.place_rot_deg,
             self.calib_n,
             self.calib_pitch_mm,
+            self.calib_dot_mm,
+            self.calib_dot_kind.label(),
             self.calib_corners.len(),
             self.fid_search.len(),
         )
@@ -2064,6 +2092,27 @@ impl ConsoleApp {
                         .speed(0.05)
                         .range(0.05..=5.0),
                 );
+                ui.end_row();
+                ui.label("dot contrast").on_hover_text(
+                    "How the dots read against their background. A printed grid or a \
+                     burn that darkens the plate is dark-on-light; an ablated mark that \
+                     brightens a dark surface (or a backlit hole) is bright-on-dark. If \
+                     the fit finds 0 dots, this is usually the wrong setting.",
+                );
+                ui.horizontal(|ui| {
+                    ui.selectable_value(
+                        &mut self.calib_dot_kind,
+                        crate::calib::DotKind::Dark,
+                        "◉ dark-on-light",
+                    )
+                    .on_hover_text("Printed grid or dark-anodized burn.");
+                    ui.selectable_value(
+                        &mut self.calib_dot_kind,
+                        crate::calib::DotKind::Bright,
+                        "◎ bright-on-dark",
+                    )
+                    .on_hover_text("Ablated mark on a dark plate, or a backlit hole.");
+                });
                 ui.end_row();
                 if self.calib_mode == CalibMode::LaserAnchor {
                     ui.label("grid out .lbrn2");

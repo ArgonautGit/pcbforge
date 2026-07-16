@@ -17,7 +17,7 @@
 //! Run: `cargo run -p ui --example gen_distorted_grid`
 
 use image::{GrayImage, Luma};
-use ui::{GridSpec, fit_camera_lens};
+use ui::{DotKind, GridSpec, fit_camera_lens};
 
 const PX_PER_MM: f64 = 9.0;
 const MARGIN: f64 = 60.0;
@@ -157,7 +157,7 @@ fn main() {
         n: N,
     };
     let corners_px = [corners[0], corners[1], corners[2], corners[3]];
-    match fit_camera_lens(&img, corners_px, &grid, DOT_MM) {
+    match fit_camera_lens(&img, corners_px, &grid, DOT_MM, DotKind::Dark) {
         Ok(cal) => {
             let max_distort = cal
                 .dots

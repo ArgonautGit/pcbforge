@@ -1538,3 +1538,23 @@ showed the work-area square offset (centred ~(0,30)), so centring the grid on
   the field (⚠ lower pitch / dots per side).
 - Test extended: an off-centre work area (0,30) recentres the grid to
   (−30,0)…(30,60).
+
+## 2026-07-16 — Dot-contrast toggle so an ablated burn can anchor
+
+The operator's ComMarker burn on the dark plate imaged as **light-on-dark**
+(ablated marks), but the anchor detector hardcoded `DarkDot` (dark-on-light),
+so the fit found 0/49 dots. The vision layer already had a `Backlit`
+(bright-on-dark) profile — the calibration just never used it.
+
+- New `calib::DotKind {Dark, Bright}` maps to `FiducialProfile::DarkDot` /
+  `Backlit`, threaded through `detect_grid_dots` → `refit` →
+  `fit_camera_lens` / `fit_camera_to_machine` / `re_anchor` (all four fit
+  call sites in `app.rs`, plus the four example/test call sites).
+- Calibrate tab gains a "dot contrast" selectable (◉ dark-on-light /
+  ◎ bright-on-dark); `calib_dot_kind` persists via settings (`calib_dot_kind`)
+  and shows in `debug_summary` (`contrast=…`).
+- Tests: `bright_on_dark_needs_the_bright_polarity` (dark detector fails, bright
+  recovers ~(30,30)); headless `the_dot_contrast_toggle_switches_detection_polarity`.
+- Default stays Dark (printed grids + dark-anodized burns). Operator guidance:
+  bright-on-dark for ablated marks / backlit holes; also reduce glare, which
+  hurts either polarity.

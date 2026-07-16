@@ -34,7 +34,7 @@ fn main() {
         let (u, v) = base(mx, my);
         distort(u, v)
     });
-    let cal = ui::fit_camera_lens(&img, corners, &grid, dot).expect("fit");
+    let cal = ui::fit_camera_lens(&img, corners, &grid, dot, ui::DotKind::Dark).expect("fit");
     eprintln!(
         "lens RMS {:.0} µm, worst {:.0} µm, {} dots",
         cal.lens.rms_um, cal.lens.max_um, cal.found

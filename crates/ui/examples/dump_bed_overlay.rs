@@ -32,7 +32,8 @@ fn main() {
         (606.277, 39.892),
         (43.744, 41.83),
     ];
-    let cal = ui::fit_camera_to_machine(&img, corners, &grid, 2.0).expect("anchor fit");
+    let cal = ui::fit_camera_to_machine(&img, corners, &grid, 2.0, ui::DotKind::Dark)
+        .expect("anchor fit");
     let inv = cal.px_to_mm.try_inverse().expect("invertible");
     let proj = |mx: f64, my: f64| {
         let p = inv.apply(Point2::new(mx, my));
