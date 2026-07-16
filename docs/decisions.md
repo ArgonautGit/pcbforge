@@ -1485,3 +1485,25 @@ runner:
   verbs (e.g. `PCBFORGE_CLI=./target/debug/pcbforge`) instead of the `true`
   no-op. Confirmed the button pre-fills the fields instantly (non-blocking) and
   that the shelled `pcbforge gerbers` command produces the files at those paths.
+
+## 2026-07-15 — calib-grid: absolute output path + centre it on the field
+
+Operator feedback burning the anchor grid: (1) couldn't find the output — the
+Log echoed the bare relative name, and it landed in the process CWD (not the app
+dir for a desktop launch); (2) the grid emitted at 0..60 mm (corner origin) but
+a centre-origin galvo (BSLFiber/JCZ) has 0,0 at the field centre, so it sat off
+in one quadrant / outside the work area.
+
+- CLI `calib_grid_cmd` now creates the output's parent dir and prints the
+  **absolute** path (`std::path::absolute`), so the Log/console shows exactly
+  where the file went.
+- `--origin` gained `allow_hyphen_values` — clap was rejecting negative
+  coordinates (`--origin -30,-30`) as flags.
+- Console Generate grid now **centres the lattice on the machine field**
+  (`origin = (field_cx, field_cy) − span/2`, from the Camera-tab work-area
+  settings), so it lands inside the addressable area; the note reports the
+  centre and the resulting span. Default field (0,0) → a 60 mm grid spans
+  −30..+30.
+- Tests: `generate_grid_centers_on_the_field` (UI note asserts centred origin);
+  calib-grid e2e still green; verified the CLI prints the absolute path, creates
+  dirs, and accepts a negative origin.
