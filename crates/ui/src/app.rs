@@ -1235,12 +1235,19 @@ impl ConsoleApp {
             "--origin".into(),
             format!("{ox},{oy}"),
         ]);
+        let fits = span <= self.field_mm as f64 + 1e-6;
+        let warn = if fits {
+            ""
+        } else {
+            " ⚠ grid is BIGGER than the work area — lower pitch or dots per side"
+        };
         self.calib_note = format!(
-            "generating {n}×{n} grid centred on field ({cx:.0},{cy:.0}) → \
-             spans ({ox:.0},{oy:.0})…({x1:.0},{y1:.0}) mm — see Log for the file path",
+            "generating {n}×{n} grid centred on work area ({cx:.0},{cy:.0}) size {sz:.0} → \
+             spans ({ox:.0},{oy:.0})…({x1:.0},{y1:.0}) mm — see Log for the file path{warn}",
             n = self.calib_n,
             cx = self.field_cx_mm,
             cy = self.field_cy_mm,
+            sz = self.field_mm,
             x1 = ox + span,
             y1 = oy + span,
         );
@@ -2063,6 +2070,25 @@ impl ConsoleApp {
                     ui.add(
                         egui::TextEdit::singleline(&mut self.calib_grid_out).desired_width(240.0),
                     );
+                    ui.end_row();
+                    ui.label("work area (mm)").on_hover_text(
+                        "Your laser's addressable area as LightBurn shows it: the \
+                             work-area square's centre and side length. Generate centres \
+                             the grid here so it lands inside the field. (Same values as \
+                             the Camera-tab overlay.)",
+                    );
+                    ui.horizontal(|ui| {
+                        ui.label("cx");
+                        ui.add(egui::DragValue::new(&mut self.field_cx_mm).speed(0.5));
+                        ui.label("cy");
+                        ui.add(egui::DragValue::new(&mut self.field_cy_mm).speed(0.5));
+                        ui.label("size");
+                        ui.add(
+                            egui::DragValue::new(&mut self.field_mm)
+                                .speed(1.0)
+                                .range(10.0..=400.0),
+                        );
+                    });
                     ui.end_row();
                 }
                 let lbl = ui.label("grid frame (optional)");
@@ -4249,8 +4275,18 @@ mod tests {
         app.calibrate_generate_grid();
         // A 60 mm span centred on (0,0) → origin (-30,-30), corner (30,30).
         assert!(
-            app.calib_note.contains("centred on field") && app.calib_note.contains("(-30,-30)"),
+            app.calib_note.contains("centred on work area") && app.calib_note.contains("(-30,-30)"),
             "note: {}",
+            app.calib_note
+        );
+
+        // Off-centre work area (LightBurn origin not at 0,0): the grid follows.
+        app.field_cx_mm = 0.0;
+        app.field_cy_mm = 30.0;
+        app.calibrate_generate_grid();
+        assert!(
+            app.calib_note.contains("(-30,0)…(30,60)"),
+            "grid recentres on the work area: {}",
             app.calib_note
         );
     }

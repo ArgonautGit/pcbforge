@@ -1523,3 +1523,18 @@ timestamp, so a restored fit only read "loaded last session".
   `● anchored this session (…)`. `debug_summary` mirrors it (`saved (N days
   ago), unconfirmed`). Pre-timestamp saves show "age unknown".
 - Test `calibration_reports_age_not_just_this_session`.
+
+## 2026-07-15 — Grid centres on the real work area (operator-set), not (0,0)
+
+The centre-origin assumption was wrong for the operator's machine — LightBurn
+showed the work-area square offset (centred ~(0,30)), so centring the grid on
+(0,0) put half of it below the field.
+
+- Surfaced the work-area controls (centre cx/cy + size, the same
+  `field_cx/cy/mm` the Camera-tab overlay uses) directly in the ② Laser-anchor
+  form, with a hover telling the operator to read them off LightBurn's rulers.
+- Generate centres the grid on that work area (`origin = (cx,cy) − span/2`) and
+  the note now reports the work area + span, warning if the grid is larger than
+  the field (⚠ lower pitch / dots per side).
+- Test extended: an off-centre work area (0,30) recentres the grid to
+  (−30,0)…(30,60).
