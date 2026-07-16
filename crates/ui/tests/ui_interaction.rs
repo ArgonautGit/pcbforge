@@ -115,8 +115,40 @@ fn the_dot_contrast_toggle_switches_detection_polarity() {
     h.get_by_label("◎ bright-on-dark").click();
     h.run();
     assert!(
-        h.state().debug_summary().contains("contrast=bright-on-dark"),
+        h.state()
+            .debug_summary()
+            .contains("contrast=bright-on-dark"),
         "toggled to bright:\n{}",
+        h.state().debug_summary()
+    );
+}
+
+#[test]
+fn the_laser_field_calibration_step_is_selectable() {
+    let mut h = console();
+    h.get_by_label("🎯 Calibrate").click();
+    h.run();
+    h.get_by_label_contains("③ Laser field").click();
+    h.run();
+    let s = h.state().debug_summary();
+    assert!(
+        s.contains("calib_mode=LaserField") && s.contains("laser_field: none"),
+        "③ selects the laser-field step, uncalibrated:\n{s}"
+    );
+}
+
+#[test]
+fn compensate_field_is_present_and_gated_off_without_a_field_cal() {
+    let mut h = console();
+    h.get_by_label_contains("Place on board").click();
+    h.run();
+    // The toggle exists but stays off with no field calibration this session
+    // (its physical placement frame needs the fit).
+    h.get_by_label("compensate field").click();
+    h.run();
+    assert!(
+        h.state().debug_summary().contains("field_correct=false"),
+        "compensate-field can't arm without a field cal:\n{}",
         h.state().debug_summary()
     );
 }

@@ -113,6 +113,9 @@ enum CalibMode {
     CameraLens,
     /// Burned grid → the laser anchor (camera-px → commanded machine mm).
     LaserAnchor,
+    /// Burned grid through the metric camera → the laser field pre-distortion
+    /// (physical mm → commanded mm), baked into the emit so shapes burn true.
+    LaserField,
 }
 
 /// Correction applied to every camera frame for how the camera is physically
@@ -322,6 +325,12 @@ pub struct ConsoleApp {
     /// feedback. Session-scoped like the anchor, but far more stable.
     calib_mode: CalibMode,
     lens: Option<crate::calib::CameraCal>,
+    /// Laser field pre-distortion (from the burned grid through the metric
+    /// camera-lens map). Session-scoped; the emitted correction file persists.
+    calib_field: Option<crate::calib::FieldCal>,
+    /// When on, "Etch here" places in the physical frame and bakes the field
+    /// pre-distortion into the emitted `.lbrn2` (needs a laser-field cal).
+    place_field_correct: bool,
     /// Visual exaggeration of the distortion arrows in the overlay.
     lens_arrow_scale: f32,
     /// Visual exaggeration of the per-dot anchor residual vectors in the
@@ -429,6 +438,8 @@ impl ConsoleApp {
             calib_corners: Vec::new(),
             calib_mode: CalibMode::CameraLens,
             lens: None,
+            calib_field: None,
+            place_field_correct: false,
             lens_arrow_scale: 20.0,
             anchor_resid_scale: 30.0,
             image_views: std::collections::HashMap::new(),
@@ -497,6 +508,7 @@ impl ConsoleApp {
             ),
             ("calib_grid_out", self.calib_grid_out.clone()),
             ("cam_show_bed", self.cam_show_bed.to_string()),
+            ("place_field_correct", self.place_field_correct.to_string()),
             ("field_mm", self.field_mm.to_string()),
             ("field_cx_mm", self.field_cx_mm.to_string()),
             ("field_cy_mm", self.field_cy_mm.to_string()),
@@ -574,6 +586,15 @@ impl ConsoleApp {
         f32_field(&m, "field_cy_mm", &mut self.field_cy_mm);
         if let Some(v) = m.get("cam_show_bed").and_then(|s| s.trim().parse().ok()) {
             self.cam_show_bed = v;
+        }
+        // A persisted field-correction preference is only honored once a field
+        // cal exists this session (the placement frame needs it), so this just
+        // restores the operator's intent; calibrate_fit re-enables it on a fit.
+        if let Some(v) = m
+            .get("place_field_correct")
+            .and_then(|s| s.trim().parse().ok())
+        {
+            self.place_field_correct = v;
         }
         if let Some(o) = m
             .get("cam_orientation")
@@ -1190,12 +1211,27 @@ impl ConsoleApp {
             args.push("--outline".into());
             args.push(crate::clean_path(&self.emit_outline));
         }
+        // Field correction: pre-distort the emit so the beam cancels the laser
+        // field distortion. Only when a live field cal exists this session (its
+        // physical frame is what the placement above used).
+        let field_note = if self.place_field_correct && self.calib_field.is_some() {
+            let path = self.field_map_path();
+            if path.exists() {
+                args.push("--field-map".into());
+                args.push(path.to_string_lossy().into_owned());
+                " · field-corrected"
+            } else {
+                " · ⚠ field map file missing — emitting UNcorrected"
+            }
+        } else {
+            ""
+        };
         // Make the placement + the exact output path explicit in the log — the
         // register output is its own file (not the Job-tab emit), and this is
         // the position it bakes in.
         self.log.push(LogLine {
             text: format!(
-                "Etch here → {out}\n  job placed at ({:.2}, {:.2}) mm, {:.1}° — OPEN THIS FILE (not the Job-tab emit output)",
+                "Etch here → {out}\n  job placed at ({:.2}, {:.2}) mm, {:.1}°{field_note} — OPEN THIS FILE (not the Job-tab emit output)",
                 self.place_tx_mm, self.place_ty_mm, self.place_rot_deg
             ),
             err: false,
@@ -1359,7 +1395,48 @@ impl ConsoleApp {
                     }
                 }
             }
+            CalibMode::LaserField => {
+                let Some(lens) = self.lens.as_ref().map(|c| c.lens.clone()) else {
+                    self.calib_note =
+                        "laser-field needs a camera-lens calibration first (① Camera lens) — \
+                         it's the metric ruler that measures where burns land"
+                            .into();
+                    return;
+                };
+                match crate::calib::fit_laser_field(frame, corners, &grid, dot, kind, &lens) {
+                    Ok(cal) => {
+                        let path = self.field_map_path();
+                        let saved = std::fs::write(&path, cal.field.serialize());
+                        let worst = cal.dots.iter().map(|d| d.field_um).fold(0.0_f64, f64::max);
+                        self.calib_note = match saved {
+                            Ok(()) => format!(
+                                "field: {}/{} dots, corrects {:.0} µm worst field error to \
+                                 {:.0} µm RMS — Etch here can now compensate the laser field",
+                                cal.found, cal.total, worst, cal.field.rms_um
+                            ),
+                            Err(e) => format!(
+                                "field fit ok ({}/{} dots) but saving {} failed: {e}",
+                                cal.found,
+                                cal.total,
+                                path.display()
+                            ),
+                        };
+                        self.calib_field = Some(cal);
+                        self.place_field_correct = true;
+                    }
+                    Err(e) => {
+                        self.calib_field = None;
+                        self.calib_note = format!("laser-field fit failed: {e}");
+                    }
+                }
+            }
         }
+    }
+
+    /// Where the laser field-correction file is written for `register
+    /// --field-map` — beside the settings blob so it survives with the session.
+    fn field_map_path(&self) -> PathBuf {
+        self.settings_path.with_file_name("pcbforge-field-map.txt")
     }
 
     /// Re-anchor the existing calibration to a fresh camera frame — no corner
@@ -1452,6 +1529,18 @@ impl ConsoleApp {
     /// tab: the **camera→laser calibration** (machine mm) when calibrated, else
     /// the fiducial homography (design frame only, not machine-accurate).
     fn place_homography(&self) -> Option<vision::Homography> {
+        // With field correction on, place in the physical (metric) frame the
+        // emit pre-distorts from — its linear px map — so overlay, drag, and the
+        // baked correction all share one frame.
+        // to_px is already physical-mm → px (the shape place_homography
+        // returns); the caller inverts it for px → mm.
+        if let Some(f) = self
+            .calib_field
+            .as_ref()
+            .filter(|_| self.place_field_correct)
+        {
+            return Some(f.to_px.clone());
+        }
         match &self.calib {
             Some(c) => c.px_to_mm.try_inverse(),
             None => self.fid_homography.clone(),
@@ -1696,6 +1785,10 @@ impl ConsoleApp {
             Some(c) => format!("{} dots, RMS {:.0}µm", c.found, c.lens.rms_um),
             None => "none".into(),
         };
+        let field = match &self.calib_field {
+            Some(c) => format!("{} dots, RMS {:.0}µm", c.found, c.field.rms_um),
+            None => "none".into(),
+        };
         let cam = match &self.cam_last {
             Some(g) => format!(
                 "{}×{} (view ×{:.3})",
@@ -1733,6 +1826,7 @@ impl ConsoleApp {
              gerbers: {gerbers}\n\
              calib_anchor: {calib}\n\
              camera_lens: {lens}\n\
+             laser_field: {field} field_correct={}\n\
              camera_frame: {cam}\n\
              calib_frame: {calib_frame}\n\
              bed_overlay: show={} field={:.0}mm center=({:.1},{:.1})\n\
@@ -1742,6 +1836,7 @@ impl ConsoleApp {
             self.tab,
             self.side,
             self.calib_mode,
+            self.place_field_correct,
             self.cam_show_bed,
             self.field_mm,
             self.field_cx_mm,
@@ -2051,6 +2146,11 @@ impl ConsoleApp {
                 CalibMode::LaserAnchor,
                 "② Laser anchor (burned grid)",
             );
+            ui.selectable_value(
+                &mut self.calib_mode,
+                CalibMode::LaserField,
+                "③ Laser field (burned grid)",
+            );
         });
         match self.calib_mode {
             CalibMode::CameraLens => ui.label(egui::RichText::new(
@@ -2062,6 +2162,12 @@ impl ConsoleApp {
                 "Anchor to the laser: burn a dot grid at known coordinates, leave it taped down, image it, \
                  mark the 4 corners, and Fit. Re-anchor / ● Live re-lock to that fixed grid as the camera \
                  moves — so the camera always knows where the laser's coordinates are.",
+            ).weak()),
+            CalibMode::LaserField => ui.label(egui::RichText::new(
+                "Correct the laser field: needs ① Camera lens first (the metric ruler). Burn a dot grid at \
+                 known coordinates, image it, mark the 4 corners, and Fit — this measures where each command \
+                 physically lands and fits a pre-distortion. Turn on \"compensate field\" on the Place tab so \
+                 Etch here bakes it in and shapes burn dimensionally true.",
             ).weak()),
         };
         egui::Grid::new("calib-form")
@@ -2114,7 +2220,7 @@ impl ConsoleApp {
                     .on_hover_text("Ablated mark on a dark plate, or a backlit hole.");
                 });
                 ui.end_row();
-                if self.calib_mode == CalibMode::LaserAnchor {
+                if self.calib_mode != CalibMode::CameraLens {
                     ui.label("grid out .lbrn2");
                     ui.add(
                         egui::TextEdit::singleline(&mut self.calib_grid_out).desired_width(240.0),
@@ -2149,7 +2255,7 @@ impl ConsoleApp {
                 ui.end_row();
             });
         ui.horizontal(|ui| {
-            if self.calib_mode == CalibMode::LaserAnchor
+            if self.calib_mode != CalibMode::CameraLens
                 && ui
                     .button("① Generate grid")
                     .on_hover_text("Emit the dot grid to burn.")
@@ -2256,6 +2362,38 @@ impl ConsoleApp {
                          Dots: green = tight, amber/red = loose; orange vectors (× exaggerated) \
                          point commanded→detected. Hollow red squares = dots that didn't lock.",
                     );
+                }
+            }
+            CalibMode::LaserField => {
+                if self.lens.is_none() {
+                    ui.colored_label(
+                        status_color(false),
+                        "○ needs ① Camera lens first — that metric ruler measures where burns land",
+                    );
+                }
+                let (status, ok) = match &self.calib_field {
+                    Some(c) => {
+                        let worst = c.dots.iter().map(|d| d.field_um).fold(0.0_f64, f64::max);
+                        (
+                            format!(
+                                "● field calibrated ({}/{} dots, corrects {:.0} µm worst → {:.0} µm RMS)",
+                                c.found, c.total, worst, c.field.rms_um
+                            ),
+                            true,
+                        )
+                    }
+                    None => (
+                        "○ laser field not calibrated — Etch here emits uncorrected geometry"
+                            .to_string(),
+                        false,
+                    ),
+                };
+                ui.colored_label(status_color(ok), status);
+                if self.calib_field.is_some() {
+                    ui.weak(format!(
+                        "Correction file: {}. Turn on \"compensate field\" on the Place tab.",
+                        self.field_map_path().display()
+                    ));
                 }
             }
         }
@@ -2779,6 +2917,22 @@ impl ConsoleApp {
             }
             if ui.button("▶ Etch here (register)").clicked() {
                 self.emit_at_placement();
+            }
+            let has_field = self.calib_field.is_some();
+            ui.add_enabled_ui(has_field, |ui| {
+                changed |= ui
+                    .checkbox(&mut self.place_field_correct, "compensate field")
+                    .on_hover_text(if has_field {
+                        "Pre-distort the emitted geometry so the beam cancels the laser's field \
+                         distortion — shapes burn dimensionally true. Places in the physical \
+                         (camera-lens) frame. Calibrate it in ③ Laser field."
+                    } else {
+                        "Calibrate ③ Laser field first (needs ① Camera lens)."
+                    })
+                    .changed();
+            });
+            if !has_field && self.place_field_correct {
+                self.place_field_correct = false;
             }
         });
         ui.horizontal(|ui| {

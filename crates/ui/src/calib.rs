@@ -17,7 +17,8 @@
 use image::GrayImage;
 use nalgebra::{Matrix3, Point2};
 use vision::{
-    BedMap, FiducialProfile, Homography, LensMap, find_fiducials, fit_homography, fit_lens,
+    BedMap, FiducialProfile, FieldMap, Homography, LensMap, find_fiducials, fit_field,
+    fit_homography, fit_lens,
 };
 
 /// How the grid dots read against their background. A **printed** reference
@@ -321,6 +322,114 @@ pub fn re_anchor(
         rms: 0.0,
     };
     refit(frame, &mm_to_px, grid, dot_mm, kind)
+}
+
+// ---- laser field distortion (burned grid through the metric camera) -------
+
+/// One burned-grid dot's laser-field feedback for the overlay: where it was
+/// detected in the frame, the true physical mm it landed at (read through the
+/// camera-lens map), the commanded mm it was burned at, and the field error
+/// (physical − commanded) it exhibits.
+#[derive(Debug, Clone, Copy)]
+pub struct FieldDot {
+    /// Detected dot center in the camera frame (px).
+    pub px: (f64, f64),
+    /// Where it physically landed, true mm (camera-lens metric).
+    pub physical_mm: (f64, f64),
+    /// The commanded machine coordinate it was burned at (mm).
+    pub commanded_mm: (f64, f64),
+    /// Field error at this dot: `|physical − commanded|`, µm. This is what the
+    /// pre-distortion cancels.
+    pub field_um: f64,
+    /// Post-fit residual of the field map at this dot, µm.
+    pub resid_um: f64,
+}
+
+/// A fitted laser field-distortion calibration: the `physical ↔ commanded`
+/// pre-distortion map plus per-dot feedback.
+#[derive(Debug, Clone)]
+pub struct FieldCal {
+    /// Physical machine mm → commanded mm (apply to emitted geometry).
+    pub field: FieldMap,
+    /// Physical machine mm → camera px (a linear approximation, for the Place
+    /// overlay so it positions in the same metric frame the emit corrects in).
+    pub to_px: Homography,
+    pub dots: Vec<FieldDot>,
+    pub found: usize,
+    pub total: usize,
+}
+
+/// Fit the laser field pre-distortion from a frame of the **burned** grid and
+/// the four hand-marked corner-dot pixels. `lens` is the camera lens map (from
+/// [`fit_camera_lens`]) that turns the camera into a metric ruler: each burned
+/// dot's detected pixel is mapped to its true physical mm, paired with the
+/// commanded coordinate it was burned at, and a `physical → commanded`
+/// polynomial is fit. Emitting geometry through it cancels the field distortion.
+///
+/// The camera must not have moved between the lens fit and this frame — both
+/// share the metric frame the lens map defines.
+pub fn fit_laser_field(
+    frame: &GrayImage,
+    corners_px: [(f64, f64); 4],
+    grid: &GridSpec,
+    dot_mm: f64,
+    kind: DotKind,
+    lens: &LensMap,
+) -> Result<FieldCal, String> {
+    if grid.n < 4 {
+        return Err("laser-field fit needs at least a 4×4 grid".into());
+    }
+    let seed = corner_seed(corners_px, grid)?;
+    let (pairs, total) = detect_grid_dots(frame, &seed, grid, dot_mm, kind)?;
+    let found = pairs.len();
+    if found < 10 {
+        return Err(format!(
+            "only {found}/{total} grid dots detected — the field fit needs ≥10 \
+             (check the burned grid, the corner clicks, the dot size, and polarity)"
+        ));
+    }
+    // Detected px → true physical mm (camera-lens metric), paired with the
+    // commanded coordinate each dot was burned at.
+    let field_pairs: Vec<(Point2<f64>, Point2<f64>)> = pairs
+        .iter()
+        .map(|(fpx, cmd)| {
+            let (phx, phy) = lens.px_to_mm.apply(fpx.x, fpx.y);
+            (Point2::new(phx, phy), Point2::new(cmd.x, cmd.y))
+        })
+        .collect();
+    let field = fit_field(&field_pairs).map_err(|e| format!("field fit: {e}"))?;
+    // A linear physical-mm → px map for the Place overlay: fit a homography
+    // from each dot's physical position to its detected pixel.
+    let to_px_pairs: Vec<(Point2<f64>, Point2<f64>)> = pairs
+        .iter()
+        .zip(&field_pairs)
+        .map(|((fpx, _), (phys, _))| (*phys, *fpx))
+        .collect();
+    let to_px = fit_homography(&to_px_pairs).map_err(|e| format!("overlay fit: {e}"))?;
+
+    let dots: Vec<FieldDot> = pairs
+        .iter()
+        .zip(&field_pairs)
+        .map(|((fpx, cmd), (phys, _))| {
+            let field_um = ((phys.x - cmd.x).powi(2) + (phys.y - cmd.y).powi(2)).sqrt() * 1000.0;
+            let (gx, gy) = field.precompensate(phys.x, phys.y);
+            let resid_um = ((gx - cmd.x).powi(2) + (gy - cmd.y).powi(2)).sqrt() * 1000.0;
+            FieldDot {
+                px: (fpx.x, fpx.y),
+                physical_mm: (phys.x, phys.y),
+                commanded_mm: (cmd.x, cmd.y),
+                field_um,
+                resid_um,
+            }
+        })
+        .collect();
+    Ok(FieldCal {
+        field,
+        to_px,
+        dots,
+        found,
+        total,
+    })
 }
 
 #[cfg(test)]
@@ -688,6 +797,90 @@ mod tests {
             max_distort > 3.0,
             "shows the barrel field: {max_distort:.1} px"
         );
+    }
+
+    /// End-to-end laser-field fit: a burned grid imaged through a metric
+    /// camera, where the laser's field distortion put each commanded dot a few
+    /// percent off. The fit (via the camera-lens map) recovers a pre-distortion
+    /// that cancels it: a physical target maps to a command the field bends
+    /// back onto that target.
+    #[test]
+    fn laser_field_fit_recovers_precompensation() {
+        let grid = GridSpec {
+            origin_mm: (0.0, 0.0),
+            pitch_mm: 10.0,
+            n: 7,
+        };
+        let dot_mm = 1.5;
+        // Camera: physical mm → px, a plain 10 px/mm ruler offset by (50,50).
+        let cam = |phx: f64, phy: f64| (10.0 * phx + 50.0, 10.0 * phy + 50.0);
+        // Laser field: commanded → physical, ~3% pincushion about (30,30).
+        let field = |cx: f64, cy: f64| {
+            let (du, dv) = (cx - 30.0, cy - 30.0);
+            let r2 = (du * du + dv * dv) / (30.0 * 30.0);
+            let f = 1.0 + 0.03 * r2;
+            (30.0 + du * f, 30.0 + dv * f)
+        };
+
+        // Camera-lens map from a printed grid (physical known, imaged by cam).
+        let lens_pairs: Vec<(Point2<f64>, Point2<f64>)> = grid
+            .points()
+            .iter()
+            .map(|&(x, y)| {
+                let (u, v) = cam(x, y);
+                (Point2::new(u, v), Point2::new(x, y))
+            })
+            .collect();
+        let lens = fit_lens(&lens_pairs).expect("lens");
+
+        // Burned grid: commanded dots land physically distorted, imaged by cam.
+        let centers: Vec<(f64, f64, f64)> = grid
+            .points()
+            .iter()
+            .map(|&(cx, cy)| {
+                let (px, py) = field(cx, cy);
+                let (u, v) = cam(px, py);
+                (u, v, dot_mm * 10.0)
+            })
+            .collect();
+        let (w, h) = (720u32, 720u32);
+        let img = GrayImage::from_fn(w, h, |x, y| {
+            let mut cover = 0.0;
+            for sy in 0..4 {
+                for sx in 0..4 {
+                    let px = x as f64 + (sx as f64 + 0.5) / 4.0 - 0.5;
+                    let py = y as f64 + (sy as f64 + 0.5) / 4.0 - 0.5;
+                    if centers.iter().any(|&(cx, cy, r)| {
+                        ((px - cx).powi(2) + (py - cy).powi(2)).sqrt() < r / 2.0
+                    }) {
+                        cover += 1.0 / 16.0;
+                    }
+                }
+            }
+            image::Luma([(210.0 - 150.0 * cover) as u8])
+        });
+        // Corner clicks: the burned corner dots' pixels.
+        let corners_px = grid.corners_mm().map(|(cx, cy)| {
+            let (px, py) = field(cx, cy);
+            cam(px, py)
+        });
+
+        let cal = fit_laser_field(&img, corners_px, &grid, dot_mm, DotKind::Dark, &lens)
+            .expect("field fit");
+        assert_eq!(cal.found, 49, "all dots detected");
+        assert!(cal.field.rms_um < 60.0, "field RMS {} µm", cal.field.rms_um);
+        // The distortion is real: corner dots are visibly off their command.
+        let worst = cal.dots.iter().map(|d| d.field_um).fold(0.0_f64, f64::max);
+        assert!(worst > 300.0, "field error present: worst {worst:.0} µm");
+
+        // Precompensation cancels it: a physical target we didn't fit maps to a
+        // command the field bends back onto the target.
+        for &(tx, ty) in &[(25.0, 25.0), (5.0, 55.0), (55.0, 5.0)] {
+            let (cx, cy) = cal.field.precompensate(tx, ty);
+            let (lx, ly) = field(cx, cy);
+            let err = ((lx - tx).powi(2) + (ly - ty).powi(2)).sqrt() * 1000.0;
+            assert!(err < 80.0, "target ({tx},{ty}) off by {err:.0} µm");
+        }
     }
 
     #[test]

@@ -22,8 +22,8 @@ use capture as camera;
 
 pub use app::{ConsoleApp, LogLine, default_cli_cmd, job_shapes, preview_image, run_capture};
 pub use calib::{
-    AnchorDot, Calibration, CameraCal, DotKind, GridSpec, LensDot, fit_camera_lens,
-    fit_camera_to_machine,
+    AnchorDot, Calibration, CameraCal, DotKind, FieldCal, FieldDot, GridSpec, LensDot,
+    fit_camera_lens, fit_camera_to_machine, fit_laser_field,
 };
 pub use capture::{Capture, Source, clean_path, grab, list_devices};
 pub use fiducial::{

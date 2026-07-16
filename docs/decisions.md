@@ -1579,3 +1579,32 @@ keeping the anti-false-positive discrimination:
 Also fixed a test-isolation weakness the new persistent `calib_dot_kind`
 exposed: `the_dot_contrast_toggle_switches_detection_polarity` now drives to a
 known polarity first instead of trusting the (persisted) default.
+
+## 2026-07-16 — Laser field-distortion correction (emit pre-distortion)
+
+The register/emit path baked only a rigid affine, so a design square burned as a
+perfect square in *commanded* coordinates but physically bowed by the galvo/
+f-theta field distortion. Added an end-to-end correction that pre-distorts the
+emitted geometry so the beam cancels the field error.
+
+Measurement is camera-metric (operator's choice): the ① camera-lens map is the
+metric ruler; a burned grid at known commanded coords is imaged, each dot's true
+physical position is read through the lens map, and a **physical→commanded**
+bi-cubic (`vision::FieldMap`/`fit_field`, reusing the lens-poly machinery) is
+fit. Emitting `to_commanded(geometry)` cancels the distortion.
+
+- vision: FieldMap + fit_field + Poly2 coeff (de)serialization + a text file
+  format for the emit subprocess. precompensation_cancels_the_field_distortion.
+- cam: transform_shapes_field — affine, then densify each edge (a straight
+  design edge is a curved commanded path under pincushion) and warp every point
+  via a closure (cam stays dependency-free).
+- cli: register --field-map [--field-seg-mm]; e2e test.
+- ui: calib::fit_laser_field (burned grid + lens map → FieldMap + a linear
+  physical→px map for the overlay); ③ Laser-field calibration step; a Place-tab
+  "compensate field" toggle that places in the physical frame and passes
+  --field-map to register. The correction file persists beside settings.
+
+Model is a global bi-cubic (operator's choice) — smooth, ideal for f-theta
+pincushion, one RMS number. The field cal is session-scoped like the anchor;
+"compensate field" only arms with a live field cal so the placement frame and
+the baked correction always agree.
