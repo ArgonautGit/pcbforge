@@ -1507,3 +1507,19 @@ in one quadrant / outside the work area.
 - Tests: `generate_grid_centers_on_the_field` (UI note asserts centred origin);
   calib-grid e2e still green; verified the CLI prints the absolute path, creates
   dirs, and accepts a negative origin.
+
+## 2026-07-15 — Report calibration age (missing vs old vs fresh)
+
+Operator asked to know whether the camera calibration is *non-existent* or
+*old*, not just "not calibrated this session". The persisted anchor had no
+timestamp, so a restored fit only read "loaded last session".
+
+- New `calib_saved_at: Option<u64>` (Unix seconds), stamped on every fresh
+  anchor (fit / re-anchor / live), persisted alongside `calib_matrix`, and
+  restored on load. `now_unix()` + `human_age()` helpers ("just now / N min /
+  N h / N days ago").
+- Status line (② Laser anchor) now reads: `○ no camera calibration — never
+  anchored`; `◐ saved calibration, 3 days ago — ⟳ Re-anchor to confirm`; or
+  `● anchored this session (…)`. `debug_summary` mirrors it (`saved (N days
+  ago), unconfirmed`). Pre-timestamp saves show "age unknown".
+- Test `calibration_reports_age_not_just_this_session`.

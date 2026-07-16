@@ -26,6 +26,27 @@ use crate::status::{self, StatusSnapshot};
 const NAV_HINT: &str =
     "Navigate: Ctrl+drag to pan · Ctrl+wheel to zoom · Ctrl+double-click to reset.";
 
+/// Current wall-clock as Unix seconds (0 if the clock is before the epoch).
+fn now_unix() -> u64 {
+    std::time::SystemTime::now()
+        .duration_since(std::time::UNIX_EPOCH)
+        .map(|d| d.as_secs())
+        .unwrap_or(0)
+}
+
+/// Human "how long ago" for an age in seconds.
+fn human_age(secs: u64) -> String {
+    match secs {
+        0..=89 => "just now".into(),
+        90..=5399 => format!("{} min ago", secs / 60),
+        5400..=86399 => format!("{} h ago", secs / 3600),
+        _ => {
+            let days = secs / 86400;
+            format!("{days} day{} ago", if days == 1 { "" } else { "s" })
+        }
+    }
+}
+
 /// Longest-side cap for the live camera *view* texture. The full-resolution
 /// frame is always kept for calibration/detection; only the on-screen preview
 /// is downscaled to this, so streaming a 2K/4K sensor stays cheap.
@@ -279,6 +300,10 @@ pub struct ConsoleApp {
     // camera moves between jobs, so this is not persisted — recalibrate each
     // session. `calib` present ⇒ the Place tab works in true machine mm.
     calib: Option<crate::calib::Calibration>,
+    /// Unix seconds when the anchor was last established (fit/re-anchor),
+    /// persisted so a restored calibration can report its age — distinguishing
+    /// "never calibrated" from "old (from N days ago)".
+    calib_saved_at: Option<u64>,
     calib_n: usize,
     calib_pitch_mm: f64,
     calib_dot_mm: f64,
@@ -388,6 +413,7 @@ impl ConsoleApp {
             cam_file: String::new(),
             cam_orientation: Orientation::Normal,
             calib: None,
+            calib_saved_at: None,
             calib_n: 7,
             calib_pitch_mm: 10.0,
             calib_dot_mm: 0.4,
@@ -478,6 +504,12 @@ impl ConsoleApp {
                     })
                     .unwrap_or_default(),
             ),
+            (
+                "calib_saved_at",
+                self.calib_saved_at
+                    .map(|t| t.to_string())
+                    .unwrap_or_default(),
+            ),
         ])
     }
 
@@ -560,8 +592,14 @@ impl ConsoleApp {
                 total: self.calib_n * self.calib_n,
                 dots: Vec::new(),
             });
-            self.calib_note =
-                "loaded last session's calibration — click ⟳ Re-anchor to re-lock to the taped grid".into();
+            self.calib_saved_at = m.get("calib_saved_at").and_then(|s| s.trim().parse().ok());
+            let age = match self.calib_saved_at {
+                Some(t) => human_age(now_unix().saturating_sub(t)),
+                None => "age unknown".into(),
+            };
+            self.calib_note = format!(
+                "loaded a saved calibration ({age}) — click ⟳ Re-anchor to re-lock to the taped grid"
+            );
         }
     }
 
@@ -1287,6 +1325,7 @@ impl ConsoleApp {
                             cal.found, cal.total, cal.rms_um
                         );
                         self.calib = Some(cal);
+                        self.calib_saved_at = Some(now_unix());
                     }
                     Err(e) => {
                         self.calib = None;
@@ -1317,6 +1356,7 @@ impl ConsoleApp {
                             cal.found, cal.total, cal.rms_um
                         );
                         self.calib = Some(cal);
+                        self.calib_saved_at = Some(now_unix());
                     }
                     Err(e) => {
                         self.calib_note = format!("re-anchor failed: {e} — re-Fit the corners")
@@ -1366,6 +1406,7 @@ impl ConsoleApp {
                         cal.found, cal.total, cal.rms_um
                     );
                     self.calib = Some(cal);
+                    self.calib_saved_at = Some(now_unix());
                 }
                 Err(e) => self.calib_note = format!("live anchor lost the grid: {e}"),
             }
@@ -1605,7 +1646,17 @@ impl ConsoleApp {
     /// than a full `Debug` — textures and channels aren't useful to print.
     pub fn debug_summary(&self) -> String {
         let calib = match &self.calib {
-            Some(c) => format!("{}/{} dots, RMS {:.0}µm", c.found, c.total, c.rms_um),
+            Some(c) if c.found == 0 => {
+                let age = match self.calib_saved_at {
+                    Some(t) => human_age(now_unix().saturating_sub(t)),
+                    None => "age unknown".into(),
+                };
+                format!("saved ({age}), unconfirmed")
+            }
+            Some(c) => format!(
+                "this session, {}/{} dots, RMS {:.0}µm",
+                c.found, c.total, c.rms_um
+            ),
             None => "none".into(),
         };
         let lens = match &self.lens {
@@ -2091,23 +2142,31 @@ impl ConsoleApp {
                     }
                 });
                 let (status, ok) = match &self.calib {
-                    Some(c) if c.found == 0 => (
-                        "◐ loaded last session — ⟳ Re-anchor to re-lock to the taped grid"
-                            .to_string(),
-                        false,
-                    ),
+                    // Restored from disk (not re-confirmed this session): report
+                    // its age so "old" is distinguishable from "just now".
+                    Some(c) if c.found == 0 => {
+                        let age = match self.calib_saved_at {
+                            Some(t) => human_age(now_unix().saturating_sub(t)),
+                            None => "age unknown".into(),
+                        };
+                        (
+                            format!("◐ saved calibration, {age} — ⟳ Re-anchor to confirm"),
+                            false,
+                        )
+                    }
                     Some(c) => {
                         let worst = c.dots.iter().map(|d| d.resid_um).fold(0.0_f64, f64::max);
                         (
                             format!(
-                                "● anchored ({}/{} dots, RMS {:.0} µm, worst {:.0} µm)",
+                                "● anchored this session ({}/{} dots, RMS {:.0} µm, worst {:.0} µm)",
                                 c.found, c.total, c.rms_um, worst
                             ),
                             true,
                         )
                     }
                     None => (
-                        "○ not anchored — Place uses the design frame only".to_string(),
+                        "○ no camera calibration — never anchored (Place uses the design frame only)"
+                            .to_string(),
                         false,
                     ),
                 };
@@ -4193,6 +4252,35 @@ mod tests {
             app.calib_note.contains("centred on field") && app.calib_note.contains("(-30,-30)"),
             "note: {}",
             app.calib_note
+        );
+    }
+
+    /// The calibration status distinguishes "never anchored" from a *saved*
+    /// calibration, reporting the latter's age.
+    #[test]
+    fn calibration_reports_age_not_just_this_session() {
+        let mut app = ConsoleApp::new(tmp_db(), vec!["true".into()]);
+        assert!(
+            app.debug_summary().contains("calib_anchor: none"),
+            "never anchored"
+        );
+        // A restored (unconfirmed) calibration saved 3 days ago.
+        app.calib = Some(crate::calib::Calibration {
+            px_to_mm: vision::Homography {
+                matrix: nalgebra::Matrix3::identity(),
+                residuals: vec![],
+                rms: 0.0,
+            },
+            rms_um: 0.0,
+            found: 0,
+            total: 49,
+            dots: Vec::new(),
+        });
+        app.calib_saved_at = Some(now_unix().saturating_sub(3 * 86_400));
+        assert!(
+            app.debug_summary().contains("saved (3 days ago)"),
+            "reports age: {}",
+            app.debug_summary()
         );
     }
 
