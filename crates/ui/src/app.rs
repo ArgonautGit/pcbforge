@@ -1178,6 +1178,12 @@ impl ConsoleApp {
             self.calib_note = "set an output path for the grid".into();
             return;
         }
+        // Centre the grid on the machine field (Camera-tab work area), so it
+        // lands inside the addressable area — a centre-origin galvo has (0,0)
+        // at the field centre, not a corner. origin = field centre − span/2.
+        let span = (self.calib_n.saturating_sub(1)) as f64 * self.calib_pitch_mm;
+        let ox = self.field_cx_mm as f64 - span / 2.0;
+        let oy = self.field_cy_mm as f64 - span / 2.0;
         self.run_verb(&[
             "calib-grid".into(),
             "--out".into(),
@@ -1188,7 +1194,18 @@ impl ConsoleApp {
             format!("{}", self.calib_pitch_mm),
             "--dot-mm".into(),
             format!("{}", self.calib_dot_mm),
+            "--origin".into(),
+            format!("{ox},{oy}"),
         ]);
+        self.calib_note = format!(
+            "generating {n}×{n} grid centred on field ({cx:.0},{cy:.0}) → \
+             spans ({ox:.0},{oy:.0})…({x1:.0},{y1:.0}) mm — see Log for the file path",
+            n = self.calib_n,
+            cx = self.field_cx_mm,
+            cy = self.field_cy_mm,
+            x1 = ox + span,
+            y1 = oy + span,
+        );
     }
 
     /// Load the burned-grid frame — from the camera (source picked in the
@@ -4157,6 +4174,26 @@ mod tests {
         assert!((app.cam_view_scale - 0.5).abs() < 0.01);
         let tex = app.cam_tex.as_ref().unwrap().size();
         assert_eq!(tex[0], 1280, "view texture capped to 1280");
+    }
+
+    /// Generate grid centres the lattice on the machine field so it lands
+    /// inside the addressable work area (a centre-origin galvo has 0,0 at the
+    /// field centre, not a corner).
+    #[test]
+    fn generate_grid_centers_on_the_field() {
+        let mut app = ConsoleApp::new(tmp_db(), vec!["true".into()]);
+        app.calib_n = 7;
+        app.calib_pitch_mm = 10.0;
+        app.field_cx_mm = 0.0;
+        app.field_cy_mm = 0.0;
+        app.calib_grid_out = "calib-grid.lbrn2".into();
+        app.calibrate_generate_grid();
+        // A 60 mm span centred on (0,0) → origin (-30,-30), corner (30,30).
+        assert!(
+            app.calib_note.contains("centred on field") && app.calib_note.contains("(-30,-30)"),
+            "note: {}",
+            app.calib_note
+        );
     }
 
     /// A second frame after a status refresh still lays out (state survives).

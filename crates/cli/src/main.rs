@@ -296,8 +296,10 @@ enum Command {
         /// Grid pitch, mm.
         #[arg(long, default_value_t = 10.0)]
         pitch_mm: f64,
-        /// Lower-left dot's commanded position, mm (as "x,y").
-        #[arg(long, default_value = "0,0")]
+        /// Lower-left dot's commanded position, mm (as "x,y"). Accepts negative
+        /// values (a centre-origin galvo puts the field centre at 0,0), e.g.
+        /// `--origin -30,-30`.
+        #[arg(long, default_value = "0,0", allow_hyphen_values = true)]
         origin: String,
         /// Dot side length, mm.
         #[arg(long, default_value_t = 0.4)]
@@ -633,12 +635,17 @@ fn calib_grid_cmd(
         passes: 1,
     };
     let layer = EmitLayer::fill("CAL", params, lbrn2::polys_to_elems(&dots));
+    if let Some(dir) = out.parent().filter(|d| !d.as_os_str().is_empty()) {
+        std::fs::create_dir_all(dir).ok();
+    }
     lbrn2::write_lbrn2(device, &[layer], out)?;
     let span = (n - 1) as f64 * pitch_mm;
     eprintln!(
         "calib grid: {n}×{n} dots, {pitch_mm} mm pitch, from ({ox}, {oy}) over {span}×{span} mm"
     );
-    println!("wrote {}", out.display());
+    // Print the absolute path so it's findable regardless of the working dir.
+    let abs = std::path::absolute(out).unwrap_or_else(|_| out.to_path_buf());
+    println!("wrote {}", abs.display());
     Ok(())
 }
 
