@@ -100,10 +100,14 @@ fn the_dot_contrast_toggle_switches_detection_polarity() {
     let mut h = console();
     h.get_by_label("🎯 Calibrate").click();
     h.run();
-    // Defaults to dark-on-light (printed grids, dark-anodized burns).
+    // Drive to a known state rather than trusting the persisted default (the
+    // setting survives across runs, so the starting polarity is whatever was
+    // saved last). Dark-on-light is for printed grids / dark-anodized burns.
+    h.get_by_label("◉ dark-on-light").click();
+    h.run();
     assert!(
         h.state().debug_summary().contains("contrast=dark-on-light"),
-        "default polarity is dark:\n{}",
+        "selected dark:\n{}",
         h.state().debug_summary()
     );
     // Switching to bright-on-dark is what lets an ablated (light-on-dark) burn

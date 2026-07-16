@@ -175,13 +175,25 @@ pub enum Miss {
     },
 }
 
-/// Minimum peak SNR before a window is declared to have any signal.
-const MIN_SNR: f64 = 5.0;
-/// Component area gates relative to the profile's nominal disc area.
-const AREA_MIN_FRAC: f64 = 0.2;
-const AREA_MAX_FRAC: f64 = 4.0;
-/// Minimum fill ratio of the circumscribed circle.
-const MIN_CIRCULARITY: f64 = 0.35;
+/// Minimum peak SNR before a window is declared to have any signal. Loosened
+/// from 5.0: a real ablated burn under bench glare rides much lower contrast
+/// than a printed target — 3.5 still sits well above sensor noise (the MAD σ
+/// is robust to the glare gradient) while admitting the operator's dim dots.
+const MIN_SNR: f64 = 3.5;
+/// Component area gates relative to the profile's nominal disc area. The lower
+/// bound is loose (0.12) because a partially-taken burn only thresholds a small
+/// bright core; the upper bound (4.6) still rejects a honeycomb-bed hole ~2.2×
+/// the dot diameter (≈4.8× area) — the decoy hazard from the field photo.
+const AREA_MIN_FRAC: f64 = 0.12;
+const AREA_MAX_FRAC: f64 = 4.6;
+/// Minimum fill ratio of the circumscribed circle. Loosened from 0.35: an
+/// ablated dot is rarely a clean disc (spatter, comet tails, uneven take), so
+/// 0.25 admits the ragged real ones while still culling line/edge fragments.
+const MIN_CIRCULARITY: f64 = 0.25;
+/// Bounding-box aspect-ratio window (bw/bh). Widened from 0.35..=2.86 so a
+/// smeared or elongated burn still passes; anything beyond ~3:1 is a streak.
+const ASPECT_MIN: f64 = 0.3;
+const ASPECT_MAX: f64 = 3.3;
 
 /// Find each of `expected_mm` in `frame`, searching `search_mm` around the
 /// expected spot. The result is aligned with `expected_mm`: index `i`
@@ -287,7 +299,7 @@ fn find_one(
             let bh = (c.max_y - c.min_y + 1) as f64;
             let maxdim = bw.max(bh);
             let circularity = area / (std::f64::consts::FRAC_PI_4 * maxdim * maxdim);
-            if circularity < MIN_CIRCULARITY || !(0.35..=2.86).contains(&(bw / bh)) {
+            if circularity < MIN_CIRCULARITY || !(ASPECT_MIN..=ASPECT_MAX).contains(&(bw / bh)) {
                 return None;
             }
             let (cx, cy) = c.mean();
@@ -706,6 +718,29 @@ mod tests {
         .expect("blob found");
         let err = ((f.found_px.x - 80.4).powi(2) + (f.found_px.y - 120.6).powi(2)).sqrt();
         assert!(err < 0.15, "center error {err:.3} px");
+    }
+
+    /// Forgiveness: a dim, low-contrast burn — the kind a real ablated grid
+    /// throws under bench glare — now locks. Its SNR sits in the band between
+    /// the loosened gate (3.5) and the old one (5.0), so the previous detector
+    /// would have reported LowContrast and missed it.
+    #[test]
+    fn dim_low_contrast_burn_is_now_found() {
+        // Shallow contrast (depth 25) over noise 6 → peak-over-noise ~4, in the
+        // band between the loosened gate (3.5) and the old one (5.0).
+        let frame = render(200, 200, &[(100.4, 99.6, 10.0)], 25.0, 6.0, 5);
+        let bed = BedMap::uniform_scale(PX_PER_MM);
+        let expected = [bed.px_to_mm(Point2::new(100.0, 100.0))];
+        let f = find_fiducials(&frame, &expected, 2.0, &dark_1mm(), &bed)
+            .remove(0)
+            .expect("dim burn found under the loosened SNR gate");
+        assert!(
+            f.confidence.snr < 5.0,
+            "snr {:.2} should sit below the OLD gate (5.0) — proving forgiveness",
+            f.confidence.snr
+        );
+        let err = ((f.found_px.x - 100.4).powi(2) + (f.found_px.y - 99.6).powi(2)).sqrt();
+        assert!(err < 0.5, "center still recovered: {err:.3} px");
     }
 
     /// The bed map is not assumed axis-aligned: a rotated + translated

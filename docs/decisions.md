@@ -1558,3 +1558,24 @@ so the fit found 0/49 dots. The vision layer already had a `Backlit`
 - Default stays Dark (printed grids + dark-anodized burns). Operator guidance:
   bright-on-dark for ablated marks / backlit holes; also reduce glare, which
   hurts either polarity.
+
+## 2026-07-16 — Loosen the fiducial gates for real ablated burns
+
+Even with the right polarity, the detector's gates were tuned for clean
+synthetic/printed dots and rejected real ablated grid dots (dim under bench
+glare, ragged, size-variable). Relaxed the hard gates in `vision::fiducial`,
+keeping the anti-false-positive discrimination:
+
+- `MIN_SNR` 5.0 → 3.5 (glare tolerance; robust MAD σ keeps it above noise).
+- `AREA_MIN_FRAC` 0.2 → 0.12; `AREA_MAX_FRAC` 4.0 → 4.6 (still rejects the
+  honeycomb-bed decoy hole ~4.8× area from the field photo).
+- `MIN_CIRCULARITY` 0.35 → 0.25 (spatter/comet-tail burns).
+- Aspect window 0.35..=2.86 → `ASPECT_MIN..=ASPECT_MAX` (0.3..=3.3).
+- Score is feedback only — never a gate — so none of this hallucinates; the
+  `decoy_holes` and `low_contrast_reports_snr` tests still hold.
+- New test `dim_low_contrast_burn_is_now_found` (SNR below the old 5.0 gate is
+  now located).
+
+Also fixed a test-isolation weakness the new persistent `calib_dot_kind`
+exposed: `the_dot_contrast_toggle_switches_detection_polarity` now drives to a
+known polarity first instead of trusting the (persisted) default.
