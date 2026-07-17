@@ -1707,3 +1707,29 @@ Also fixed two operator-facing accuracy issues found in the same pass
   finding and implied something needs fixing. Reworded to lead with "this
   field is likely already good; don't enable correction here" and demote
   the LightBurn/EZCAD line to the fallback if dots are still visibly off.
+
+## 2026-07-17 — Field diagnostic: fable-review fixes (non-radial, fail-closed)
+
+A fable-model review of the pincushion-vs-noise diagnostic found two real
+problems; both fixed directly:
+
+1. A pure galvo **rotation/skew** is entirely tangential (zero radial signal),
+   so it read as `Noise` ("field is fine, don't correct") even though the
+   bi-cubic fixes it. `classify_field_error` now also fits a tangential linear
+   term (`t1·r`, exactly a rigid rotation) and the noise floor is the residual
+   after removing BOTH radial and tangential models. New `FieldPattern::NonRadial`
+   ("systematic but not curvature — correction still helps; check alignment").
+   Tangential is fit linear-only (one param) to keep noise sensitivity low; the
+   n=10 Monte-Carlo boundary test was broadened to reject false NonRadial too
+   and still passes.
+2. The console **auto-enabled** correction on every fit, against the verdict.
+   `place_field_correct` now auto-arms only when `field_correction_advised`
+   (Systematic/NonRadial); the ③ status hint is verdict-conditional.
+
+Also from the review: fail closed on non-finite input (`InconclusiveReason::
+NonFinite`) instead of falling through to `Noise`; replaced the axis-aligned
+bbox collinearity gate with a second-moment (PCA eigenvalue) test so a diagonal
+line of dots is caught; documented the centered-grid (centroid-as-center)
+assumption on the API; `UniformScale` wording now also names a mis-scaled
+reference/print as a suspect. New tests: rotation→NonRadial, non-finite→
+Inconclusive, diagonal→SpanTooThin.

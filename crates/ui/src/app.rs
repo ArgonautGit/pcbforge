@@ -1410,8 +1410,7 @@ impl ConsoleApp {
                         let worst = cal.dots.iter().map(|d| d.field_um).fold(0.0_f64, f64::max);
                         self.calib_note = match saved {
                             Ok(()) => format!(
-                                "field: {}/{} dots, corrects {:.0} µm worst field error to \
-                                 {:.0} µm RMS — {} — Etch here can now compensate the laser field",
+                                "field: {}/{} dots, error up to {:.0} µm (fit residual {:.0} µm) — {}",
                                 cal.found,
                                 cal.total,
                                 worst,
@@ -1425,8 +1424,12 @@ impl ConsoleApp {
                                 path.display()
                             ),
                         };
+                        // Only auto-arm the emit correction when the verdict
+                        // actually recommends it — don't correct against a
+                        // "noise/inconclusive" reading (that's the whole point
+                        // of the diagnostic).
+                        self.place_field_correct = field_correction_advised(&cal.field_verdict);
                         self.calib_field = Some(cal);
-                        self.place_field_correct = true;
                     }
                     Err(e) => {
                         self.calib_field = None;
@@ -2405,7 +2408,9 @@ impl ConsoleApp {
                     // correct). Amber is reserved for actual uncertainty: not
                     // enough/well-distributed data to tell signal from scatter.
                     let (glyph, verdict_ok) = match c.field_verdict.pattern {
-                        FieldPattern::Systematic { .. } | FieldPattern::UniformScale => ("⬤", true),
+                        FieldPattern::Systematic { .. }
+                        | FieldPattern::NonRadial
+                        | FieldPattern::UniformScale => ("⬤", true),
                         FieldPattern::Noise => ("○", true),
                         FieldPattern::Borderline | FieldPattern::Inconclusive(_) => ("?", false),
                     };
@@ -2413,8 +2418,16 @@ impl ConsoleApp {
                         status_color(verdict_ok),
                         format!("{glyph} {}", field_verdict_phrase(&c.field_verdict)),
                     );
+                    // Only nudge the operator to enable correction when the
+                    // verdict actually recommends it.
+                    let hint = if field_correction_advised(&c.field_verdict) {
+                        "Turn on \"compensate field\" on the Place tab to apply it."
+                    } else {
+                        "Correction stays off for this verdict; enable \"compensate field\" \
+                         manually on the Place tab only if you want to apply it anyway."
+                    };
                     ui.weak(format!(
-                        "Correction file: {}. Turn on \"compensate field\" on the Place tab.",
+                        "Correction file: {}. {hint}",
                         self.field_map_path().display()
                     ));
                 }
@@ -3505,6 +3518,18 @@ fn status_color(ok: bool) -> Color32 {
     }
 }
 
+/// Whether the verdict recommends enabling the emit field correction. True
+/// only for the clear "real distortion the bi-cubic fixes" readings; uniform
+/// scale (a recal is the likelier root cause), borderline, noise, and
+/// inconclusive leave the operator to decide rather than auto-arming.
+fn field_correction_advised(v: &vision::FieldVerdict) -> bool {
+    use vision::FieldPattern;
+    matches!(
+        v.pattern,
+        FieldPattern::Systematic { .. } | FieldPattern::NonRadial
+    )
+}
+
 /// Operator-facing phrase for a laser-field pincushion-vs-noise verdict.
 fn field_verdict_phrase(v: &vision::FieldVerdict) -> String {
     use vision::{FieldPattern, InconclusiveReason};
@@ -3517,10 +3542,16 @@ fn field_verdict_phrase(v: &vision::FieldVerdict) -> String {
             v.systematic_um,
             v.noise_um
         ),
+        FieldPattern::NonRadial => format!(
+            "systematic error, but non-radial — looks like a rotation/misalignment, not lens \
+             curvature ({:.1}× noise floor, {:.0} µm tangential vs {:.0} µm scatter). Correction \
+             still fixes it; also check the galvo/camera alignment",
+            v.ratio, v.tangential_um, v.noise_um
+        ),
         FieldPattern::UniformScale => format!(
             "looks like a uniform scale error, not curvature ({:.0} µm signal vs {:.0} µm \
-             scatter) — a LightBurn/EZCAD origin & scale recal may be simpler than field \
-             correction",
+             scatter) — a LightBurn/EZCAD origin & scale recal, or a mis-scaled reference/print, \
+             is the likelier root cause; correction still works",
             v.systematic_um, v.noise_um
         ),
         FieldPattern::Borderline => format!(
@@ -3530,9 +3561,8 @@ fn field_verdict_phrase(v: &vision::FieldVerdict) -> String {
         ),
         FieldPattern::Noise => format!(
             "no systematic pattern above the noise floor ({:.0} µm signal vs {:.0} µm scatter) \
-             — this field is likely already good; don't enable correction here. If dots still \
-             land visibly off, that's a LightBurn/EZCAD origin & scale issue, not field \
-             curvature",
+             — the field is likely already tight; don't enable correction here (it would just \
+             fit noise)",
             v.systematic_um, v.noise_um
         ),
         FieldPattern::Inconclusive(reason) => format!(
@@ -3542,6 +3572,7 @@ fn field_verdict_phrase(v: &vision::FieldVerdict) -> String {
                 InconclusiveReason::TooFewOffCenter => "too few dots away from the field center",
                 InconclusiveReason::SpanTooSmall => "dots too clustered",
                 InconclusiveReason::SpanTooThin => "dots too nearly collinear",
+                InconclusiveReason::NonFinite => "bad (non-finite) sample data",
             }
         ),
     }
@@ -3555,6 +3586,7 @@ fn field_verdict_token(v: &vision::FieldVerdict) -> String {
             format!("pincushion(ratio={:.1})", v.ratio)
         }
         FieldPattern::Systematic { pincushion: false } => format!("barrel(ratio={:.1})", v.ratio),
+        FieldPattern::NonRadial => format!("non_radial(ratio={:.1})", v.ratio),
         FieldPattern::UniformScale => format!("uniform_scale(ratio={:.1})", v.ratio),
         FieldPattern::Borderline => format!("borderline(ratio={:.1})", v.ratio),
         FieldPattern::Noise => format!("noise(ratio={:.1})", v.ratio),
@@ -3565,6 +3597,7 @@ fn field_verdict_token(v: &vision::FieldVerdict) -> String {
                 InconclusiveReason::TooFewOffCenter => "too_few_offcenter",
                 InconclusiveReason::SpanTooSmall => "span_too_small",
                 InconclusiveReason::SpanTooThin => "span_too_thin",
+                InconclusiveReason::NonFinite => "non_finite",
             }
         ),
     }
