@@ -9,7 +9,7 @@
 //! how well (µm). The map is fit both directions (`px→mm` for measurement,
 //! `mm→px` for drawing the corrected grid back onto the image).
 
-use nalgebra::{DMatrix, DVector, Point2};
+use nalgebra::{DMatrix, DVector, Point2, Vector2};
 
 /// The 10 bi-cubic basis terms of normalized coordinates.
 fn basis(u: f64, v: f64) -> [f64; 10] {
@@ -280,6 +280,336 @@ pub fn fit_field(pairs: &[(Point2<f64>, Point2<f64>)]) -> Result<FieldMap, Strin
     })
 }
 
+// ---- pincushion-vs-noise diagnostic ---------------------------------------
+//
+// Classifies a measured laser-field displacement (physical − commanded, per
+// dot) as genuine radial field distortion — pincushion/barrel curvature the
+// bi-cubic pre-distortion above will fix, or a uniform scale/pitch error a
+// LightBurn/EZCAD recal will fix — vs. it being measurement scatter that
+// neither would help with.
+
+/// Below `MIN_DOTS` samples, the `k1·r + k3·r³` fit has too few residual
+/// degrees of freedom for a fixed `RATIO_THRESHOLD` to hold: Monte-Carlo
+/// stress testing pure isotropic noise (no true field distortion) against
+/// `classify_field_error` shows `n = 6` (the naive "2-parameter fit needs
+/// ≥3 points" floor) lets scatter cross `ratio ≥ RATIO_THRESHOLD` and read as
+/// genuine `Systematic` pincushion/barrel in ~1-in-5,000–10,000 trials at
+/// realistic (10–30 µm) noise — a false "correction will help" call. `n = 9`
+/// already showed zero false `Systematic` reads (20,000 trials) but still a
+/// non-trivial `Borderline` rate; `n ≥ 16` (the field grid the UI's
+/// `fit_laser_field` actually gates, ≥4×4) showed zero of either across
+/// 20,000+ trials. `10` sits above the observed danger zone with margin,
+/// while staying below every real call site's grid size.
+const MIN_DOTS: usize = 10;
+/// Need at least this many samples outside the center-exclusion radius to
+/// trust the radial slope and still have residual degrees of freedom.
+const MIN_OFFCENTER: usize = 4;
+/// Sample positions must span at least this far end-to-end, mm. Smaller than
+/// any real grid pitch used elsewhere in this codebase (10–20 mm in
+/// tests/fixtures), so a normal grid always clears it; a clustered or
+/// duplicated set doesn't.
+const MIN_SPAN_MM: f64 = 3.0;
+/// Bounding-box `min(width,height)/max(width,height)` of sample positions
+/// must clear this. Below it the samples are nearly collinear and a 2-D
+/// radial model isn't identifiable.
+const MIN_ASPECT: f64 = 0.15;
+/// `systematic_um` must clear this before it's trusted at all, independent
+/// of `ratio`. Below the typical clean-fit RMS this codebase already reports
+/// (`FieldMap::rms_um`/`LensMap::rms_um`, commonly 20–60 µm in fixtures) but
+/// above plausible pure-detection noise.
+const ABS_FLOOR_UM: f64 = 15.0;
+/// Floor for a `Borderline` call — half of `ABS_FLOOR_UM`.
+const BORDERLINE_FLOOR_UM: f64 = ABS_FLOOR_UM / 2.0;
+/// `systematic_um` must be at least this many times `noise_um` for a firm
+/// `Systematic`/`UniformScale` verdict.
+const RATIO_THRESHOLD: f64 = 2.0;
+/// Below `RATIO_THRESHOLD` but at/above this (and past `BORDERLINE_FLOOR_UM`)
+/// reads as `Borderline` rather than flat `Noise`.
+const RATIO_BORDERLINE: f64 = 1.3;
+/// Points within `max(CENTER_EXCLUDE_MM, CENTER_EXCLUDE_FRAC·r_max)` of the
+/// center are excluded from the `MIN_OFFCENTER` *count* only — not from the
+/// fit itself, where small `r` already down-weights them naturally.
+const CENTER_EXCLUDE_MM: f64 = 0.5;
+const CENTER_EXCLUDE_FRAC: f64 = 0.05;
+/// Below this radius a sample's direction is undefined; its whole
+/// displacement is folded into `noise_um`, none into the radial fit.
+const EPS_MM: f64 = 1e-6;
+
+/// Why `classify_field_error` couldn't reach a
+/// `Systematic`/`UniformScale`/`Borderline`/`Noise` verdict — the sample set
+/// itself doesn't constrain the radial fit enough to trust any answer.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum InconclusiveReason {
+    /// Fewer than `MIN_DOTS` samples total.
+    TooFewDots,
+    /// Fewer than `MIN_OFFCENTER` samples fall outside the center-exclusion
+    /// radius, so the radial slope is unconstrained.
+    TooFewOffCenter,
+    /// Sample positions span less than `MIN_SPAN_MM` end to end.
+    SpanTooSmall,
+    /// Sample positions are nearly collinear (bounding-box aspect below
+    /// `MIN_ASPECT`).
+    SpanTooThin,
+}
+
+/// What a measured laser-field displacement sample set looks like, per
+/// [`classify_field_error`].
+#[derive(Debug, Clone, Copy, PartialEq)]
+pub enum FieldPattern {
+    /// The cubic (curvature) term dominates and clears the noise floor:
+    /// genuine pincushion/barrel field curvature — the bi-cubic
+    /// pre-distortion ([`fit_field`]) will measurably fix this.
+    Systematic { pincushion: bool },
+    /// Signal clears the noise floor, but the linear term dominates over the
+    /// cubic one: reads as a uniform radial scale/pitch error, not
+    /// curvature — a LightBurn/EZCAD origin & scale recal is likely simpler
+    /// than field pre-distortion.
+    UniformScale,
+    /// Some radial trend above the noise floor, but not enough to commit to
+    /// either verdict above — a wider/denser grid would sharpen the call.
+    Borderline,
+    /// No radial trend distinguishable from scatter: correcting won't help
+    /// (and risks overfitting) — points elsewhere (LightBurn/EZCAD recal, or
+    /// the field is already tight).
+    Noise,
+    /// Not enough / not well-distributed data to tell either way.
+    Inconclusive(InconclusiveReason),
+}
+
+/// Classification of a measured laser-field error against a radial
+/// (pincushion/barrel/uniform-scale) model, vs. it being measurement
+/// scatter. Returned by [`classify_field_error`].
+#[derive(Debug, Clone, PartialEq)]
+pub struct FieldVerdict {
+    pub pattern: FieldPattern,
+    /// Distortion-center estimate: the centroid of `position_mm` across all
+    /// samples, machine mm. `None` only when `samples` is empty.
+    pub center_mm: Option<Point2<f64>>,
+    /// Fitted linear radial coefficient from `rad(r) ≈ k1·r + k3·r³`, µm per
+    /// mm of radius — a uniform scale/pitch error, NOT curvature. `0.0`
+    /// whenever `pattern` is `Inconclusive` (no fit attempted).
+    pub k1_um_per_mm: f64,
+    /// Fitted cubic radial coefficient, µm per mm³ of radius. Positive =
+    /// pincushion (grows outward), negative = barrel. `0.0` whenever
+    /// `pattern` is `Inconclusive`.
+    pub k3_um_per_mm3: f64,
+    /// RMS of the full fitted radial model (`k1·r + k3·r³`) over all
+    /// samples, µm — the "systematic signal".
+    pub systematic_um: f64,
+    /// RMS of the cubic term alone over all samples, µm — used to decide
+    /// `Systematic` vs `UniformScale`.
+    pub curvature_um: f64,
+    /// RMS of the linear term alone over all samples, µm.
+    pub linear_um: f64,
+    /// RMS of what's left after subtracting the fitted radial model
+    /// (tangential component + radial-fit residual) over all samples, µm —
+    /// the "noise floor". In an `Inconclusive` verdict this is just the RMS
+    /// of the raw displacement magnitudes (no fit attempted).
+    pub noise_um: f64,
+    /// `systematic_um / noise_um`. `0.0` whenever `pattern` is
+    /// `Inconclusive`. Effectively unbounded (divides by `f64::EPSILON`)
+    /// when `noise_um` is exactly `0.0`.
+    pub ratio: f64,
+    /// Farthest sample from `center_mm`, mm. `0.0` when `samples` is empty.
+    pub edge_radius_mm: f64,
+    /// Sample count passed in.
+    pub n: usize,
+}
+
+/// Classify a set of `(position_mm, displacement_mm)` laser-field samples —
+/// `displacement_mm = physical_mm − commanded_mm` for each burned dot,
+/// `position_mm` the dot's **commanded** (exact, not camera-measured)
+/// coordinate — as genuine radial field distortion (pincushion/barrel
+/// curvature, or a uniform scale error) vs. measurement scatter.
+///
+/// `position_mm` is deliberately the commanded coordinate, not `physical_mm`:
+/// it's exact by construction (it's what the grid generator was told), so it
+/// doesn't drag camera/lens-fit noise into the radius estimate the way
+/// `physical_mm` would.
+///
+/// Never fails: degenerate input (too few dots, a degenerate span, pure
+/// noise) comes back as `FieldPattern::Inconclusive`/`Noise`, not `Err`.
+pub fn classify_field_error(samples: &[(Point2<f64>, Vector2<f64>)]) -> FieldVerdict {
+    let n = samples.len();
+    if n == 0 {
+        return FieldVerdict {
+            pattern: FieldPattern::Inconclusive(InconclusiveReason::TooFewDots),
+            center_mm: None,
+            k1_um_per_mm: 0.0,
+            k3_um_per_mm3: 0.0,
+            systematic_um: 0.0,
+            curvature_um: 0.0,
+            linear_um: 0.0,
+            noise_um: 0.0,
+            ratio: 0.0,
+            edge_radius_mm: 0.0,
+            n: 0,
+        };
+    }
+
+    // Center: centroid of commanded positions. No nonlinear fit — see doc
+    // comment above.
+    let mut center = Point2::new(0.0, 0.0);
+    for (p, _) in samples {
+        center.x += p.x;
+        center.y += p.y;
+    }
+    center.x /= n as f64;
+    center.y /= n as f64;
+
+    // Per-sample radius, plus the position bounding box (span/aspect gates).
+    let mut r = vec![0.0_f64; n];
+    let mut r_max = 0.0_f64;
+    let (mut min_x, mut max_x, mut min_y, mut max_y) = (
+        f64::INFINITY,
+        f64::NEG_INFINITY,
+        f64::INFINITY,
+        f64::NEG_INFINITY,
+    );
+    for (i, (p, _)) in samples.iter().enumerate() {
+        r[i] = ((p.x - center.x).powi(2) + (p.y - center.y).powi(2)).sqrt();
+        r_max = r_max.max(r[i]);
+        min_x = min_x.min(p.x);
+        max_x = max_x.max(p.x);
+        min_y = min_y.min(p.y);
+        max_y = max_y.max(p.y);
+    }
+    let width = (max_x - min_x).max(0.0);
+    let height = (max_y - min_y).max(0.0);
+    let aspect = width.min(height) / width.max(height).max(1e-9);
+
+    // RMS displacement magnitude over all samples — the fallback `noise_um`
+    // used by every early-exit (Inconclusive) branch below, no fit attempted.
+    let raw_noise_um = {
+        let sumsq: f64 = samples
+            .iter()
+            .map(|(_, d)| (d.x * 1000.0).powi(2) + (d.y * 1000.0).powi(2))
+            .sum();
+        (sumsq / n as f64).sqrt()
+    };
+    let inconclusive = |reason: InconclusiveReason| FieldVerdict {
+        pattern: FieldPattern::Inconclusive(reason),
+        center_mm: Some(center),
+        k1_um_per_mm: 0.0,
+        k3_um_per_mm3: 0.0,
+        systematic_um: 0.0,
+        curvature_um: 0.0,
+        linear_um: 0.0,
+        noise_um: raw_noise_um,
+        ratio: 0.0,
+        edge_radius_mm: r_max,
+        n,
+    };
+
+    if n < MIN_DOTS {
+        return inconclusive(InconclusiveReason::TooFewDots);
+    }
+    if r_max < MIN_SPAN_MM {
+        return inconclusive(InconclusiveReason::SpanTooSmall);
+    }
+    if aspect < MIN_ASPECT {
+        return inconclusive(InconclusiveReason::SpanTooThin);
+    }
+
+    let r_min = CENTER_EXCLUDE_MM.max(CENTER_EXCLUDE_FRAC * r_max);
+    let offcenter = r.iter().filter(|&&ri| ri >= r_min).count();
+    if offcenter < MIN_OFFCENTER {
+        return inconclusive(InconclusiveReason::TooFewOffCenter);
+    }
+
+    // Signed radial component per sample (all n; r_i > EPS_MM only —
+    // direction is undefined at r=0, that displacement is pure noise below).
+    let mut rad = vec![0.0_f64; n];
+    for (i, (p, d)) in samples.iter().enumerate() {
+        if r[i] > EPS_MM {
+            let ux = (p.x - center.x) / r[i];
+            let uy = (p.y - center.y) / r[i];
+            rad[i] = (d.x * 1000.0) * ux + (d.y * 1000.0) * uy;
+        }
+    }
+
+    // Closed-form fit rad(r) ≈ k1·r + k3·r³ — 2×2 normal equations, no SVD
+    // needed for one dependent variable and two basis columns.
+    let (mut s11, mut s13, mut s33, mut b1, mut b3) = (0.0, 0.0, 0.0, 0.0, 0.0);
+    for i in 0..n {
+        let ri = r[i];
+        if ri <= EPS_MM {
+            continue;
+        }
+        let r3 = ri * ri * ri;
+        s11 += ri * ri;
+        s13 += ri * r3;
+        s33 += r3 * r3;
+        b1 += ri * rad[i];
+        b3 += r3 * rad[i];
+    }
+    let det = s11 * s33 - s13 * s13;
+    let (k1, k3) = if det.abs() > 1e-9 {
+        ((b1 * s33 - b3 * s13) / det, (s11 * b3 - s13 * b1) / det)
+    } else {
+        // Degenerate design (e.g. all off-center points equidistant from the
+        // centroid) — no reliable slope; treat as no signal.
+        (0.0, 0.0)
+    };
+
+    // Systematic vs. noise, over ALL n samples (orthogonal per-sample split:
+    // predicted radial component vs. everything else — tangential +
+    // radial-fit residual).
+    let (mut sum_pred2, mut sum_curv2, mut sum_lin2, mut sum_resid2) = (0.0, 0.0, 0.0, 0.0);
+    for (i, (p, d)) in samples.iter().enumerate() {
+        let ri = r[i];
+        let lin = k1 * ri;
+        let curv = k3 * ri * ri * ri;
+        let pred = lin + curv;
+        sum_pred2 += pred * pred;
+        sum_curv2 += curv * curv;
+        sum_lin2 += lin * lin;
+        let dx_um = d.x * 1000.0;
+        let dy_um = d.y * 1000.0;
+        let (rx, ry) = if ri > EPS_MM {
+            let ux = (p.x - center.x) / ri;
+            let uy = (p.y - center.y) / ri;
+            (dx_um - pred * ux, dy_um - pred * uy)
+        } else {
+            (dx_um, dy_um)
+        };
+        sum_resid2 += rx * rx + ry * ry;
+    }
+    let systematic_um = (sum_pred2 / n as f64).sqrt();
+    let curvature_um = (sum_curv2 / n as f64).sqrt();
+    let linear_um = (sum_lin2 / n as f64).sqrt();
+    let noise_um = (sum_resid2 / n as f64).sqrt();
+    let ratio = systematic_um / noise_um.max(f64::EPSILON);
+
+    let pattern = if systematic_um >= ABS_FLOOR_UM && ratio >= RATIO_THRESHOLD {
+        if curvature_um >= linear_um {
+            FieldPattern::Systematic {
+                pincushion: k3 > 0.0,
+            }
+        } else {
+            FieldPattern::UniformScale
+        }
+    } else if systematic_um >= BORDERLINE_FLOOR_UM && ratio >= RATIO_BORDERLINE {
+        FieldPattern::Borderline
+    } else {
+        FieldPattern::Noise
+    };
+
+    FieldVerdict {
+        pattern,
+        center_mm: Some(center),
+        k1_um_per_mm: k1,
+        k3_um_per_mm3: k3,
+        systematic_um,
+        curvature_um,
+        linear_um,
+        noise_um,
+        ratio,
+        edge_radius_mm: r_max,
+        n,
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -442,5 +772,226 @@ mod tests {
             "round-trip precompensation: ({a},{b}) vs ({c},{d})"
         );
         assert!((restored.rms_um - field.rms_um).abs() < 1e-3);
+    }
+
+    #[test]
+    fn classify_pincushion_reads_systematic() {
+        let mut samples = Vec::new();
+        for r in 0..7 {
+            for c in 0..7 {
+                let cmd = (c as f64 * 20.0, r as f64 * 20.0);
+                let phys = laser_field(cmd);
+                samples.push((
+                    Point2::new(cmd.0, cmd.1),
+                    Vector2::new(phys.0 - cmd.0, phys.1 - cmd.1),
+                ));
+            }
+        }
+        let v = classify_field_error(&samples);
+        assert!(
+            matches!(v.pattern, FieldPattern::Systematic { pincushion: true }),
+            "{:?}",
+            v.pattern
+        );
+        assert!(v.ratio >= 2.0);
+    }
+
+    #[test]
+    fn classify_barrel_sign_flips() {
+        // Same shape as laser_field but k = -0.03 (barrel).
+        let barrel = |cmd: (f64, f64)| {
+            let (du, dv) = (cmd.0 - 70.0, cmd.1 - 70.0);
+            let r2 = (du * du + dv * dv) / (70.0 * 70.0);
+            let f = 1.0 - 0.03 * r2;
+            (70.0 + du * f, 70.0 + dv * f)
+        };
+        let mut samples = Vec::new();
+        for r in 0..7 {
+            for c in 0..7 {
+                let cmd = (c as f64 * 20.0, r as f64 * 20.0);
+                let phys = barrel(cmd);
+                samples.push((
+                    Point2::new(cmd.0, cmd.1),
+                    Vector2::new(phys.0 - cmd.0, phys.1 - cmd.1),
+                ));
+            }
+        }
+        let v = classify_field_error(&samples);
+        assert!(matches!(
+            v.pattern,
+            FieldPattern::Systematic { pincushion: false }
+        ));
+    }
+
+    #[test]
+    fn classify_uniform_scale_is_not_pincushion() {
+        // Pure 5% scale error, no r² term.
+        let mut samples = Vec::new();
+        for r in 0..7 {
+            for c in 0..7 {
+                let cmd = (c as f64 * 20.0, r as f64 * 20.0);
+                let (du, dv) = (cmd.0 - 70.0, cmd.1 - 70.0);
+                let phys = (70.0 + du * 1.05, 70.0 + dv * 1.05);
+                samples.push((
+                    Point2::new(cmd.0, cmd.1),
+                    Vector2::new(phys.0 - cmd.0, phys.1 - cmd.1),
+                ));
+            }
+        }
+        let v = classify_field_error(&samples);
+        assert_eq!(v.pattern, FieldPattern::UniformScale);
+    }
+
+    #[test]
+    fn classify_random_scatter_reads_noise() {
+        // Deterministic pseudo-noise (no RNG dep): hash-based jitter, no radial
+        // structure, amplitude comparable to real camera/detection noise.
+        fn jitter(seed: u64) -> f64 {
+            let x = seed.wrapping_mul(2654435761) ^ (seed >> 13);
+            ((x % 1000) as f64 / 1000.0 - 0.5) * 0.02 // ±10 µm
+        }
+        let mut samples = Vec::new();
+        let mut seed = 1u64;
+        for r in 0..7 {
+            for c in 0..7 {
+                let cmd = (c as f64 * 20.0, r as f64 * 20.0);
+                seed = seed.wrapping_add(1);
+                let dx = jitter(seed);
+                seed = seed.wrapping_add(1);
+                let dy = jitter(seed);
+                samples.push((Point2::new(cmd.0, cmd.1), Vector2::new(dx, dy)));
+            }
+        }
+        let v = classify_field_error(&samples);
+        assert_eq!(v.pattern, FieldPattern::Noise, "{v:?}");
+    }
+
+    #[test]
+    fn classify_too_few_dots_is_inconclusive() {
+        let samples = vec![
+            (Point2::new(0.0, 0.0), Vector2::new(0.01, 0.0)),
+            (Point2::new(10.0, 0.0), Vector2::new(0.02, 0.0)),
+        ];
+        let v = classify_field_error(&samples);
+        assert_eq!(
+            v.pattern,
+            FieldPattern::Inconclusive(InconclusiveReason::TooFewDots)
+        );
+    }
+
+    /// Deterministic xorshift64* PRNG + a 12-uniform CLT approximation to
+    /// ~N(0,1) — matches the pattern `fiducial::tests` already uses for
+    /// noise, no `rand` dependency.
+    struct Rng(u64);
+    impl Rng {
+        fn next_f64(&mut self) -> f64 {
+            self.0 ^= self.0 << 13;
+            self.0 ^= self.0 >> 7;
+            self.0 ^= self.0 << 17;
+            (self.0.wrapping_mul(0x2545F4914F6CDD1D) >> 11) as f64 / (1u64 << 53) as f64
+        }
+        /// Approximately `N(0, sigma²)`.
+        fn gauss(&mut self, sigma: f64) -> f64 {
+            let mut s = 0.0;
+            for _ in 0..12 {
+                s += self.next_f64();
+            }
+            (s - 6.0) * sigma
+        }
+    }
+
+    /// Adversarial check (a): pure isotropic noise, no true field distortion,
+    /// must never read as `Systematic` — at ANY sample count `classify_field_error`
+    /// accepts, not just the well-populated grids the other tests use.
+    ///
+    /// Monte-Carlo stress testing (20,000+ trials/cell, not committed here —
+    /// see `docs/decisions.md`) found the old `MIN_DOTS = 6` let noise cross
+    /// `ratio ≥ RATIO_THRESHOLD` in ~1-in-5,000–10,000 trials at the boundary
+    /// `n`; `MIN_DOTS` was raised to 10 to clear that. This test locks the
+    /// fix in cheaply: many seeds at exactly the (now-safe) `MIN_DOTS`
+    /// boundary, asserting `Systematic` never fires on pure scatter.
+    #[test]
+    fn classify_pure_noise_at_min_dots_boundary_never_reads_systematic() {
+        // n = MIN_DOTS = 10, a 2×5 lattice — clears span/aspect/off-center
+        // gates but has minimal residual degrees of freedom for the radial
+        // fit, the regime where a fixed ratio threshold is most exposed.
+        let base: Vec<(f64, f64)> = (0..2)
+            .flat_map(|r| (0..5).map(move |c| (c as f64 * 20.0, r as f64 * 20.0)))
+            .collect();
+        assert_eq!(base.len(), MIN_DOTS);
+        for sigma_um in [5.0_f64, 10.0, 15.0, 20.0, 30.0] {
+            for trial in 0..500u64 {
+                let mut rng = Rng(0xD00D_u64
+                    ^ trial.wrapping_mul(0x9E37_79B9_7F4A_7C15)
+                    ^ (sigma_um as u64) << 32);
+                let samples: Vec<_> = base
+                    .iter()
+                    .map(|&(x, y)| {
+                        let dx = rng.gauss(sigma_um) / 1000.0;
+                        let dy = rng.gauss(sigma_um) / 1000.0;
+                        (Point2::new(x, y), Vector2::new(dx, dy))
+                    })
+                    .collect();
+                let v = classify_field_error(&samples);
+                assert!(
+                    !matches!(v.pattern, FieldPattern::Systematic { .. }),
+                    "pure noise misread as Systematic at sigma={sigma_um}µm trial={trial}: {v:?}"
+                );
+            }
+        }
+    }
+
+    /// Adversarial check (b): a genuine ~2–4% pincushion PLUS realistic
+    /// per-dot detection noise (not the noise-free fixture the other
+    /// pincushion tests use) must still read as `Systematic { pincushion:
+    /// true }` with a comfortable ratio — proving the noise floor doesn't
+    /// eat the real signal. Covers both a normal 7×7 field grid and the
+    /// smallest grid the UI actually allows (4×4, `fit_laser_field`'s floor).
+    #[test]
+    fn classify_pincushion_survives_realistic_measurement_noise() {
+        let pincushion = |pct: f64, half_span: f64, cmd: (f64, f64)| {
+            let (du, dv) = (cmd.0 - half_span, cmd.1 - half_span);
+            let r2 = (du * du + dv * dv) / (half_span * half_span);
+            let f = 1.0 + pct * r2;
+            (half_span + du * f, half_span + dv * f)
+        };
+        for &side in &[4usize, 7] {
+            let half_span = (side - 1) as f64 * 20.0 / 2.0;
+            for &pct in &[0.02_f64, 0.03, 0.04] {
+                for &sigma_um in &[5.0_f64, 10.0, 15.0] {
+                    for trial in 0..20u64 {
+                        let mut rng = Rng(0xF00D_u64
+                            ^ trial.wrapping_mul(0x2545_F491_4F6C_DD1D)
+                            ^ (side as u64) << 48
+                            ^ ((pct * 1000.0) as u64) << 8
+                            ^ (sigma_um as u64) << 24);
+                        let mut samples = Vec::new();
+                        for r in 0..side {
+                            for c in 0..side {
+                                let cmd = (c as f64 * 20.0, r as f64 * 20.0);
+                                let phys = pincushion(pct, half_span, cmd);
+                                let dx = phys.0 - cmd.0 + rng.gauss(sigma_um) / 1000.0;
+                                let dy = phys.1 - cmd.1 + rng.gauss(sigma_um) / 1000.0;
+                                samples.push((Point2::new(cmd.0, cmd.1), Vector2::new(dx, dy)));
+                            }
+                        }
+                        let v = classify_field_error(&samples);
+                        assert!(
+                            matches!(v.pattern, FieldPattern::Systematic { pincushion: true }),
+                            "side={side} pct={pct} sigma={sigma_um}µm trial={trial}: \
+                             expected pincushion, got {:?} (ratio={:.2})",
+                            v.pattern,
+                            v.ratio
+                        );
+                        assert!(
+                            v.ratio >= RATIO_THRESHOLD,
+                            "side={side} pct={pct} sigma={sigma_um}µm trial={trial}: \
+                             ratio {:.2} below threshold",
+                            v.ratio
+                        );
+                    }
+                }
+            }
+        }
     }
 }

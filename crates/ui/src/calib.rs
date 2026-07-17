@@ -15,10 +15,10 @@
 //! console flags a stale calibration.
 
 use image::GrayImage;
-use nalgebra::{Matrix3, Point2};
+use nalgebra::{Matrix3, Point2, Vector2};
 use vision::{
-    BedMap, FiducialProfile, FieldMap, Homography, LensMap, find_fiducials, fit_field,
-    fit_homography, fit_lens,
+    BedMap, FiducialProfile, FieldMap, FieldVerdict, Homography, LensMap, classify_field_error,
+    find_fiducials, fit_field, fit_homography, fit_lens,
 };
 
 /// How the grid dots read against their background. A **printed** reference
@@ -357,6 +357,10 @@ pub struct FieldCal {
     pub dots: Vec<FieldDot>,
     pub found: usize,
     pub total: usize,
+    /// Whether the measured field error is genuine radial distortion the
+    /// correction will fix, or scatter it won't help with — see
+    /// `vision::classify_field_error`.
+    pub field_verdict: FieldVerdict,
 }
 
 /// Fit the laser field pre-distortion from a frame of the **burned** grid and
@@ -407,6 +411,13 @@ pub fn fit_laser_field(
         .collect();
     let to_px = fit_homography(&to_px_pairs).map_err(|e| format!("overlay fit: {e}"))?;
 
+    let field_verdict = classify_field_error(
+        &field_pairs
+            .iter()
+            .map(|(phys, cmd)| (*cmd, Vector2::new(phys.x - cmd.x, phys.y - cmd.y)))
+            .collect::<Vec<_>>(),
+    );
+
     let dots: Vec<FieldDot> = pairs
         .iter()
         .zip(&field_pairs)
@@ -429,6 +440,7 @@ pub fn fit_laser_field(
         dots,
         found,
         total,
+        field_verdict,
     })
 }
 
@@ -881,6 +893,82 @@ mod tests {
             let err = ((lx - tx).powi(2) + (ly - ty).powi(2)).sqrt() * 1000.0;
             assert!(err < 80.0, "target ({tx},{ty}) off by {err:.0} µm");
         }
+
+        // The genuine ~3% pincushion is classified as such, not written off as
+        // scatter — this is what routes the operator to "correction will help"
+        // in the ③ status block.
+        assert!(
+            matches!(
+                cal.field_verdict.pattern,
+                vision::FieldPattern::Systematic { pincushion: true }
+            ),
+            "expected a pincushion verdict, got {:?}",
+            cal.field_verdict.pattern
+        );
+        assert!(cal.field_verdict.ratio >= 2.0);
+    }
+
+    /// A burned grid with NO field distortion (commanded == physical, up to
+    /// camera/detection quantization) must NOT be misread as pincushion — the
+    /// diagnostic's whole point is to not flag noise as a real field problem.
+    #[test]
+    fn laser_field_fit_flat_grid_reads_noise_not_pincushion() {
+        let grid = GridSpec {
+            origin_mm: (0.0, 0.0),
+            pitch_mm: 10.0,
+            n: 7,
+        };
+        let dot_mm = 1.5;
+        let cam = |phx: f64, phy: f64| (10.0 * phx + 50.0, 10.0 * phy + 50.0);
+
+        let lens_pairs: Vec<(Point2<f64>, Point2<f64>)> = grid
+            .points()
+            .iter()
+            .map(|&(x, y)| {
+                let (u, v) = cam(x, y);
+                (Point2::new(u, v), Point2::new(x, y))
+            })
+            .collect();
+        let lens = fit_lens(&lens_pairs).expect("lens");
+
+        // Burned grid: commanded dots land exactly where commanded (no field
+        // distortion), imaged by the same camera map.
+        let centers: Vec<(f64, f64, f64)> = grid
+            .points()
+            .iter()
+            .map(|&(cx, cy)| {
+                let (u, v) = cam(cx, cy);
+                (u, v, dot_mm * 10.0)
+            })
+            .collect();
+        let (w, h) = (720u32, 720u32);
+        let img = GrayImage::from_fn(w, h, |x, y| {
+            let mut cover = 0.0;
+            for sy in 0..4 {
+                for sx in 0..4 {
+                    let px = x as f64 + (sx as f64 + 0.5) / 4.0 - 0.5;
+                    let py = y as f64 + (sy as f64 + 0.5) / 4.0 - 0.5;
+                    if centers.iter().any(|&(cx, cy, r)| {
+                        ((px - cx).powi(2) + (py - cy).powi(2)).sqrt() < r / 2.0
+                    }) {
+                        cover += 1.0 / 16.0;
+                    }
+                }
+            }
+            image::Luma([(210.0 - 150.0 * cover) as u8])
+        });
+        let corners_px = grid.corners_mm().map(|(cx, cy)| cam(cx, cy));
+
+        let cal = fit_laser_field(&img, corners_px, &grid, dot_mm, DotKind::Dark, &lens)
+            .expect("field fit");
+        assert!(
+            !matches!(
+                cal.field_verdict.pattern,
+                vision::FieldPattern::Systematic { .. }
+            ),
+            "a flat field must not be flagged as systematic distortion: {:?}",
+            cal.field_verdict.pattern
+        );
     }
 
     #[test]

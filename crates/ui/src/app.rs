@@ -1411,8 +1411,12 @@ impl ConsoleApp {
                         self.calib_note = match saved {
                             Ok(()) => format!(
                                 "field: {}/{} dots, corrects {:.0} µm worst field error to \
-                                 {:.0} µm RMS — Etch here can now compensate the laser field",
-                                cal.found, cal.total, worst, cal.field.rms_um
+                                 {:.0} µm RMS — {} — Etch here can now compensate the laser field",
+                                cal.found,
+                                cal.total,
+                                worst,
+                                cal.field.rms_um,
+                                field_verdict_phrase(&cal.field_verdict)
                             ),
                             Err(e) => format!(
                                 "field fit ok ({}/{} dots) but saving {} failed: {e}",
@@ -1786,7 +1790,12 @@ impl ConsoleApp {
             None => "none".into(),
         };
         let field = match &self.calib_field {
-            Some(c) => format!("{} dots, RMS {:.0}µm", c.found, c.field.rms_um),
+            Some(c) => format!(
+                "{} dots, RMS {:.0}µm, verdict={}",
+                c.found,
+                c.field.rms_um,
+                field_verdict_token(&c.field_verdict)
+            ),
             None => "none".into(),
         };
         let cam = match &self.cam_last {
@@ -2389,7 +2398,21 @@ impl ConsoleApp {
                     ),
                 };
                 ui.colored_label(status_color(ok), status);
-                if self.calib_field.is_some() {
+                if let Some(c) = &self.calib_field {
+                    use vision::FieldPattern;
+                    // `ok` (green) marks a CONCLUSIVE read either way — genuine
+                    // distortion to correct, or confirmed clean (nothing to
+                    // correct). Amber is reserved for actual uncertainty: not
+                    // enough/well-distributed data to tell signal from scatter.
+                    let (glyph, verdict_ok) = match c.field_verdict.pattern {
+                        FieldPattern::Systematic { .. } | FieldPattern::UniformScale => ("⬤", true),
+                        FieldPattern::Noise => ("○", true),
+                        FieldPattern::Borderline | FieldPattern::Inconclusive(_) => ("?", false),
+                    };
+                    ui.colored_label(
+                        status_color(verdict_ok),
+                        format!("{glyph} {}", field_verdict_phrase(&c.field_verdict)),
+                    );
                     ui.weak(format!(
                         "Correction file: {}. Turn on \"compensate field\" on the Place tab.",
                         self.field_map_path().display()
@@ -3479,6 +3502,71 @@ fn status_color(ok: bool) -> Color32 {
         Color32::from_rgb(0x50, 0xb0, 0x60)
     } else {
         Color32::from_rgb(0xe0, 0x90, 0x20)
+    }
+}
+
+/// Operator-facing phrase for a laser-field pincushion-vs-noise verdict.
+fn field_verdict_phrase(v: &vision::FieldVerdict) -> String {
+    use vision::{FieldPattern, InconclusiveReason};
+    match v.pattern {
+        FieldPattern::Systematic { pincushion } => format!(
+            "{} detected ({:.1}× noise floor, {:.0} µm signal vs {:.0} µm scatter) — \
+             correction should help",
+            if pincushion { "pincushion" } else { "barrel" },
+            v.ratio,
+            v.systematic_um,
+            v.noise_um
+        ),
+        FieldPattern::UniformScale => format!(
+            "looks like a uniform scale error, not curvature ({:.0} µm signal vs {:.0} µm \
+             scatter) — a LightBurn/EZCAD origin & scale recal may be simpler than field \
+             correction",
+            v.systematic_um, v.noise_um
+        ),
+        FieldPattern::Borderline => format!(
+            "borderline — {:.0} µm signal vs {:.0} µm scatter isn't conclusive yet — burn a \
+             wider/denser grid before trusting this correction",
+            v.systematic_um, v.noise_um
+        ),
+        FieldPattern::Noise => format!(
+            "no systematic pattern above the noise floor ({:.0} µm signal vs {:.0} µm scatter) \
+             — this field is likely already good; don't enable correction here. If dots still \
+             land visibly off, that's a LightBurn/EZCAD origin & scale issue, not field \
+             curvature",
+            v.systematic_um, v.noise_um
+        ),
+        FieldPattern::Inconclusive(reason) => format!(
+            "can't tell pattern from noise yet ({}) — burn a wider/denser grid",
+            match reason {
+                InconclusiveReason::TooFewDots => "too few dots",
+                InconclusiveReason::TooFewOffCenter => "too few dots away from the field center",
+                InconclusiveReason::SpanTooSmall => "dots too clustered",
+                InconclusiveReason::SpanTooThin => "dots too nearly collinear",
+            }
+        ),
+    }
+}
+
+/// Short machine-greppable token for `debug_summary()` / headless tests.
+fn field_verdict_token(v: &vision::FieldVerdict) -> String {
+    use vision::{FieldPattern, InconclusiveReason};
+    match v.pattern {
+        FieldPattern::Systematic { pincushion: true } => {
+            format!("pincushion(ratio={:.1})", v.ratio)
+        }
+        FieldPattern::Systematic { pincushion: false } => format!("barrel(ratio={:.1})", v.ratio),
+        FieldPattern::UniformScale => format!("uniform_scale(ratio={:.1})", v.ratio),
+        FieldPattern::Borderline => format!("borderline(ratio={:.1})", v.ratio),
+        FieldPattern::Noise => format!("noise(ratio={:.1})", v.ratio),
+        FieldPattern::Inconclusive(reason) => format!(
+            "inconclusive({})",
+            match reason {
+                InconclusiveReason::TooFewDots => "too_few_dots",
+                InconclusiveReason::TooFewOffCenter => "too_few_offcenter",
+                InconclusiveReason::SpanTooSmall => "span_too_small",
+                InconclusiveReason::SpanTooThin => "span_too_thin",
+            }
+        ),
     }
 }
 

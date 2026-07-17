@@ -1608,3 +1608,102 @@ Model is a global bi-cubic (operator's choice) — smooth, ideal for f-theta
 pincushion, one RMS number. The field cal is session-scoped like the anchor;
 "compensate field" only arms with a live field cal so the placement frame and
 the baked correction always agree.
+
+## 2026-07-17 — Pincushion-vs-noise diagnostic for the laser field cal
+
+The ③ Laser field calibration reported an RMS/worst-error number but no way to
+tell if it was genuine radial distortion (worth correcting) or measurement
+scatter (correcting would overfit). Added `vision::classify_field_error`.
+
+- Center: the centroid of the burned grid's **commanded** coordinates, not a
+  fitted center — the commanded grid is exact by construction and already
+  centered on the field by the operator, so a centroid is a robust,
+  always-defined proxy; a fitted (cross-product regression) center was
+  considered and rejected as unneeded rigor — it adds a second linear solve,
+  a condition-number reliability gate, and a fallback path for a case the
+  centroid never hits.
+- Radial model: closed-form `rad(r) = k1·r + k3·r³` (2×2 normal equations, no
+  SVD) — the cubic term is pincushion/barrel curvature the bi-cubic
+  pre-distortion fixes; the linear term isolates a uniform scale/pitch error
+  that a LightBurn/EZCAD recal fixes instead, so the verdict can route the
+  operator to the right fix.
+  Significance: `systematic_um` (RMS of the fitted radial model) vs.
+  `noise_um` (RMS of everything the model leaves unexplained — tangential +
+  radial residual), gated by an absolute floor (15 µm) and a ratio threshold
+  (2.0×, with a 1.3×/7.5µm `Borderline` band below it) rather than a formal
+  F-test — the Cauchy–Schwarz bound (fitted signal ≤ raw signal energy)
+  already guarantees pure noise concentrates the ratio near its null value
+  without needing a critical-value table/dependency.
+- Wired into `FieldCal::field_verdict`, the ③ status block, `calib_note`, and
+  `debug_summary()`'s `laser_field:` line (`verdict=pincushion(ratio=…)` /
+  `barrel(…)` / `uniform_scale(…)` / `borderline(…)` / `noise(…)` /
+  `inconclusive(reason)`).
+- Test lock-in deviates from the letter of the UI-verification convention:
+  marking the 4 calibration corners is a canvas interaction, which
+  `AGENT_DEBUGGING.md`/CLAUDE.md already documents as undrivable via
+  accesskit. Rather than fake it with raw pointer-event injection at
+  hand-computed screen coordinates (fragile — depends on the image-view
+  zoom/pan state), the discrimination proof lives as `vision::lens` unit
+  tests (pincushion / barrel / uniform-scale / random-noise) plus two
+  `calib::fit_laser_field` tests (`laser_field_fit_recovers_precompensation`
+  asserts the verdict on a genuine pincushion fixture,
+  `laser_field_fit_flat_grid_reads_noise_not_pincushion` asserts an
+  undistorted grid is never flagged `Systematic`) — the same
+  render-grid-and-fit path the module's existing tests use, exercised through
+  the real `FieldCal`, just not through simulated mouse clicks.
+
+### Post-implementation hardening (adversarial verify pass, same day)
+
+Monte-Carlo stress-testing `classify_field_error` against pure isotropic
+noise (no true field distortion) at various `n` — not committed as a test
+itself, it's too slow/flaky at the trial counts needed to see the tail —
+found a real gap at the original `MIN_DOTS = 6`: with only `n − 2` residual
+degrees of freedom for the 2-parameter `k1·r + k3·r³` fit, a fixed
+`ratio ≥ RATIO_THRESHOLD` gate has a non-negligible false-positive tail at
+the smallest allowed `n`. 20,000-trial sweeps at realistic 10–30 µm
+per-dot noise:
+
+| n (shape)      | false `Systematic` | false `Borderline` |
+|----------------|---------------------|---------------------|
+| 6 (old MIN_DOTS, 2×3) | 2–6 / 20,000 (~0.01–0.03%) | ~130 / 20,000 (~0.65%) |
+| 9 (3×3)        | 0 / 20,000          | 10 / 20,000 (0.05%) |
+| 10 (2×5)       | 0 / 30,000          | 2 / 30,000 |
+| 12 (3×4)       | 0 / 30,000          | 1 / 30,000 |
+| 16 (4×4)       | 0 / 20,000          | 0 / 20,000 |
+
+So pure noise *could* occasionally read as genuine pincushion/barrel right at
+the minimum sample count — a false "correction should help" call, the
+opposite of the diagnostic's purpose. `MIN_DOTS` raised **6 → 10**: clears
+the observed danger zone with margin, and stays below every real call
+site's grid — `calib::fit_laser_field` already floors at a 4×4 (16-dot)
+grid, so this only closes a loophole in the public `classify_field_error`
+API for hypothetical smaller/non-grid callers, it doesn't change any
+production behavior.
+
+Locked in with two cheap, deterministic (xorshift64* + 12-uniform CLT
+Gaussian, no `rand` dep — same pattern `fiducial::tests` uses) regression
+tests in `vision::lens::tests`, run at normal `cargo test` speed (hundreds
+of trials, not tens of thousands):
+- `classify_pure_noise_at_min_dots_boundary_never_reads_systematic` — many
+  seeds × noise levels at exactly `n = MIN_DOTS`, asserts `Systematic` never
+  fires on scatter alone.
+- `classify_pincushion_survives_realistic_measurement_noise` — a genuine
+  2–4% pincushion PLUS realistic per-dot noise (the earlier pincushion
+  tests were noise-free fixtures), on both a 7×7 field grid and the
+  smallest grid the UI allows (4×4), asserts the signal still clears
+  `RATIO_THRESHOLD` and reads `Systematic { pincushion: true }` — proving
+  the raised floor didn't buy safety by eating real sensitivity.
+
+Also fixed two operator-facing accuracy issues found in the same pass
+(`crates/ui/src/app.rs`):
+- The ③ status block colored `FieldPattern::Noise` the same amber/warning
+  as `Borderline`/`Inconclusive`. That's backwards — `Noise` is a
+  *conclusive* good-news read (no distortion detected, don't correct),
+  same confidence tier as `Systematic`, not the same tier as genuine
+  "can't tell yet" uncertainty. Now green like `Systematic`/`UniformScale`;
+  amber is reserved for `Borderline`/`Inconclusive`.
+- `field_verdict_phrase`'s `Noise` message read as "correction likely won't
+  help (check LightBurn/EZCAD instead)", which undersold the actual
+  finding and implied something needs fixing. Reworded to lead with "this
+  field is likely already good; don't enable correction here" and demote
+  the LightBurn/EZCAD line to the fallback if dots are still visibly off.
