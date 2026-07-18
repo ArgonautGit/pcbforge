@@ -664,6 +664,12 @@ impl ConsoleApp {
     /// Persist the input fields if they changed since the last save. Cheap to
     /// call every frame — it only touches the disk on an actual edit.
     fn save_settings_if_changed(&mut self) {
+        // The live anchor rewrites the calib matrix every frame; don't churn the
+        // settings file to disk on every one. It's flushed once live stops (the
+        // matrix is only a re-anchor seed anyway) (LR-46).
+        if self.calib_live {
+            return;
+        }
         let blob = self.settings_blob();
         if blob != self.last_settings {
             let _ = std::fs::write(&self.settings_path, &blob);
@@ -846,6 +852,11 @@ impl ConsoleApp {
         }
         if i < self.fid_found.len() {
             self.fid_found.remove(i);
+        }
+        // Keep the summary/ring rows aligned too, or colours and rows index
+        // stale markers until the next Check (LR-40).
+        if i < self.fid_rows.len() {
+            self.fid_rows.remove(i);
         }
         // Lengths already match; sync is a no-op reconcile (and re-seeds only if
         // the layout still parses).
@@ -1115,11 +1126,17 @@ impl ConsoleApp {
         self.side = side;
         self.fid_search.clear();
         self.fid_found.clear();
+        self.fid_rows.clear();
         self.fid_homography = None;
         self.ar_board.clear();
         self.ar_copper.clear();
         self.ar_ablate.clear();
         self.place_job.clear();
+        // Also drop the cached frame/textures, or both tabs keep painting the
+        // other side's image until a new frame is loaded (LR-41).
+        self.place_frame_img = None;
+        self.place_tex = None;
+        self.preview_tex = None;
     }
 
     /// Current manual placement.
