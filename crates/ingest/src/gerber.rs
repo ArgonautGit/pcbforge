@@ -411,7 +411,9 @@ impl<'a> Parser<'a> {
         match name {
             ".N" => self.obj_net = (!val.is_empty()).then(|| val.to_string()),
             ".P" => {
-                let mut p = val.splitn(2, ',');
+                // `.P,<refdes>,<pin>[,<function>]` — split into 3 so the
+                // optional pad-function field (§5.6.14) isn't glued onto `pin`.
+                let mut p = val.splitn(3, ',');
                 let refdes = p.next().unwrap_or("").to_string();
                 let pin = p.next().unwrap_or("").to_string();
                 self.obj_pad = Some((refdes, pin));
@@ -486,17 +488,32 @@ impl<'a> Parser<'a> {
     // -- extended (%...%) commands ------------------------------------------
 
     fn extended(&mut self, body: &str) -> Result<(), GerberError> {
-        // A %...% block may contain several '*'-terminated records (e.g. %AM%).
-        // Dispatch on the first record's prefix; %AM% consumes the whole block.
+        // A %...% block may contain several '*'-terminated records. Most are
+        // standalone commands that legally chain (deprecated but valid
+        // RS-274X, e.g. `%LPC*LPD*%` or `%FSLAX46Y46*MOMM*%`) — dispatch every
+        // one, or a dropped record silently changes polarity/units. `%AM%` is
+        // the exception: its records are macro primitives spanning the block.
         let records: Vec<&str> = body.split('*').filter(|r| !r.is_empty()).collect();
         let first = match records.first() {
             Some(f) => *f,
             None => return Ok(()),
         };
-        if let Some(rest) = first.strip_prefix("FS") {
+        if first.starts_with("AM") {
+            return self.cmd_am(&records);
+        }
+        for rec in &records {
+            self.dispatch_extended_record(rec)?;
+        }
+        Ok(())
+    }
+
+    /// Dispatch a single `*`-terminated extended record. Not used for `%AM%`
+    /// macros, which span a whole block (see [`Parser::extended`]).
+    fn dispatch_extended_record(&mut self, rec: &str) -> Result<(), GerberError> {
+        if let Some(rest) = rec.strip_prefix("FS") {
             return self.cmd_fs(rest);
         }
-        if let Some(rest) = first.strip_prefix("MO") {
+        if let Some(rest) = rec.strip_prefix("MO") {
             return match rest {
                 "MM" => {
                     self.unit_nm = Some(1e6);
@@ -511,13 +528,10 @@ impl<'a> Parser<'a> {
                 other => Err(self.err(format!("unsupported unit mode %MO{other}%"))),
             };
         }
-        if first.starts_with("AM") {
-            return self.cmd_am(&records);
-        }
-        if let Some(rest) = first.strip_prefix("ADD") {
+        if let Some(rest) = rec.strip_prefix("ADD") {
             return self.cmd_ad(rest);
         }
-        if let Some(rest) = first.strip_prefix("LP") {
+        if let Some(rest) = rec.strip_prefix("LP") {
             self.dark = match rest {
                 "D" => true,
                 "C" => false,
@@ -528,56 +542,56 @@ impl<'a> Parser<'a> {
         // X2 attributes (Ucamco §5.6). `.TF` file attributes are pure
         // metadata; `.TA`/`.TO`/`.TD` maintain the aperture/object attribute
         // dictionary that ING-3 preserves (inert unless `track_attrs`).
-        if first.starts_with("TF") {
+        if rec.starts_with("TF") {
             return Ok(());
         }
-        if let Some(rest) = first.strip_prefix("TA") {
+        if let Some(rest) = rec.strip_prefix("TA") {
             if self.track_attrs {
                 self.set_aperture_attr(rest);
             }
             return Ok(());
         }
-        if let Some(rest) = first.strip_prefix("TO") {
+        if let Some(rest) = rec.strip_prefix("TO") {
             if self.track_attrs {
                 self.set_object_attr(rest);
             }
             return Ok(());
         }
-        if let Some(rest) = first.strip_prefix("TD") {
+        if let Some(rest) = rec.strip_prefix("TD") {
             if self.track_attrs {
                 self.delete_attr(rest);
             }
             return Ok(());
         }
-        if first.starts_with("IN") || first.starts_with("LN") || first == "IPPOS" {
+        if rec.starts_with("IN") || rec.starts_with("LN") || rec == "IPPOS" {
             return Ok(()); // legacy names / positive image polarity
         }
-        if let Some(rest) = first.strip_prefix("SR") {
+        if let Some(rest) = rec.strip_prefix("SR") {
             // Step-repeat other than the trivial 1x1 block changes geometry.
             if rest.is_empty() || rest == "X1Y1I0J0" {
                 return Ok(());
             }
             return Err(self.err(format!("unsupported step-repeat %SR{rest}%")));
         }
-        if let Some(rest) = first.strip_prefix("LM") {
+        if let Some(rest) = rec.strip_prefix("LM") {
             if rest == "N" {
                 return Ok(());
             }
             return Err(self.err(format!("unsupported load-mirror %LM{rest}%")));
         }
-        if let Some(rest) = first.strip_prefix("LR") {
+        if let Some(rest) = rec.strip_prefix("LR") {
             if rest.parse::<f64>() == Ok(0.0) {
                 return Ok(());
             }
             return Err(self.err(format!("unsupported load-rotation %LR{rest}%")));
         }
-        if let Some(rest) = first.strip_prefix("LS") {
+        if let Some(rest) = rec.strip_prefix("LS") {
             if rest.parse::<f64>() == Ok(1.0) {
                 return Ok(());
             }
             return Err(self.err(format!("unsupported load-scale %LS{rest}%")));
         }
-        Err(self.err(format!("unsupported extended command %{first}...%")))
+        Err(self.err(format!("unsupported extended command %{rec}...%")))
     }
 
     fn cmd_fs(&mut self, rest: &str) -> Result<(), GerberError> {
@@ -618,7 +632,7 @@ impl<'a> Parser<'a> {
         }
     }
 
-    fn coord_to_nm(&self, raw: i64) -> Nm {
+    fn coord_to_nm(&self, raw: i64) -> Result<Nm, GerberError> {
         let v = raw as i128 * self.coord_num;
         // Round half away from zero.
         let d = self.coord_den;
@@ -627,7 +641,9 @@ impl<'a> Parser<'a> {
         } else {
             (v - d / 2) / d
         };
-        r as Nm
+        // An absurd-but-parseable coordinate must not wrap silently through
+        // the i128→i64 cast — error naming it instead.
+        Nm::try_from(r).map_err(|_| self.err(format!("coordinate {raw} overflows the nm range")))
     }
 
     fn unit_to_nm(&self, v: f64) -> f64 {
@@ -637,6 +653,9 @@ impl<'a> Parser<'a> {
     // -- aperture definitions ------------------------------------------------
 
     fn cmd_am(&mut self, records: &[&str]) -> Result<(), GerberError> {
+        if self.unit_nm.is_none() {
+            return Err(self.err("aperture macro before %MO% unit mode (mm vs inch unknown)"));
+        }
         let name = records[0][2..].to_string();
         if name.is_empty() {
             return Err(self.err("aperture macro with empty name"));
@@ -683,6 +702,12 @@ impl<'a> Parser<'a> {
     }
 
     fn cmd_ad(&mut self, rest: &str) -> Result<(), GerberError> {
+        // Units must be known first — otherwise `unit_to_nm` would silently
+        // assume mm and shrink an inch-mode aperture 25.4× (same contract as
+        // the coordinate guard: hard error, never a silent approximation).
+        if self.unit_nm.is_none() {
+            return Err(self.err(format!("aperture ADD{rest} before %MO% unit mode")));
+        }
         // rest = "10C,0.200000" or "12RoundRect,0.135X-0.2X..." etc.
         let split = rest
             .find(|c: char| !c.is_ascii_digit())
@@ -902,10 +927,10 @@ impl<'a> Parser<'a> {
                     .map_err(|_| self.err(format!("malformed coordinate '{c}{s}' in '{w}'")))
             };
             match c {
-                'X' => x = self.coord_to_nm(parse_raw(num)?),
-                'Y' => y = self.coord_to_nm(parse_raw(num)?),
-                'I' => i_off = self.coord_to_nm(parse_raw(num)?),
-                'J' => j_off = self.coord_to_nm(parse_raw(num)?),
+                'X' => x = self.coord_to_nm(parse_raw(num)?)?,
+                'Y' => y = self.coord_to_nm(parse_raw(num)?)?,
+                'I' => i_off = self.coord_to_nm(parse_raw(num)?)?,
+                'J' => j_off = self.coord_to_nm(parse_raw(num)?)?,
                 'D' => {
                     op = Some(match num {
                         "01" | "1" => 1,
@@ -1553,6 +1578,37 @@ mod tests {
             "area {}",
             area_mm2(&layer)
         );
+    }
+
+    #[test]
+    fn a_combined_fs_mo_block_dispatches_both_records() {
+        // `%FSLAX46Y46*MOMM*%` is one block with two records; the old code
+        // dispatched only FS, dropped MO, then died "coordinate before %MO%"
+        // (LR-13).
+        let src = "%TF.FileFunction,Copper,L1,Top*%\n%FSLAX46Y46*MOMM*%\n\
+                   %ADD10C,1.000000*%\nD10*\nX0Y0D03*\nM02*\n";
+        let layer = parse_gerber(src).expect("combined FS/MO block parses");
+        assert_eq!(layer.polys.len(), 1);
+    }
+
+    #[test]
+    fn chained_polarity_records_all_apply() {
+        // `%LPC*LPD*%` must apply BOTH records, ending dark. The old code
+        // applied only LPC (clear), so the following flash subtracted instead
+        // of adding — silently wrong copper (LR-13).
+        let src = "%TF.FileFunction,Copper,L1,Top*%\n%FSLAX46Y46*%\n%MOMM*%\n\
+                   %ADD10C,1.000000*%\nD10*\n%LPC*LPD*%\nX0Y0D03*\nM02*\n";
+        let layer = parse_gerber(src).expect("parse");
+        assert!(!layer.polys.is_empty(), "final polarity must be dark (LPD won)");
+    }
+
+    #[test]
+    fn aperture_before_unit_mode_is_an_error() {
+        // No %MO% yet ⇒ mm-vs-inch unknown ⇒ hard error, never a silent mm
+        // assumption that would shrink an inch aperture 25.4× (LR-12).
+        let src = "%FSLAX46Y46*%\n%ADD10C,0.200000*%\n%MOMM*%\nM02*\n";
+        let err = parse_gerber(src).expect_err("aperture before MO must error");
+        assert!(format!("{err}").contains("MO"), "got: {err}");
     }
 
     #[test]

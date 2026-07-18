@@ -211,6 +211,7 @@ impl Parser {
         let scale = self
             .scale_nm
             .ok_or_else(|| self.err(format!("tool definition '{stmt}' before METRIC/INCH")))?;
+        require_decimal_point("tool diameter", dia_str).map_err(|e| self.err(e))?;
         let dia = decimal_to_nm(dia_str, scale)
             .map_err(|e| self.err(format!("tool T{num} diameter: {e}")))?;
         if dia <= 0 {
@@ -304,6 +305,8 @@ impl Parser {
                 "expected Y coordinate in '{whole}' (modal/partial coordinates unsupported)"
             ))
         })?;
+        require_decimal_point("X coordinate", x_str).map_err(|e| self.err(e))?;
+        require_decimal_point("Y coordinate", y_str).map_err(|e| self.err(e))?;
         let x = decimal_to_nm(x_str, scale)
             .map_err(|e| self.err(format!("X coordinate in '{whole}': {e}")))?;
         let y = decimal_to_nm(y_str, scale)
@@ -322,6 +325,22 @@ fn take_field(s: &str, letter: char) -> Option<(&str, &str)> {
         return None;
     }
     Some((&rest[..end], &rest[end..]))
+}
+
+/// A coordinate/diameter field must carry an explicit decimal point. A bare
+/// integer is the signature of a zero-suppressed / fixed-format file this
+/// parser can't disambiguate — `X001234` would silently read as 1234 mm
+/// instead of, say, 1.234 mm (LR-32). (The general [`decimal_to_nm`] converter
+/// still accepts whole numbers; only file coordinate/diameter fields are gated.)
+fn require_decimal_point(kind: &str, s: &str) -> Result<(), String> {
+    if s.contains('.') {
+        Ok(())
+    } else {
+        Err(format!(
+            "{kind} '{s}' has no decimal point — only explicit-decimal Excellon \
+             is supported (zero-suppressed / fixed-format coordinates are ambiguous)"
+        ))
+    }
 }
 
 /// Convert a decimal string in file units to integer nanometers exactly.
@@ -374,6 +393,23 @@ fn decimal_to_nm(s: &str, scale_nm: i64) -> Result<Nm, String> {
 // ---------------------------------------------------------------------------
 // Tests
 // ---------------------------------------------------------------------------
+
+#[cfg(test)]
+mod decimal_tests {
+    use super::*;
+
+    #[test]
+    fn coordinate_and_diameter_fields_require_a_decimal_point() {
+        // Zero-suppressed / fixed-format fields are ambiguous and must be
+        // rejected, not misread as whole millimeters (LR-32) — while the
+        // general converter still accepts whole numbers.
+        assert!(require_decimal_point("X coordinate", "1234").is_err());
+        assert!(require_decimal_point("tool diameter", "1").is_err());
+        assert!(require_decimal_point("X coordinate", "1.234").is_ok());
+        assert!(require_decimal_point("Y coordinate", "-2.5").is_ok());
+        assert_eq!(decimal_to_nm("3", NM_PER_MM), Ok(3_000_000));
+    }
+}
 
 #[cfg(test)]
 mod tests {
