@@ -314,6 +314,14 @@ pub struct ConsoleApp {
     /// burn on the dark plate reads bright-on-dark. Persisted so the operator's
     /// material choice survives a restart.
     calib_dot_kind: crate::calib::DotKind,
+    /// Machine-mm origin (lower-left dot) the calibration grid was **generated
+    /// at** — `field_center − span/2` for a centre-origin galvo. The burned-grid
+    /// fit (LaserAnchor/LaserField) and the bed overlay must use this exact
+    /// origin, not (0,0), or every calibrated placement is offset by
+    /// `span/2 − field_center` (LR-02). Persisted so it survives the
+    /// burn → image → fit gap across restarts; recomputing from the *current*
+    /// field centre would be wrong if the operator edits the field between.
+    calib_grid_origin_mm: (f64, f64),
     calib_grid_out: String,
     calib_frame: String,
     calib_frame_img: Option<image::GrayImage>,
@@ -431,6 +439,7 @@ impl ConsoleApp {
             calib_pitch_mm: 10.0,
             calib_dot_mm: 0.4,
             calib_dot_kind: crate::calib::DotKind::Dark,
+            calib_grid_origin_mm: (0.0, 0.0),
             calib_grid_out: "calib-grid.lbrn2".into(),
             calib_frame: String::new(),
             calib_frame_img: None,
@@ -506,6 +515,14 @@ impl ConsoleApp {
                     crate::calib::DotKind::Bright => "bright".to_string(),
                 },
             ),
+            (
+                "calib_grid_origin_x",
+                self.calib_grid_origin_mm.0.to_string(),
+            ),
+            (
+                "calib_grid_origin_y",
+                self.calib_grid_origin_mm.1.to_string(),
+            ),
             ("calib_grid_out", self.calib_grid_out.clone()),
             ("cam_show_bed", self.cam_show_bed.to_string()),
             ("place_field_correct", self.place_field_correct.to_string()),
@@ -568,6 +585,8 @@ impl ConsoleApp {
         f64_field(&m, "place_px_per_mm", &mut self.place_px_per_mm);
         f64_field(&m, "fid_px_per_mm", &mut self.fid_px_per_mm);
         f64_field(&m, "calib_pitch_mm", &mut self.calib_pitch_mm);
+        f64_field(&m, "calib_grid_origin_x", &mut self.calib_grid_origin_mm.0);
+        f64_field(&m, "calib_grid_origin_y", &mut self.calib_grid_origin_mm.1);
         f64_field(&m, "calib_dot_mm", &mut self.calib_dot_mm);
         if let Some(v) = m.get("calib_dot_kind") {
             self.calib_dot_kind = match v.trim() {
@@ -1256,7 +1275,10 @@ impl ConsoleApp {
     /// The grid spec from the calibrate form.
     fn calib_grid(&self) -> crate::calib::GridSpec {
         crate::calib::GridSpec {
-            origin_mm: (0.0, 0.0),
+            // The origin the grid was generated (burned) at — NOT (0,0). The
+            // burned-grid fit and bed overlay must match where the dots
+            // actually landed (LR-02).
+            origin_mm: self.calib_grid_origin_mm,
             pitch_mm: self.calib_pitch_mm,
             n: self.calib_n,
         }
@@ -1276,6 +1298,10 @@ impl ConsoleApp {
         let span = (self.calib_n.saturating_sub(1)) as f64 * self.calib_pitch_mm;
         let ox = self.field_cx_mm as f64 - span / 2.0;
         let oy = self.field_cy_mm as f64 - span / 2.0;
+        // Remember the exact origin the grid is burned at, so the later fit
+        // labels the lower-left dot with the machine mm it was actually
+        // commanded to — not (0,0) (LR-02).
+        self.calib_grid_origin_mm = (ox, oy);
         self.run_verb(&[
             "calib-grid".into(),
             "--out".into(),
@@ -1365,7 +1391,14 @@ impl ConsoleApp {
         let kind = self.calib_dot_kind;
         match self.calib_mode {
             CalibMode::CameraLens => {
-                match crate::calib::fit_camera_lens(frame, corners, &grid, dot, kind) {
+                // The camera-lens fit is a metric ruler over a printed grid: its
+                // origin is arbitrary, so pin it to (0,0) rather than inheriting
+                // a burn origin left over from a generated laser grid (LR-02).
+                let paper = crate::calib::GridSpec {
+                    origin_mm: (0.0, 0.0),
+                    ..grid
+                };
+                match crate::calib::fit_camera_lens(frame, corners, &paper, dot, kind) {
                     Ok(cal) => {
                         self.calib_note = format!(
                             "lens fit: {}/{} dots, RMS {:.0} µm, worst {:.0} µm — camera is now a metric ruler",
@@ -1374,8 +1407,10 @@ impl ConsoleApp {
                         self.lens = Some(cal);
                     }
                     Err(e) => {
-                        self.lens = None;
-                        self.calib_note = format!("lens fit failed: {e}");
+                        // Keep any previous lens calibration — a bad fit
+                        // (wrong corners/polarity) must not erase the working
+                        // one the operator depends on (LR-16).
+                        self.calib_note = format!("lens fit failed (kept previous): {e}");
                     }
                 }
             }
@@ -1390,8 +1425,9 @@ impl ConsoleApp {
                         self.calib_saved_at = Some(now_unix());
                     }
                     Err(e) => {
-                        self.calib = None;
-                        self.calib_note = format!("anchor fit failed: {e}");
+                        // Preserve the taped-grid calibration on a failed
+                        // re-fit (matches re_anchor's behavior) (LR-16).
+                        self.calib_note = format!("anchor fit failed (kept previous): {e}");
                     }
                 }
             }
@@ -1432,8 +1468,9 @@ impl ConsoleApp {
                         self.calib_field = Some(cal);
                     }
                     Err(e) => {
-                        self.calib_field = None;
-                        self.calib_note = format!("laser-field fit failed: {e}");
+                        // Keep any previous field calibration on a failed fit
+                        // (LR-16).
+                        self.calib_note = format!("laser-field fit failed (kept previous): {e}");
                     }
                 }
             }
@@ -1843,7 +1880,7 @@ impl ConsoleApp {
              calib_frame: {calib_frame}\n\
              bed_overlay: show={} field={:.0}mm center=({:.1},{:.1})\n\
              place: x={:.2} y={:.2} rot={:.1}°\n\
-             calib_grid: n={} pitch={:.2}mm dot={:.2}mm contrast={} corners_marked={}\n\
+             calib_grid: n={} pitch={:.2}mm dot={:.2}mm contrast={} corners_marked={} origin=({:.1},{:.1})\n\
              fiducials: {} markers",
             self.tab,
             self.side,
@@ -1861,6 +1898,8 @@ impl ConsoleApp {
             self.calib_dot_mm,
             self.calib_dot_kind.label(),
             self.calib_corners.len(),
+            self.calib_grid_origin_mm.0,
+            self.calib_grid_origin_mm.1,
             self.fid_search.len(),
         )
     }
@@ -4603,6 +4642,10 @@ mod tests {
             "note: {}",
             app.calib_note
         );
+        // The fit grid must carry that same burn origin — not (0,0) — or every
+        // calibrated etch is offset by span/2 − field_center (LR-02).
+        assert_eq!(app.calib_grid().origin_mm, (-30.0, -30.0));
+        assert_eq!(app.calib_grid_origin_mm, (-30.0, -30.0));
 
         // Off-centre work area (LightBurn origin not at 0,0): the grid follows.
         app.field_cx_mm = 0.0;
@@ -4611,6 +4654,39 @@ mod tests {
         assert!(
             app.calib_note.contains("(-30,0)…(30,60)"),
             "grid recentres on the work area: {}",
+            app.calib_note
+        );
+    }
+
+    /// A failed re-fit (wrong corners/polarity — the operator's 0/49 case)
+    /// must keep the working calibration, not erase it (LR-16).
+    #[test]
+    fn a_failed_fit_keeps_the_previous_calibration() {
+        let mut app = ConsoleApp::new(tmp_db(), vec!["true".into()]);
+        app.calib = Some(crate::calib::Calibration {
+            px_to_mm: vision::Homography {
+                matrix: nalgebra::Matrix3::identity(),
+                residuals: vec![],
+                rms: 0.0,
+            },
+            rms_um: 12.0,
+            found: 49,
+            total: 49,
+            dots: Vec::new(),
+        });
+        app.calib_mode = CalibMode::LaserAnchor;
+        // A blank frame + 4 corners: the detector finds no dots and the fit
+        // errors.
+        app.calib_frame_img = Some(image::GrayImage::from_pixel(200, 200, image::Luma([200])));
+        app.calib_corners = vec![(10.0, 10.0), (190.0, 10.0), (190.0, 190.0), (10.0, 190.0)];
+        app.calibrate_fit();
+        assert!(
+            app.calib.is_some(),
+            "a failed fit must not erase the previous calibration"
+        );
+        assert!(
+            app.calib_note.contains("kept previous"),
+            "note explains the keep: {}",
             app.calib_note
         );
     }
