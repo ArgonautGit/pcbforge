@@ -7,7 +7,15 @@ use std::path::{Path, PathBuf};
 use std::process::Command;
 
 fn tmp() -> PathBuf {
-    let d = std::env::temp_dir().join(format!("pcbforge-guide-{}", std::process::id()));
+    // Unique per call: tests run in parallel threads of one process, so a
+    // pid-only dir would let one test's remove_dir_all race another's files.
+    use std::sync::atomic::{AtomicU64, Ordering};
+    static N: AtomicU64 = AtomicU64::new(0);
+    let d = std::env::temp_dir().join(format!(
+        "pcbforge-guide-{}-{}",
+        std::process::id(),
+        N.fetch_add(1, Ordering::Relaxed)
+    ));
     let _ = std::fs::remove_dir_all(&d);
     std::fs::create_dir_all(&d).unwrap();
     d
