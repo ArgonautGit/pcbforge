@@ -374,6 +374,17 @@ enum Command {
         /// Detector search radius around the target, mm.
         #[arg(long, default_value_t = 1.0)]
         search_mm: f64,
+
+        /// Force-confirm the pending hole without the detector gate — for a
+        /// correctly-drilled hole the detector can't confirm (e.g. a merged
+        /// slot). Advances past it. Mutually exclusive with --skip.
+        #[arg(long, conflicts_with = "skip")]
+        accept: bool,
+
+        /// Advance past the pending hole WITHOUT confirming it (leaves it
+        /// unverified). Mutually exclusive with --accept.
+        #[arg(long)]
+        skip: bool,
     },
     /// Export the copper + outline Gerbers a job needs from a KiCad project,
     /// via kicad-cli. Point it at a `.kicad_pcb` (or a project directory with
@@ -555,6 +566,8 @@ fn run(cli: &Cli) -> Result<(), Box<dyn std::error::Error>> {
             px_per_mm,
             tol_um,
             search_mm,
+            accept,
+            skip,
         } => {
             let lines = drillguide::step(
                 drills,
@@ -564,6 +577,8 @@ fn run(cli: &Cli) -> Result<(), Box<dyn std::error::Error>> {
                 *px_per_mm,
                 *tol_um,
                 *search_mm,
+                *accept,
+                *skip,
             )?;
             for l in lines {
                 println!("{l}");
@@ -681,7 +696,11 @@ fn cam_cmd(
                 println!("{idx}: {name}");
             }
         }
-        return Ok(());
+        // Fall through to also grab when both are asked for, rather than
+        // silently dropping --grab (LR-39).
+        if grab.is_none() {
+            return Ok(());
+        }
     }
 
     let Some(out) = grab else {
@@ -1175,7 +1194,10 @@ fn load_board_and_thickness(
     a: &CutArgs,
 ) -> Result<(Vec<pcb_core::Poly>, Nm), Box<dyn std::error::Error>> {
     match (a.outline, a.board) {
-        (Some(outline), _) => {
+        // Both given would silently ignore --board (and its .gbrjob thickness);
+        // reject rather than pick one arbitrarily (LR-38).
+        (Some(_), Some(_)) => Err("pass only one of --board or --outline, not both".into()),
+        (Some(outline), None) => {
             let thickness_mm = a
                 .thickness_mm
                 .ok_or("--thickness-mm is required with --outline")?;

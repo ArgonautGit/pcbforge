@@ -261,6 +261,8 @@ pub fn step(
     px_per_mm: f64,
     tol_um: f64,
     search_mm: f64,
+    accept: bool,
+    skip: bool,
 ) -> Result<Vec<String>, String> {
     if px_per_mm <= 0.0 {
         return Err("px per mm must be positive".into());
@@ -269,6 +271,16 @@ pub fn step(
     let holes = order_holes(&ops);
     if holes.is_empty() {
         return Err("drill file contains no holes".into());
+    }
+    // Frame contract: coordinates must be non-negative (aux-origin export). A
+    // default KiCad export keeps the sheet frame (negative Y), which maps
+    // off-frame — every hole misses and the blank canvas clips (LR-14).
+    if let Some(t) = holes.iter().find(|t| t.x_mm < 0.0 || t.y_mm < 0.0) {
+        return Err(format!(
+            "hole at ({:.3}, {:.3}) mm has a negative coordinate — export the drill file at the \
+             aux/drill origin (not the sheet frame) so all holes are non-negative",
+            t.x_mm, t.y_mm
+        ));
     }
     let fp = fingerprint(&holes);
 
@@ -284,15 +296,26 @@ pub fn step(
                     state_path.display()
                 ));
             }
+            if s.pending > holes.len() {
+                return Err(format!(
+                    "state file {} is corrupt: pending {} exceeds {} holes",
+                    state_path.display(),
+                    s.pending,
+                    holes.len()
+                ));
+            }
             (s, true)
         }
-        Err(_) => (
+        // Only an absent state file is a fresh start. Any other read error
+        // (permissions, I/O) must surface, not silently restart at hole 0 (LR-24).
+        Err(e) if e.kind() == std::io::ErrorKind::NotFound => (
             GuideState {
                 fingerprint: fp,
                 pending: 0,
             },
             false,
         ),
+        Err(e) => return Err(format!("read {}: {e}", state_path.display())),
     };
 
     let mut out = Vec::new();
@@ -300,17 +323,43 @@ pub fn step(
     // Confirm the pending hole on the frame before advancing (only once the
     // guide has started — the first invocation just presents the first target).
     if started && state.pending < holes.len() {
-        let fpath = frame_path.ok_or("pass --frame <image> to confirm the pending hole")?;
-        let frame = image::open(fpath)
-            .map_err(|e| format!("open {}: {e}", fpath.display()))?
-            .to_luma8();
         let t = holes[state.pending];
-        let off = check_hole(&frame, &t, px_per_mm, tol_um, search_mm)?;
-        out.push(format!(
-            "confirmed hole #{} at ({:.3}, {:.3}) mm — {off:.0} µm off target",
-            state.pending, t.x_mm, t.y_mm
-        ));
-        state.pending += 1;
+        // Escape hatches so a correctly-drilled hole the detector can't confirm
+        // (e.g. a short slot whose two drilled ends merge into one oval, putting
+        // the centroid L/2 off target) can't hard-lock the flow (LR-08).
+        if skip {
+            out.push(format!(
+                "skipped hole #{} at ({:.3}, {:.3}) mm — NOT confirmed",
+                state.pending + 1,
+                t.x_mm,
+                t.y_mm
+            ));
+            state.pending += 1;
+        } else if accept {
+            out.push(format!(
+                "force-accepted hole #{} at ({:.3}, {:.3}) mm — confirmation gate overridden",
+                state.pending + 1,
+                t.x_mm,
+                t.y_mm
+            ));
+            state.pending += 1;
+        } else {
+            let fpath = frame_path
+                .ok_or("pass --frame <image> to confirm the pending hole (or --skip / --accept)")?;
+            let frame = image::open(fpath)
+                .map_err(|e| format!("open {}: {e}", fpath.display()))?
+                .to_luma8();
+            let off = check_hole(&frame, &t, px_per_mm, tol_um, search_mm).map_err(|e| {
+                format!("{e} — rerun with --accept to force-confirm this hole or --skip to pass it")
+            })?;
+            out.push(format!(
+                "confirmed hole #{} at ({:.3}, {:.3}) mm — {off:.0} µm off target",
+                state.pending + 1,
+                t.x_mm,
+                t.y_mm
+            ));
+            state.pending += 1;
+        }
     }
 
     // Render the map over the frame if given, else over a blank canvas sized

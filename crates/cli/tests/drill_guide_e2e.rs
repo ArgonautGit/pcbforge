@@ -113,7 +113,7 @@ fn guided_drilling_walks_three_holes_to_done() {
     let (ok, out, err) = run(&argv(&base_args(Some(&frame))));
     assert!(ok, "confirm step: {err}");
     assert!(
-        out.contains("confirmed hole #0") && out.contains("hole #2/3"),
+        out.contains("confirmed hole #1") && out.contains("hole #2/3"),
         "confirms and prompts the next: {out}"
     );
 
@@ -156,4 +156,63 @@ fn guided_drilling_walks_three_holes_to_done() {
         err.contains("different drill file"),
         "stale state named: {err}"
     );
+}
+
+#[test]
+fn skip_advances_past_an_unconfirmable_hole() {
+    // A correctly-drilled hole the detector can't confirm must not hard-lock
+    // the flow: --skip advances past it with no frame (LR-08).
+    let dir = tmp();
+    let drl = dir.join("board.drl");
+    std::fs::write(&drl, DRL).unwrap();
+    let state = dir.join("s.txt");
+    let overlay = dir.join("o.png");
+    let common: Vec<String> = vec![
+        "drill-guide".into(),
+        "--drills".into(),
+        drl.to_string_lossy().into(),
+        "--state".into(),
+        state.to_string_lossy().into(),
+        "--overlay".into(),
+        overlay.to_string_lossy().into(),
+        "--px-per-mm".into(),
+        "10".into(),
+    ];
+    fn as_refs(v: &[String]) -> Vec<&str> {
+        v.iter().map(String::as_str).collect()
+    }
+    // First invocation presents hole #1.
+    assert!(run(&as_refs(&common)).0);
+    // --skip advances without a frame.
+    let mut a = common.clone();
+    a.push("--skip".into());
+    let (ok, out, err) = run(&as_refs(&a));
+    assert!(ok, "skip failed: {err}");
+    assert!(out.contains("skipped hole #1"), "out: {out}");
+}
+
+#[test]
+fn negative_coordinate_is_rejected() {
+    // A sheet-frame (non-aux-origin) export lands off-frame; reject it with a
+    // message naming the fix instead of missing every hole (LR-14).
+    let dir = tmp();
+    let drl = dir.join("neg.drl");
+    std::fs::write(
+        &drl,
+        "M48\nFMAT,2\nMETRIC\nT1C1.000\n%\nG90\nG05\nT1\nX5.0Y-5.0\nM30\n",
+    )
+    .unwrap();
+    let (ok, _out, err) = run(&[
+        "drill-guide",
+        "--drills",
+        &drl.to_string_lossy(),
+        "--state",
+        &dir.join("s.txt").to_string_lossy(),
+        "--overlay",
+        &dir.join("o.png").to_string_lossy(),
+        "--px-per-mm",
+        "10",
+    ]);
+    assert!(!ok, "should fail on a negative coordinate");
+    assert!(err.contains("negative coordinate"), "err: {err}");
 }
