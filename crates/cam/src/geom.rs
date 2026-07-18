@@ -332,9 +332,14 @@ fn ring_offset_loops(ring: &Ring, delta_mm: f64, arc_tol_mm: f64, out: &mut Vec<
 
     let a_ring = ring_doubled_area(&canonical).unsigned_abs() as f64 / 2.0;
     let perim = ring_perimeter_nm(&canonical);
-    let budget = ARTIFACT_BUDGET_PER_RADIAN * eta_nm * eta_nm * total_abs_turning(&canonical)
-        + 2.0 * perim
-        + 1e6;
+    // The curvature-artifact term scales with η², so an extreme erosion (η on
+    // the order of the board — the fill-hatch collapse path) inflates it past
+    // the ring's own area, letting junk cavalier output "validate" (LR-37).
+    // Real artifacts stay under ~0.1 % of the ring area; cap the term at 2 % so
+    // it always dwarfs legitimate artifacts yet can never approach a full ring.
+    let artifact = (ARTIFACT_BUDGET_PER_RADIAN * eta_nm * eta_nm * total_abs_turning(&canonical))
+        .min(0.02 * a_ring);
+    let budget = artifact + 2.0 * perim + 1e6;
 
     // An empty offset result can only be legitimate when the ring can
     // actually collapse: erosion, with the whole area within |η| of the

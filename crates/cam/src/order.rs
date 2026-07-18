@@ -61,7 +61,7 @@ pub fn order(paths: &Paths) -> Paths {
     // the round-robin emit close to the grid pitch.
     let mut cell_list: Vec<((i64, i64), Vec<usize>)> = cells
         .into_iter()
-        .map(|(k, idxs)| (k, nn_chain(elems, idxs)))
+        .map(|(k, idxs)| (k, spread(nn_chain(elems, idxs))))
         .collect();
     cell_list.sort_by_key(|((cx, cy), _)| (*cx, if cx.rem_euclid(2) == 0 { *cy } else { -*cy }));
 
@@ -106,6 +106,34 @@ pub fn mean_consecutive_centroid_dist_nm(paths: &Paths) -> f64 {
         .map(|w| dist(centroid(&w[0]), centroid(&w[1])))
         .sum();
     sum / (e.len() - 1) as f64
+}
+
+/// Reorder a spatially-coherent nn-chain into a bisection (van der Corput)
+/// order, so that *consecutive* entries are far apart in the chain rather than
+/// adjacent. This matters in the round-robin tail (LR-07): once shallow cells
+/// exhaust, the deepest cell's remaining chain emits back-to-back, and an
+/// nn-chain would fire spatially-adjacent hatch lines consecutively — the very
+/// local heat build-up CAM-3 exists to prevent. Emitting the chain's midpoint,
+/// then the midpoints of each half, and so on, keeps successive tail emissions
+/// ~half-a-cell apart instead of one hatch pitch. Still a permutation.
+fn spread(chain: Vec<usize>) -> Vec<usize> {
+    let n = chain.len();
+    if n <= 2 {
+        return chain;
+    }
+    let mut order = Vec::with_capacity(n);
+    let mut q = std::collections::VecDeque::new();
+    q.push_back((0usize, n)); // half-open [lo, hi)
+    while let Some((lo, hi)) = q.pop_front() {
+        if lo >= hi {
+            continue;
+        }
+        let mid = lo + (hi - lo) / 2;
+        order.push(chain[mid]);
+        q.push_back((lo, mid));
+        q.push_back((mid + 1, hi));
+    }
+    order
 }
 
 /// Nearest-neighbour chain over `idxs` using the end→start distance metric.
@@ -309,6 +337,49 @@ mod tests {
         let naive = ablation_paths(&layer, &CamOpts::default(), 1);
         let ordered = order(&naive);
         assert!(is_permutation(&naive, &ordered));
+    }
+
+    fn seg(x0: f64, y0: f64, x1: f64, y1: f64) -> PathElem {
+        PathElem {
+            kind: PathKind::Cut,
+            pts: vec![P::from_mm(x0, y0), P::from_mm(x1, y1)],
+            closed: false,
+        }
+    }
+
+    #[test]
+    fn spread_makes_consecutive_entries_non_adjacent() {
+        let chain: Vec<usize> = (0..16).collect();
+        let s = spread(chain.clone());
+        let mut sorted = s.clone();
+        sorted.sort();
+        assert_eq!(sorted, chain, "spread is a permutation");
+        // Consecutive emissions are never adjacent in the coherent nn order, so
+        // the round-robin tail can't fire two adjacent hatch lines back-to-back.
+        for w in s.windows(2) {
+            assert!(w[0].abs_diff(w[1]) >= 2, "{} and {} are adjacent", w[0], w[1]);
+        }
+    }
+
+    #[test]
+    fn a_dense_cell_tail_stays_heat_spread() {
+        // One 10 mm cell packed with 32 hatch lines 0.3 mm apart, plus four
+        // sparse neighbours. The round-robin tail drains the dense cell; with a
+        // raw nn-chain those 0.3 mm-adjacent lines fire back-to-back (LR-07).
+        let mut elems = Vec::new();
+        for k in 0..32 {
+            let y = 0.2 + k as f64 * 0.3;
+            elems.push(seg(0.5, y, 9.5, y));
+        }
+        for (cx, cy) in [(15.0, 5.0), (5.0, 15.0), (25.0, 5.0), (5.0, 25.0)] {
+            elems.push(seg(cx, cy, cx + 1.0, cy));
+        }
+        let ordered = order(&Paths { elems });
+        let mean = mean_consecutive_centroid_dist_nm(&ordered);
+        assert!(
+            mean >= 2.0 * NM_PER_MM as f64,
+            "tail too clustered: mean consecutive centroid dist {mean} nm (< 2 mm)"
+        );
     }
 
     #[test]
