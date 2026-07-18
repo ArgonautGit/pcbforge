@@ -1196,6 +1196,21 @@ impl ConsoleApp {
     /// Emit the job registered to the current manual placement by encoding it
     /// as fiducial correspondences and shelling `pcbforge register`.
     fn emit_at_placement(&mut self) {
+        // Back-side etch is not wired: this path hardcodes the FRONT Gerbers and
+        // shells `register`, which has no mirror pass — it would emit the front
+        // copper's ablate set, unmirrored, translated by the mirrored job's
+        // pivot: wrong pattern, wrong chirality, wrong position, silently.
+        // Refuse until register grows `--mirror-x` (IMP-05) (LR-03).
+        if self.side == Side::Back {
+            self.log.push(LogLine {
+                text: "place: back-side \"Etch here\" isn't supported yet — register can't \
+                       mirror, so it would burn the FRONT copper unmirrored at the wrong \
+                       spot. Switch to the front side to etch."
+                    .into(),
+                err: true,
+            });
+            return;
+        }
         if self.place_job.is_empty() {
             self.log.push(LogLine {
                 text: "place: load a frame + job first".into(),
@@ -4688,6 +4703,21 @@ mod tests {
             app.calib_note.contains("kept previous"),
             "note explains the keep: {}",
             app.calib_note
+        );
+    }
+
+    /// Back-side "Etch here" is refused (register can't mirror), rather than
+    /// silently emitting the front copper unmirrored at the wrong place (LR-03).
+    #[test]
+    fn back_side_etch_is_refused() {
+        let mut app = ConsoleApp::new(tmp_db(), vec!["true".into()]);
+        app.side = Side::Back;
+        app.emit_at_placement();
+        let last = app.log.last().expect("a log line was pushed");
+        assert!(
+            last.err && last.text.contains("back-side"),
+            "expected a back-side refusal, got: {}",
+            last.text
         );
     }
 
