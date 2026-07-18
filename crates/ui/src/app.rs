@@ -1823,6 +1823,12 @@ impl ConsoleApp {
     /// under a bare `egui::Context` in tests.
     pub fn ui(&mut self, ctx: &Context) {
         self.pump_verb(ctx);
+        // Pump the live-capture loops regardless of the visible tab, or a
+        // tab-switch during ● Live leaves the device held with no consumer and
+        // stop-requests unexecuted until the tab is revisited (LR-45). Each is
+        // a cheap no-op (and drops its capture) when its Live toggle is off.
+        self.pump_calib_live(ctx);
+        self.pump_fid_live(ctx);
         egui::TopBottomPanel::top("top").show(ctx, |ui| {
             ui.horizontal(|ui| {
                 ui.heading("PCBForge console");
@@ -2239,8 +2245,7 @@ impl ConsoleApp {
     }
 
     fn calibrate_view(&mut self, ui: &mut egui::Ui) {
-        let ctx = ui.ctx().clone();
-        self.pump_calib_live(&ctx);
+        // Live capture is pumped from ui() regardless of tab (LR-45).
         ui.horizontal(|ui| {
             ui.label("step");
             ui.selectable_value(
@@ -3122,8 +3127,7 @@ impl ConsoleApp {
     }
 
     fn fiducial_view(&mut self, ui: &mut egui::Ui) {
-        let ctx = ui.ctx().clone();
-        self.pump_fid_live(&ctx);
+        // Live capture is pumped from ui() regardless of tab (LR-45).
         egui::Grid::new("fid-form")
             .num_columns(2)
             .spacing([8.0, 6.0])
