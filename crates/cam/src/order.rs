@@ -140,9 +140,16 @@ fn start(e: &PathElem) -> P {
     e.pts.first().copied().unwrap_or_default()
 }
 
-/// End point of an element (`pts.last()`), origin if the element is empty.
+/// End point of an element: `pts.first()` for a closed loop (which physically
+/// finishes where it began — closure is implicit, so `pts.last()` is the
+/// *penultimate* vertex, up to a full side away), else `pts.last()`. Origin if
+/// the element is empty.
 fn end(e: &PathElem) -> P {
-    e.pts.last().copied().unwrap_or_default()
+    if e.closed {
+        start(e)
+    } else {
+        e.pts.last().copied().unwrap_or_default()
+    }
 }
 
 /// Centroid (mean of `pts`) of an element, origin if the element is empty.
@@ -302,6 +309,24 @@ mod tests {
         let naive = ablation_paths(&layer, &CamOpts::default(), 1);
         let ordered = order(&naive);
         assert!(is_permutation(&naive, &ordered));
+    }
+
+    #[test]
+    fn end_of_a_closed_loop_is_its_start_not_the_last_vertex() {
+        // A closed ring finishes where it began (closure implicit), so end()
+        // must equal start() — not pts.last(), which is up to a side away and
+        // misled nn_chain / total_jump_length_nm (LR-20).
+        let e = PathElem {
+            kind: PathKind::Isolation(0),
+            pts: vec![
+                P::from_mm(0.0, 0.0),
+                P::from_mm(10.0, 0.0),
+                P::from_mm(10.0, 10.0),
+            ],
+            closed: true,
+        };
+        assert_eq!(end(&e), start(&e));
+        assert_ne!(end(&e), *e.pts.last().unwrap());
     }
 
     #[test]

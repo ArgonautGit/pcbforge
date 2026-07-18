@@ -284,17 +284,17 @@ fn cut_setting_xml(index: u32, layer: &EmitLayer) -> String {
     field("maxPower", num(p.power_pct));
     field("maxPower2", num(p.power_pct));
     field("speed", num(p.speed_mm_s));
-    field("frequency", num(p.frequency_khz * 1000.0)); // schema: Hz
+    // Hz is an integer field: round, don't stringify a 17-digit float
+    // (`1.001 kHz` → `1000.9999999999999`) (LR-23).
+    field("frequency", ((p.frequency_khz * 1000.0).round() as i64).to_string());
     if p.pulse_ns > 0 {
         field("QPulseWidth", p.pulse_ns.to_string());
     }
-    if layer.wobble {
-        field("wobbleEnable", "1".into());
-    }
+    // Emit an explicit 0/1 rather than omitting the field when off: absent
+    // must not inherit a device profile that defaults wobble on (LR-36).
+    field("wobbleEnable", if layer.wobble { "1" } else { "0" }.into());
     if layer.mode == LayerMode::Fill {
-        if layer.cross_hatch {
-            field("crossHatch", "1".into());
-        }
+        field("crossHatch", if layer.cross_hatch { "1" } else { "0" }.into());
         field("interval", num(layer.interval_mm));
         if layer.angle_deg != 0.0 {
             field("angle", num(layer.angle_deg));
@@ -361,6 +361,24 @@ mod tests {
             pulse_ns: 1,
             passes: 1,
         }
+    }
+
+    #[test]
+    fn fractional_khz_emits_integer_hz() {
+        // 1.001 kHz used to stringify as `1000.9999999999999` (LR-23).
+        let mut params = base_params();
+        params.frequency_khz = 1.001;
+        let doc = lbrn2_string("BSLFiber", &[EmitLayer::line("C00", params, Vec::new())]);
+        assert!(doc.contains("<frequency Value=\"1001\"/>"), "{doc}");
+        assert!(!doc.contains("1000.99"), "no float Hz");
+    }
+
+    #[test]
+    fn wobble_off_is_emitted_explicitly() {
+        // A Line layer with wobble off emits `wobbleEnable Value="0"` rather
+        // than omitting it and inheriting a device default (LR-36).
+        let doc = lbrn2_string("BSLFiber", &[EmitLayer::line("C00", base_params(), Vec::new())]);
+        assert!(doc.contains("<wobbleEnable Value=\"0\"/>"), "{doc}");
     }
 
     /// The VertList/PrimList this emitter produces for the operator's exact

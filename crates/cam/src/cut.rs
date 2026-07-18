@@ -155,6 +155,12 @@ pub fn tab_ring(ring: &Ring, gap_w_nm: Nm, tab_count: u32) -> Vec<PathElem> {
             kept[0] + total
         };
         let s1 = next - h;
+        // Skip a vanishing or inverted gap: at minimum tab spacing `s1` can
+        // land at/just below `s0`, and subarc would emit a reversed 2-point
+        // sliver "cut" (LR-35). 1 µm is far below any real cut segment.
+        if s1 - s0 < 1000.0 {
+            continue;
+        }
         let pts = subarc(ring, &cum, total, s0, s1);
         if pts.len() >= 2 {
             out.push(PathElem {

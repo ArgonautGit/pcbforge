@@ -125,6 +125,11 @@ pub fn hatch_set_angle_deg(opts: &CamOpts, k: u32) -> f64 {
 /// `tol_nm` of any ring edge (the boundary, padded by `tol_nm`, counts as
 /// inside). Parity is computed exactly in `i128`; the edge-distance check is
 /// f64 (exact for PCB-scale coordinates).
+///
+/// **Precondition:** `polys` must be *normalized* (non-self-overlapping, holes
+/// nested in outers). Even–odd parity reads a region covered by two
+/// overlapping un-normalized outers as *outside* — pass geometry through the
+/// crate's normalization first, matching its nonzero-winding convention (LR-50).
 pub fn point_in_polys(pt: P, polys: &[Poly], tol_nm: Nm) -> bool {
     let tol2 = tol_nm as f64 * tol_nm as f64;
     let mut inside = false;
