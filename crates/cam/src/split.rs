@@ -16,32 +16,38 @@
 //!   between `clearance_mm` and `clearance_mm + band_mm` outside the copper,
 //!   i.e. the copper-clearance area that must be ablated.
 //!
-//! * **Fiber** — the removal region eroded inward by `guard_mm`
-//!   ([`geom::offset`](crate::geom::offset) by `-guard`). Its inner boundary
-//!   (the one nearest the copper) therefore sits at `clearance_mm + guard_mm`
-//!   from the copper edge, so the fiber territory is at least `guard_mm` clear
-//!   of any copper boundary by construction.
+//! * **Fiber** — the removal band with a `clearance_mm + guard_mm` copper
+//!   keep-out differenced out
+//!   ([`geom::difference`](crate::geom::difference) against
+//!   [`geom::offset`](crate::geom::offset)`(copper, clearance+guard)`). Only
+//!   the copper-facing side is eroded, so the fiber keeps the band's full outer
+//!   extent while its nearest approach to copper is `clearance_mm + guard_mm`.
+//!   (Eroding the band on *both* sides — `offset(removal, -guard)` — stranded a
+//!   guard-width strip at the outer edge that no machine cleared; see LR-05.)
 //!
 //!   *Representation:* the fiber machine clears the bulk with its own downstream
-//!   fill/hatch pattern, so this stage emits only the **eroded region's ring
+//!   fill/hatch pattern, so this stage emits only the **region's ring
 //!   polylines** — every outer and hole ring as a closed
 //!   [`PathKind::Rubout`]`(0)` element. These rings are the region outline the
 //!   fiber must cover, not a finished tool path.
 //!
-//! * **UV** — the guard band's finishing work, three tagged sets:
+//! * **UV** — the guard band's finishing work, four tagged sets:
 //!   1. the final **isolation** contours (the CAM-1 isolation set,
 //!      [`PathKind::Isolation`]), which hug the copper edge;
 //!   2. all **force-clear** centerlines
 //!      ([`force_clear::force_clear`](crate::force_clear::force_clear)) over the
 //!      removal region ([`PathKind::ForceClear`]);
 //!   3. one **boundary** contour per copper ring traced at offset 0 — the exact
-//!      design copper edge ([`PathKind::Boundary`]).
+//!      design copper edge ([`PathKind::Boundary`]);
+//!   4. the near-copper strip the fiber keep-out excludes (removal minus the
+//!      fiber region), as [`PathKind::Rubout`]`(0)` fill. Fiber ∪ this == the
+//!      removal band, so the whole band is cleared by exactly one machine.
 //!
 //! # Guard invariant
 //!
 //! Every fiber element stays at least `guard_mm` from any copper boundary.
-//! Because the fiber region is the removal band (inner edge at `clearance_mm`)
-//! eroded by `guard_mm`, its nearest approach to copper is `clearance_mm +
+//! Because the fiber region excludes a `clearance_mm + guard_mm` copper
+//! keep-out, its nearest approach to copper is `clearance_mm +
 //! guard_mm` — comfortably beyond the `guard_mm` floor. The property test in
 //! `tests/split_props.rs` verifies the segment-to-segment distance from every
 //! fiber element to every copper-boundary edge is `>= guard_mm - `
@@ -79,17 +85,22 @@ pub struct SplitJobs {
 /// See the module docs for the removal region, the fiber representation, the
 /// three UV sets, and the guard invariant.
 pub fn split(layer: &Layer, opts: &CamOpts) -> SplitJobs {
-    let guard_nm = mm_to_nm(opts.guard_mm);
-
     // Removal region = the CAM-1 rub-out band (copper-clearance area to ablate).
     let removal = rubout_band(layer, opts);
 
-    // ---- Fiber: removal region eroded inward by guard, rings as Rubout(0). --
+    // ---- Fiber: removal band minus a (clearance+guard) copper keep-out. -----
+    // Erode ONLY the copper-facing side. `offset(removal, -guard)` eroded BOTH
+    // edges of the band, stranding a guard-width strip at the *outer* edge that
+    // no machine cleared (LR-05); differencing against a copper keep-out pulls
+    // the fiber back from the delicate design edge while leaving the outer
+    // extent intact. The near-copper strip it excludes becomes UV set (4).
+    let keepout = geom::offset(&layer.polys, mm_to_nm(opts.clearance_mm + opts.guard_mm));
+    let fiber_region = geom::difference(&removal, &keepout);
     let mut fiber = Vec::new();
-    for poly in geom::offset(&removal, -guard_nm) {
-        push_closed(&mut fiber, PathKind::Rubout(0), poly.outer);
-        for hole in poly.holes {
-            push_closed(&mut fiber, PathKind::Rubout(0), hole);
+    for poly in &fiber_region {
+        push_closed(&mut fiber, PathKind::Rubout(0), poly.outer.clone());
+        for hole in &poly.holes {
+            push_closed(&mut fiber, PathKind::Rubout(0), hole.clone());
         }
     }
 
@@ -107,6 +118,17 @@ pub fn split(layer: &Layer, opts: &CamOpts) -> SplitJobs {
                 pts: pl.pts,
                 closed: false,
             });
+        }
+    }
+
+    // (4) The near-copper strip the fiber keep-out excludes (removal minus the
+    // fiber region): UV clears it as Rubout(0) fill, since the fiber must stay
+    // guard-clear of the design edge. fiber ∪ this == removal, so the band is
+    // fully covered — no strip is left for no machine to ablate (LR-05).
+    for poly in geom::difference(&removal, &fiber_region) {
+        push_closed(&mut uv, PathKind::Rubout(0), poly.outer);
+        for hole in poly.holes {
+            push_closed(&mut uv, PathKind::Rubout(0), hole);
         }
     }
 
@@ -426,6 +448,35 @@ mod tests {
                 "fiber element {d} nm < guard {guard_nm} nm"
             );
         }
+    }
+
+    #[test]
+    fn fiber_and_uv_fill_partition_the_whole_removal_band() {
+        // Coverage property (LR-05): the fiber region and the UV near-copper
+        // strip together equal the removal band — nothing is left un-cleared.
+        let layer = Layer {
+            polys: vec![rect_mm(0.0, 0.0, 10.0, 10.0)],
+        };
+        let opts = CamOpts::default();
+        let removal = rubout_band(&layer, &opts);
+        let removal_a = geom::area_nm2(&removal);
+
+        let keepout = geom::offset(&layer.polys, mm_to_nm(opts.clearance_mm + opts.guard_mm));
+        let fiber_region = geom::difference(&removal, &keepout);
+        let uv_fill = geom::difference(&removal, &fiber_region);
+        let sum = geom::area_nm2(&fiber_region) + geom::area_nm2(&uv_fill);
+        assert!(
+            (sum - removal_a).abs() / removal_a < 1e-6,
+            "fiber+uv_fill {sum} must equal removal band {removal_a}"
+        );
+
+        // The old both-sides erosion stranded a real chunk of the band.
+        let old_fiber = geom::offset(&removal, -mm_to_nm(opts.guard_mm));
+        assert!(
+            geom::area_nm2(&old_fiber) < removal_a * 0.85,
+            "old fiber left >15% of the band ({} of {removal_a}) to no machine",
+            geom::area_nm2(&old_fiber)
+        );
     }
 
     #[test]

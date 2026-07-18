@@ -64,6 +64,11 @@ pub struct TilePlan {
     /// field in some dimension — they cannot fit any tile and need a smaller
     /// field or manual handling.
     pub oversized: Vec<usize>,
+    /// Indices of elements that fit the field width but whose extent straddles
+    /// every discrete field window, so no single tile can contain them. They
+    /// are still assigned (to their centroid cell) but flagged here rather than
+    /// silently spilling out of their tile (LR-06).
+    pub unfittable: Vec<usize>,
 }
 
 impl TilePlan {
@@ -88,6 +93,7 @@ pub fn tile(paths: &Paths, field_mm: f64, overlap_mm: f64) -> TilePlan {
             field_nm,
             overlap_nm,
             oversized: Vec::new(),
+            unfittable: Vec::new(),
         };
     };
 
@@ -96,18 +102,28 @@ pub fn tile(paths: &Paths, field_mm: f64, overlap_mm: f64) -> TilePlan {
     let cols = axis_count(maxx - minx, field_nm, stride_nm);
     let rows = axis_count(maxy - miny, field_nm, stride_nm);
 
-    // Bucket element indices by the field cell their centroid falls in.
+    // Bucket each element into a field cell whose window actually *contains*
+    // it, nearest its centroid — not the raw centroid cell, which for an
+    // element near a cell's trailing edge picks a window the element spills out
+    // of and can't be addressed from (LR-06). When no single window can hold it
+    // fall back to the centroid cell and flag why.
     let mut buckets: Vec<Vec<usize>> = vec![Vec::new(); (cols * rows) as usize];
     let mut oversized = Vec::new();
+    let mut unfittable = Vec::new();
     for (i, e) in paths.elems.iter().enumerate() {
         let c = centroid(&e.pts);
-        let col = cell(c.x - minx, stride_nm, cols);
-        let row = cell(c.y - miny, stride_nm, rows);
-        buckets[(row * cols + col) as usize].push(i);
-
         let (ex0, ey0, ex1, ey1) = elem_bbox(e);
+        let col = containing_cell(ex0 - minx, ex1 - minx, c.x - minx, stride_nm, field_nm, cols);
+        let row = containing_cell(ey0 - miny, ey1 - miny, c.y - miny, stride_nm, field_nm, rows);
+        let bcol = col.unwrap_or_else(|| cell(c.x - minx, stride_nm, cols));
+        let brow = row.unwrap_or_else(|| cell(c.y - miny, stride_nm, rows));
+        buckets[(brow * cols + bcol) as usize].push(i);
+
         if (ex1 - ex0) > field_nm || (ey1 - ey0) > field_nm {
             oversized.push(i);
+        } else if col.is_none() || row.is_none() {
+            // Fits the field width but straddles every discrete window edge.
+            unfittable.push(i);
         }
     }
 
@@ -142,6 +158,7 @@ pub fn tile(paths: &Paths, field_mm: f64, overlap_mm: f64) -> TilePlan {
         field_nm,
         overlap_nm,
         oversized,
+        unfittable,
     }
 }
 
@@ -161,6 +178,34 @@ fn cell(off: Nm, stride: Nm, count: u32) -> u32 {
         return 0;
     }
     ((off / stride) as u32).min(count - 1)
+}
+
+/// The field-cell index whose window `[c·stride, c·stride + field]` contains
+/// the element extent `[off0, off1]` (offsets from the bbox origin), preferring
+/// the cell nearest `centroid_off`. `None` when no discrete window can hold it:
+/// the element is wider than the field, or (rarely) a fitting width straddles
+/// every window boundary.
+fn containing_cell(
+    off0: Nm,
+    off1: Nm,
+    centroid_off: Nm,
+    stride: Nm,
+    field: Nm,
+    count: u32,
+) -> Option<u32> {
+    // Window must start at/left of the element: c ≤ floor(off0 / stride).
+    let hi = ((off0.max(0) / stride) as i64).min((count - 1) as i64);
+    // …and end at/right of it: c ≥ ceil((off1 − field) / stride).
+    let lo = if off1 <= field {
+        0
+    } else {
+        (((off1 - field) as f64) / stride as f64).ceil() as i64
+    };
+    if lo > hi {
+        return None;
+    }
+    let natural = cell(centroid_off, stride, count) as i64;
+    Some(natural.clamp(lo, hi) as u32)
 }
 
 fn centroid(pts: &[P]) -> P {
@@ -326,6 +371,43 @@ mod tests {
             (reassembled - original).abs() < 1.0,
             "tiled area {reassembled} != original {original}"
         );
+    }
+
+    #[test]
+    fn containing_cell_prefers_a_window_that_holds_the_element() {
+        // Windows [0,140] [100,240] [200,340] (field 140, stride 100).
+        let (stride, field, count) = (100, 140, 3);
+        // [95,135] centroid 115 → natural cell 1, but window 1 starts past 95;
+        // window 0 contains it, so clamp down to 0 (the LR-06 mis-tiling fix).
+        assert_eq!(containing_cell(95, 135, 115, stride, field, count), Some(0));
+        // A centred element keeps its natural cell.
+        assert_eq!(containing_cell(110, 230, 170, stride, field, count), Some(1));
+        // The [87,187] case at stride 138 straddles every window edge → None.
+        assert_eq!(containing_cell(87, 187, 137, 138, 140, 2), None);
+        // Wider than the field → no window holds it.
+        assert_eq!(containing_cell(0, 200, 100, stride, field, count), None);
+    }
+
+    #[test]
+    fn a_wide_element_straddling_every_field_is_flagged_not_silently_mistiled() {
+        // The LR-06 [87,187] mm element: 100 mm (< 140 mm field) but no 140 mm
+        // window at stride 138 contains it (windows anchored at x=0 by the dot).
+        // It must be flagged, not silently placed in a tile it spills out of.
+        let wide = PathElem {
+            kind: PathKind::Cut,
+            pts: vec![P::new(87 * MM, 10 * MM), P::new(187 * MM, 10 * MM)],
+            closed: false,
+        };
+        let plan = tile(
+            &Paths {
+                elems: vec![wide, dot(0.0, 0.0)],
+            },
+            FIELD_MM,
+            STITCH_OVERLAP_MM,
+        );
+        assert!(plan.oversized.is_empty(), "100 mm < 140 mm field, not oversized");
+        assert!(plan.unfittable.contains(&0), "the wide element is flagged unfittable");
+        assert_eq!(plan.total_elems(), 2, "still assigned, not dropped");
     }
 
     #[test]
