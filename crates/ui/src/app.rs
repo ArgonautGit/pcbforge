@@ -965,19 +965,23 @@ impl ConsoleApp {
             self.fid_search_mm,
         );
         let (s, w, m) = r.tally;
-        self.fid_measured_ppm = r.measured_px_per_mm;
-        let scale = match r.measured_px_per_mm {
+        self.fid_rows = r.rows;
+        self.fid_found = r.found_px;
+
+        // Measure the camera scale from KNOWN design spacing paired with the
+        // detected pixels — not the dragged search-marker spacing check_frame
+        // uses internally, which a small drag turns into a scale error (LR-17).
+        let design = fiducial::parse_layout(&self.fid_layout).unwrap_or_default();
+        self.fid_measured_ppm = fiducial::scale_from_design(&design, &self.fid_found);
+        let scale = match self.fid_measured_ppm {
             Some(p) => format!("  ·  measured {p:.2} px/mm"),
             None => String::new(),
         };
         self.fid_note = format!("{s} strong, {w} weak, {m} missed{scale}");
-        self.fid_rows = r.rows;
-        self.fid_found = r.found_px;
 
         // Perspective: with ≥4 detected fiducials, fit the design→pixel
         // homography (a tilted camera keystones the flat board). It corrects
         // the Place overlay and any downstream mapping; <4 can only be affine.
-        let design = fiducial::parse_layout(&self.fid_layout).unwrap_or_default();
         let corr: Vec<_> = design
             .iter()
             .zip(&self.fid_found)

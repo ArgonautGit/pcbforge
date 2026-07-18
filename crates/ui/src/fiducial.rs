@@ -138,6 +138,19 @@ fn measure_scale(found: &[DesignPx]) -> Option<f64> {
     (n > 0).then(|| acc / n as f64)
 }
 
+/// Measured px/mm from KNOWN design spacing paired (by index) with detected
+/// pixel positions — the true camera scale, independent of where the operator
+/// dragged the search markers. Using the dragged spacing instead turns a 1 mm
+/// drag over a 50 mm baseline into ~2% scale error (LR-17).
+pub fn scale_from_design(design: &[(f64, f64)], found_px: &[Option<(f64, f64)>]) -> Option<f64> {
+    let pairs: Vec<DesignPx> = design
+        .iter()
+        .zip(found_px)
+        .filter_map(|(&d, f)| f.map(|p| (d, p)))
+        .collect();
+    measure_scale(&pairs)
+}
+
 /// Run detection on an in-memory frame and build the overlay + summary.
 /// `expected_mm` is the nominal fiducial layout in bed mm; `px_per_mm` is the
 /// (uniform, pre-VIS-3) bed scale; `profile` is the operator-selected fiducial
@@ -505,6 +518,17 @@ mod tests {
             (measured - PPM).abs() < 0.1,
             "measured {measured}, truth {PPM}"
         );
+    }
+
+    #[test]
+    fn scale_from_design_uses_design_spacing() {
+        // Detected 500 px apart; the DESIGN says 50 mm apart → 10 px/mm,
+        // independent of where the search markers were dragged (LR-17).
+        let design = vec![(0.0, 0.0), (50.0, 0.0)];
+        let found = vec![Some((100.0, 100.0)), Some((600.0, 100.0))];
+        assert!((scale_from_design(&design, &found).unwrap() - 10.0).abs() < 1e-9);
+        // A missing detection drops that point from the pairing.
+        assert!(scale_from_design(&design, &[Some((100.0, 100.0)), None]).is_none());
     }
 
     /// A low-contrast frame produces a MISS row that names the SNR reason —
