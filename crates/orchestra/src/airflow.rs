@@ -29,6 +29,13 @@ pub const ENV_AIR_UV: &str = "PCBFORGE_AIR_UV";
 /// Time allowed for RTS to propagate through the sail switch to CTS.
 pub const SETTLE_DELAY: Duration = Duration::from_millis(50);
 
+/// Consecutive CTS-high samples required before airflow is trusted — debounces
+/// a fluttering sail that would pass on one lucky read (LR-19).
+pub const DEBOUNCE_SAMPLES: usize = 3;
+
+/// Spacing between debounce samples.
+pub const DEBOUNCE_INTERVAL: Duration = Duration::from_millis(30);
+
 /// Baud rate used when opening the dongle. Irrelevant to the modem lines,
 /// but the port must be opened with some configuration.
 const BAUD: u32 = 9600;
@@ -47,6 +54,10 @@ pub fn machine_name(machine: Machine) -> &'static str {
 pub enum AirflowError {
     /// The sail switch did not close: CTS stayed low after asserting RTS.
     NoAirflow { machine: Machine, dongle: String },
+    /// CTS stayed high with RTS deasserted — a welded sail switch, an RTS-CTS
+    /// bridge, or the wrong device. The interlock can't detect real airflow, so
+    /// it fails closed rather than trust a stuck-high line (LR-19).
+    StuckClosed { machine: Machine, dongle: String },
     /// The dongle's serial port could not be opened or driven.
     Port {
         machine: Machine,
@@ -75,6 +86,13 @@ impl fmt::Display for AirflowError {
                 f,
                 "airflow check failed on machine `{name}`: cannot drive \
                  dongle AIR-{name} at {dongle}: {source}",
+                name = machine_name(*machine),
+            ),
+            AirflowError::StuckClosed { machine, dongle } => write!(
+                f,
+                "airflow interlock self-test failed on machine `{name}`: CTS stayed \
+                 high with RTS deasserted (dongle AIR-{name} at {dongle}) — welded sail, \
+                 RTS-CTS bridge, or wrong device; refusing to lase on an unverifiable interlock",
                 name = machine_name(*machine),
             ),
             AirflowError::ConfigMissing { machine, var } => write!(
@@ -131,8 +149,9 @@ impl AirflowConfig {
 /// The two modem control lines the sail-switch dongle uses. Abstracted so
 /// the interlock logic can be unit-tested without hardware.
 pub trait ModemLines {
-    /// Asserts (raises) the RTS line.
-    fn assert_rts(&mut self) -> Result<(), serialport::Error>;
+    /// Drives the RTS line high (`on = true`) or low. Deasserting is needed for
+    /// the stuck-closed self-test (LR-19).
+    fn set_rts(&mut self, on: bool) -> Result<(), serialport::Error>;
     /// Reads whether the CTS line is asserted.
     fn read_cts(&mut self) -> Result<bool, serialport::Error>;
 }
@@ -157,9 +176,9 @@ impl SerialModemLines {
 }
 
 impl ModemLines for SerialModemLines {
-    fn assert_rts(&mut self) -> Result<(), serialport::Error> {
-        // serialport 4.9.0: SerialPort::write_request_to_send(true) asserts RTS.
-        self.port.write_request_to_send(true)
+    fn set_rts(&mut self, on: bool) -> Result<(), serialport::Error> {
+        // serialport 4.9.0: SerialPort::write_request_to_send(on) drives RTS.
+        self.port.write_request_to_send(on)
     }
 
     fn read_cts(&mut self) -> Result<bool, serialport::Error> {
@@ -183,15 +202,32 @@ pub fn require_airflow_with(
         source,
     };
 
-    lines.assert_rts().map_err(port_err)?;
+    // Self-test: with RTS deasserted, CTS must fall. A welded sail, an RTS-CTS
+    // bridge, or the wrong device leaves CTS stuck high and would read "airflow
+    // OK" forever — fail closed instead (LR-19).
+    lines.set_rts(false).map_err(port_err)?;
     thread::sleep(SETTLE_DELAY);
-    match lines.read_cts().map_err(port_err)? {
-        true => Ok(()),
-        false => Err(AirflowError::NoAirflow {
+    if lines.read_cts().map_err(port_err)? {
+        return Err(AirflowError::StuckClosed {
             machine,
             dongle: dongle.to_owned(),
-        }),
+        });
     }
+
+    // Assert RTS and require several consecutive high samples, so a fluttering
+    // sail can't pass on one lucky read.
+    lines.set_rts(true).map_err(port_err)?;
+    thread::sleep(SETTLE_DELAY);
+    for _ in 0..DEBOUNCE_SAMPLES {
+        if !lines.read_cts().map_err(port_err)? {
+            return Err(AirflowError::NoAirflow {
+                machine,
+                dongle: dongle.to_owned(),
+            });
+        }
+        thread::sleep(DEBOUNCE_INTERVAL);
+    }
+    Ok(())
 }
 
 /// Checks the sail switch for `machine` using the dongle mapped by `config`.
@@ -218,37 +254,70 @@ pub fn require_airflow(machine: Machine) -> Result<(), AirflowError> {
 mod tests {
     use super::*;
 
-    /// Scripted modem lines: records RTS asserts, returns canned CTS values.
+    /// How the mock's sail switch behaves — CTS as a function of RTS.
+    #[derive(Clone, Copy)]
+    enum Sail {
+        /// Airflow present: CTS follows RTS (low when deasserted, high when on).
+        Healthy,
+        /// Sail open: CTS stays low regardless of RTS.
+        NoAirflow,
+        /// Welded / RTS-CTS bridge / wrong device: CTS stuck high.
+        StuckHigh,
+    }
+
+    /// Modem-line mock whose CTS follows a [`Sail`] fault model, so the
+    /// self-test + debounce logic can be exercised without hardware.
     struct MockLines {
+        sail: Sail,
+        rts: bool,
         rts_result: Result<(), serialport::Error>,
         cts_result: Result<bool, serialport::Error>,
-        rts_asserted: bool,
-        cts_read_after_rts: bool,
+        set_rts_calls: usize,
     }
 
     impl MockLines {
-        fn new(
-            rts_result: Result<(), serialport::Error>,
-            cts_result: Result<bool, serialport::Error>,
-        ) -> Self {
+        fn with(sail: Sail) -> Self {
             Self {
-                rts_result,
-                cts_result,
-                rts_asserted: false,
-                cts_read_after_rts: false,
+                sail,
+                rts: false,
+                rts_result: Ok(()),
+                cts_result: Ok(true),
+                set_rts_calls: 0,
+            }
+        }
+        fn healthy() -> Self {
+            Self::with(Sail::Healthy)
+        }
+        fn rts_err(e: serialport::Error) -> Self {
+            Self {
+                rts_result: Err(e),
+                ..Self::healthy()
+            }
+        }
+        fn cts_err(e: serialport::Error) -> Self {
+            Self {
+                cts_result: Err(e),
+                ..Self::healthy()
             }
         }
     }
 
     impl ModemLines for MockLines {
-        fn assert_rts(&mut self) -> Result<(), serialport::Error> {
-            self.rts_asserted = true;
+        fn set_rts(&mut self, on: bool) -> Result<(), serialport::Error> {
+            self.set_rts_calls += 1;
+            self.rts = on;
             self.rts_result.clone()
         }
 
         fn read_cts(&mut self) -> Result<bool, serialport::Error> {
-            self.cts_read_after_rts = self.rts_asserted;
-            self.cts_result.clone()
+            if let Err(e) = &self.cts_result {
+                return Err(e.clone());
+            }
+            Ok(match self.sail {
+                Sail::Healthy => self.rts,
+                Sail::NoAirflow => false,
+                Sail::StuckHigh => true,
+            })
         }
     }
 
@@ -258,16 +327,25 @@ mod tests {
 
     #[test]
     fn cts_high_means_airflow_ok() {
-        let mut lines = MockLines::new(Ok(()), Ok(true));
+        let mut lines = MockLines::healthy();
         let r = require_airflow_with(&mut lines, Machine::Fiber, "/dev/ttyUSB0");
         assert!(r.is_ok());
-        assert!(lines.rts_asserted, "RTS must be asserted");
-        assert!(lines.cts_read_after_rts, "CTS must be read after RTS");
+        // Drove RTS both ways: the self-test deassert plus the assert.
+        assert!(lines.set_rts_calls >= 2, "RTS must be toggled for the self-test");
+    }
+
+    #[test]
+    fn welded_sail_fails_the_self_test() {
+        // CTS stuck high with RTS deasserted must fail closed (LR-19).
+        let mut lines = MockLines::with(Sail::StuckHigh);
+        let err = require_airflow_with(&mut lines, Machine::Fiber, "/dev/ttyUSB0").unwrap_err();
+        assert!(matches!(err, AirflowError::StuckClosed { .. }), "{err}");
+        assert!(err.to_string().contains("self-test"), "{err}");
     }
 
     #[test]
     fn cts_low_names_machine_and_dongle() {
-        let mut lines = MockLines::new(Ok(()), Ok(false));
+        let mut lines = MockLines::with(Sail::NoAirflow);
         let err = require_airflow_with(&mut lines, Machine::Uv, "/dev/ttyACM3").unwrap_err();
         assert!(matches!(err, AirflowError::NoAirflow { .. }));
         let msg = err.to_string();
@@ -278,7 +356,7 @@ mod tests {
 
     #[test]
     fn rts_failure_propagates_with_context() {
-        let mut lines = MockLines::new(Err(io_err("rts pin dead")), Ok(true));
+        let mut lines = MockLines::rts_err(io_err("rts pin dead"));
         let err = require_airflow_with(&mut lines, Machine::Fiber, "/dev/ttyUSB7").unwrap_err();
         assert!(matches!(err, AirflowError::Port { .. }));
         let msg = err.to_string();
@@ -289,7 +367,7 @@ mod tests {
 
     #[test]
     fn cts_read_failure_propagates() {
-        let mut lines = MockLines::new(Ok(()), Err(io_err("modem status ioctl failed")));
+        let mut lines = MockLines::cts_err(io_err("modem status ioctl failed"));
         let err = require_airflow_with(&mut lines, Machine::Uv, "/dev/ttyUSB1").unwrap_err();
         assert!(matches!(err, AirflowError::Port { .. }));
         assert!(err.to_string().contains("/dev/ttyUSB1"));
