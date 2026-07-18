@@ -29,6 +29,9 @@ pub enum MarkerError {
     /// it exists so the trait surface matches the native driver, which surfaces
     /// controller faults (interlock open, no laser-ready, comms timeout) here.
     Backend(String),
+    /// [`configure`](Marker::configure) got invalid process parameters (e.g.
+    /// zero passes, which would no-op `mark` yet still report `Complete`).
+    InvalidParams(String),
 }
 
 impl std::fmt::Display for MarkerError {
@@ -38,6 +41,7 @@ impl std::fmt::Display for MarkerError {
                 f.write_str("marker used before configure() set process parameters")
             }
             MarkerError::Backend(msg) => write!(f, "marker backend fault: {msg}"),
+            MarkerError::InvalidParams(msg) => write!(f, "invalid marker parameters: {msg}"),
         }
     }
 }
@@ -253,6 +257,11 @@ impl SimMarker {
 
 impl Marker for SimMarker {
     fn configure(&mut self, params: &AblationParams) -> Result<(), MarkerError> {
+        // Zero passes would make `mark` a silent no-op that still reports
+        // Complete — a board that never got ablated but looks done (LR-30).
+        if params.passes == 0 {
+            return Err(MarkerError::InvalidParams("passes must be ≥ 1".into()));
+        }
         self.passes = params.passes;
         self.configured = true;
         Ok(())
@@ -336,6 +345,18 @@ mod tests {
 
     fn white_count(img: &GrayImage) -> u64 {
         img.pixels().filter(|p| p[0] >= 128).count() as u64
+    }
+
+    #[test]
+    fn zero_passes_is_rejected_at_configure() {
+        // Otherwise `mark` no-ops yet `status()` reports Complete — a board
+        // that was never ablated but looks done (LR-30).
+        let mut sim = SimMarker::new(P::from_mm(0.0, 0.0), P::from_mm(1.0, 1.0), 10, 45.0);
+        assert!(matches!(
+            sim.configure(&cfg(0)),
+            Err(MarkerError::InvalidParams(_))
+        ));
+        assert!(sim.configure(&cfg(1)).is_ok());
     }
 
     // (1) A single straight path marks a stripe of ~spot width. -----------
