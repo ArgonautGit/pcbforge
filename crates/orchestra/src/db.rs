@@ -123,6 +123,20 @@ impl Db {
                 "INSERT INTO schema_version (version) VALUES (?1)",
                 params![SCHEMA_VERSION],
             )?;
+        } else {
+            // Fail loudly at open on schema drift, rather than at a random
+            // query later when a migration changed the shape (LR-29).
+            let stored: i64 =
+                conn.query_row("SELECT version FROM schema_version", [], |r| r.get(0))?;
+            if stored != SCHEMA_VERSION {
+                return Err(rusqlite::Error::SqliteFailure(
+                    rusqlite::ffi::Error::new(rusqlite::ffi::SQLITE_ERROR),
+                    Some(format!(
+                        "database schema version {stored} != supported {SCHEMA_VERSION}; \
+                         migrate or use a matching build"
+                    )),
+                ));
+            }
         }
         Ok(Self { conn })
     }
@@ -290,12 +304,13 @@ impl Db {
         )
     }
 
-    /// All runlog entries for one board, in append order (`at`, then `id` to
-    /// break same-second ties).
+    /// All runlog entries for one board, in append order. Ordered by the
+    /// monotonic rowid `id` alone — not the wall-clock `at`, which a backward
+    /// NTP/clock step could reorder into a false history (LR-28).
     pub fn list_runlog_for_board(&self, board_id: i64) -> Result<Vec<RunlogEntry>> {
         let mut stmt = self.conn.prepare(
             "SELECT id, board_id, at, stage, event, detail
-             FROM runlog WHERE board_id = ?1 ORDER BY at, id",
+             FROM runlog WHERE board_id = ?1 ORDER BY id",
         )?;
         let rows = stmt.query_map(params![board_id], runlog_from_row)?;
         rows.collect()

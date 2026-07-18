@@ -126,6 +126,7 @@ fn board_walks_fiducials_to_done_across_restarts() {
             ("fiducials", "prompt"),
             ("fiducials", "stage_done"),
             ("bulk_top", "stage_start"),
+            ("bulk_top", "airflow_skipped"),
             ("bulk_top", "emit_intent"),
             ("bulk_top", "stage_done"),
             ("iso_check", "stage_start"),

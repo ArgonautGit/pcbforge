@@ -46,6 +46,8 @@ pub enum EngineError {
     NoAltSuccessor(String),
     /// The pallet tag could not be read.
     Pallet(PalletError),
+    /// A configuration value (e.g. a bring-up env var) was malformed.
+    Config(String),
 }
 
 impl std::fmt::Display for EngineError {
@@ -60,6 +62,7 @@ impl std::fmt::Display for EngineError {
                 "stage `{s}`'s executor branched (AdvanceAlt) but the stage has no `next_alt`"
             ),
             EngineError::Pallet(e) => write!(f, "could not read pallet tag: {e}"),
+            EngineError::Config(m) => write!(f, "configuration error: {m}"),
         }
     }
 }
@@ -69,8 +72,27 @@ impl std::error::Error for EngineError {
         match self {
             EngineError::Db(e) => Some(e),
             EngineError::Pallet(e) => Some(e),
-            EngineError::UnknownStage(_) | EngineError::NoAltSuccessor(_) => None,
+            EngineError::UnknownStage(_)
+            | EngineError::NoAltSuccessor(_)
+            | EngineError::Config(_) => None,
         }
+    }
+}
+
+/// Strictly parse a bring-up boolean env var: `1`/`true`/`yes` → `Some(true)`,
+/// `0`/`false`/`no` → `Some(false)` (case- and whitespace-insensitive), unset →
+/// `None`. Anything else is an error so a typo (`on`, `y`, `tru`) surfaces
+/// instead of silently defaulting — mirroring [`EnvPalletSource`] (LR-04).
+fn parse_env_bool(var: &str) -> Result<Option<bool>> {
+    match env::var(var) {
+        Err(_) => Ok(None),
+        Ok(raw) => match raw.trim().to_ascii_lowercase().as_str() {
+            "1" | "true" | "yes" => Ok(Some(true)),
+            "0" | "false" | "no" => Ok(Some(false)),
+            other => Err(EngineError::Config(format!(
+                "{var}=`{other}` is not a boolean (use 1/0, true/false, or yes/no)"
+            ))),
+        },
     }
 }
 
@@ -226,20 +248,85 @@ impl StageExecutor for ManualExecutor {
     }
 }
 
-/// Laser stage. Records the intent to emit a job set for the stage's machine
-/// and process, then advances. Real emission (compile + burn + wait) is wired
-/// in ORC-3/DRV-6; here the side effect is purely the runlog row.
-pub struct LaserExecutor;
+/// How [`LaserExecutor`] gates on extraction airflow before emitting.
+///
+/// The airflow interlock (`airflow::require_airflow`) must run on every
+/// laser-emitting path — a low CTS means the sail switch sees no extraction and
+/// the stage must not burn. Real emission (ORC-3/DRV-6) will always
+/// [`Require`](AirflowGate::Require); the bring-up stub defaults to
+/// [`Skip`](AirflowGate::Skip) but records an `airflow_skipped` row so the
+/// ungated state is auditable and can't be silently forgotten (LR-01).
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum AirflowGate {
+    /// Bring-up: don't touch hardware, but record that the interlock did NOT
+    /// run so it shows up in the runlog.
+    Skip,
+    /// Production: verify airflow for the stage's machine and [`Halt`] on
+    /// failure ([`StageOutcome::Halt`]).
+    Require,
+}
+
+/// Laser stage. Checks the airflow interlock per its [`AirflowGate`], records
+/// the intent to emit a job set for the stage's machine and process, then
+/// advances. Real emission (compile + burn + wait) is wired in ORC-3/DRV-6.
+pub struct LaserExecutor {
+    /// Airflow interlock policy (see [`AirflowGate`]).
+    pub airflow: AirflowGate,
+}
 
 impl StageExecutor for LaserExecutor {
     fn run(&self, ctx: &mut StageCtx) -> Result<StageOutcome> {
         let machine = ctx.def.machine.as_deref().unwrap_or("");
         let process = ctx.def.process.as_deref().unwrap_or("");
+
+        match self.airflow {
+            AirflowGate::Skip => {
+                ctx.record(
+                    "airflow_skipped",
+                    &json_detail(&[
+                        ("machine", machine),
+                        (
+                            "note",
+                            "bring-up stub: airflow interlock NOT checked \
+                             (ORC-3/DRV-6 sets AirflowGate::Require)",
+                        ),
+                    ]),
+                )?;
+            }
+            AirflowGate::Require => {
+                // Unknown machine = hard error, fail closed (never burn blind).
+                let m = parse_machine(machine)?;
+                match crate::airflow::require_airflow(m) {
+                    Ok(()) => {
+                        ctx.record("airflow_ok", &json_detail(&[("machine", machine)]))?;
+                    }
+                    Err(e) => {
+                        ctx.record(
+                            "airflow_blocked",
+                            &json_detail(&[("machine", machine), ("error", &e.to_string())]),
+                        )?;
+                        return Ok(StageOutcome::Halt);
+                    }
+                }
+            }
+        }
+
         ctx.record(
             "emit_intent",
             &json_detail(&[("machine", machine), ("process", process)]),
         )?;
         Ok(StageOutcome::Advance)
+    }
+}
+
+/// Map a stage's machine string to a [`Machine`]; unknown = fail-closed error.
+fn parse_machine(s: &str) -> Result<pcb_core::Machine> {
+    match s.trim().to_ascii_lowercase().as_str() {
+        "fiber" => Ok(pcb_core::Machine::Fiber),
+        "uv" => Ok(pcb_core::Machine::Uv),
+        other => Err(EngineError::Config(format!(
+            "laser stage has unknown machine `{other}` (expected `fiber` or `uv`)"
+        ))),
     }
 }
 
@@ -275,13 +362,13 @@ pub enum FlipMode {
 }
 
 impl FlipMode {
-    fn is_double_sided(self) -> bool {
+    fn is_double_sided(self) -> Result<bool> {
         match self {
-            FlipMode::SingleSided => false,
-            FlipMode::DoubleSided => true,
-            FlipMode::FromEnv => env::var(ENV_DOUBLE_SIDED)
-                .map(|v| matches!(v.trim().to_ascii_lowercase().as_str(), "1" | "true" | "yes"))
-                .unwrap_or(false),
+            FlipMode::SingleSided => Ok(false),
+            FlipMode::DoubleSided => Ok(true),
+            // A malformed value must error, not fall back to single-sided and
+            // silently skip the bottom side (scrapped board) (LR-04).
+            FlipMode::FromEnv => Ok(parse_env_bool(ENV_DOUBLE_SIDED)?.unwrap_or(false)),
         }
     }
 }
@@ -300,7 +387,7 @@ pub struct FlipExecutor {
 
 impl StageExecutor for FlipExecutor {
     fn run(&self, ctx: &mut StageCtx) -> Result<StageOutcome> {
-        if self.mode.is_double_sided() {
+        if self.mode.is_double_sided()? {
             ctx.record(
                 "flip_prompt",
                 &json_detail(&[
@@ -338,7 +425,9 @@ impl ExecutorRegistry {
     pub fn with_defaults() -> Self {
         Self {
             manual: Box::new(ManualExecutor),
-            laser: Box::new(LaserExecutor),
+            laser: Box::new(LaserExecutor {
+                airflow: AirflowGate::Skip,
+            }),
             clearance: Box::new(ClearanceLoopExecutor),
             flip: Box::new(FlipExecutor {
                 mode: FlipMode::FromEnv,
@@ -567,6 +656,11 @@ fn escape_into(s: &str, out: &mut String) {
         match c {
             '"' => out.push_str("\\\""),
             '\\' => out.push_str("\\\\"),
+            '\n' => out.push_str("\\n"),
+            '\r' => out.push_str("\\r"),
+            '\t' => out.push_str("\\t"),
+            // Any other control char is invalid raw in a JSON string (LR-27).
+            c if (c as u32) < 0x20 => out.push_str(&format!("\\u{:04x}", c as u32)),
             _ => out.push(c),
         }
     }
@@ -575,6 +669,31 @@ fn escape_into(s: &str, out: &mut String) {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn parse_machine_is_fail_closed_on_unknown() {
+        assert_eq!(parse_machine("fiber").unwrap(), pcb_core::Machine::Fiber);
+        assert_eq!(parse_machine(" UV ").unwrap(), pcb_core::Machine::Uv);
+        assert!(matches!(parse_machine("plasma"), Err(EngineError::Config(_))));
+        assert!(matches!(parse_machine(""), Err(EngineError::Config(_))));
+    }
+
+    #[test]
+    fn parse_env_bool_rejects_typos_and_reads_both_polarities() {
+        // A uniquely-named var keeps this off the shared-env race surface.
+        let var = "PCBFORGE_TEST_DOUBLE_SIDED_LR04";
+        // SAFETY: single-threaded test body; var is unique to this test.
+        unsafe {
+            std::env::set_var(var, "on");
+            assert!(matches!(parse_env_bool(var), Err(EngineError::Config(_))));
+            std::env::set_var(var, "YES");
+            assert_eq!(parse_env_bool(var).unwrap(), Some(true));
+            std::env::set_var(var, "0");
+            assert_eq!(parse_env_bool(var).unwrap(), Some(false));
+            std::env::remove_var(var);
+        }
+        assert_eq!(parse_env_bool(var).unwrap(), None);
+    }
 
     #[test]
     fn env_source_falls_back_to_default_when_unset() {
