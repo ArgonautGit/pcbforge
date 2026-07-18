@@ -194,7 +194,7 @@ fn containing_cell(
     count: u32,
 ) -> Option<u32> {
     // Window must start at/left of the element: c ≤ floor(off0 / stride).
-    let hi = ((off0.max(0) / stride) as i64).min((count - 1) as i64);
+    let hi = (off0.max(0) / stride).min((count - 1) as i64);
     // …and end at/right of it: c ≥ ceil((off1 − field) / stride).
     let lo = if off1 <= field {
         0
