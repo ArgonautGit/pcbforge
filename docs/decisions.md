@@ -1733,3 +1733,51 @@ line of dots is caught; documented the centered-grid (centroid-as-center)
 assumption on the API; `UniformScale` wording now also names a mis-scaled
 reference/print as a suspect. New tests: rotation→NonRadial, non-finite→
 Inconclusive, diagonal→SpanTooThin.
+
+## 2026-07-18 — Repo-wide logic-review remediation (LR-01…LR-50)
+
+Worked the 50 findings from the 2026-07-17 logic review. 46 fixed with
+regression tests (443 workspace tests green, clippy clean); 4 deferred with
+rationale below. Fixes of note:
+
+- **Safety/etch path:** airflow interlock wired into `LaserExecutor` via an
+  `AirflowGate` (bring-up default records an `airflow_skipped` audit row;
+  `Require` verifies + Halts, unknown machine fails closed) (LR-01); interlock
+  self-test (deassert RTS, require CTS low → `StuckClosed`) + debounce (LR-19);
+  back-side "Etch here" refused until `register` can mirror (LR-03).
+- **Calibration correctness:** grid burn-origin persisted and returned by
+  `calib_grid()` — the fit no longer labels the lower-left dot (0,0) when it was
+  burned at `field_center − span/2` (LR-02); a failed fit keeps the previous
+  calibration (LR-16); camera scale measured from design spacing, not dragged
+  markers (LR-17).
+- **Orchestration durability:** each `step` runs in one `BEGIN IMMEDIATE`
+  transaction (atomic runlog+advance, no board stranded at `'start'`, serialized
+  steppers) + `busy_timeout` (LR-09/10/11); strict `PCBFORGE_DOUBLE_SIDED`
+  parse (LR-04); runlog ordered by rowid (LR-28); schema-version checked on open
+  (LR-29).
+- **CAM coverage:** dual-machine split erodes only the copper side and gives the
+  near-copper strip to UV, so fiber ∪ UV == the removal band (LR-05); tiling
+  buckets into a field window that contains the element, flagging the rest as
+  `unfittable` (LR-06); heat-order tail spread via a bisection permutation
+  (LR-07); winding-validation budget capped at 2% of ring area (LR-37).
+- **Ingest:** every record in a `%…%` block dispatched (LR-13); apertures before
+  `%MO` error (LR-12); decimal-only Excellon coordinates (LR-32).
+
+### Deferred (not fixed) — rationale
+
+- **LR-21** (BedMap y-flip half-pixel): every y-flip producer/consumer currently
+  agrees on the `H` convention; changing only `BedMap` to `(H−1)` would
+  *introduce* a real 1 px disagreement to remove a latent one. Needs a
+  consistent sweep across all ~8 sites + fixtures as its own reviewed change.
+- **LR-15** (back-side AR double-mirror): a cross-cutting mirror-convention
+  decision (`x_mm: 0.0` vs `cx`, mirrored-vs-unmirrored compositing) on the AR
+  overlay — a canvas render not drivable headlessly (see AGENT_DEBUGGING.md).
+  Display-only now that back-side etch is refused (LR-03); a blind change risks
+  a plausible-but-wrong overlay.
+- **LR-44** (click-to-place mm under an active homography): the fiducial-check
+  placement is the pre-registration bootstrap that *produces* the homography, so
+  inverting it here is circular; the review itself tags it `[suspected]` with two
+  conflicting fixes. Unverifiable canvas click path.
+- **LR-34** (exact `s==e` full-circle detection): spec-compliant for a
+  non-KiCad emitter; the suggested fix is a warning, but the parser has no
+  diagnostic/warn channel.
