@@ -504,6 +504,31 @@ pub fn step(
     pallet: &dyn PalletSource,
     defaults: &BoardDefaults,
 ) -> Result<StepReport> {
+    // Run the whole step — pallet/board resolution and the stage transition —
+    // in one `BEGIN IMMEDIATE` transaction. This makes the stage_start /
+    // executor / stage_done / update_board writes atomic (a crash can't leave
+    // the runlog and board.stage disagreeing and re-run the stage — LR-09),
+    // makes the new-board insert-then-set-entry atomic so no board is ever
+    // persisted at the placeholder `'start'` stage (LR-10), and serializes
+    // concurrent steppers so two `next`s can't both run and advance (LR-11).
+    db.begin_immediate()?;
+    let result = step_txn(db, graph, registry, pallet, defaults);
+    match &result {
+        Ok(_) => db.commit()?,
+        Err(_) => {
+            let _ = db.rollback();
+        }
+    }
+    result
+}
+
+fn step_txn(
+    db: &Db,
+    graph: &StageGraph,
+    registry: &ExecutorRegistry,
+    pallet: &dyn PalletSource,
+    defaults: &BoardDefaults,
+) -> Result<StepReport> {
     let tag = pallet.read_tag()?;
     let pallet_id = resolve_pallet(db, tag)?;
     let mut board = resolve_board(db, graph, pallet_id, defaults)?;
@@ -622,6 +647,9 @@ fn resolve_board(
     }
     // New board: `insert_board` parks it at the schema default `'start'`; move
     // it to the graph entry so the persisted stage is always a real stage name.
+    // Both statements run inside `step`'s transaction, so a crash between them
+    // rolls the insert back entirely — no board is ever left at `'start'`
+    // (which no stage graph contains, and would brick the pallet) (LR-10).
     let mut board = db.insert_board(
         Some(pallet_id),
         &defaults.design_path,

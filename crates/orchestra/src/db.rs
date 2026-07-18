@@ -115,6 +115,9 @@ impl Db {
     /// `IF NOT EXISTS`) and `schema_version` is stamped if empty.
     pub fn open<P: AsRef<Path>>(path: P) -> Result<Self> {
         let conn = Connection::open(path)?;
+        // Wait for a concurrent writer's transaction instead of failing a
+        // `step`'s `BEGIN IMMEDIATE` immediately with SQLITE_BUSY (LR-11).
+        conn.busy_timeout(std::time::Duration::from_secs(5))?;
         conn.execute_batch(SCHEMA_SQL)?;
         let versions: i64 =
             conn.query_row("SELECT COUNT(*) FROM schema_version", [], |r| r.get(0))?;
@@ -139,6 +142,27 @@ impl Db {
             }
         }
         Ok(Self { conn })
+    }
+
+    /// Begin an immediate-mode write transaction (acquires the write lock now,
+    /// so a concurrent stepper serializes behind it). Pair with [`commit`] or
+    /// [`rollback`]. `Db` holds a `&Connection`, so this drives the
+    /// transaction via SQL rather than a borrowing `Transaction` guard.
+    ///
+    /// [`commit`]: Db::commit
+    /// [`rollback`]: Db::rollback
+    pub fn begin_immediate(&self) -> Result<()> {
+        self.conn.execute_batch("BEGIN IMMEDIATE")
+    }
+
+    /// Commit the current transaction.
+    pub fn commit(&self) -> Result<()> {
+        self.conn.execute_batch("COMMIT")
+    }
+
+    /// Roll back the current transaction.
+    pub fn rollback(&self) -> Result<()> {
+        self.conn.execute_batch("ROLLBACK")
     }
 
     /// The stored schema version.
@@ -507,6 +531,25 @@ mod tests {
         assert_eq!(db.get_pallet(p.id).unwrap().unwrap(), renamed);
 
         assert!(db.get_pallet(9999).unwrap().is_none());
+    }
+
+    #[test]
+    fn rollback_undoes_writes_in_a_transaction() {
+        // The atomicity mechanism `step` relies on (LR-09/LR-10): a rolled-back
+        // transaction leaves no trace of its inserts.
+        let db = Db::open(temp_db_path("txn")).unwrap();
+        db.begin_immediate().unwrap();
+        db.insert_pallet(4242, "", 0, 0).unwrap();
+        db.rollback().unwrap();
+        assert!(
+            db.get_pallet_by_tag(4242).unwrap().is_none(),
+            "rollback must undo the pallet insert"
+        );
+        // And a committed one persists.
+        db.begin_immediate().unwrap();
+        db.insert_pallet(4243, "", 0, 0).unwrap();
+        db.commit().unwrap();
+        assert!(db.get_pallet_by_tag(4243).unwrap().is_some());
     }
 
     #[test]
