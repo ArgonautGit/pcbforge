@@ -160,6 +160,13 @@ pub struct Fiducial {
 pub enum Miss {
     /// The search window falls outside (or nearly outside) the frame.
     OutsideFrame,
+    /// The dot images below ~2 px across, so no centroid is meaningful. The
+    /// fix is scale/diameter (move the camera closer, correct `diameter_mm`
+    /// or `px_per_mm`), *not* reframing — a distinct miss from `OutsideFrame`.
+    DotTooSmall {
+        /// Estimated dot diameter in pixels.
+        dot_px: f64,
+    },
     /// Nothing in the window rises above the noise. Per the backlog this is
     /// a lighting problem, not a code problem — the SNR is reported so the
     /// operator can see how far off it is.
@@ -240,8 +247,10 @@ fn find_one(
     let dot_px = profile.diameter_mm() * 0.5 * (sx + sy);
     let search_px = search_mm * sx.max(sy);
     if dot_px < 2.0 {
-        // The dot is sub-2-pixel: no centroid can be meaningful.
-        return Err(Miss::OutsideFrame);
+        // The dot is sub-2-pixel: no centroid can be meaningful. This is a
+        // scale/diameter problem, not a framing one — report it as such so the
+        // operator doesn't chase the camera around the bed.
+        return Err(Miss::DotTooSmall { dot_px });
     }
 
     let half = (search_px + dot_px).ceil() as i64;
@@ -782,5 +791,19 @@ mod tests {
         let bed = BedMap::uniform_scale(PX_PER_MM);
         let r = find_fiducials(&frame, &[Point2::new(30.0, 5.0)], 2.0, &dark_1mm(), &bed);
         assert_eq!(r[0], Err(Miss::OutsideFrame));
+    }
+
+    /// A dot imaging below ~2 px is a scale/diameter miss, not a framing one
+    /// (LR-48): at 1 px/mm a 1 mm dot is only ~1 px across.
+    #[test]
+    fn sub_two_pixel_dot_reports_dot_too_small() {
+        let frame = render(100, 100, &[], 0.0, 4.0, 5);
+        let bed = BedMap::uniform_scale(1.0); // 1 px/mm → 1 mm dot ≈ 1 px
+        let r = find_fiducials(&frame, &[Point2::new(30.0, 30.0)], 2.0, &dark_1mm(), &bed);
+        assert!(
+            matches!(r[0], Err(Miss::DotTooSmall { .. })),
+            "expected DotTooSmall, got {:?}",
+            r[0]
+        );
     }
 }

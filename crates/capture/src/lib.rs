@@ -15,13 +15,18 @@
 //! A grab returns a grayscale frame (the detectors and overlays work in gray);
 //! callers convert it to a texture / save it as needed.
 
-use std::sync::Arc;
 use std::sync::atomic::{AtomicBool, Ordering};
-use std::sync::mpsc::{self, Receiver, SyncSender, TrySendError};
+use std::sync::{Arc, Mutex};
 use std::thread::{self, JoinHandle};
 use std::time::Duration;
 
 use image::GrayImage;
+
+/// A 1-deep shared slot the capture thread overwrites with the freshest frame.
+/// A plain `sync_channel(1)` drops the *newer* frame when full (keeping the
+/// stale one); overwriting a shared slot keeps the newest, which is what a
+/// live preview wants.
+type Slot = Arc<Mutex<Option<Result<GrayImage, String>>>>;
 
 /// Strip surrounding single/double quotes and whitespace from a pasted file
 /// path (drag-and-drop and file managers often quote paths with spaces).
@@ -51,7 +56,7 @@ pub enum Source {
 /// never blocks the UI. The caller polls [`latest`](Capture::latest); the
 /// thread stops when the `Capture` is dropped.
 pub struct Capture {
-    rx: Receiver<Result<GrayImage, String>>,
+    slot: Slot,
     stop: Arc<AtomicBool>,
     handle: Option<JoinHandle<()>>,
 }
@@ -60,25 +65,23 @@ impl Capture {
     /// Spawn a capture thread for `source`.
     pub fn start(source: Source) -> Self {
         let stop = Arc::new(AtomicBool::new(false));
-        // Depth 1: the thread keeps only the freshest frame; the caller drains.
-        let (tx, rx) = mpsc::sync_channel::<Result<GrayImage, String>>(1);
+        // The thread overwrites this slot with the freshest frame; the caller
+        // takes it. Newest always wins — no fresh frame is ever dropped.
+        let slot: Slot = Arc::new(Mutex::new(None));
         let stop_t = stop.clone();
-        let handle = thread::spawn(move || capture_loop(source, tx, stop_t));
+        let slot_t = slot.clone();
+        let handle = thread::spawn(move || capture_loop(source, slot_t, stop_t));
         Self {
-            rx,
+            slot,
             stop,
             handle: Some(handle),
         }
     }
 
-    /// The most recent frame, draining any staler ones. `None` if nothing new
-    /// has arrived since the last poll.
+    /// The most recent frame, consuming it. `None` if nothing new has arrived
+    /// since the last poll.
     pub fn latest(&self) -> Option<Result<GrayImage, String>> {
-        let mut last = None;
-        while let Ok(f) = self.rx.try_recv() {
-            last = Some(f);
-        }
-        last
+        self.slot.lock().unwrap().take()
     }
 }
 
@@ -91,28 +94,23 @@ impl Drop for Capture {
     }
 }
 
-/// Push `frame` into the 1-slot channel, dropping it if the slot is still full
-/// (the caller hasn't consumed the previous one) — we only want the latest.
-fn offer(tx: &SyncSender<Result<GrayImage, String>>, frame: Result<GrayImage, String>) -> bool {
-    match tx.try_send(frame) {
-        Ok(()) | Err(TrySendError::Full(_)) => true,
-        Err(TrySendError::Disconnected(_)) => false,
-    }
+/// Overwrite the shared slot with the freshest `frame`, discarding any
+/// previous frame the caller hasn't consumed — we only want the latest.
+fn offer(slot: &Slot, frame: Result<GrayImage, String>) {
+    *slot.lock().unwrap() = Some(frame);
 }
 
-fn capture_loop(source: Source, tx: SyncSender<Result<GrayImage, String>>, stop: Arc<AtomicBool>) {
+fn capture_loop(source: Source, slot: Slot, stop: Arc<AtomicBool>) {
     #[cfg(feature = "camera")]
     if let Source::Device(index) = source {
-        device_loop(index, &tx, &stop);
+        device_loop(index, &slot, &stop);
         return;
     }
     // File source (and Device without the feature) — re-grab with a throttle.
     while !stop.load(Ordering::Relaxed) {
         let frame = grab(&source);
         let slow = frame.is_err();
-        if !offer(&tx, frame) {
-            return; // receiver gone
-        }
+        offer(&slot, frame);
         thread::sleep(Duration::from_millis(if slow { 300 } else { 40 }));
     }
 }
@@ -168,7 +166,9 @@ fn frame_to_gray(cam: &mut nokhwa::Camera) -> Result<GrayImage, String> {
     Ok(GrayImage::from_fn(w, h, |x, y| {
         let p = rgb.get_pixel(x, y).0;
         let l = 0.299 * p[0] as f64 + 0.587 * p[1] as f64 + 0.114 * p[2] as f64;
-        image::Luma([l as u8])
+        // Round, don't truncate: `as u8` floors, a ~0.5-LSB systematic
+        // darkening of every pixel. `l ∈ [0, 255]`, so this never overflows.
+        image::Luma([l.round() as u8])
     }))
 }
 
@@ -180,20 +180,18 @@ fn grab_device(index: u32) -> Result<GrayImage, String> {
 /// Persistent device capture: open the camera once, then stream frames until
 /// stopped — avoids the per-frame reopen that would stutter a live feed.
 #[cfg(feature = "camera")]
-fn device_loop(index: u32, tx: &SyncSender<Result<GrayImage, String>>, stop: &Arc<AtomicBool>) {
+fn device_loop(index: u32, slot: &Slot, stop: &Arc<AtomicBool>) {
     let mut cam = match open_camera(index) {
         Ok(c) => c,
         Err(e) => {
-            let _ = offer(tx, Err(e));
+            offer(slot, Err(e));
             return;
         }
     };
     while !stop.load(Ordering::Relaxed) {
         let frame = frame_to_gray(&mut cam);
         let slow = frame.is_err();
-        if !offer(tx, frame) {
-            return;
-        }
+        offer(slot, frame);
         if slow {
             thread::sleep(Duration::from_millis(300));
         }
@@ -217,7 +215,10 @@ fn list_devices_impl() -> Vec<(u32, String)> {
         .map(|infos| {
             infos
                 .into_iter()
-                .map(|i| (i.index().as_index().unwrap_or(0), i.human_name()))
+                // Keep only numeric-index devices. A string-indexed camera has
+                // no `u32` to open by, and mapping them all to 0 (the old
+                // `unwrap_or(0)`) silently collides distinct devices onto one.
+                .filter_map(|i| i.index().as_index().ok().map(|idx| (idx, i.human_name())))
                 .collect()
         })
         .unwrap_or_default()
@@ -292,6 +293,18 @@ mod tests {
         }
         drop(cap); // stops + joins the thread
         assert_eq!(got.expect("a frame arrived").dimensions(), (24, 16));
+    }
+
+    #[test]
+    fn a_slow_poller_gets_the_freshest_frame_not_a_stale_one() {
+        // Two frames produced with no poll in between: the slot must hold the
+        // *newer* one. The old sync_channel(1) kept the older frame and
+        // dropped the fresh one (the LR-22 staleness bug).
+        let slot: Slot = Arc::new(Mutex::new(None));
+        offer(&slot, Ok(GrayImage::from_pixel(2, 2, image::Luma([1]))));
+        offer(&slot, Ok(GrayImage::from_pixel(2, 2, image::Luma([2]))));
+        let got = slot.lock().unwrap().take().unwrap().unwrap();
+        assert_eq!(got.get_pixel(0, 0).0[0], 2, "newest frame wins");
     }
 
     #[test]

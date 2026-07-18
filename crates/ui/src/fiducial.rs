@@ -267,6 +267,9 @@ fn summarize(
                     Miss::LowContrast { snr } => format!("low contrast (snr {snr:.1})"),
                     Miss::NoCandidate { snr } => format!("no candidate (snr {snr:.1})"),
                     Miss::OutsideFrame => "search window outside frame".to_string(),
+                    Miss::DotTooSmall { dot_px } => {
+                        format!("dot too small ({dot_px:.1} px) — move closer or fix diameter/scale")
+                    }
                 };
                 rows.push(FidRow {
                     text: format!("#{i}  ({:.1},{:.1}) mm   MISS: {why}", exp.0, exp.1),

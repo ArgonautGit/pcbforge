@@ -43,6 +43,12 @@ impl Homography {
     /// The inverse transform (dst → src), or `None` if singular.
     pub fn try_inverse(&self) -> Option<Homography> {
         let inv = self.matrix.try_inverse()?;
+        // `inv[(2,2)]` can be exactly 0 even for a nonsingular H (it is the
+        // source matrix's top-left 2×2 minor over det); normalizing by it
+        // would spray inf/NaN through an otherwise "successful" inverse.
+        if inv[(2, 2)].abs() < 1e-12 {
+            return None;
+        }
         let m = inv / inv[(2, 2)];
         Some(Homography {
             matrix: m,
@@ -305,6 +311,20 @@ mod tests {
             fit_homography(&three),
             Err(HomographyError::TooFewPoints { got: 3 })
         );
+    }
+
+    #[test]
+    fn inverse_of_zero_bottom_right_minor_is_none_not_nan() {
+        // Nonsingular (det = −1) but its top-left 2×2 minor is 0, so the
+        // inverse's [(2,2)] is 0 — the old code divided by it and returned a
+        // matrix full of inf/NaN (LR-26). Now it's a clean `None`.
+        let h = Homography {
+            matrix: Matrix3::new(1.0, 1.0, 0.0, 1.0, 1.0, 1.0, 0.0, 1.0, 1.0),
+            residuals: Vec::new(),
+            rms: 0.0,
+        };
+        assert!(h.matrix.determinant().abs() > 0.5, "H is nonsingular");
+        assert!(h.try_inverse().is_none());
     }
 
     #[test]

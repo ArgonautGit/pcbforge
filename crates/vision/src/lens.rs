@@ -111,6 +111,22 @@ impl Poly2 {
         let bx = DVector::from_iterator(n, dst.iter().map(|&(x, _)| x));
         let by = DVector::from_iterator(n, dst.iter().map(|&(_, y)| y));
         let svd = a.svd(true, true);
+        // Reject a rank-deficient design (near-collinear or under-spread grid
+        // points): nalgebra's `solve` happily pseudo-inverts it and returns a
+        // confident minimum-norm answer that is garbage off the sampled line.
+        // Rank relative to σ_max, matching `fit_affine`'s degeneracy gate.
+        let smax = svd.singular_values.iter().cloned().fold(0.0_f64, f64::max);
+        let rank = svd
+            .singular_values
+            .iter()
+            .filter(|&&s| s > smax * 1e-9)
+            .count();
+        if rank < 10 {
+            return Err(format!(
+                "lens fit is rank-deficient (rank {rank}/10): the points are \
+                 near-collinear or under-spread — image a full 2-D grid"
+            ));
+        }
         let sol_x = svd.solve(&bx, 1e-12).map_err(|e| format!("x fit: {e}"))?;
         let sol_y = svd.solve(&by, 1e-12).map_err(|e| format!("y fit: {e}"))?;
         let mut coeff_x = [0.0; 10];
@@ -141,6 +157,27 @@ pub struct LensMap {
     pub max_um: f64,
     /// Per fit point: `(px_x, px_y, residual_µm)` — for the heat-map / vectors.
     pub residuals: Vec<(f64, f64, f64)>,
+}
+
+#[cfg(test)]
+mod rank_tests {
+    use super::*;
+
+    /// Collinear inputs used to "fit" with ~0 RMS garbage (LR-18): nalgebra's
+    /// `solve` pseudo-inverts the rank-deficient design. The rank gate now
+    /// rejects them instead of returning a confident wrong map.
+    #[test]
+    fn rank_deficient_collinear_fit_is_rejected() {
+        let pairs: Vec<(Point2<f64>, Point2<f64>)> = (0..12)
+            .map(|i| {
+                let t = i as f64;
+                // All points on the line y = x in both frames.
+                (Point2::new(t, t), Point2::new(2.0 * t + 1.0, 2.0 * t + 1.0))
+            })
+            .collect();
+        let err = fit_lens(&pairs).unwrap_err();
+        assert!(err.contains("rank-deficient"), "got: {err}");
+    }
 }
 
 /// Fit a lens model from `(pixel, true_mm)` correspondences (the imaged known
@@ -405,8 +442,9 @@ pub struct FieldVerdict {
     /// pincushion (grows outward), negative = barrel. `0.0` whenever
     /// `pattern` is `Inconclusive`.
     pub k3_um_per_mm3: f64,
-    /// RMS of the full fitted radial model (`k1·r + k3·r³`) over all
-    /// samples, µm — the "systematic signal".
+    /// RMS of the full fitted systematic model — radial (`k1·r + k3·r³`) and
+    /// tangential (`t1·r`) combined — over all samples, µm; the "systematic
+    /// signal" that is removed to isolate `noise_um`.
     pub systematic_um: f64,
     /// RMS of the radial cubic term alone over all samples, µm — used to
     /// decide pincushion/barrel vs a uniform scale.
