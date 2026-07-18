@@ -1167,9 +1167,12 @@ impl ConsoleApp {
             }
         };
         self.place_pivot = crate::place::bbox_center_mm(&ablate);
-        // Start centered on the frame.
-        self.place_tx_mm = img.width() as f64 / 2.0 / self.place_px_per_mm;
-        self.place_ty_mm = img.height() as f64 / 2.0 / self.place_px_per_mm;
+        // Start centered on the frame — in the SAME frame the overlay draws in.
+        // Under an active homography, uniform px/mm would land the job far
+        // off-centre until dragged (LR-42).
+        let (cx, cy) = self.initial_center_mm(img.width() as f64, img.height() as f64);
+        self.place_tx_mm = cx;
+        self.place_ty_mm = cy;
         self.place_rot_deg = 0.0;
         self.place_job = ablate;
         self.place_frame_img = Some(img);
@@ -1194,9 +1197,13 @@ impl ConsoleApp {
             [0xf0, 0x50, 0x30],
             0.55,
         );
-        // Which frame the placement coordinates live in — machine (calibrated)
-        // vs the design frame — so the operator knows if the burn is absolute.
-        let frame_note = if self.calib.is_some() {
+        // Which frame the placement coordinates live in — must mirror
+        // place_homography's precedence, or the note lies when field correction
+        // is active (it says "machine mm" while the overlay is in the physical
+        // field frame) (LR-43).
+        let frame_note = if self.place_field_correct && self.calib_field.is_some() {
+            " · physical mm (field-corrected)"
+        } else if self.calib.is_some() {
             " · machine mm (calibrated)"
         } else if self.fid_homography.is_some() {
             " · design frame (perspective; not machine-calibrated)"
@@ -1604,6 +1611,23 @@ impl ConsoleApp {
     /// The homography mapping placement target-mm → camera px for the Place
     /// tab: the **camera→laser calibration** (machine mm) when calibrated, else
     /// the fiducial homography (design frame only, not machine-accurate).
+    /// Bed-mm placement that lands the job pivot at the frame's pixel centre,
+    /// in whatever frame the overlay draws in: invert the active homography
+    /// (bed-mm → px) when present, else the uniform px/mm scale (LR-42).
+    fn initial_center_mm(&self, w_px: f64, h_px: f64) -> (f64, f64) {
+        let px_center = nalgebra::Point2::new(w_px / 2.0, h_px / 2.0);
+        match self.place_homography().and_then(|h| h.try_inverse()) {
+            Some(inv) => {
+                let m = inv.apply(px_center);
+                (m.x, m.y)
+            }
+            None => (
+                px_center.x / self.place_px_per_mm,
+                px_center.y / self.place_px_per_mm,
+            ),
+        }
+    }
+
     fn place_homography(&self) -> Option<vision::Homography> {
         // With field correction on, place in the physical (metric) frame the
         // emit pre-distorts from — its linear px map — so overlay, drag, and the
@@ -4720,6 +4744,38 @@ mod tests {
             app.calib_note.contains("kept previous"),
             "note explains the keep: {}",
             app.calib_note
+        );
+    }
+
+    /// The initial placement centre lands the job pivot at the frame's pixel
+    /// centre in the overlay's own frame — under an active homography, not the
+    /// uniform scale that would render it far off-centre (LR-42).
+    #[test]
+    fn initial_placement_centers_under_an_active_homography() {
+        let mut app = ConsoleApp::new(tmp_db(), vec!["true".into()]);
+        app.place_px_per_mm = 10.0;
+        // A keystone homography (bed-mm → px) as the active placement map.
+        let h = vision::Homography {
+            matrix: nalgebra::Matrix3::new(
+                9.8, 0.2, 15.0, //
+                -0.1, 10.1, -8.0, //
+                0.0006, -0.0004, 1.0,
+            ),
+            residuals: vec![],
+            rms: 0.0,
+        };
+        app.fid_homography = Some(h.clone());
+        let (w, ht) = (400.0, 300.0);
+        let (tx, ty) = app.initial_center_mm(w, ht);
+        // The job pivot placed at (tx,ty) must map back to the pixel centre.
+        let c = h.apply(nalgebra::Point2::new(tx, ty));
+        assert!(
+            (c.x - w / 2.0).abs() < 1e-3 && (c.y - ht / 2.0).abs() < 1e-3,
+            "pivot maps to ({:.2},{:.2}), want ({},{})",
+            c.x,
+            c.y,
+            w / 2.0,
+            ht / 2.0
         );
     }
 
