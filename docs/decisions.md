@@ -1883,13 +1883,12 @@ and radial distortion are present together.
   corroborating centroid only when it agrees with the generic component
   detector. It is not allowed to manufacture a lock by itself on textured
   copper.
-- `Poly2` can use the full 4×4 tensor-product bicubic (16 coefficients per
+- `Poly2` is now the full 4×4 tensor-product bicubic (16 coefficients per
   output axis). The original ten terms keep their ordering; legacy 23-value
   maps are promoted by zero-filling the six new cross terms.
-- Live calibration remains usable with 10 detected marks. It selects the full
-  16-term basis only when at least 16 well-spread detections support it, and
-  automatically falls back to the legacy 10-term basis for sparse or
-  rank-deficient frames instead of refusing to fit.
+- Operator calibration requires at least 20 locks, and laser-field calibration
+  at least a 5×5 grid, so the 16-term model remains overdetermined and its
+  residuals still measure error instead of an exact 4×4 interpolation.
 - Field-map serialization advances to `pcbforge-field 2` with 35 coefficients
   per direction. Version 1 files remain readable, so existing correction files
   are not invalidated.

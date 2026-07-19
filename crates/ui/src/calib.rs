@@ -474,9 +474,9 @@ fn refit_precise(
     kind: DotKind,
 ) -> Result<(Calibration, LensMap), String> {
     let (pairs, total) = detect_grid_dots(frame, mm_to_px_seed, grid, dot_mm, kind)?;
-    if pairs.len() < 10 {
+    if pairs.len() < 20 {
         return Err(format!(
-            "only {}/{} grid dots detected — nonlinear anchor needs ≥10",
+            "only {}/{} grid dots detected — nonlinear anchor needs ≥20",
             pairs.len(),
             total
         ));
@@ -550,9 +550,9 @@ pub fn fit_camera_lens(
     let seed = corner_seed(corners_px, grid)?;
     let (pairs, total) = detect_grid_dots(frame, &seed, grid, dot_mm, kind)?;
     let found = pairs.len();
-    if found < 10 {
+    if found < 20 {
         return Err(format!(
-            "only {found}/{total} grid dots detected — the lens fit needs ≥10 \
+            "only {found}/{total} grid dots detected — the lens fit needs ≥20 \
              (check the printed grid, the corner clicks, and the dot size)"
         ));
     }
@@ -865,15 +865,15 @@ pub fn fit_laser_field(
     kind: DotKind,
     lens: &LensMap,
 ) -> Result<FieldCal, String> {
-    if grid.n < 4 {
-        return Err("laser-field fit needs at least a 4×4 grid".into());
+    if grid.n < 5 {
+        return Err("laser-field fit needs at least a 5×5 grid".into());
     }
     let seed = corner_seed(corners_px, grid)?;
     let (pairs, total) = detect_grid_dots(frame, &seed, grid, dot_mm, kind)?;
     let found = pairs.len();
-    if found < 10 {
+    if found < 20 {
         return Err(format!(
-            "only {found}/{total} grid dots detected — the field fit needs ≥10 \
+            "only {found}/{total} grid dots detected — the field fit needs ≥20 \
              (check the burned grid, the corner clicks, the dot size, and polarity)"
         ));
     }

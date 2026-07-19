@@ -100,13 +100,11 @@ impl Poly2 {
         }
     }
 
-    /// Fit `src → dst` (both `(x, y)`) by least squares. Uses the full
-    /// 16-term tensor bicubic when the detections support it, and falls back
-    /// to the legacy 10-term cubic for sparse or rank-deficient live frames.
+    /// Fit `src → dst` (both `(x, y)`) by least squares. Needs ≥ 16 points.
     fn fit(src: &[(f64, f64)], dst: &[(f64, f64)]) -> Result<Poly2, String> {
         let n = src.len();
-        if n < 10 {
-            return Err(format!("polynomial fit needs ≥10 points, got {n}"));
+        if n < 16 {
+            return Err(format!("bicubic fit needs ≥16 points, got {n}"));
         }
         // Normalize the input to ~[-1, 1] so the design matrix is well
         // conditioned (raw pixels or mm span hundreds).
@@ -123,42 +121,40 @@ impl Poly2 {
         }
         let scale = 1.0 / half;
 
+        let mut a = DMatrix::<f64>::zeros(n, 16);
+        for (i, &(x, y)) in src.iter().enumerate() {
+            let b = basis((x - cx) * scale, (y - cy) * scale);
+            for (j, bj) in b.iter().enumerate() {
+                a[(i, j)] = *bj;
+            }
+        }
         let bx = DVector::from_iterator(n, dst.iter().map(|&(x, _)| x));
         let by = DVector::from_iterator(n, dst.iter().map(|&(_, y)| y));
-        let solve = |terms: usize| -> Result<([f64; 16], [f64; 16]), String> {
-            let mut a = DMatrix::<f64>::zeros(n, terms);
-            for (i, &(x, y)) in src.iter().enumerate() {
-                let b = basis((x - cx) * scale, (y - cy) * scale);
-                for j in 0..terms {
-                    a[(i, j)] = b[j];
-                }
-            }
-            let svd = a.svd(true, true);
-            let smax = svd.singular_values.iter().cloned().fold(0.0_f64, f64::max);
-            let rank = svd
-                .singular_values
-                .iter()
-                .filter(|&&s| s > smax * 1e-9)
-                .count();
-            if rank < terms {
-                return Err(format!(
-                    "polynomial fit is rank-deficient (rank {rank}/{terms}): the points are \
-                     near-collinear or under-spread — image a full 2-D grid"
-                ));
-            }
-            let sol_x = svd.solve(&bx, 1e-12).map_err(|e| format!("x fit: {e}"))?;
-            let sol_y = svd.solve(&by, 1e-12).map_err(|e| format!("y fit: {e}"))?;
-            let mut coeff_x = [0.0; 16];
-            let mut coeff_y = [0.0; 16];
-            coeff_x[..terms].copy_from_slice(sol_x.as_slice());
-            coeff_y[..terms].copy_from_slice(sol_y.as_slice());
-            Ok((coeff_x, coeff_y))
-        };
-        let (coeff_x, coeff_y) = if n >= 16 {
-            solve(16).or_else(|_| solve(10))?
-        } else {
-            solve(10)?
-        };
+        let svd = a.svd(true, true);
+        // Reject a rank-deficient design (near-collinear or under-spread grid
+        // points): nalgebra's `solve` happily pseudo-inverts it and returns a
+        // confident minimum-norm answer that is garbage off the sampled line.
+        // Rank relative to σ_max, matching `fit_affine`'s degeneracy gate.
+        let smax = svd.singular_values.iter().cloned().fold(0.0_f64, f64::max);
+        let rank = svd
+            .singular_values
+            .iter()
+            .filter(|&&s| s > smax * 1e-9)
+            .count();
+        if rank < 16 {
+            return Err(format!(
+                "bicubic fit is rank-deficient (rank {rank}/16): the points are \
+                 near-collinear or under-spread — image a full 2-D grid"
+            ));
+        }
+        let sol_x = svd.solve(&bx, 1e-12).map_err(|e| format!("x fit: {e}"))?;
+        let sol_y = svd.solve(&by, 1e-12).map_err(|e| format!("y fit: {e}"))?;
+        let mut coeff_x = [0.0; 16];
+        let mut coeff_y = [0.0; 16];
+        for (i, (cx, cy)) in coeff_x.iter_mut().zip(coeff_y.iter_mut()).enumerate() {
+            *cx = sol_x[i];
+            *cy = sol_y[i];
+        }
         Ok(Poly2 {
             cx: coeff_x,
             cy: coeff_y,
@@ -205,8 +201,7 @@ mod rank_tests {
 }
 
 /// Fit a lens model from `(pixel, true_mm)` correspondences (the imaged known
-/// grid). Needs ≥ 10 non-degenerate points; ≥16 well-spread points enable the
-/// full tensor bicubic.
+/// grid). Needs ≥ 16 non-degenerate points.
 pub fn fit_lens(pairs: &[(Point2<f64>, Point2<f64>)]) -> Result<LensMap, String> {
     let px: Vec<(f64, f64)> = pairs.iter().map(|(p, _)| (p.x, p.y)).collect();
     let mm: Vec<(f64, f64)> = pairs.iter().map(|(_, m)| (m.x, m.y)).collect();
@@ -330,8 +325,7 @@ impl FieldMap {
 /// Fit a laser-field pre-distortion from `(physical_mm, commanded_mm)`
 /// correspondences: the physical position each burned dot actually landed at
 /// (read through the metric camera-lens map) paired with the commanded
-/// coordinate it was burned at. Needs ≥ 10 non-degenerate points; ≥16
-/// well-spread points enable the full tensor bicubic.
+/// coordinate it was burned at. Needs ≥ 16 non-degenerate points.
 pub fn fit_field(pairs: &[(Point2<f64>, Point2<f64>)]) -> Result<FieldMap, String> {
     let phys: Vec<(f64, f64)> = pairs.iter().map(|(p, _)| (p.x, p.y)).collect();
     let cmd: Vec<(f64, f64)> = pairs.iter().map(|(_, c)| (c.x, c.y)).collect();
