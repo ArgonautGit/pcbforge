@@ -167,6 +167,19 @@ impl ConsoleApp {
                     .map(|f| format!("{} {}", f.found, f.total))
                     .unwrap_or_default(),
             ),
+            // The burned-grid frame anchor (paper mm → machine mm rigid).
+            (
+                "field_frame",
+                self.calibration
+                    .field
+                    .as_ref()
+                    .filter(|_| self.calibration.field_accepted)
+                    .map(|f| {
+                        let r = &f.paper_to_machine;
+                        format!("{} {} {} {}", r.cos, r.sin, r.tx, r.ty)
+                    })
+                    .unwrap_or_default(),
+            ),
         ])
     }
 
@@ -344,10 +357,27 @@ impl ConsoleApp {
                     nalgebra::Matrix3::new(v[0], v[1], v[2], v[3], v[4], v[5], v[6], v[7], v[8]);
                 vision::Homography::from_matrix(mat).ok()
             });
+            // The frame anchor is required: a save without it predates the
+            // burned-grid frame fix, and its field map is paper-anchored —
+            // restoring it would reintroduce the frame-mismatch bug.
+            let frame = m.get("field_frame").and_then(|s| {
+                let vals: Vec<f64> = s
+                    .split_whitespace()
+                    .filter_map(|t| t.parse().ok())
+                    .filter(|v: &f64| v.is_finite())
+                    .collect();
+                let v: [f64; 4] = vals.try_into().ok()?;
+                Some(crate::calib::Rigid2 {
+                    cos: v[0],
+                    sin: v[1],
+                    tx: v[2],
+                    ty: v[3],
+                })
+            });
             let field = std::fs::read_to_string(self.field_map_path())
                 .ok()
                 .and_then(|s| vision::FieldMap::parse(&s).ok());
-            if let (Some(to_px), Some(field)) = (to_px, field) {
+            if let (Some(to_px), Some(field), Some(paper_to_machine)) = (to_px, field, frame) {
                 let mut stats = m
                     .get("field_stats")
                     .map(|s| s.split_whitespace())
@@ -355,6 +385,7 @@ impl ConsoleApp {
                     .flatten();
                 self.calibration.field = Some(crate::calib::FieldCal {
                     field,
+                    paper_to_machine,
                     to_px,
                     dots: Vec::new(),
                     found: stats.next().and_then(|s| s.parse().ok()).unwrap_or(0),
