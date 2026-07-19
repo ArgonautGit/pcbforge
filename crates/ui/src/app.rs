@@ -326,10 +326,9 @@ impl ConsoleApp {
         };
         let projection = match self.camera.last.as_ref().map(|f| f.dimensions()) {
             Some(dimensions) => match self.camera_projection(dimensions) {
-                Ok(Some(CameraProjection::CommandedNonlinear { .. })) => "nonlinear",
+                Ok(Some(CameraProjection::CommandedField { .. })) => "field-warped-commanded",
+                Ok(Some(CameraProjection::PhysicalLens { .. })) => "physical",
                 Ok(Some(CameraProjection::Homography { .. })) => "homography",
-                Ok(Some(CameraProjection::PhysicalLens { .. })) => "physical-lens",
-                Ok(Some(CameraProjection::Uniform { .. })) => "uniform",
                 Ok(None) => "none",
                 Err(_) => "invalid",
             },
@@ -405,18 +404,6 @@ impl ConsoleApp {
             self.runtime.settings_error.as_deref().unwrap_or("saved"),
         )
     }
-}
-
-/// Whether the verdict recommends enabling the emit field correction. True
-/// only for the clear "real distortion the bi-cubic fixes" readings; uniform
-/// scale (a recal is the likelier root cause), borderline, noise, and
-/// inconclusive leave the operator to decide rather than auto-arming.
-fn field_correction_advised(v: &vision::FieldVerdict) -> bool {
-    use vision::FieldPattern;
-    matches!(
-        v.pattern,
-        FieldPattern::Systematic { .. } | FieldPattern::NonRadial
-    )
 }
 
 /// Operator-facing phrase for a laser-field pincushion-vs-noise verdict.

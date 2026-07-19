@@ -18,6 +18,21 @@ fn tmp() -> PathBuf {
     d
 }
 
+fn identity_field_map(dir: &Path) -> PathBuf {
+    use nalgebra::Point2;
+    let pairs: Vec<_> = (0..4)
+        .flat_map(|row| {
+            (0..4).map(move |column| {
+                let point = Point2::new(column as f64 * 50.0, row as f64 * 50.0);
+                (point, point)
+            })
+        })
+        .collect();
+    let path = dir.join("identity-field.txt");
+    std::fs::write(&path, vision::fit_field(&pairs).unwrap().serialize()).unwrap();
+    path
+}
+
 /// Parse the first `V<x> <y>` X-coordinates out of an emitted `.lbrn2`.
 fn vert_xs(doc: &str) -> Vec<f64> {
     let mut xs = Vec::new();
@@ -37,6 +52,7 @@ fn vert_xs(doc: &str) -> Vec<f64> {
 #[test]
 fn mirror_x_reflects_the_design_for_the_back() {
     let dir = tmp();
+    let field = identity_field_map(&dir);
     let front = dir.join("front.lbrn2");
     let back = dir.join("back.lbrn2");
     let args = |out: &Path, mirror: bool| {
@@ -48,6 +64,8 @@ fn mirror_x_reflects_the_design_for_the_back() {
             fixture("demo-Edge_Cuts.gbr").to_str().unwrap().into(),
             "--lbrn2".into(),
             out.to_str().unwrap().into(),
+            "--field-map".into(),
+            field.to_str().unwrap().into(),
         ];
         if mirror {
             a.push("--mirror-x".into());

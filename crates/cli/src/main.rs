@@ -239,6 +239,15 @@ enum Command {
         /// left-right needs the design mirrored to match). Winding is preserved.
         #[arg(long)]
         mirror_x: bool,
+
+        /// Required laser-field calibration map. Every production edge is
+        /// densified and pre-warped from desired physical mm to commanded mm
+        /// before writing the LightBurn job.
+        #[arg(long)]
+        field_map: PathBuf,
+        /// Maximum physical edge segment before field pre-warping, mm.
+        #[arg(long, default_value_t = 0.25)]
+        field_seg_mm: f64,
     },
     /// Fiducial-registered emit (VIS-6, host side): fit a design→machine affine
     /// from fiducial correspondences and bake it into the emitted `.lbrn2`, so
@@ -299,12 +308,12 @@ enum Command {
         #[arg(long, default_value_t = 0.05)]
         max_rms_mm: f64,
 
-        /// Laser field-distortion correction file (from the console's ③ Laser-
-        /// field calibration). When given, every emitted vertex is pre-distorted
+        /// Required laser field-distortion correction file (from the console's
+        /// ③ Laser-field calibration). Every emitted vertex is pre-distorted
         /// physical→commanded so the beam cancels the galvo/f-theta field error;
         /// edges are densified so the pre-curvature is preserved.
         #[arg(long)]
-        field_map: Option<PathBuf>,
+        field_map: PathBuf,
         /// Edge densification for --field-map, mm (smaller = finer curve).
         #[arg(long, default_value_t = 0.5)]
         field_seg_mm: f64,
@@ -513,6 +522,8 @@ fn run(cli: &Cli) -> Result<(), Box<dyn std::error::Error>> {
             origin_y,
             center,
             mirror_x,
+            field_map,
+            field_seg_mm,
         } => emit_cmd(EmitArgs {
             copper,
             outline: outline.as_deref(),
@@ -536,6 +547,8 @@ fn run(cli: &Cli) -> Result<(), Box<dyn std::error::Error>> {
             origin_y: *origin_y,
             center: *center,
             mirror_x: *mirror_x,
+            field_map,
+            field_seg_mm: *field_seg_mm,
         }),
         Command::Register {
             copper,
@@ -567,7 +580,7 @@ fn run(cli: &Cli) -> Result<(), Box<dyn std::error::Error>> {
             margin_mm: *margin_mm,
             device,
             max_rms_mm: *max_rms_mm,
-            field_map: field_map.as_deref(),
+            field_map,
             field_seg_mm: *field_seg_mm,
         }),
         Command::CalibGrid {
@@ -764,6 +777,8 @@ struct EmitArgs<'a> {
     origin_y: f64,
     center: bool,
     mirror_x: bool,
+    field_map: &'a std::path::Path,
+    field_seg_mm: f64,
 }
 
 /// The inverted job geometry plus the inputs a preview needs.
@@ -772,6 +787,34 @@ struct BuiltJob {
     copper: Vec<pcb_core::Poly>,
     /// Non-copper (to-ablate) regions in the original Gerber frame.
     shapes: Vec<pcb_core::Poly>,
+}
+
+fn load_field_map(path: &std::path::Path) -> Result<vision::FieldMap, Box<dyn std::error::Error>> {
+    let field = vision::FieldMap::parse(&std::fs::read_to_string(path)?)
+        .map_err(|e| format!("field map {}: {e}", path.display()))?;
+    let coefficients_are_finite = field
+        .to_commanded
+        .to_coeffs()
+        .into_iter()
+        .chain(field.to_physical.to_coeffs())
+        .all(f64::is_finite);
+    if !coefficients_are_finite || !field.rms_um.is_finite() || !field.max_um.is_finite() {
+        return Err(format!(
+            "field map {} contains non-finite calibration values",
+            path.display()
+        )
+        .into());
+    }
+    Ok(field)
+}
+
+fn validate_field_segment(field_seg_mm: f64) -> Result<(), Box<dyn std::error::Error>> {
+    if !field_seg_mm.is_finite() || field_seg_mm <= 0.0 {
+        return Err(
+            format!("--field-seg-mm must be finite and positive, got {field_seg_mm}").into(),
+        );
+    }
+    Ok(())
 }
 
 /// Load copper + board region and invert to the non-copper regions — the shared
@@ -857,6 +900,18 @@ fn emit_cmd(a: EmitArgs) -> Result<(), Box<dyn std::error::Error>> {
     } else {
         shapes
     };
+    let field = load_field_map(a.field_map)?;
+    validate_field_segment(a.field_seg_mm)?;
+    eprintln!(
+        "emit: mandatory field warp on (fit RMS {:.1} µm, worst {:.1} µm), edges ≤{:.2} mm",
+        field.rms_um, field.max_um, a.field_seg_mm
+    );
+    let shapes = cam::register::transform_shapes_field(
+        &shapes,
+        &cam::register::Affine2::identity(),
+        a.field_seg_mm,
+        |x, y| field.precompensate(x, y),
+    );
 
     let mut layer = EmitLayer::fill("C00", a.params, cam::lbrn2::polys_to_elems(&shapes));
     layer.interval_mm = a.interval_mm;
@@ -887,7 +942,7 @@ struct RegisterArgs<'a> {
     margin_mm: f64,
     device: &'a str,
     max_rms_mm: f64,
-    field_map: Option<&'a std::path::Path>,
+    field_map: &'a std::path::Path,
     field_seg_mm: f64,
 }
 
@@ -954,22 +1009,18 @@ fn register_cmd(a: RegisterArgs) -> Result<(), Box<dyn std::error::Error>> {
     )?;
     // Apply the fit to the design-frame geometry → machine frame. No
     // normalize_frame: registration places the job in absolute machine mm.
-    // With a field-correction map, additionally pre-distort every vertex
-    // (physical→commanded) so the beam cancels the laser's field distortion.
-    let placed = match a.field_map {
-        None => cam::register::transform_shapes(&job.shapes, &affine),
-        Some(path) => {
-            let field = vision::FieldMap::parse(&std::fs::read_to_string(path)?)
-                .map_err(|e| format!("field map {}: {e}", path.display()))?;
-            eprintln!(
-                "register: field correction on (fit RMS {:.1} µm, worst {:.1} µm), edges ≤{:.2} mm",
-                field.rms_um, field.max_um, a.field_seg_mm
-            );
-            cam::register::transform_shapes_field(&job.shapes, &affine, a.field_seg_mm, |x, y| {
-                field.precompensate(x, y)
-            })
-        }
-    };
+    // Always pre-distort every vertex physical→commanded so the beam cancels
+    // the laser's field distortion. There is no affine-only production path.
+    let field = load_field_map(a.field_map)?;
+    validate_field_segment(a.field_seg_mm)?;
+    eprintln!(
+        "register: mandatory field warp on (fit RMS {:.1} µm, worst {:.1} µm), edges ≤{:.2} mm",
+        field.rms_um, field.max_um, a.field_seg_mm
+    );
+    let placed =
+        cam::register::transform_shapes_field(&job.shapes, &affine, a.field_seg_mm, |x, y| {
+            field.precompensate(x, y)
+        });
 
     // Same default recipe as `emit`; the operator tunes it in LightBurn or
     // re-runs with a richer flag set later.
@@ -997,12 +1048,12 @@ fn register_cmd(a: RegisterArgs) -> Result<(), Box<dyn std::error::Error>> {
         }
     }
     eprintln!(
-        "registered: {} shape(s), {rings} ring(s) at machine coordinates",
+        "registered: {} shape(s), {rings} ring(s) in field-warped commanded coordinates",
         placed.len()
     );
     if let Some((x0, y0, x1, y1)) = bb {
         eprintln!(
-            "placed at machine ({:.2}, {:.2})..({:.2}, {:.2}) mm, center ({:.2}, {:.2}) mm",
+            "commanded bounds ({:.2}, {:.2})..({:.2}, {:.2}) mm, center ({:.2}, {:.2}) mm",
             mm(x0),
             mm(y0),
             mm(x1),

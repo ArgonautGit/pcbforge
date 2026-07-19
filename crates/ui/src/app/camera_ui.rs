@@ -364,10 +364,13 @@ impl ConsoleApp {
             if self.camera.show_bed {
                 let (text, ok) = match self.camera.last.as_ref().map(|f| f.dimensions()) {
                     Some(dimensions) => match self.camera_projection(dimensions) {
-                        Ok(Some(CameraProjection::CommandedNonlinear { .. })) => (
-                            "● nonlinear lens + laser-field projection active".to_string(),
+                        Ok(Some(CameraProjection::CommandedField { .. })) => (
+                            "● commanded→physical→camera projection · field warp active".to_string(),
                             true,
                         ),
+                        Ok(Some(CameraProjection::PhysicalLens { .. })) => {
+                            ("● physical camera projection".to_string(), true)
+                        }
                         Ok(Some(CameraProjection::Homography { .. })) => (
                             "◐ approximate homography anchor — run ① Camera lens + ③ Laser field for distortion compensation".to_string(),
                             false,
@@ -411,8 +414,9 @@ impl ConsoleApp {
     }
 
     /// Draw the laser work area and a 50 mm scale onto the camera feed, both
-    /// projected through the active commanded-mm → camera-px mapping and then
-    /// the pan/zoom transform, so they stay glued to the bed as the view moves.
+    /// projected through the active commanded-mm → physical-mm →
+    /// camera-px mapping and then the pan/zoom transform, so the overlay shows
+    /// where machine coordinates really land and stays glued to the bed.
     pub(super) fn draw_bed_overlay(
         &self,
         ui: &egui::Ui,
@@ -428,6 +432,22 @@ impl ConsoleApp {
             projection
                 .to_px((mx, my))
                 .map(|p| xf.to_screen(p.0 * vs, p.1 * vs))
+        };
+        // A laser-field map bends straight commanded edges in physical space.
+        // Project intermediate points too; joining only the four transformed
+        // corners would flatten the correction back into straight chords.
+        let projected_segment = |start: (f64, f64), end: (f64, f64)| {
+            let length = ((end.0 - start.0).powi(2) + (end.1 - start.1).powi(2)).sqrt();
+            let steps = (length / 1.0).ceil().max(1.0) as usize;
+            (0..=steps)
+                .map(|index| {
+                    let t = index as f64 / steps as f64;
+                    proj(
+                        start.0 + (end.0 - start.0) * t,
+                        start.1 + (end.1 - start.1) * t,
+                    )
+                })
+                .collect::<Option<Vec<_>>>()
         };
         let yellow = Color32::from_rgb(0xf0, 0xd0, 0x40);
         let green = Color32::from_rgb(0x30, 0xd0, 0x80);
@@ -446,30 +466,38 @@ impl ConsoleApp {
             (cx + h, cy + h),
             (cx - h, cy + h),
         ];
-        let Some(sp): Option<Vec<egui::Pos2>> = sq.iter().map(|&(x, y)| proj(x, y)).collect()
+        let Some(work_edges): Option<Vec<Vec<egui::Pos2>>> = (0..4)
+            .map(|index| projected_segment(sq[index], sq[(index + 1) % 4]))
+            .collect()
         else {
             self.draw_projection_warning(ui, xf, "projection returned a non-finite work area");
             return;
         };
         let base = (cx - h, cy - h);
-        let Some(scale_x) = proj(base.0 + 50.0, base.1) else {
+        let Some(scale_x) = projected_segment(base, (base.0 + 50.0, base.1)) else {
             self.draw_projection_warning(ui, xf, "projection returned a non-finite X scale");
             return;
         };
-        let Some(scale_y) = proj(base.0, base.1 + 50.0) else {
+        let Some(scale_y) = projected_segment(base, (base.0, base.1 + 50.0)) else {
             self.draw_projection_warning(ui, xf, "projection returned a non-finite Y scale");
             return;
         };
-        let (Some(o), Some(axis_x), Some(axis_y)) =
-            (proj(0.0, 0.0), proj(20.0, 0.0), proj(0.0, 20.0))
-        else {
+        let (Some(axis_x), Some(axis_y)) = (
+            projected_segment((0.0, 0.0), (20.0, 0.0)),
+            projected_segment((0.0, 0.0), (0.0, 20.0)),
+        ) else {
             self.draw_projection_warning(ui, xf, "projection returned non-finite machine axes");
             return;
         };
-        for i in 0..4 {
-            painter.line_segment([sp[i], sp[(i + 1) % 4]], (2.0, yellow));
+        let b = work_edges[0][0];
+        let o = axis_x[0];
+        for edge in &work_edges {
+            painter.add(egui::Shape::line(
+                edge.clone(),
+                egui::Stroke::new(2.0, yellow),
+            ));
         }
-        let topmid = egui::pos2((sp[2].x + sp[3].x) * 0.5, (sp[2].y + sp[3].y) * 0.5);
+        let topmid = work_edges[2][work_edges[2].len() / 2];
         painter.text(
             topmid,
             egui::Align2::CENTER_BOTTOM,
@@ -481,9 +509,9 @@ impl ConsoleApp {
         // 50 mm scale as an L at the work-area's lower-left corner: one arm along
         // machine +X, one along +Y, each capped and labelled — perspective-
         // correct at that spot because it goes through the same homography.
-        let b = sp[0];
-        for (end, label, up) in [(scale_x, "50 mm", false), (scale_y, "50 mm", true)] {
-            painter.line_segment([b, end], (2.5, white));
+        for (path, label, up) in [(scale_x, "50 mm", false), (scale_y, "50 mm", true)] {
+            let end = *path.last().expect("sampled scale has endpoints");
+            painter.add(egui::Shape::line(path, egui::Stroke::new(2.5, white)));
             // End caps, perpendicular to the arm in screen space.
             let d = end - b;
             let len = d.length().max(1.0);
@@ -501,11 +529,12 @@ impl ConsoleApp {
 
         // Machine origin + axes (clipped to the panel if off to the side).
         painter.circle_filled(o, 3.0, green);
-        for (end, label, align) in [
+        for (path, label, align) in [
             (axis_x, "+X", egui::Align2::LEFT_CENTER),
             (axis_y, "+Y", egui::Align2::CENTER_BOTTOM),
         ] {
-            painter.line_segment([o, end], (2.0, green));
+            let end = *path.last().expect("sampled axis has endpoints");
+            painter.add(egui::Shape::line(path, egui::Stroke::new(2.0, green)));
             painter.circle_filled(end, 2.0, green);
             painter.text(
                 egui::pos2(end.x + 2.0, end.y),

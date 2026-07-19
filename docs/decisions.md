@@ -1888,3 +1888,27 @@ Changing the calibration polynomial would only fit those wrong observations.
   adds or moves that lattice observation, right-clicking removes a suspect one,
   and the homography/residuals are re-fit immediately. Live re-anchoring pauses
   during correction so it cannot overwrite the operator's review.
+
+## 2026-07-19 — Require field-warped production geometry
+
+Live output showed that the Place overlay could use calibrated coordinates while
+the saved place_field_correct=false preference still selected affine-only
+geometry for register. An optional correction switch is unsafe because both
+files look plausible in LightBurn.
+
+- Place now operates only in desired physical millimeters through the accepted
+  camera-lens map. Homography and uniform-scale projections remain diagnostic
+  camera aids; they are no longer production placement fallbacks.
+- Etch here always passes the accepted field map to register, which densifies
+  every edge before mapping physical→commanded. Missing, rejected, stale,
+  non-finite, or unsaved calibration fails closed.
+- The Job-tab direct .lbrn2 exporter has the same requirement. CLI `emit` and
+  `register` both require `--field-map`; both apply the same densify-and-warp
+  kernel, so there is no production affine-only command-line bypass.
+- Machine-space camera overlays compose commanded→physical field distortion
+  with physical→camera lens projection. Work-area edges, scales, and axes are
+  sampled before projection so nonlinear curves are not flattened into chords.
+- The old persisted place_field_correct key remains readable for settings
+  compatibility but no longer selects an unwarped production path.
+- Calibration grids remain deliberately unwarped: their commanded-vs-physical
+  error is the measurement used to construct the field map.

@@ -88,27 +88,28 @@ fn nonlinear_app() -> ConsoleApp {
 }
 
 #[test]
-fn accepted_field_uses_nonlinear_projection_and_physical_corrected_place() {
-    let mut app = nonlinear_app();
+fn accepted_field_composes_machine_overlay_and_uses_physical_place_projection() {
+    let app = nonlinear_app();
     let projection = app.camera_projection((800, 800)).unwrap().unwrap();
     assert!(matches!(
         projection,
-        CameraProjection::CommandedNonlinear { .. }
+        CameraProjection::CommandedField { .. }
     ));
     let px = projection.to_px((40.0, 40.0)).unwrap();
     let mm = projection.from_px(px).unwrap();
     assert!((mm.0 - 40.0).abs() < 0.1 && (mm.1 - 40.0).abs() < 0.1);
 
-    app.placement.field_correct = false;
-    assert!(matches!(
-        app.place_projection(800, 800).unwrap(),
-        CameraProjection::CommandedNonlinear { .. }
-    ));
-    app.placement.field_correct = true;
     assert!(matches!(
         app.place_projection(800, 800).unwrap(),
         CameraProjection::PhysicalLens { .. }
     ));
+}
+
+#[test]
+fn place_refuses_every_uncalibrated_projection_fallback() {
+    let app = ConsoleApp::new(tmp_db(), vec!["true".into()]);
+    let error = app.place_projection(800, 800).unwrap_err();
+    assert!(error.contains("unwarped geometry export is disabled"));
 }
 
 #[test]
@@ -125,14 +126,46 @@ fn invalid_nonlinear_projection_fails_closed_without_homography_fallback() {
 #[test]
 fn field_corrected_emit_refuses_a_missing_map_file() {
     let mut app = nonlinear_app();
-    app.placement.field_correct = true;
     app.placement.job = vec![pcb_core::Poly::default()];
+    app.placement.frame_img = Some(image::GrayImage::new(800, 800));
     app.job.emit_copper = "board.gbr".into();
     assert!(!app.field_map_path().exists());
     app.emit_at_placement();
     let line = app.runtime.log.last().expect("refusal is logged");
     assert!(
-        line.err && line.text.contains("refusing to emit an uncorrected job"),
+        line.err && line.text.contains("refusing unwarped geometry export"),
+        "got: {}",
+        line.text
+    );
+}
+
+#[test]
+fn place_export_always_arms_the_field_warp_when_the_map_exists() {
+    let mut app = nonlinear_app();
+    app.placement.job = vec![pcb_core::Poly::default()];
+    app.placement.frame_img = Some(image::GrayImage::new(800, 800));
+    app.job.emit_copper = "board.gbr".into();
+    let map = app.calibration.field.as_ref().unwrap().field.serialize();
+    std::fs::write(app.field_map_path(), map).unwrap();
+
+    app.emit_at_placement();
+    assert!(app.placement.field_correct);
+    assert!(
+        app.runtime
+            .log
+            .iter()
+            .any(|line| !line.err && line.text.contains("mandatory field-warped geometry"))
+    );
+}
+
+#[test]
+fn job_emit_refuses_without_an_accepted_field_map() {
+    let mut app = ConsoleApp::new(tmp_db(), vec!["true".into()]);
+    app.job.emit_copper = "board.gbr".into();
+    app.emit_clicked();
+    let line = app.runtime.log.last().expect("refusal is logged");
+    assert!(
+        line.err && line.text.contains("refusing unwarped geometry export"),
         "got: {}",
         line.text
     );
@@ -150,7 +183,10 @@ fn camera_ui_reports_active_and_invalid_nonlinear_projection() {
     );
     let out = ctx.run(egui::RawInput::default(), |ctx| app.ui(ctx));
     assert!(!out.shapes.is_empty());
-    assert!(app.debug_summary().contains("camera_projection: nonlinear"));
+    assert!(
+        app.debug_summary()
+            .contains("camera_projection: field-warped-commanded")
+    );
 
     let field = &mut app.calibration.field.as_mut().unwrap().field;
     let mut coeffs = field.to_physical.to_coeffs();
@@ -646,68 +682,51 @@ fn ar_overlay_projects_design_through_the_homography() {
     assert_eq!(plain.pixels[50 * 200 + 50], Color32::from_gray(120));
 }
 
-/// Place drag tracks the cursor in pixel space, even under perspective: a
+/// Place drag tracks the cursor in pixel space under the calibrated physical
+/// lens projection: a
 /// drag of (dpx, dpy) frame pixels shifts the pivot's *projected pixel* by
 /// exactly that — so the overlay follows the mouse over the image instead of
 /// sliding along the tilted plane.
 #[test]
-fn place_drag_tracks_cursor_under_perspective() {
-    use nalgebra::Point2;
-    let mut app = ConsoleApp::new(tmp_db(), vec!["true".into()]);
-    // A keystone homography (bed-mm → px): top edge narrower than bottom.
-    let corr = [
-        (Point2::new(0.0, 0.0), Point2::new(180.0, 110.0)),
-        (Point2::new(60.0, 0.0), Point2::new(460.0, 110.0)),
-        (Point2::new(60.0, 50.0), Point2::new(520.0, 380.0)),
-        (Point2::new(0.0, 50.0), Point2::new(120.0, 380.0)),
-    ];
-    app.fiducials.homography = Some(vision::fit_homography(&corr).unwrap());
-    app.placement.frame_img = Some(image::GrayImage::from_pixel(640, 480, image::Luma([120])));
-    app.placement.px_per_mm = 8.0;
+fn place_drag_tracks_cursor_in_the_physical_lens_frame() {
+    let mut app = nonlinear_app();
+    app.placement.frame_img = Some(image::GrayImage::from_pixel(800, 800, image::Luma([120])));
     app.placement.tx_mm = 30.0;
     app.placement.ty_mm = 25.0;
 
     let pivot = |a: &ConsoleApp| {
-        a.fiducials
-            .homography
-            .as_ref()
+        a.place_projection(800, 800)
             .unwrap()
-            .apply(Point2::new(a.placement.tx_mm, a.placement.ty_mm))
+            .to_px((a.placement.tx_mm, a.placement.ty_mm))
+            .unwrap()
     };
     let before = pivot(&app);
     app.drag_place_px(12.0, -7.0).unwrap();
     let after = pivot(&app);
     assert!(
-        (after.x - (before.x + 12.0)).abs() < 1e-6,
+        (after.0 - (before.0 + 12.0)).abs() < 1e-6,
         "x pixel tracked: {} vs {}",
-        after.x,
-        before.x + 12.0
+        after.0,
+        before.0 + 12.0
     );
     assert!(
-        (after.y - (before.y - 7.0)).abs() < 1e-6,
+        (after.1 - (before.1 - 7.0)).abs() < 1e-6,
         "y pixel tracked: {} vs {}",
-        after.y,
-        before.y - 7.0
+        after.1,
+        before.1 - 7.0
     );
 }
 
-/// Without a homography the drag is the plain uniform-scale move — with
-/// bed y **up** (machine frame): dragging the mouse up (−dpy, toward the
-/// top of the image) *increases* the bed-mm y of the placement.
 #[test]
-fn place_drag_uniform_without_homography() {
+fn place_drag_refuses_an_uncalibrated_uniform_fallback() {
     let mut app = ConsoleApp::new(tmp_db(), vec!["true".into()]);
-    app.fiducials.homography = None;
-    app.placement.px_per_mm = 10.0;
     app.placement.frame_img = Some(image::GrayImage::from_pixel(100, 100, image::Luma([120])));
     app.placement.tx_mm = 5.0;
     app.placement.ty_mm = 5.0;
-    app.drag_place_px(20.0, -30.0).unwrap();
-    assert!((app.placement.tx_mm - (5.0 + 2.0)).abs() < 1e-9);
     assert!(
-        (app.placement.ty_mm - (5.0 + 3.0)).abs() < 1e-9,
-        "mouse up = bed y up: {}",
-        app.placement.ty_mm
+        app.drag_place_px(20.0, -30.0)
+            .unwrap_err()
+            .contains("unwarped geometry export is disabled")
     );
 }
 
@@ -1395,32 +1414,22 @@ fn a_failed_fit_keeps_the_previous_calibration() {
 }
 
 /// The initial placement centre lands the job pivot at the frame's pixel
-/// centre in the overlay's own frame — under an active homography, not the
-/// uniform scale that would render it far off-centre (LR-42).
+/// centre in the calibrated physical-lens frame.
 #[test]
-fn initial_placement_centers_under_an_active_homography() {
-    let mut app = ConsoleApp::new(tmp_db(), vec!["true".into()]);
-    app.placement.px_per_mm = 10.0;
-    // A keystone homography (bed-mm → px) as the active placement map.
-    let h = vision::Homography {
-        matrix: nalgebra::Matrix3::new(
-            9.8, 0.2, 15.0, //
-            -0.1, 10.1, -8.0, //
-            0.0006, -0.0004, 1.0,
-        ),
-        residuals: vec![],
-        rms: 0.0,
-    };
-    app.fiducials.homography = Some(h.clone());
-    let (w, ht) = (400.0, 300.0);
+fn initial_placement_centers_in_the_physical_lens_frame() {
+    let app = nonlinear_app();
+    let (w, ht) = (800.0, 800.0);
     let (tx, ty) = app.initial_center_mm(w, ht).unwrap();
-    // The job pivot placed at (tx,ty) must map back to the pixel centre.
-    let c = h.apply(nalgebra::Point2::new(tx, ty));
+    let c = app
+        .place_projection(w as u32, ht as u32)
+        .unwrap()
+        .to_px((tx, ty))
+        .unwrap();
     assert!(
-        (c.x - w / 2.0).abs() < 1e-3 && (c.y - ht / 2.0).abs() < 1e-3,
+        (c.0 - w / 2.0).abs() < 1e-3 && (c.1 - ht / 2.0).abs() < 1e-3,
         "pivot maps to ({:.2},{:.2}), want ({},{})",
-        c.x,
-        c.y,
+        c.0,
+        c.1,
         w / 2.0,
         ht / 2.0
     );

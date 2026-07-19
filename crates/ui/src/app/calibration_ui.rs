@@ -189,21 +189,23 @@ impl ConsoleApp {
                         let worst = cal.dots.iter().map(|d| d.field_um).fold(0.0_f64, f64::max);
                         let acceptance = crate::calib::field_live_acceptance(&cal, &grid);
                         self.calibration.field_accepted = acceptance.is_ok();
-                        self.placement.field_correct = self.calibration.field_accepted
-                            && field_correction_advised(&cal.field_verdict);
+                        self.placement.field_correct = false;
                         self.calibration.note = match acceptance {
                             Ok(()) => {
                                 let path = self.field_map_path();
                                 match std::fs::write(&path, cal.field.serialize()) {
-                                    Ok(()) => format!(
-                                        "field accepted: {}/{} dots, raw worst {:.0} µm, fit RMS/worst {:.0}/{:.0} µm — {}",
-                                        cal.found,
-                                        cal.total,
-                                        worst,
-                                        cal.field.rms_um,
-                                        cal.field.max_um,
-                                        field_verdict_phrase(&cal.field_verdict)
-                                    ),
+                                    Ok(()) => {
+                                        self.placement.field_correct = true;
+                                        format!(
+                                            "field accepted: {}/{} dots, raw worst {:.0} µm, fit RMS/worst {:.0}/{:.0} µm — {}",
+                                            cal.found,
+                                            cal.total,
+                                            worst,
+                                            cal.field.rms_um,
+                                            cal.field.max_um,
+                                            field_verdict_phrase(&cal.field_verdict)
+                                        )
+                                    }
                                     Err(e) => {
                                         self.calibration.field_accepted = false;
                                         self.placement.field_correct = false;
@@ -756,8 +758,8 @@ impl ConsoleApp {
                 "Correct the laser field: needs ① Camera lens first (the metric ruler), at the same camera \
                  pose, resolution, crop, and orientation. Burn a dot grid at \
                  known coordinates, image it, mark the 4 corners, and Fit — this measures where each command \
-                 physically lands and fits a pre-distortion. Turn on \"compensate field\" on the Place tab so \
-                 Etch here bakes it in and shapes burn dimensionally true.",
+                 physically lands and fits a pre-distortion. Accepted fits are mandatory for every production \
+                 export; geometry is always field-warped so shapes burn dimensionally true.",
             ).weak()),
         };
         egui::Grid::new("calib-form")
@@ -1058,15 +1060,10 @@ impl ConsoleApp {
                         status_color(verdict_ok),
                         format!("{glyph} {}", field_verdict_phrase(&c.field_verdict)),
                     );
-                    // Only nudge the operator to enable correction when the
-                    // verdict actually recommends it.
                     let hint = if !self.calibration.field_accepted {
                         "This fit did not meet 80% + four-corner + 50/100 µm acceptance; recapture before use."
-                    } else if field_correction_advised(&c.field_verdict) {
-                        "Turn on \"compensate field\" on the Place tab to apply it."
                     } else {
-                        "Correction stays off for this verdict; enable \"compensate field\" \
-                         manually on the Place tab only if you want to apply it anyway."
+                        "Field warping is mandatory and active for every production console export."
                     };
                     if self.calibration.field_accepted {
                         ui.weak(format!(

@@ -180,19 +180,15 @@ fn laser_anchor_exposes_manual_dot_correction() {
 }
 
 #[test]
-fn compensate_field_is_present_and_gated_off_without_a_field_cal() {
+fn place_reports_that_field_warp_is_mandatory() {
     let mut h = console();
     h.get_by_label_contains("Place on board").click();
     h.run();
-    // The toggle exists but stays off with no field calibration this session
-    // (its physical placement frame needs the fit).
-    h.get_by_label("compensate field").click();
-    h.run();
     assert!(
-        h.state().debug_summary().contains("field_correct=false"),
-        "compensate-field can't arm without a field cal:\n{}",
-        h.state().debug_summary()
+        h.query_by_label_contains("export disabled until").is_some(),
+        "Place must visibly fail closed until a field map is active"
     );
+    assert!(h.query_by_label("compensate field").is_none());
 }
 
 #[test]

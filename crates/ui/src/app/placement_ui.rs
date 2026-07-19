@@ -238,6 +238,47 @@ impl ConsoleApp {
             });
             return;
         }
+        let Some(dimensions) = self
+            .placement
+            .frame_img
+            .as_ref()
+            .map(image::GenericImageView::dimensions)
+        else {
+            self.runtime.log.push(LogLine {
+                text: "place: load the current camera frame before export".into(),
+                err: true,
+            });
+            return;
+        };
+        match self.nonlinear_maps_for_frame(dimensions) {
+            Ok(Some(_)) => {}
+            Ok(None) => {
+                self.runtime.log.push(LogLine {
+                    text: "place: accepted ① Camera lens + ③ Laser field calibration required — refusing unwarped geometry export".into(),
+                    err: true,
+                });
+                return;
+            }
+            Err(error) => {
+                self.runtime.log.push(LogLine {
+                    text: format!("place: field-warp calibration is stale or invalid: {error}"),
+                    err: true,
+                });
+                return;
+            }
+        }
+        let field_path = self.field_map_path();
+        if !field_path.exists() {
+            self.runtime.log.push(LogLine {
+                text: format!(
+                    "place: mandatory field map {} is missing — refusing unwarped geometry export",
+                    field_path.display()
+                ),
+                err: true,
+            });
+            return;
+        }
+        self.placement.field_correct = true;
         // Resolve the output to an ABSOLUTE path so the operator knows exactly
         // which file to open. A bare filename (e.g. "placed.lbrn2") lands next
         // to the copper Gerber — beside their inputs — not in the console's
@@ -258,28 +299,11 @@ impl ConsoleApp {
             args.push("--outline".into());
             args.push(crate::clean_path(&self.job.emit_outline));
         }
-        // Field correction: pre-distort the emit so the beam cancels the laser
-        // field distortion. Only when a live field cal exists this session (its
-        // physical frame is what the placement above used).
-        let field_note = if self.placement.field_correct && self.calibration.field.is_some() {
-            let path = self.field_map_path();
-            if path.exists() {
-                args.push("--field-map".into());
-                args.push(path.to_string_lossy().into_owned());
-                " · field-corrected"
-            } else {
-                self.runtime.log.push(LogLine {
-                    text: format!(
-                        "place: field correction is armed but {} is missing — refusing to emit an uncorrected job",
-                        path.display()
-                    ),
-                    err: true,
-                });
-                return;
-            }
-        } else {
-            ""
-        };
+        // Every production edge is densified and mapped physical→commanded by
+        // register; there is no affine-only Place export path.
+        args.push("--field-map".into());
+        args.push(field_path.to_string_lossy().into_owned());
+        let field_note = " · mandatory field-warped geometry";
         // Make the placement + the exact output path explicit in the log — the
         // register output is its own file (not the Job-tab emit), and this is
         // the position it bakes in.
@@ -326,15 +350,6 @@ impl ConsoleApp {
                          Gerber; the log prints the full path it wrote.",
                     );
                 ui.end_row();
-                ui.label("px per mm");
-                changed |= ui
-                    .add(
-                        egui::DragValue::new(&mut self.placement.px_per_mm)
-                            .speed(0.1)
-                            .range(0.1..=1000.0),
-                    )
-                    .changed();
-                ui.end_row();
             });
         ui.horizontal(|ui| {
             if ui.button("⤵ Load frame + job").clicked() {
@@ -353,21 +368,18 @@ impl ConsoleApp {
                     .is_some_and(|(lens, field)| {
                         crate::calib::composed_projection_is_finite(&lens.lens, &field.field)
                     });
-            ui.add_enabled_ui(has_field, |ui| {
-                changed |= ui
-                    .checkbox(&mut self.placement.field_correct, "compensate field")
-                    .on_hover_text(if has_field {
-                        "Pre-distort the emitted geometry so the beam cancels the laser's field \
-                         distortion — shapes burn dimensionally true. Places in the physical \
-                         (camera-lens) frame. Calibrate it in ③ Laser field."
-                    } else {
-                        "Calibrate ③ Laser field first (needs ① Camera lens)."
-                    })
-                    .changed();
-            });
-            if !has_field && self.placement.field_correct {
-                self.placement.field_correct = false;
-            }
+            self.placement.field_correct = has_field;
+            ui.colored_label(
+                status_color(has_field),
+                if has_field {
+                    "● mandatory field-warped export active"
+                } else {
+                    "○ export disabled until ① Camera lens + ③ Laser field"
+                },
+            )
+            .on_hover_text(
+                "All production geometry is densified and pre-warped through the accepted laser-field map. Unwarped Place export is not available.",
+            );
         });
         if self.calibration.field.is_some() && !self.calibration.field_accepted {
             ui.colored_label(
@@ -394,7 +406,7 @@ impl ConsoleApp {
                 .changed();
         });
         ui.label(egui::RichText::new(&self.placement.note).weak());
-        ui.weak("Uses the Job-tab Gerbers. Drag the overlay to position; “Etch here” bakes it in via register.");
+        ui.weak("Uses the Job-tab Gerbers. Drag in physical millimeters; “Etch here” always densifies and field-warps every edge.");
         ui.weak(NAV_HINT);
         ui.separator();
 

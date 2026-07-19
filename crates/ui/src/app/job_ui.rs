@@ -220,12 +220,15 @@ impl ConsoleApp {
                 let ctx = ui.ctx().clone();
                 self.render_preview(&ctx);
             }
-            if ui.button("▶ Emit .lbrn2").clicked() {
+            if ui.button("▶ Emit field-warped .lbrn2").clicked() {
                 self.emit_clicked();
             }
         });
 
         ui.separator();
+        ui.weak(
+            "Production .lbrn2 export requires an accepted ① Camera lens + ③ Laser field map and always field-warps every edge.",
+        );
         if ui.button("⏭ Next stage (bring-up)").clicked() {
             self.run_verb(&["next".into(), "--bringup-stubs".into()]);
         }
@@ -233,7 +236,7 @@ impl ConsoleApp {
         ui.weak("Live camera → the “📷 Camera” tab.");
     }
 
-    fn emit_clicked(&mut self) {
+    pub(super) fn emit_clicked(&mut self) {
         let (copper, outline) = self.active_gerbers();
         let (copper, outline) = (crate::clean_path(copper), crate::clean_path(outline));
         if copper.is_empty() {
@@ -247,6 +250,33 @@ impl ConsoleApp {
             });
             return;
         }
+        let valid_field = self.calibration.field_accepted
+            && self
+                .calibration
+                .lens
+                .as_ref()
+                .zip(self.calibration.field.as_ref())
+                .is_some_and(|(lens, field)| {
+                    crate::calib::composed_projection_is_finite(&lens.lens, &field.field)
+                });
+        if !valid_field {
+            self.runtime.log.push(LogLine {
+                text: "emit: accepted ① Camera lens + ③ Laser field calibration required — refusing unwarped geometry export".into(),
+                err: true,
+            });
+            return;
+        }
+        let field_path = self.field_map_path();
+        if !field_path.exists() {
+            self.runtime.log.push(LogLine {
+                text: format!(
+                    "emit: mandatory field map {} is missing — refusing unwarped geometry export",
+                    field_path.display()
+                ),
+                err: true,
+            });
+            return;
+        }
         let mut args: Vec<String> = vec![
             "emit".into(),
             "--copper".into(),
@@ -255,6 +285,8 @@ impl ConsoleApp {
             crate::clean_path(&self.job.emit_lbrn2),
             "--offset-mm".into(),
             format!("{}", self.job.offset_mm),
+            "--field-map".into(),
+            field_path.to_string_lossy().into_owned(),
         ];
         if !outline.is_empty() {
             args.push("--outline".into());

@@ -16,9 +16,25 @@ fn tmp(tag: &str) -> PathBuf {
     d
 }
 
+fn identity_field_map(tag: &str) -> PathBuf {
+    use nalgebra::Point2;
+    let pairs: Vec<_> = (0..4)
+        .flat_map(|row| {
+            (0..4).map(move |column| {
+                let point = Point2::new(column as f64 * 50.0, row as f64 * 50.0);
+                (point, point)
+            })
+        })
+        .collect();
+    let path = tmp(tag).join("identity-field.txt");
+    std::fs::write(&path, vision::fit_field(&pairs).unwrap().serialize()).unwrap();
+    path
+}
+
 #[test]
 fn emit_writes_a_fill_layer_lbrn2() {
     let out = tmp("out").join("board.lbrn2");
+    let field = identity_field_map("out-field");
     let result = Command::new(env!("CARGO_BIN_EXE_pcbforge"))
         .args([
             "emit",
@@ -36,6 +52,8 @@ fn emit_writes_a_fill_layer_lbrn2() {
             "3",
             "--lbrn2",
             out.to_str().unwrap(),
+            "--field-map",
+            field.to_str().unwrap(),
         ])
         .output()
         .expect("binary runs");
@@ -78,6 +96,7 @@ fn emit_writes_a_fill_layer_lbrn2() {
 #[test]
 fn uv_test_board_emits_unique_shape_ids() {
     let out = tmp("uvtest").join("job.lbrn2");
+    let field = identity_field_map("uvtest-field");
     let result = Command::new(env!("CARGO_BIN_EXE_pcbforge"))
         .args([
             "emit",
@@ -89,6 +108,8 @@ fn uv_test_board_emits_unique_shape_ids() {
             "0.025",
             "--lbrn2",
             out.to_str().unwrap(),
+            "--field-map",
+            field.to_str().unwrap(),
         ])
         .output()
         .expect("binary runs");
@@ -168,6 +189,7 @@ fn nonconductor_pour_is_kept_by_default() {
     let dir = tmp("noncond");
     let copper = fixture("uv_test-F_Cu.gbr");
     let outline = fixture("uv_test-Edge_Cuts.gbr");
+    let field = identity_field_map("noncond-field");
     let run = |extra: &[&str], name: &str| -> String {
         let out = dir.join(name);
         let mut args = vec![
@@ -178,6 +200,8 @@ fn nonconductor_pour_is_kept_by_default() {
             outline.to_str().unwrap(),
             "--lbrn2",
             out.to_str().unwrap(),
+            "--field-map",
+            field.to_str().unwrap(),
         ];
         args.extend_from_slice(extra);
         let r = Command::new(env!("CARGO_BIN_EXE_pcbforge"))
@@ -244,6 +268,7 @@ fn placement_flags_translate_the_job() {
     let dir = tmp("place");
     let copper = fixture("demo-F_Cu.gbr");
     let outline = fixture("demo-Edge_Cuts.gbr");
+    let field = identity_field_map("place-field");
     let run = |extra: &[&str], name: &str| -> Vec<(f64, f64)> {
         let out = dir.join(name);
         let mut args = vec![
@@ -254,6 +279,8 @@ fn placement_flags_translate_the_job() {
             outline.to_str().unwrap(),
             "--lbrn2",
             out.to_str().unwrap(),
+            "--field-map",
+            field.to_str().unwrap(),
         ];
         args.extend_from_slice(extra);
         let r = Command::new(env!("CARGO_BIN_EXE_pcbforge"))
@@ -321,6 +348,7 @@ fn emit_writes_a_preview_svg() {
     let dir = tmp("prev");
     let out = dir.join("job.lbrn2");
     let svg = dir.join("job.svg");
+    let field = identity_field_map("prev-field");
     let result = Command::new(env!("CARGO_BIN_EXE_pcbforge"))
         .args([
             "emit",
@@ -330,6 +358,8 @@ fn emit_writes_a_preview_svg() {
             fixture("uv_test-Edge_Cuts.gbr").to_str().unwrap(),
             "--lbrn2",
             out.to_str().unwrap(),
+            "--field-map",
+            field.to_str().unwrap(),
             "--preview",
             svg.to_str().unwrap(),
         ])
@@ -352,6 +382,7 @@ fn emit_writes_a_preview_svg() {
 #[test]
 fn emit_rejects_out_of_range_offset() {
     let out = tmp("bad").join("x.lbrn2");
+    let field = identity_field_map("bad-field");
     let result = Command::new(env!("CARGO_BIN_EXE_pcbforge"))
         .args([
             "emit",
@@ -361,6 +392,8 @@ fn emit_rejects_out_of_range_offset() {
             "50",
             "--lbrn2",
             out.to_str().unwrap(),
+            "--field-map",
+            field.to_str().unwrap(),
         ])
         .output()
         .expect("binary runs");

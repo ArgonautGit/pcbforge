@@ -34,6 +34,7 @@ fn register(extra: &[&str], name: &str) -> (bool, String, String) {
     let out = tmp("run").join(name);
     let copper = fixture("uv_test-F_Cu.gbr");
     let outline = fixture("uv_test-Edge_Cuts.gbr");
+    let default_field = (!extra.contains(&"--field-map")).then(|| identity_field_map("register"));
     let mut args = vec![
         "register",
         "--copper",
@@ -43,6 +44,9 @@ fn register(extra: &[&str], name: &str) -> (bool, String, String) {
         "--lbrn2",
         out.to_str().unwrap(),
     ];
+    if let Some(path) = &default_field {
+        args.extend(["--field-map", path.to_str().unwrap()]);
+    }
     args.extend_from_slice(extra);
     let r = Command::new(env!("CARGO_BIN_EXE_pcbforge"))
         .args(&args)
@@ -54,6 +58,102 @@ fn register(extra: &[&str], name: &str) -> (bool, String, String) {
         doc,
         String::from_utf8_lossy(&r.stderr).into_owned(),
     )
+}
+
+fn emit(extra: &[&str], name: &str) -> (bool, String, String) {
+    let out = tmp("emit").join(name);
+    let copper = fixture("uv_test-F_Cu.gbr");
+    let outline = fixture("uv_test-Edge_Cuts.gbr");
+    let default_field = (!extra.contains(&"--field-map")).then(|| identity_field_map("emit"));
+    let mut args = vec![
+        "emit",
+        "--copper",
+        copper.to_str().unwrap(),
+        "--outline",
+        outline.to_str().unwrap(),
+        "--lbrn2",
+        out.to_str().unwrap(),
+        "--origin-x",
+        "130",
+        "--origin-y=-85",
+        "--center",
+    ];
+    if let Some(path) = &default_field {
+        args.extend(["--field-map", path.to_str().unwrap()]);
+    }
+    args.extend_from_slice(extra);
+    let result = Command::new(env!("CARGO_BIN_EXE_pcbforge"))
+        .args(&args)
+        .output()
+        .expect("binary runs");
+    let doc = std::fs::read_to_string(&out).unwrap_or_default();
+    (
+        result.status.success(),
+        doc,
+        String::from_utf8_lossy(&result.stderr).into_owned(),
+    )
+}
+
+fn pincushion_field_map(tag: &str) -> PathBuf {
+    use nalgebra::Point2;
+    let field_center = (130.0, -85.0);
+    let laser = |cx: f64, cy: f64| {
+        let (du, dv) = (cx - field_center.0, cy - field_center.1);
+        let r2 = (du * du + dv * dv) / (70.0 * 70.0);
+        let f = 1.0 + 0.03 * r2;
+        (field_center.0 + du * f, field_center.1 + dv * f)
+    };
+    let mut pairs = Vec::new();
+    for r in 0..7 {
+        for c in 0..7 {
+            let cmd = (80.0 + c as f64 * 16.0, -130.0 + r as f64 * 16.0);
+            let phys = laser(cmd.0, cmd.1);
+            pairs.push((Point2::new(phys.0, phys.1), Point2::new(cmd.0, cmd.1)));
+        }
+    }
+    let field = vision::fit_field(&pairs).expect("fit field");
+    let path = tmp(tag).join("field.txt");
+    std::fs::write(&path, field.serialize()).unwrap();
+    path
+}
+
+fn identity_field_map(tag: &str) -> PathBuf {
+    use nalgebra::Point2;
+    let coordinates = [-150.0, -50.0, 50.0, 150.0];
+    let pairs: Vec<_> = coordinates
+        .iter()
+        .flat_map(|&y| {
+            coordinates.iter().map(move |&x| {
+                let point = Point2::new(x, y);
+                (point, point)
+            })
+        })
+        .collect();
+    let field = vision::fit_field(&pairs).expect("fit identity field");
+    let path = tmp(tag).join("identity-field.txt");
+    std::fs::write(&path, field.serialize()).unwrap();
+    path
+}
+
+#[test]
+fn production_emit_refuses_to_run_without_a_field_map() {
+    let output = tmp("missing-field").join("uncalibrated.lbrn2");
+    let result = Command::new(env!("CARGO_BIN_EXE_pcbforge"))
+        .args([
+            "emit",
+            "--copper",
+            fixture("uv_test-F_Cu.gbr").to_str().unwrap(),
+            "--lbrn2",
+            output.to_str().unwrap(),
+        ])
+        .output()
+        .expect("binary runs");
+    assert!(!result.status.success());
+    assert!(
+        String::from_utf8_lossy(&result.stderr).contains("--field-map"),
+        "the CLI must name the missing mandatory calibration"
+    );
+    assert!(!output.exists(), "no unwarped production file is written");
 }
 
 /// Identity correspondences leave the Gerber-frame geometry untouched; a pure
@@ -180,37 +280,19 @@ fn frame_detection_path_fits_and_emits() {
     assert!(!verts(&doc).is_empty(), "job has geometry");
 }
 
-/// `--field-map` bakes the laser field pre-distortion into the emit: the
-/// geometry is densified (subdivision) and every vertex is pre-warped, so the
-/// output differs from the affine-only baseline. The correction math itself is
+/// The required `--field-map` bakes the laser field pre-distortion into the
+/// emit. Both the identity and distorted maps densify every edge; the
+/// distorted map additionally moves the vertices. The correction math itself is
 /// unit-tested in `vision`; this proves the CLI wiring applies it.
 #[test]
 fn field_map_predistorts_and_subdivides_the_emit() {
-    use nalgebra::Point2;
-
-    // A field-correction file fit from a known pincushion about (130,-85),
-    // the region the identity-placed fixture geometry occupies.
-    let field_center = (130.0, -85.0);
-    let laser = |cx: f64, cy: f64| {
-        let (du, dv) = (cx - field_center.0, cy - field_center.1);
-        let r2 = (du * du + dv * dv) / (70.0 * 70.0);
-        let f = 1.0 + 0.03 * r2;
-        (field_center.0 + du * f, field_center.1 + dv * f)
-    };
-    let mut pairs = Vec::new();
-    for r in 0..7 {
-        for c in 0..7 {
-            let cmd = (80.0 + c as f64 * 16.0, -130.0 + r as f64 * 16.0);
-            let phys = laser(cmd.0, cmd.1);
-            pairs.push((Point2::new(phys.0, phys.1), Point2::new(cmd.0, cmd.1)));
-        }
-    }
-    let field = vision::fit_field(&pairs).expect("fit field");
-    let map_path = tmp("field").join("field.txt");
-    std::fs::write(&map_path, field.serialize()).unwrap();
+    let map_path = pincushion_field_map("field");
 
     let corr = "131,-92=131,-92; 146,-92=146,-92; 131,-81=131,-81";
-    let (ok_base, base_doc, _) = register(&["--fiducials", corr], "fld-base.lbrn2");
+    let (ok_base, base_doc, _) = register(
+        &["--fiducials", corr, "--field-seg-mm", "1.0"],
+        "fld-base.lbrn2",
+    );
     assert!(ok_base);
     let (ok, doc, stderr) = register(
         &[
@@ -225,15 +307,15 @@ fn field_map_predistorts_and_subdivides_the_emit() {
     );
     assert!(ok, "field-map register succeeds; stderr: {stderr}");
     assert!(
-        stderr.contains("field correction on"),
+        stderr.contains("mandatory field warp on"),
         "stderr reports the correction: {stderr}"
     );
 
     let base = verts(&base_doc);
     let warped = verts(&doc);
     assert!(
-        warped.len() > base.len(),
-        "edges densified: {} → {} vertices",
+        warped.len() == base.len(),
+        "both required field maps densify identically: {} vs {} vertices",
         base.len(),
         warped.len()
     );
@@ -252,6 +334,32 @@ fn field_map_predistorts_and_subdivides_the_emit() {
         shift > 0.01,
         "pre-distortion shifts the geometry: {shift:.4} mm"
     );
+}
+
+#[test]
+fn field_map_predistorts_every_direct_emit_edge() {
+    let map_path = pincushion_field_map("emit-field");
+    let (base_ok, base_doc, base_stderr) = emit(&["--field-seg-mm", "1.0"], "emit-base.lbrn2");
+    assert!(base_ok, "baseline emit succeeds: {base_stderr}");
+    let (ok, warped_doc, stderr) = emit(
+        &[
+            "--field-map",
+            map_path.to_str().unwrap(),
+            "--field-seg-mm",
+            "1.0",
+        ],
+        "emit-field.lbrn2",
+    );
+    assert!(ok, "field-warped emit succeeds: {stderr}");
+    assert!(
+        stderr.contains("emit: mandatory field warp on"),
+        "stderr reports mandatory-capable warp path: {stderr}"
+    );
+    assert!(
+        verts(&warped_doc).len() == verts(&base_doc).len(),
+        "direct emit densifies every edge for every required field map"
+    );
+    assert_ne!(warped_doc, base_doc, "the nonlinear map must move geometry");
 }
 
 #[test]
