@@ -25,7 +25,8 @@ pub use calib::{
     AnchorDot, Calibration, CameraCal, DotKind, FieldCal, FieldDot, GridSpec, LensDot,
     camera_px_to_commanded, camera_px_to_physical, commanded_to_camera_px,
     composed_projection_is_finite, field_live_acceptance, fit_camera_lens, fit_camera_to_machine,
-    fit_laser_field, physical_to_camera_px,
+    fit_camera_to_machine_precise, fit_laser_field, physical_to_camera_px, re_anchor,
+    re_anchor_precise,
 };
 pub use capture::{Capture, Source, clean_path, grab, list_devices};
 pub use fiducial::{

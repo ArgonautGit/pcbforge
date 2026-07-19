@@ -150,12 +150,16 @@ impl ConsoleApp {
                 }
             }
             CalibMode::LaserAnchor => {
-                match crate::calib::fit_camera_to_machine(frame, corners, &grid, dot, kind) {
-                    Ok(cal) => {
+                match crate::calib::fit_camera_to_machine_precise(frame, corners, &grid, dot, kind)
+                {
+                    Ok((cal, nonlinear)) => {
                         self.calibration.note = format!(
-                            "anchor: {}/{} dots, RMS {:.0} µm — Place now burns in machine coordinates",
-                            cal.found, cal.total, cal.rms_um
+                            "nonlinear anchor: {}/{} dots, RMS/worst {:.0}/{:.0} µm — Place now follows the burned lattice in machine coordinates",
+                            cal.found, cal.total, nonlinear.rms_um, nonlinear.max_um
                         );
+                        self.calibration.anchor_nonlinear = Some(nonlinear);
+                        self.calibration.anchor_frame_signature =
+                            Some((frame.dimensions(), self.camera.orientation));
                         self.calibration.anchor = Some(cal);
                         self.calibration.saved_at = Some(now_unix());
                     }
@@ -258,12 +262,15 @@ impl ConsoleApp {
         match crate::camera::grab(&self.cam_source()) {
             Ok(g) => {
                 let frame = self.camera.orientation.apply(g);
-                match crate::calib::re_anchor(&frame, &prev, &grid, dot, kind) {
-                    Ok(cal) => {
+                match crate::calib::re_anchor_precise(&frame, &prev, &grid, dot, kind) {
+                    Ok((cal, nonlinear)) => {
                         self.calibration.note = format!(
-                            "re-anchored: {}/{} dots, RMS {:.0} µm",
-                            cal.found, cal.total, cal.rms_um
+                            "re-anchored nonlinear: {}/{} dots, RMS/worst {:.0}/{:.0} µm",
+                            cal.found, cal.total, nonlinear.rms_um, nonlinear.max_um
                         );
+                        self.calibration.anchor_nonlinear = Some(nonlinear);
+                        self.calibration.anchor_frame_signature =
+                            Some((frame.dimensions(), self.camera.orientation));
                         self.calibration.anchor = Some(cal);
                         self.calibration.saved_at = Some(now_unix());
                     }
@@ -310,18 +317,21 @@ impl ConsoleApp {
             };
             self.calibration.frame_tex =
                 Some(ctx.load_texture("calib-frame", color, TextureOptions::NEAREST));
-            match crate::calib::re_anchor(
+            match crate::calib::re_anchor_precise(
                 &frame,
                 &prev,
                 &self.calib_grid(),
                 self.calibration.dot_mm,
                 self.calibration.dot_kind,
             ) {
-                Ok(cal) => {
+                Ok((cal, nonlinear)) => {
                     self.calibration.note = format!(
-                        "live: {}/{} dots, RMS {:.0} µm",
-                        cal.found, cal.total, cal.rms_um
+                        "live nonlinear: {}/{} dots, RMS/worst {:.0}/{:.0} µm",
+                        cal.found, cal.total, nonlinear.rms_um, nonlinear.max_um
                     );
+                    self.calibration.anchor_nonlinear = Some(nonlinear);
+                    self.calibration.anchor_frame_signature =
+                        Some((frame.dimensions(), self.camera.orientation));
                     self.calibration.anchor = Some(cal);
                     self.calibration.saved_at = Some(now_unix());
                 }
@@ -382,11 +392,9 @@ impl ConsoleApp {
             }
         }
 
-        // Laser-anchor feedback (after a fit): the machine coordinate grid the
-        // camera reconstructs, drawn as a blue mesh over the burned dots, with
-        // the origin + axes, per-dot residual vectors (× exaggerated), and any
-        // dots that failed to lock. This makes the abstract homography visible:
-        // the operator sees exactly where the laser thinks its grid is.
+        // Laser-anchor feedback (after a fit): prefer the direct nonlinear
+        // burn-lattice map so the mesh follows combined camera/laser curvature;
+        // a restored session without that map still shows its homography seed.
         if self.calibration.mode == CalibMode::LaserAnchor
             && let Some(cal) = &self.calibration.anchor
             && cal.found > 0
@@ -394,9 +402,20 @@ impl ConsoleApp {
         {
             let grid = self.calib_grid();
             let exagg = self.calibration.anchor_resid_scale;
+            let nonlinear = self.calibration.anchor_nonlinear.as_ref().filter(|_| {
+                self.calibration.frame_img.as_ref().is_some_and(|frame| {
+                    self.calibration.anchor_frame_signature
+                        == Some((frame.dimensions(), self.camera.orientation))
+                })
+            });
             let proj = |mx: f64, my: f64| {
-                let p = mm_to_px.apply(nalgebra::Point2::new(mx, my));
-                to_screen(p.x, p.y)
+                let p = nonlinear
+                    .map(|map| map.mm_to_px.apply(mx, my))
+                    .unwrap_or_else(|| {
+                        let p = mm_to_px.apply(nalgebra::Point2::new(mx, my));
+                        (p.x, p.y)
+                    });
+                to_screen(p.0, p.1)
             };
             let green = Color32::from_rgb(0x40, 0xc0, 0x50);
             let amber = Color32::from_rgb(0xe0, 0x90, 0x20);
@@ -636,7 +655,7 @@ impl ConsoleApp {
             ui.selectable_value(
                 &mut self.calibration.mode,
                 CalibMode::LaserAnchor,
-                "② Laser anchor (approximate)",
+                "② Laser anchor (nonlinear)",
             );
             ui.selectable_value(
                 &mut self.calibration.mode,
@@ -651,9 +670,10 @@ impl ConsoleApp {
                  The arrows show the lens distortion; the color shows how well it was corrected.",
             ).weak()),
             CalibMode::LaserAnchor => ui.label(egui::RichText::new(
-                "Approximate homography anchor: burn a dot grid at known coordinates, leave it taped down, image it, \
+                "Nonlinear burn anchor: burn a square grid at known coordinates, leave it taped down, image it, \
                  mark the 4 corners, and Fit. Re-anchor / ● Live re-lock to that fixed grid as the camera \
-                 moves. It cannot model lens/field curvature; ①+③ provide the corrected nonlinear projection.",
+                 moves. It follows the combined camera + laser curvature immediately; ①+③ still decompose \
+                 those effects so emitted geometry can be physically pre-distorted.",
             ).weak()),
             CalibMode::LaserField => ui.label(egui::RichText::new(
                 "Correct the laser field: needs ① Camera lens first (the metric ruler), at the same camera \
@@ -693,10 +713,11 @@ impl ConsoleApp {
                 );
                 ui.end_row();
                 ui.label("dot contrast").on_hover_text(
-                    "How the dots read against their background. A printed grid or a \
+                    "Preferred contrast. A printed grid or a \
                      burn that darkens the plate is dark-on-light; an ablated mark that \
-                     brightens a dark surface (or a backlit hole) is bright-on-dark. If \
-                     the fit finds 0 dots, this is usually the wrong setting.",
+                     brightens a dark surface is bright-on-dark. Calibration also checks \
+                     the opposite polarity at each site because reflections can flip the \
+                     same square across the camera field.",
                 );
                 ui.horizontal(|ui| {
                     ui.selectable_value(

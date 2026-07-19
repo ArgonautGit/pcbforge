@@ -127,6 +127,10 @@ pub(super) struct CameraState {
 
 pub(super) struct CalibrationState {
     pub(super) anchor: Option<crate::calib::Calibration>,
+    /// Direct camera-pixel ↔ commanded-machine polynomial fitted from the
+    /// burned lattice. Session-only; the homography remains the restart seed.
+    pub(super) anchor_nonlinear: Option<vision::LensMap>,
+    pub(super) anchor_frame_signature: Option<((u32, u32), Orientation)>,
     pub(super) saved_at: Option<u64>,
     pub(super) n: usize,
     pub(super) pitch_mm: f64,

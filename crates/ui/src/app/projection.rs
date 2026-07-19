@@ -16,6 +16,12 @@ pub(super) enum CameraProjection {
     PhysicalLens {
         lens: vision::LensMap,
     },
+    /// Direct camera ↔ commanded-machine polynomial from the burned lattice.
+    /// This removes the combined camera/laser curvature in step ② before the
+    /// two effects have been decomposed by step ③.
+    AnchorNonlinear {
+        map: vision::LensMap,
+    },
     Homography {
         mm_to_px: vision::Homography,
         px_to_mm: vision::Homography,
@@ -33,6 +39,7 @@ impl CameraProjection {
                 crate::calib::commanded_to_camera_px(lens, field, mm)?
             }
             Self::PhysicalLens { lens } => crate::calib::physical_to_camera_px(lens, mm)?,
+            Self::AnchorNonlinear { map } => crate::calib::physical_to_camera_px(map, mm)?,
             Self::Homography { mm_to_px, .. } => {
                 let p = mm_to_px.apply(nalgebra::Point2::new(mm.0, mm.1));
                 (p.x, p.y)
@@ -48,6 +55,7 @@ impl CameraProjection {
                 crate::calib::camera_px_to_commanded(lens, field, px)?
             }
             Self::PhysicalLens { lens } => crate::calib::camera_px_to_physical(lens, px)?,
+            Self::AnchorNonlinear { map } => crate::calib::camera_px_to_physical(map, px)?,
             Self::Homography { px_to_mm, .. } => {
                 let p = px_to_mm.apply(nalgebra::Point2::new(px.0, px.1));
                 (p.x, p.y)
@@ -63,6 +71,7 @@ impl CameraProjection {
         match self {
             Self::CommandedNonlinear { .. } => "commanded mm (nonlinear lens + field)",
             Self::PhysicalLens { .. } => "physical mm (field-corrected)",
+            Self::AnchorNonlinear { .. } => "machine mm (nonlinear burn anchor)",
             Self::Homography { .. } => "machine mm (approximate homography)",
             Self::Uniform { .. } => "design frame (uncalibrated)",
         }
@@ -74,6 +83,28 @@ pub(super) fn finite_pair(p: (f64, f64)) -> Option<(f64, f64)> {
 }
 
 impl ConsoleApp {
+    fn anchor_nonlinear_for_frame(
+        &self,
+        dimensions: (u32, u32),
+    ) -> Result<Option<vision::LensMap>, String> {
+        let Some(map) = self.calibration.anchor_nonlinear.as_ref() else {
+            return Ok(None);
+        };
+        if self.calibration.anchor_frame_signature != Some((dimensions, self.camera.orientation)) {
+            return Ok(None);
+        }
+        if !map
+            .px_to_mm
+            .to_coeffs()
+            .into_iter()
+            .chain(map.mm_to_px.to_coeffs())
+            .all(f64::is_finite)
+        {
+            return Err("nonlinear burn anchor contains non-finite coefficients".into());
+        }
+        Ok(Some(map.clone()))
+    }
+
     pub(super) fn initial_center_mm(&self, w_px: f64, h_px: f64) -> Result<(f64, f64), String> {
         let projection = self.place_projection(w_px as u32, h_px as u32)?;
         projection
@@ -138,6 +169,9 @@ impl ConsoleApp {
         if let Some((lens, field)) = self.nonlinear_maps_for_frame(dimensions)? {
             return Ok(Some(CameraProjection::CommandedNonlinear { lens, field }));
         }
+        if let Some(map) = self.anchor_nonlinear_for_frame(dimensions)? {
+            return Ok(Some(CameraProjection::AnchorNonlinear { map }));
+        }
         let Some(px_to_mm) = self.calibration.anchor.as_ref().map(|c| c.px_to_mm.clone()) else {
             return Ok(None);
         };
@@ -164,6 +198,9 @@ impl ConsoleApp {
                 "field correction is unavailable because the latest ③ fit was rejected or is stale"
                     .into(),
             );
+        }
+        if let Some(map) = self.anchor_nonlinear_for_frame((width, height))? {
+            return Ok(CameraProjection::AnchorNonlinear { map });
         }
         if let Some(mm_to_px) = self.place_homography() {
             let px_to_mm = mm_to_px

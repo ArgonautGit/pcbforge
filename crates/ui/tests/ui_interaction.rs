@@ -150,14 +150,14 @@ fn the_laser_field_calibration_step_is_selectable() {
 }
 
 #[test]
-fn laser_anchor_is_explicitly_labelled_as_approximate() {
+fn laser_anchor_is_explicitly_labelled_as_nonlinear() {
     let mut h = console();
     h.get_by_label_contains("Calibrate").click();
     h.run();
     assert!(
-        h.query_by_label_contains("② Laser anchor (approximate)")
+        h.query_by_label_contains("② Laser anchor (nonlinear)")
             .is_some(),
-        "the homography-only fallback must not imply lens/field correction"
+        "the direct burned-lattice map should advertise its nonlinear projection"
     );
 }
 

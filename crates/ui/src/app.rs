@@ -159,6 +159,8 @@ impl ConsoleApp {
             },
             calibration: CalibrationState {
                 anchor: None,
+                anchor_nonlinear: None,
+                anchor_frame_signature: None,
                 saved_at: None,
                 n: 7,
                 pitch_mm: 10.0,
@@ -326,6 +328,7 @@ impl ConsoleApp {
         let projection = match self.camera.last.as_ref().map(|f| f.dimensions()) {
             Some(dimensions) => match self.camera_projection(dimensions) {
                 Ok(Some(CameraProjection::CommandedNonlinear { .. })) => "nonlinear",
+                Ok(Some(CameraProjection::AnchorNonlinear { .. })) => "anchor-nonlinear",
                 Ok(Some(CameraProjection::Homography { .. })) => "homography",
                 Ok(Some(CameraProjection::PhysicalLens { .. })) => "physical-lens",
                 Ok(Some(CameraProjection::Uniform { .. })) => "uniform",

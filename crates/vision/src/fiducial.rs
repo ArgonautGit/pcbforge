@@ -102,6 +102,16 @@ pub enum FiducialProfile {
         /// Dot diameter on the bed, mm.
         diameter_mm: f64,
     },
+    /// Bright filled square on a dark field, as emitted by `calib-grid`.
+    BrightSquare {
+        /// Square side length on the bed, mm.
+        side_mm: f64,
+    },
+    /// Dark filled square on a bright field, as emitted by `calib-grid`.
+    DarkSquare {
+        /// Square side length on the bed, mm.
+        side_mm: f64,
+    },
 }
 
 impl FiducialProfile {
@@ -111,13 +121,18 @@ impl FiducialProfile {
             Self::Backlit { diameter_mm }
             | Self::Annulus { diameter_mm }
             | Self::DarkDot { diameter_mm } => diameter_mm,
+            Self::BrightSquare { side_mm } | Self::DarkSquare { side_mm } => side_mm,
         }
     }
 
     /// Dark-on-bright profiles are inverted so the target is always the
     /// bright class internally.
     fn is_dark(&self) -> bool {
-        matches!(self, Self::DarkDot { .. })
+        matches!(self, Self::DarkDot { .. } | Self::DarkSquare { .. })
+    }
+
+    fn is_square(&self) -> bool {
+        matches!(self, Self::BrightSquare { .. } | Self::DarkSquare { .. })
     }
 }
 
@@ -294,8 +309,15 @@ fn find_one(
     let thr = bg + 0.4 * (peak - bg);
     let mask: Vec<bool> = win.v.iter().map(|&x| x > thr).collect();
 
-    // Connected components + gates: size, circularity, distance.
-    let nominal_area = std::f64::consts::FRAC_PI_4 * dot_px * dot_px;
+    // Connected components + gates: size, circularity, distance. Rank by how
+    // well each component matches the requested target, not distance alone:
+    // field/lens distortion can move the real mark several pixels while a
+    // scratch or dust speck happens to sit closer to the seed.
+    let nominal_area = if profile.is_square() {
+        dot_px * dot_px
+    } else {
+        std::f64::consts::FRAC_PI_4 * dot_px * dot_px
+    };
     let exp_in_win = (center_px.x - x0 as f64, center_px.y - y0 as f64);
     let best = components(&mask, w, h)
         .into_iter()
@@ -316,7 +338,11 @@ fn find_one(
             if dist > search_px {
                 return None;
             }
-            Some((c, circularity, dist))
+            let size_error = (area / nominal_area).ln().abs();
+            let shape_error = 1.0 - circularity.min(1.0);
+            let distance_error = dist / search_px.max(1.0);
+            let cost = 0.60 * size_error + 0.25 * shape_error + 0.15 * distance_error;
+            Some((c, circularity, cost))
         })
         .min_by(|a, b| a.2.total_cmp(&b.2));
     let Some((comp, circularity, _)) = best else {
@@ -696,6 +722,29 @@ mod tests {
             .expect("true hole found");
         let err = ((f.found_px.x - true_c.0).powi(2) + (f.found_px.y - true_c.1).powi(2)).sqrt();
         assert!(err < 0.5, "locked onto a decoy: found {:?}", f.found_px);
+    }
+
+    #[test]
+    fn nearer_undersize_speck_loses_to_nominal_target() {
+        let bed = BedMap::uniform_scale(PX_PER_MM);
+        // Both components pass the deliberately forgiving area gate. The old
+        // nearest-component rule selected the 5 px speck at the seed; target
+        // likelihood must instead select the 10 px calibration mark displaced
+        // by 0.9 mm.
+        let frame = render(
+            180,
+            180,
+            &[(101.0, 90.0, 5.0), (110.0, 90.0, 10.0)],
+            90.0,
+            3.0,
+            123,
+        );
+        let expected = [bed.px_to_mm(Point2::new(101.0, 90.0))];
+        let found = find_fiducials(&frame, &expected, 2.0, &dark_1mm(), &bed)
+            .remove(0)
+            .expect("nominal target found");
+        let error = (found.found_px.x - 110.0).hypot(found.found_px.y - 90.0);
+        assert!(error < 0.5, "undersize speck captured detector: {found:?}");
     }
 
     /// Low contrast is a lighting problem: report SNR, don't hallucinate.
