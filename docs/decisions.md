@@ -1866,3 +1866,25 @@ hard to review and encouraged accidental coupling between workflows.
 - Cross-workflow access is limited to private or `pub(super)` interfaces. The
   settings keys, debug-summary tokens, public methods, and widget labels remain
   stable so saved consoles and headless driving scripts continue to work.
+
+## 2026-07-19 — Detect burned square grids as a coherent lattice
+
+A live 7×7 burn showed two failure modes in the generic fiducial detector:
+strong illumination falloff/glare changed the apparent foreground across the
+frame, and independent search windows could lock to unrelated bright texture.
+Changing the calibration polynomial would only fit those wrong observations.
+
+- Burned-square calibration now first applies local mean/variance contrast
+  normalization, scores opposing square edges at several apparent sizes, and
+  chooses candidates as one smooth lattice. This is polarity independent and
+  tolerates both the dark lower field and the saturated central reflection.
+- The generic fiducial detector remains the fallback for printed/circular or
+  weak fixtures. Grid generation, square dimensions, pitch, and all lens/field
+  fit models are unchanged.
+- The supplied live frame is a committed UI test fixture with independently
+  measured square centers. The regression requires broad coverage and bounded
+  center error, rather than merely accepting a successful fit.
+- Laser-anchor results can be reviewed manually: left-clicking a burned square
+  adds or moves that lattice observation, right-clicking removes a suspect one,
+  and the homography/residuals are re-fit immediately. Live re-anchoring pauses
+  during correction so it cannot overwrite the operator's review.

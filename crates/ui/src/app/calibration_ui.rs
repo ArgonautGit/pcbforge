@@ -334,6 +334,94 @@ impl ConsoleApp {
 }
 
 impl ConsoleApp {
+    pub(super) fn calibrate_edit_anchor_dot(&mut self, native_px: (f64, f64), remove: bool) {
+        let Some(current) = self.calibration.anchor.clone() else {
+            self.calibration.note = "fit the anchor before correcting dots".into();
+            return;
+        };
+        let Some(mm_to_px) = current.px_to_mm.try_inverse() else {
+            self.calibration.note = "cannot edit dots: the anchor is singular".into();
+            return;
+        };
+        let grid = self.calib_grid();
+        let native = nalgebra::Point2::new(native_px.0, native_px.1);
+        let (ox, oy) = grid.origin_mm;
+        let origin = mm_to_px.apply(nalgebra::Point2::new(ox, oy));
+        let pitch_x = mm_to_px.apply(nalgebra::Point2::new(ox + grid.pitch_mm, oy)) - origin;
+        let pitch_y = mm_to_px.apply(nalgebra::Point2::new(ox, oy + grid.pitch_mm)) - origin;
+        let pitch_px = (0.5 * (pitch_x.norm() + pitch_y.norm())).max(8.0);
+        let mut dots = current.dots.clone();
+
+        let action = if remove {
+            let Some((index, distance)) = dots
+                .iter()
+                .enumerate()
+                .map(|(index, dot)| {
+                    (
+                        index,
+                        (nalgebra::Point2::new(dot.px.0, dot.px.1) - native).norm(),
+                    )
+                })
+                .min_by(|a, b| a.1.total_cmp(&b.1))
+            else {
+                self.calibration.note = "there are no detected dots to remove".into();
+                return;
+            };
+            if distance > pitch_px * 0.30 {
+                self.calibration.note = "right-click closer to a detected dot to remove it".into();
+                return;
+            }
+            let removed = dots.remove(index);
+            format!(
+                "removed dot at ({:.0}, {:.0}) mm",
+                removed.mm.0, removed.mm.1
+            )
+        } else {
+            let Some((mm, distance)) = grid
+                .points()
+                .into_iter()
+                .map(|mm| {
+                    let expected = mm_to_px.apply(nalgebra::Point2::new(mm.0, mm.1));
+                    (mm, (expected - native).norm())
+                })
+                .min_by(|a, b| a.1.total_cmp(&b.1))
+            else {
+                self.calibration.note = "the calibration grid has no sites".into();
+                return;
+            };
+            if distance > pitch_px * 0.48 {
+                self.calibration.note =
+                    "left-click closer to the square you want to correct".into();
+                return;
+            }
+            if let Some(dot) = dots
+                .iter_mut()
+                .find(|dot| (dot.mm.0 - mm.0).abs() < 1e-6 && (dot.mm.1 - mm.1).abs() < 1e-6)
+            {
+                dot.px = native_px;
+            } else {
+                dots.push(crate::calib::AnchorDot {
+                    px: native_px,
+                    mm,
+                    resid_um: 0.0,
+                });
+            }
+            format!("corrected dot at ({:.0}, {:.0}) mm", mm.0, mm.1)
+        };
+
+        match crate::calib::refit_anchor_dots(&dots, current.total) {
+            Ok(calibration) => {
+                self.calibration.note = format!(
+                    "{action}; re-fit {}/{} dots, RMS {:.0} µm",
+                    calibration.found, calibration.total, calibration.rms_um
+                );
+                self.calibration.anchor = Some(calibration);
+                self.calibration.saved_at = Some(now_unix());
+            }
+            Err(error) => self.calibration.note = format!("dot correction rejected: {error}"),
+        }
+    }
+
     pub(super) fn calib_frame_overlay(&mut self, ui: &mut egui::Ui) {
         let Some(tex) = self.calibration.frame_tex.clone() else {
             ui.weak("(load a grid frame to mark corners)");
@@ -344,11 +432,20 @@ impl ConsoleApp {
         let to_screen = |px: f64, py: f64| xf.to_screen(px, py);
         // A click adds the next corner (up to 4) — unless navigating (Ctrl).
         if !crate::imgview::is_navigating(ui)
-            && resp.clicked()
-            && self.calibration.corners.len() < 4
             && let Some(pos) = resp.interact_pointer_pos()
         {
-            self.calibration.corners.push(xf.to_native(pos));
+            if self.calibration.edit_anchor_dots && self.calibration.mode == CalibMode::LaserAnchor
+            {
+                if resp.clicked_by(egui::PointerButton::Primary) {
+                    self.calibrate_edit_anchor_dot(xf.to_native(pos), false);
+                } else if resp.clicked_by(egui::PointerButton::Secondary) {
+                    self.calibrate_edit_anchor_dot(xf.to_native(pos), true);
+                }
+            } else if resp.clicked_by(egui::PointerButton::Primary)
+                && self.calibration.corners.len() < 4
+            {
+                self.calibration.corners.push(xf.to_native(pos));
+            }
         }
         let painter = ui.painter_at(rect);
         let cyan = Color32::from_rgb(0x22, 0xcc, 0xdd);
@@ -831,6 +928,28 @@ impl ConsoleApp {
                              camera as it moves. Keep the burned grid in view.",
                             );
                     });
+                    let can_edit = self
+                        .calibration
+                        .anchor
+                        .as_ref()
+                        .is_some_and(|anchor| !anchor.dots.is_empty());
+                    let edit = ui
+                        .add_enabled(
+                            can_edit,
+                            egui::Checkbox::new(
+                                &mut self.calibration.edit_anchor_dots,
+                                "Correct detected dots",
+                            ),
+                        )
+                        .on_hover_text(
+                            "Review the fitted squares on the image. Left-click a burn to add or move its center; right-click a detected center to remove it.",
+                        );
+                    if edit.changed() && self.calibration.edit_anchor_dots {
+                        self.calibration.live = false;
+                        self.calibration.note =
+                            "dot correction active: left-click a square; right-click removes a dot"
+                                .into();
+                    }
                     if self.calibration.live {
                         ui.spinner();
                     }
@@ -871,6 +990,12 @@ impl ConsoleApp {
                     .as_ref()
                     .is_some_and(|c| !c.dots.is_empty())
                 {
+                    if self.calibration.edit_anchor_dots {
+                        ui.colored_label(
+                            Color32::from_rgb(0xf0, 0xc0, 0x40),
+                            "Correction active — left-click a square center; right-click removes a detection.",
+                        );
+                    }
                     ui.add(
                         egui::Slider::new(&mut self.calibration.anchor_resid_scale, 1.0..=100.0)
                             .text("residual ×"),

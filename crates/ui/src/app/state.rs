@@ -145,6 +145,7 @@ pub(super) struct CalibrationState {
     pub(super) field_accepted: bool,
     pub(super) lens_arrow_scale: f32,
     pub(super) anchor_resid_scale: f32,
+    pub(super) edit_anchor_dots: bool,
     pub(super) live: bool,
     pub(super) capture: Option<crate::camera::Capture>,
     pub(super) capture_src: Option<crate::camera::Source>,

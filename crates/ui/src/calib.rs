@@ -21,6 +21,8 @@ use vision::{
     classify_field_error, find_fiducials, fit_field, fit_homography, fit_lens,
 };
 
+mod square_grid;
+
 /// How the grid dots read against their background. A **printed** reference
 /// grid and a burn that darkens the surface (dark-anodized plate) are
 /// dark-on-light; an **ablated** mark that brightens a dark surface — or a
@@ -142,12 +144,28 @@ fn detect_grid_dots(
     // ~0.4·pitch so windows don't overlap, but at least the dot size. This also
     // bounds how far the camera may drift between re-anchors and still lock on.
     let search_mm = (grid.pitch_mm * 0.4).max(dot_mm);
+    // Ablated bright burns use the globally constrained square detector first;
+    // this is the difficult low-contrast/glare case. Keep the established
+    // generic path fast for printed dark/circular fixtures, with the square
+    // detector as its fallback when generic coverage is poor.
+    if kind == DotKind::Bright {
+        let square_pairs = square_grid::detect_square_grid(frame, mm_to_px_seed, grid, dot_mm);
+        if square_pairs.len() * 5 >= commanded.len() * 3 {
+            return Ok((square_pairs, commanded.len()));
+        }
+    }
     let results = find_fiducials(frame, &expected, search_mm, &profile, &bed);
     let pairs: Vec<(Point2<f64>, Point2<f64>)> = commanded
         .iter()
         .zip(&results)
         .filter_map(|(&(mx, my), r)| r.as_ref().ok().map(|f| (f.found_px, Point2::new(mx, my))))
         .collect();
+    if kind == DotKind::Dark && pairs.len() * 5 < commanded.len() * 3 {
+        let square_pairs = square_grid::detect_square_grid(frame, mm_to_px_seed, grid, dot_mm);
+        if square_pairs.len() > pairs.len() {
+            return Ok((square_pairs, commanded.len()));
+        }
+    }
     Ok((pairs, commanded.len()))
 }
 
@@ -180,28 +198,66 @@ fn refit(
              the seed, and the dot size; a big camera move needs a fresh corner fit)"
         ));
     }
-    let px_to_mm = fit_homography(&pairs).map_err(|e| format!("grid fit: {e}"))?;
-    let rms_um = px_to_mm.rms * 1000.0;
-    // Per-dot anchor residual for the overlay: how far each detected dot lands
-    // from its commanded machine coordinate once mapped through the fit.
     let dots: Vec<AnchorDot> = pairs
         .iter()
-        .map(|(fpx, mm)| {
-            let got = px_to_mm.apply(*fpx);
-            let resid_um = ((got.x - mm.x).powi(2) + (got.y - mm.y).powi(2)).sqrt() * 1000.0;
+        .map(|(fpx, mm)| AnchorDot {
+            px: (fpx.x, fpx.y),
+            mm: (mm.x, mm.y),
+            resid_um: 0.0,
+        })
+        .collect();
+    refit_anchor_dots(&dots, total)
+}
+
+/// Refit an anchor after the operator has corrected one or more detected
+/// square centers. The grid identity (`mm`) of every point is retained; only
+/// its observed pixel center changes.
+pub(crate) fn refit_anchor_dots(
+    dots: &[AnchorDot],
+    total: usize,
+) -> Result<Calibration, String> {
+    if dots.len() < 4 {
+        return Err(format!(
+            "only {}/{} anchor dots remain — need ≥4",
+            dots.len(),
+            total
+        ));
+    }
+    if dots.iter().any(|dot| {
+        !dot.px.0.is_finite()
+            || !dot.px.1.is_finite()
+            || !dot.mm.0.is_finite()
+            || !dot.mm.1.is_finite()
+    }) {
+        return Err("anchor correction contains a non-finite coordinate".into());
+    }
+    let pairs: Vec<DotPair> = dots
+        .iter()
+        .map(|dot| {
+            (
+                Point2::new(dot.px.0, dot.px.1),
+                Point2::new(dot.mm.0, dot.mm.1),
+            )
+        })
+        .collect();
+    let px_to_mm = fit_homography(&pairs).map_err(|e| format!("grid fit: {e}"))?;
+    let fitted = dots
+        .iter()
+        .map(|dot| {
+            let got = px_to_mm.apply(Point2::new(dot.px.0, dot.px.1));
             AnchorDot {
-                px: (fpx.x, fpx.y),
-                mm: (mm.x, mm.y),
-                resid_um,
+                px: dot.px,
+                mm: dot.mm,
+                resid_um: ((got.x - dot.mm.0).powi(2) + (got.y - dot.mm.1).powi(2)).sqrt() * 1000.0,
             }
         })
         .collect();
     Ok(Calibration {
+        rms_um: px_to_mm.rms * 1000.0,
         px_to_mm,
-        rms_um,
-        found,
-        total,
-        dots,
+        found: dots.len(),
+        total: total.max(dots.len()),
+        dots: fitted,
     })
 }
 
@@ -708,6 +764,49 @@ mod tests {
         assert_eq!(
             g.corners_mm(),
             [(0.0, 0.0), (60.0, 0.0), (60.0, 60.0), (0.0, 60.0)]
+        );
+    }
+
+    #[test]
+    fn corrected_anchor_dots_are_refit_and_rescored() {
+        let dots = [
+            AnchorDot {
+                px: (20.0, 30.0),
+                mm: (0.0, 0.0),
+                resid_um: 999.0,
+            },
+            AnchorDot {
+                px: (120.0, 30.0),
+                mm: (10.0, 0.0),
+                resid_um: 999.0,
+            },
+            AnchorDot {
+                px: (120.0, 130.0),
+                mm: (10.0, 10.0),
+                resid_um: 999.0,
+            },
+            AnchorDot {
+                px: (20.0, 130.0),
+                mm: (0.0, 10.0),
+                resid_um: 999.0,
+            },
+            AnchorDot {
+                px: (70.0, 80.0),
+                mm: (5.0, 5.0),
+                resid_um: 999.0,
+            },
+        ];
+        let calibration = refit_anchor_dots(&dots, 49).expect("manual correction refits");
+        assert_eq!((calibration.found, calibration.total), (5, 49));
+        assert!(calibration.rms_um < 1e-6);
+        assert!(calibration.dots.iter().all(|dot| dot.resid_um < 1e-6));
+
+        let mut invalid = dots;
+        invalid[0].px.0 = f64::NAN;
+        assert!(
+            refit_anchor_dots(&invalid, 49)
+                .unwrap_err()
+                .contains("non-finite")
         );
     }
 

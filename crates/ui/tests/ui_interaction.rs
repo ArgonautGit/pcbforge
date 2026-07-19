@@ -162,6 +162,24 @@ fn laser_anchor_is_explicitly_labelled_as_approximate() {
 }
 
 #[test]
+fn laser_anchor_exposes_manual_dot_correction() {
+    let mut h = console();
+    h.get_by_label_contains("Calibrate").click();
+    h.run();
+    h.get_by_label_contains("② Laser anchor").click();
+    h.run();
+    assert!(
+        h.query_by_label("Correct detected dots").is_some(),
+        "the review control must remain accessible to headless/operator driving"
+    );
+    assert!(
+        h.state().debug_summary().contains("edit_anchor_dots=false"),
+        "correction starts inactive:\n{}",
+        h.state().debug_summary()
+    );
+}
+
+#[test]
 fn compensate_field_is_present_and_gated_off_without_a_field_cal() {
     let mut h = console();
     h.get_by_label_contains("Place on board").click();

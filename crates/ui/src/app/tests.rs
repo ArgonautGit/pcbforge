@@ -1120,6 +1120,63 @@ fn anchor_overlay_renders_the_machine_grid() {
     assert!(!out.shapes.is_empty(), "anchor overlay renders the mesh");
 }
 
+#[test]
+fn anchor_dot_correction_moves_the_selected_grid_site_and_refits() {
+    use nalgebra::Matrix3;
+    let mut app = ConsoleApp::new(tmp_db(), vec!["true".into()]);
+    app.calibration.anchor = Some(crate::calib::Calibration {
+        px_to_mm: vision::Homography {
+            matrix: Matrix3::new(0.1, 0.0, -2.0, 0.0, 0.1, -3.0, 0.0, 0.0, 1.0),
+            residuals: vec![],
+            rms: 0.0,
+        },
+        rms_um: 0.0,
+        found: 5,
+        total: 49,
+        dots: vec![
+            crate::calib::AnchorDot {
+                px: (20.0, 30.0),
+                mm: (0.0, 0.0),
+                resid_um: 0.0,
+            },
+            crate::calib::AnchorDot {
+                px: (620.0, 30.0),
+                mm: (60.0, 0.0),
+                resid_um: 0.0,
+            },
+            crate::calib::AnchorDot {
+                px: (620.0, 630.0),
+                mm: (60.0, 60.0),
+                resid_um: 0.0,
+            },
+            crate::calib::AnchorDot {
+                px: (20.0, 630.0),
+                mm: (0.0, 60.0),
+                resid_um: 0.0,
+            },
+            crate::calib::AnchorDot {
+                px: (320.0, 330.0),
+                mm: (30.0, 30.0),
+                resid_um: 0.0,
+            },
+        ],
+    });
+
+    app.calibrate_edit_anchor_dot((323.0, 332.0), false);
+    let anchor = app
+        .calibration
+        .anchor
+        .as_ref()
+        .expect("anchor remains fitted");
+    let corrected = anchor
+        .dots
+        .iter()
+        .find(|dot| dot.mm == (30.0, 30.0))
+        .expect("center dot retained");
+    assert_eq!(corrected.px, (323.0, 332.0));
+    assert!(app.calibration.note.contains("corrected dot"));
+}
+
 /// The camera bed overlay (work area + 50 mm scale) draws without panicking
 /// when a calibration is present and a frame is loaded.
 #[test]
