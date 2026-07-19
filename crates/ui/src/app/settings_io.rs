@@ -1,5 +1,25 @@
 use super::*;
 
+/// Space-joined full-precision coefficient row (round-trips through `parse`).
+fn coeff_row(c: &[f64; 23]) -> String {
+    c.iter()
+        .map(f64::to_string)
+        .collect::<Vec<_>>()
+        .join(" ")
+}
+
+/// Parse a [`coeff_row`] back to the 23 coefficients; `None` on any
+/// missing/extra/non-finite value.
+fn parse_coeffs(s: &str) -> Option<[f64; 23]> {
+    let vals: Vec<f64> = s
+        .split_whitespace()
+        .map(str::parse)
+        .collect::<Result<_, _>>()
+        .ok()?;
+    let arr: [f64; 23] = vals.try_into().ok()?;
+    arr.iter().all(|v| v.is_finite()).then_some(arr)
+}
+
 impl ConsoleApp {
     /// The persisted input fields, in a fixed key order.
     pub(super) fn settings_blob(&self) -> String {
@@ -24,6 +44,8 @@ impl ConsoleApp {
                 "cam_orientation",
                 self.camera.orientation.token().to_string(),
             ),
+            ("cam_use_device", self.camera.use_device.to_string()),
+            ("cam_device", self.camera.device.to_string()),
             ("calib_n", self.calibration.n.to_string()),
             ("calib_pitch_mm", self.calibration.pitch_mm.to_string()),
             ("calib_dot_mm", self.calibration.dot_mm.to_string()),
@@ -77,6 +99,70 @@ impl ConsoleApp {
                 self.calibration
                     .saved_at
                     .map(|t| t.to_string())
+                    .unwrap_or_default(),
+            ),
+            // The ① camera-lens calibration (bi-cubic px↔mm maps), so the
+            // camera distortion survives a restart. The per-dot residual
+            // vectors are display-only and are not persisted.
+            (
+                "lens_px_to_mm",
+                self.calibration
+                    .lens
+                    .as_ref()
+                    .map(|c| coeff_row(&c.lens.px_to_mm.to_coeffs()))
+                    .unwrap_or_default(),
+            ),
+            (
+                "lens_mm_to_px",
+                self.calibration
+                    .lens
+                    .as_ref()
+                    .map(|c| coeff_row(&c.lens.mm_to_px.to_coeffs()))
+                    .unwrap_or_default(),
+            ),
+            (
+                "lens_stats",
+                self.calibration
+                    .lens
+                    .as_ref()
+                    .map(|c| format!("{} {} {} {}", c.lens.rms_um, c.lens.max_um, c.found, c.total))
+                    .unwrap_or_default(),
+            ),
+            (
+                "lens_frame_sig",
+                self.calibration
+                    .lens_frame_signature
+                    .map(|((w, h), o)| format!("{w} {h} {}", o.token()))
+                    .unwrap_or_default(),
+            ),
+            // The ③ laser-field calibration: the FieldMap itself lives in the
+            // field-map file (written on acceptance); persist the rest here.
+            (
+                "field_accepted",
+                self.calibration.field_accepted.to_string(),
+            ),
+            (
+                "field_to_px",
+                self.calibration
+                    .field
+                    .as_ref()
+                    .filter(|_| self.calibration.field_accepted)
+                    .map(|f| {
+                        let m = &f.to_px.matrix;
+                        (0..9)
+                            .map(|i| m[(i / 3, i % 3)].to_string())
+                            .collect::<Vec<_>>()
+                            .join(" ")
+                    })
+                    .unwrap_or_default(),
+            ),
+            (
+                "field_stats",
+                self.calibration
+                    .field
+                    .as_ref()
+                    .filter(|_| self.calibration.field_accepted)
+                    .map(|f| format!("{} {}", f.found, f.total))
                     .unwrap_or_default(),
             ),
         ])
@@ -187,11 +273,95 @@ impl ConsoleApp {
         {
             self.camera.orientation = o;
         }
+        if let Some(v) = m.get("cam_use_device").and_then(|s| s.trim().parse().ok()) {
+            self.camera.use_device = v;
+        }
+        if let Some(v) = m
+            .get("cam_device")
+            .and_then(|s| s.trim().parse::<u32>().ok())
+        {
+            self.camera.device = v;
+        }
         if let Some(v) = m
             .get("calib_n")
             .and_then(|s| s.trim().parse::<usize>().ok())
         {
             self.calibration.n = v.clamp(2, 15);
+        }
+        // Restore the ① camera-lens calibration so the camera distortion
+        // survives a restart. Staleness is guarded at use time: the
+        // frame-signature check refuses it if resolution/crop/orientation
+        // changed, and a physically moved camera is re-anchored/re-fit anyway.
+        if let (Some(px), Some(mm)) = (
+            m.get("lens_px_to_mm").and_then(|s| parse_coeffs(s)),
+            m.get("lens_mm_to_px").and_then(|s| parse_coeffs(s)),
+        ) {
+            let mut stats = m
+                .get("lens_stats")
+                .map(|s| s.split_whitespace())
+                .into_iter()
+                .flatten();
+            self.calibration.lens = Some(crate::calib::CameraCal {
+                lens: vision::LensMap {
+                    px_to_mm: vision::Poly2::from_coeffs(&px),
+                    mm_to_px: vision::Poly2::from_coeffs(&mm),
+                    rms_um: stats.next().and_then(|s| s.parse().ok()).unwrap_or(0.0),
+                    max_um: stats.next().and_then(|s| s.parse().ok()).unwrap_or(0.0),
+                    residuals: Vec::new(),
+                },
+                dots: Vec::new(),
+                found: stats.next().and_then(|s| s.parse().ok()).unwrap_or(0),
+                total: stats.next().and_then(|s| s.parse().ok()).unwrap_or(0),
+            });
+        }
+        if let Some(sig) = m.get("lens_frame_sig") {
+            let mut it = sig.split_whitespace();
+            if let (Some(w), Some(h), Some(o)) = (
+                it.next().and_then(|s| s.parse::<u32>().ok()),
+                it.next().and_then(|s| s.parse::<u32>().ok()),
+                it.next().and_then(Orientation::from_token),
+            ) {
+                self.calibration.lens_frame_signature = Some(((w, h), o));
+            }
+        }
+        // Restore the accepted ③ laser field: the FieldMap comes from the
+        // field-map file written on acceptance; the linear to_px overlay
+        // approximation and counts are persisted here. Restored only when the
+        // lens is present too (the field is meaningless without its ruler).
+        if self.calibration.lens.is_some()
+            && m.get("field_accepted").map(|s| s.trim()) == Some("true")
+        {
+            let to_px = m.get("field_to_px").and_then(|s| {
+                let vals: Vec<f64> = s
+                    .split_whitespace()
+                    .filter_map(|t| t.parse().ok())
+                    .filter(|v: &f64| v.is_finite())
+                    .collect();
+                let v: [f64; 9] = vals.try_into().ok()?;
+                let mat = nalgebra::Matrix3::new(
+                    v[0], v[1], v[2], v[3], v[4], v[5], v[6], v[7], v[8],
+                );
+                vision::Homography::from_matrix(mat).ok()
+            });
+            let field = std::fs::read_to_string(self.field_map_path())
+                .ok()
+                .and_then(|s| vision::FieldMap::parse(&s).ok());
+            if let (Some(to_px), Some(field)) = (to_px, field) {
+                let mut stats = m
+                    .get("field_stats")
+                    .map(|s| s.split_whitespace())
+                    .into_iter()
+                    .flatten();
+                self.calibration.field = Some(crate::calib::FieldCal {
+                    field,
+                    to_px,
+                    dots: Vec::new(),
+                    found: stats.next().and_then(|s| s.parse().ok()).unwrap_or(0),
+                    total: stats.next().and_then(|s| s.parse().ok()).unwrap_or(0),
+                    field_verdict: vision::classify_field_error(&[]),
+                });
+                self.calibration.field_accepted = true;
+            }
         }
         // The taped grid persists on the bed, so restore the last calibration
         // as a re-anchor seed (found=0 ⇒ "loaded, unconfirmed" until the

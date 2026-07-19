@@ -143,9 +143,20 @@ impl ConsoleApp {
         if let Some((lens, _field)) = self.nonlinear_maps_for_frame((width, height))? {
             return Ok(CameraProjection::PhysicalLens { lens });
         }
-        Err(
-            "Place requires an accepted ① Camera lens + ③ Laser field calibration; unwarped geometry export is disabled"
-                .into(),
-        )
+        // Without an accepted nonlinear calibration, fall back to the saved
+        // laser-anchor homography so the operator can still see the frame and
+        // rough-place the job (labelled approximate). This is a viewing aid
+        // only — "Etch here" independently refuses to export until ① Camera
+        // lens + ③ Laser field are accepted, so no unwarped geometry can ship.
+        let Some(px_to_mm) = self.calibration.anchor.as_ref().map(|c| c.px_to_mm.clone()) else {
+            return Err(
+                "Place needs a projection: accept ① Camera lens + ③ Laser field (or at least a ② Laser anchor for an approximate preview)"
+                    .into(),
+            );
+        };
+        let mm_to_px = px_to_mm
+            .try_inverse()
+            .ok_or("laser-anchor homography is singular")?;
+        Ok(CameraProjection::Homography { mm_to_px, px_to_mm })
     }
 }

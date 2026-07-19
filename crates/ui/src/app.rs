@@ -376,7 +376,7 @@ impl ConsoleApp {
              camera_frame: {cam}\n\
              calib_frame: {calib_frame}\n\
              bed_overlay: show={} field={:.0}mm center=({:.1},{:.1}) auto={}\n\
-             place: x={:.2} y={:.2} rot={:.1}°\n\
+             place: x={:.2} y={:.2} rot={:.1}° frame={} note={:?}\n\
              calib_grid: n={} pitch={:.2}mm dot={:.2}mm contrast={} corners_marked={} edit_anchor_dots={} origin=({:.1},{:.1})\n\
              fiducials: {} markers\n\
              settings: {}",
@@ -392,6 +392,12 @@ impl ConsoleApp {
             self.placement.tx_mm,
             self.placement.ty_mm,
             self.placement.rot_deg,
+            match (&self.placement.frame_img, &self.placement.tex) {
+                (Some(f), Some(_)) => format!("{}x{}", f.width(), f.height()),
+                (Some(_), None) => "loaded-no-tex".into(),
+                (None, _) => "none".into(),
+            },
+            self.placement.note,
             self.calibration.n,
             self.calibration.pitch_mm,
             self.calibration.dot_mm,

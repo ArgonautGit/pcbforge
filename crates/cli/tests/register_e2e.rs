@@ -136,7 +136,7 @@ fn identity_field_map(tag: &str) -> PathBuf {
 }
 
 #[test]
-fn production_emit_refuses_to_run_without_a_field_map() {
+fn emit_without_a_field_map_warns_and_writes_unwarped() {
     let output = tmp("missing-field").join("uncalibrated.lbrn2");
     let result = Command::new(env!("CARGO_BIN_EXE_pcbforge"))
         .args([
@@ -148,12 +148,12 @@ fn production_emit_refuses_to_run_without_a_field_map() {
         ])
         .output()
         .expect("binary runs");
-    assert!(!result.status.success());
+    assert!(result.status.success(), "unwarped emit is allowed");
     assert!(
-        String::from_utf8_lossy(&result.stderr).contains("--field-map"),
-        "the CLI must name the missing mandatory calibration"
+        String::from_utf8_lossy(&result.stderr).contains("NOT field-warped"),
+        "the CLI warns about the unwarped output"
     );
-    assert!(!output.exists(), "no unwarped production file is written");
+    assert!(output.exists(), "the unwarped file is written");
 }
 
 /// Identity correspondences leave the Gerber-frame geometry untouched; a pure
@@ -307,7 +307,7 @@ fn field_map_predistorts_and_subdivides_the_emit() {
     );
     assert!(ok, "field-map register succeeds; stderr: {stderr}");
     assert!(
-        stderr.contains("mandatory field warp on"),
+        stderr.contains("field warp on"),
         "stderr reports the correction: {stderr}"
     );
 
@@ -352,7 +352,7 @@ fn field_map_predistorts_every_direct_emit_edge() {
     );
     assert!(ok, "field-warped emit succeeds: {stderr}");
     assert!(
-        stderr.contains("emit: mandatory field warp on"),
+        stderr.contains("emit: field warp on"),
         "stderr reports mandatory-capable warp path: {stderr}"
     );
     assert!(

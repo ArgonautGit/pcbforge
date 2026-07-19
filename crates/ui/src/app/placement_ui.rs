@@ -154,8 +154,17 @@ impl ConsoleApp {
         let (cx, cy) = match self.initial_center_mm(img.width() as f64, img.height() as f64) {
             Ok(center) => center,
             Err(e) => {
-                self.placement.note = format!("placement projection unavailable: {e}");
-                self.placement.tex = None;
+                // No projection at all — still show the bare frame so the
+                // operator sees what loaded; the note says what's missing.
+                self.placement.note = format!("frame loaded, but placement needs calibration: {e}");
+                let bare = ColorImage {
+                    size: [img.width() as usize, img.height() as usize],
+                    pixels: img.pixels().map(|p| Color32::from_gray(p[0])).collect(),
+                };
+                self.placement.job.clear();
+                self.placement.frame_img = Some(img);
+                self.placement.tex =
+                    Some(ctx.load_texture("place", bare, TextureOptions::NEAREST));
                 return;
             }
         };
@@ -250,35 +259,24 @@ impl ConsoleApp {
             });
             return;
         };
-        match self.nonlinear_maps_for_frame(dimensions) {
-            Ok(Some(_)) => {}
-            Ok(None) => {
-                self.runtime.log.push(LogLine {
-                    text: "place: accepted ① Camera lens + ③ Laser field calibration required — refusing unwarped geometry export".into(),
-                    err: true,
-                });
-                return;
-            }
+        // Field-warp when a valid calibration for THIS frame + the map file
+        // exist; otherwise export unwarped with a warning (operator's call).
+        let field_path = self.field_map_path();
+        let use_field = match self.nonlinear_maps_for_frame(dimensions) {
+            Ok(Some(_)) => field_path.exists(),
+            Ok(None) => false,
             Err(error) => {
                 self.runtime.log.push(LogLine {
-                    text: format!("place: field-warp calibration is stale or invalid: {error}"),
+                    text: format!(
+                        "place: field-warp calibration is stale or invalid ({error}) — \
+                         exporting UNWARPED geometry"
+                    ),
                     err: true,
                 });
-                return;
+                false
             }
-        }
-        let field_path = self.field_map_path();
-        if !field_path.exists() {
-            self.runtime.log.push(LogLine {
-                text: format!(
-                    "place: mandatory field map {} is missing — refusing unwarped geometry export",
-                    field_path.display()
-                ),
-                err: true,
-            });
-            return;
-        }
-        self.placement.field_correct = true;
+        };
+        self.placement.field_correct = use_field;
         // Resolve the output to an ABSOLUTE path so the operator knows exactly
         // which file to open. A bare filename (e.g. "placed.lbrn2") lands next
         // to the copper Gerber — beside their inputs — not in the console's
@@ -299,11 +297,19 @@ impl ConsoleApp {
             args.push("--outline".into());
             args.push(crate::clean_path(&self.job.emit_outline));
         }
-        // Every production edge is densified and mapped physical→commanded by
-        // register; there is no affine-only Place export path.
-        args.push("--field-map".into());
-        args.push(field_path.to_string_lossy().into_owned());
-        let field_note = " · mandatory field-warped geometry";
+        let field_note = if use_field {
+            args.push("--field-map".into());
+            args.push(field_path.to_string_lossy().into_owned());
+            " · field-warped geometry"
+        } else {
+            self.runtime.log.push(LogLine {
+                text: "place: no accepted ① Camera lens + ③ Laser field calibration — \
+                       exporting UNWARPED geometry"
+                    .into(),
+                err: true,
+            });
+            " · UNWARPED geometry (no field calibration)"
+        };
         // Make the placement + the exact output path explicit in the log — the
         // register output is its own file (not the Job-tab emit), and this is
         // the position it bakes in.
@@ -359,26 +365,20 @@ impl ConsoleApp {
             if ui.button("▶ Etch here (register)").clicked() {
                 self.emit_at_placement();
             }
-            let has_field = self.calibration.field_accepted
-                && self
-                    .calibration
-                    .lens
-                    .as_ref()
-                    .zip(self.calibration.field.as_ref())
-                    .is_some_and(|(lens, field)| {
-                        crate::calib::composed_projection_is_finite(&lens.lens, &field.field)
-                    });
+            let has_field = self.has_usable_field_cal();
             self.placement.field_correct = has_field;
             ui.colored_label(
                 status_color(has_field),
                 if has_field {
-                    "● mandatory field-warped export active"
+                    "● field-warped export active"
                 } else {
-                    "○ export disabled until ① Camera lens + ③ Laser field"
+                    "⚠ UNWARPED export (no ① Camera lens + ③ Laser field)"
                 },
             )
             .on_hover_text(
-                "All production geometry is densified and pre-warped through the accepted laser-field map. Unwarped Place export is not available.",
+                "With an accepted laser-field map, geometry is densified and pre-warped \
+                 physical→commanded. Without one, \"Etch here\" exports the placement \
+                 unwarped — field accuracy is then the machine's own correction.",
             );
         });
         if self.calibration.field.is_some() && !self.calibration.field_accepted {
@@ -406,7 +406,7 @@ impl ConsoleApp {
                 .changed();
         });
         ui.label(egui::RichText::new(&self.placement.note).weak());
-        ui.weak("Uses the Job-tab Gerbers. Drag in physical millimeters; “Etch here” always densifies and field-warps every edge.");
+        ui.weak("Uses the Job-tab Gerbers. Drag to place; “Etch here” field-warps every edge when a field calibration is accepted, else exports unwarped.");
         ui.weak(NAV_HINT);
         ui.separator();
 

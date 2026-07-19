@@ -238,6 +238,21 @@ impl ConsoleApp {
         }
     }
 
+    /// An accepted, finite ① lens + ③ field calibration exists — the emit
+    /// paths field-warp when this holds and fall back to unwarped (warned)
+    /// output when it doesn't.
+    pub(super) fn has_usable_field_cal(&self) -> bool {
+        self.calibration.field_accepted
+            && self
+                .calibration
+                .lens
+                .as_ref()
+                .zip(self.calibration.field.as_ref())
+                .is_some_and(|(lens, field)| {
+                    crate::calib::composed_projection_is_finite(&lens.lens, &field.field)
+                })
+    }
+
     /// Where the laser field-correction file is written for `register
     /// --field-map` — beside the settings blob so it survives with the session.
     pub(super) fn field_map_path(&self) -> PathBuf {

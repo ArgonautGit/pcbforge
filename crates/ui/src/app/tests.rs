@@ -106,10 +106,80 @@ fn accepted_field_composes_machine_overlay_and_uses_physical_place_projection() 
 }
 
 #[test]
-fn place_refuses_every_uncalibrated_projection_fallback() {
+fn place_with_no_calibration_at_all_has_no_projection() {
     let app = ConsoleApp::new(tmp_db(), vec!["true".into()]);
     let error = app.place_projection(800, 800).unwrap_err();
-    assert!(error.contains("unwarped geometry export is disabled"));
+    assert!(error.contains("needs a projection"), "got: {error}");
+}
+
+/// With no projection at all, "Load frame + job" still displays the bare
+/// frame (so the operator sees what loaded) and says what calibration is
+/// missing, instead of showing nothing.
+#[test]
+fn load_place_without_any_calibration_still_shows_the_frame() {
+    let mut app = ConsoleApp::new(tmp_db(), vec!["true".into()]);
+    let dir = std::env::temp_dir().join(format!("pcbforge-place-test-{}", std::process::id()));
+    std::fs::create_dir_all(&dir).unwrap();
+    let frame = dir.join("frame.png");
+    image::GrayImage::from_pixel(64, 48, image::Luma([90]))
+        .save(&frame)
+        .unwrap();
+    app.placement.frame = frame.to_string_lossy().into_owned();
+    let fixtures = concat!(env!("CARGO_MANIFEST_DIR"), "/../cli/tests/fixtures");
+    app.job.emit_copper = format!("{fixtures}/uv_test-F_Cu.gbr");
+    app.job.emit_outline = format!("{fixtures}/uv_test-Edge_Cuts.gbr");
+    let ctx = Context::default();
+    let _ = ctx.run(egui::RawInput::default(), |ctx| app.load_place(ctx));
+    assert!(app.placement.frame_img.is_some(), "frame image cached");
+    assert!(app.placement.tex.is_some(), "bare frame texture shown");
+    assert!(
+        app.placement.note.contains("needs calibration"),
+        "note explains the gap: {}",
+        app.placement.note
+    );
+    std::fs::remove_dir_all(dir).unwrap();
+}
+
+/// A saved ② laser anchor gives Place an approximate homography preview;
+/// "Etch here" without ① + ③ exports UNWARPED geometry with a logged warning
+/// (the operator's call — there is no hard gate).
+#[test]
+fn anchor_only_place_previews_and_exports_unwarped_with_warning() {
+    let mut app = ConsoleApp::new(tmp_db(), vec!["true".into()]);
+    app.calibration.anchor = Some(crate::calib::Calibration {
+        px_to_mm: vision::Homography {
+            matrix: nalgebra::Matrix3::new(0.1, 0.0, 0.0, 0.0, -0.1, 80.0, 0.0, 0.0, 1.0),
+            residuals: vec![],
+            rms: 0.0,
+        },
+        rms_um: 0.0,
+        found: 0,
+        total: 49,
+        dots: Vec::new(),
+    });
+    assert!(matches!(
+        app.place_projection(800, 800).unwrap(),
+        CameraProjection::Homography { .. }
+    ));
+
+    app.placement.job = vec![pcb_core::Poly::default()];
+    app.placement.frame_img = Some(image::GrayImage::new(800, 800));
+    app.job.emit_copper = "board.gbr".into();
+    app.emit_at_placement();
+    assert!(
+        app.runtime
+            .log
+            .iter()
+            .any(|l| l.err && l.text.contains("UNWARPED")),
+        "the unwarped export is warned"
+    );
+    assert!(
+        app.runtime
+            .log
+            .iter()
+            .any(|l| l.text.contains("Etch here →")),
+        "the export proceeds"
+    );
 }
 
 #[test]
@@ -124,18 +194,27 @@ fn invalid_nonlinear_projection_fails_closed_without_homography_fallback() {
 }
 
 #[test]
-fn field_corrected_emit_refuses_a_missing_map_file() {
+fn field_corrected_emit_with_a_missing_map_file_warns_and_emits_unwarped() {
     let mut app = nonlinear_app();
     app.placement.job = vec![pcb_core::Poly::default()];
     app.placement.frame_img = Some(image::GrayImage::new(800, 800));
     app.job.emit_copper = "board.gbr".into();
     assert!(!app.field_map_path().exists());
     app.emit_at_placement();
-    let line = app.runtime.log.last().expect("refusal is logged");
+    assert!(!app.placement.field_correct, "field warp is not armed");
     assert!(
-        line.err && line.text.contains("refusing unwarped geometry export"),
-        "got: {}",
-        line.text
+        app.runtime
+            .log
+            .iter()
+            .any(|l| l.err && l.text.contains("UNWARPED")),
+        "the unwarped export is warned"
+    );
+    assert!(
+        app.runtime
+            .log
+            .iter()
+            .any(|l| l.text.contains("Etch here →")),
+        "the export proceeds"
     );
 }
 
@@ -154,20 +233,21 @@ fn place_export_always_arms_the_field_warp_when_the_map_exists() {
         app.runtime
             .log
             .iter()
-            .any(|line| !line.err && line.text.contains("mandatory field-warped geometry"))
+            .any(|line| !line.err && line.text.contains("field-warped geometry"))
     );
 }
 
 #[test]
-fn job_emit_refuses_without_an_accepted_field_map() {
+fn job_emit_without_an_accepted_field_map_warns_and_emits_unwarped() {
     let mut app = ConsoleApp::new(tmp_db(), vec!["true".into()]);
     app.job.emit_copper = "board.gbr".into();
     app.emit_clicked();
-    let line = app.runtime.log.last().expect("refusal is logged");
     assert!(
-        line.err && line.text.contains("refusing unwarped geometry export"),
-        "got: {}",
-        line.text
+        app.runtime
+            .log
+            .iter()
+            .any(|l| l.err && l.text.contains("UNWARPED")),
+        "the unwarped emit is warned"
     );
 }
 
@@ -726,7 +806,8 @@ fn place_drag_refuses_an_uncalibrated_uniform_fallback() {
     assert!(
         app.drag_place_px(20.0, -30.0)
             .unwrap_err()
-            .contains("unwarped geometry export is disabled")
+            .contains("needs a projection"),
+        "no anchor and no nonlinear cal: dragging has no frame to move in"
     );
 }
 
@@ -846,6 +927,8 @@ fn input_fields_persist_across_restarts() {
     a.job.offset_mm = 0.05;
     a.placement.lbrn2 = "placed.lbrn2".into();
     a.fiducials.layout = "10,10; 60,10; 10,60; 60,60".into();
+    a.camera.use_device = true;
+    a.camera.device = 3;
     a.save_settings_if_changed(); // what the per-frame hook does
 
     // A fresh console over the same DB (a "restart") reloads them.
@@ -855,6 +938,8 @@ fn input_fields_persist_across_restarts() {
     assert!((b.job.offset_mm - 0.05).abs() < 1e-9);
     assert_eq!(b.placement.lbrn2, "placed.lbrn2");
     assert_eq!(b.fiducials.layout, "10,10; 60,10; 10,60; 60,60");
+    assert!(b.camera.use_device, "camera source choice persists");
+    assert_eq!(b.camera.device, 3, "camera device index persists");
 }
 
 #[test]
@@ -879,6 +964,8 @@ fid_layout=10,10; 60,10; 10,60; 60,60\n\
 fid_px_per_mm=12.5\n\
 cam_file=camera.png\n\
 cam_orientation=rotate180\n\
+cam_use_device=true\n\
+cam_device=2\n\
 calib_n=9\n\
 calib_pitch_mm=8\n\
 calib_dot_mm=0.3\n\
@@ -893,12 +980,21 @@ field_center_auto=false\n\
 field_cx_mm=41\n\
 field_cy_mm=39\n\
 calib_matrix=1 0 0 0 1 0 0 0 1\n\
-calib_saved_at=123456\n";
+calib_saved_at=123456\n\
+lens_px_to_mm=\n\
+lens_mm_to_px=\n\
+lens_stats=\n\
+lens_frame_sig=\n\
+field_accepted=false\n\
+field_to_px=\n\
+field_stats=\n";
     std::fs::write(&settings, legacy).unwrap();
 
     let app = ConsoleApp::new(db, vec!["true".into()]);
     assert_eq!(app.job.emit_copper, "C:/boards/F_Cu.gbr");
     assert_eq!(app.camera.orientation, Orientation::Rotate180);
+    assert!(app.camera.use_device);
+    assert_eq!(app.camera.device, 2);
     assert_eq!(app.calibration.n, 9);
     assert_eq!(app.calibration.dot_kind, crate::calib::DotKind::Bright);
     assert!(app.placement.field_correct);

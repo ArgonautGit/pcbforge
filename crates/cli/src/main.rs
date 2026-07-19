@@ -240,11 +240,13 @@ enum Command {
         #[arg(long)]
         mirror_x: bool,
 
-        /// Required laser-field calibration map. Every production edge is
+        /// Laser-field calibration map. When given, every production edge is
         /// densified and pre-warped from desired physical mm to commanded mm
-        /// before writing the LightBurn job.
+        /// before writing the LightBurn job. When omitted, the geometry is
+        /// emitted UNWARPED (a warning is printed) — field accuracy is then
+        /// whatever the machine's own correction provides.
         #[arg(long)]
-        field_map: PathBuf,
+        field_map: Option<PathBuf>,
         /// Maximum physical edge segment before field pre-warping, mm.
         #[arg(long, default_value_t = 0.25)]
         field_seg_mm: f64,
@@ -308,12 +310,14 @@ enum Command {
         #[arg(long, default_value_t = 0.05)]
         max_rms_mm: f64,
 
-        /// Required laser field-distortion correction file (from the console's
-        /// ③ Laser-field calibration). Every emitted vertex is pre-distorted
-        /// physical→commanded so the beam cancels the galvo/f-theta field error;
-        /// edges are densified so the pre-curvature is preserved.
+        /// Laser field-distortion correction file (from the console's
+        /// ③ Laser-field calibration). When given, every emitted vertex is
+        /// pre-distorted physical→commanded so the beam cancels the galvo/
+        /// f-theta field error; edges are densified so the pre-curvature is
+        /// preserved. When omitted, the affine-registered geometry is emitted
+        /// UNWARPED (a warning is printed).
         #[arg(long)]
-        field_map: PathBuf,
+        field_map: Option<PathBuf>,
         /// Edge densification for --field-map, mm (smaller = finer curve).
         #[arg(long, default_value_t = 0.5)]
         field_seg_mm: f64,
@@ -547,7 +551,7 @@ fn run(cli: &Cli) -> Result<(), Box<dyn std::error::Error>> {
             origin_y: *origin_y,
             center: *center,
             mirror_x: *mirror_x,
-            field_map,
+            field_map: field_map.as_deref(),
             field_seg_mm: *field_seg_mm,
         }),
         Command::Register {
@@ -580,7 +584,7 @@ fn run(cli: &Cli) -> Result<(), Box<dyn std::error::Error>> {
             margin_mm: *margin_mm,
             device,
             max_rms_mm: *max_rms_mm,
-            field_map,
+            field_map: field_map.as_deref(),
             field_seg_mm: *field_seg_mm,
         }),
         Command::CalibGrid {
@@ -777,7 +781,7 @@ struct EmitArgs<'a> {
     origin_y: f64,
     center: bool,
     mirror_x: bool,
-    field_map: &'a std::path::Path,
+    field_map: Option<&'a std::path::Path>,
     field_seg_mm: f64,
 }
 
@@ -900,18 +904,29 @@ fn emit_cmd(a: EmitArgs) -> Result<(), Box<dyn std::error::Error>> {
     } else {
         shapes
     };
-    let field = load_field_map(a.field_map)?;
-    validate_field_segment(a.field_seg_mm)?;
-    eprintln!(
-        "emit: mandatory field warp on (fit RMS {:.1} µm, worst {:.1} µm), edges ≤{:.2} mm",
-        field.rms_um, field.max_um, a.field_seg_mm
-    );
-    let shapes = cam::register::transform_shapes_field(
-        &shapes,
-        &cam::register::Affine2::identity(),
-        a.field_seg_mm,
-        |x, y| field.precompensate(x, y),
-    );
+    let shapes = match a.field_map {
+        Some(path) => {
+            let field = load_field_map(path)?;
+            validate_field_segment(a.field_seg_mm)?;
+            eprintln!(
+                "emit: field warp on (fit RMS {:.1} µm, worst {:.1} µm), edges ≤{:.2} mm",
+                field.rms_um, field.max_um, a.field_seg_mm
+            );
+            cam::register::transform_shapes_field(
+                &shapes,
+                &cam::register::Affine2::identity(),
+                a.field_seg_mm,
+                |x, y| field.precompensate(x, y),
+            )
+        }
+        None => {
+            eprintln!(
+                "emit: WARNING — no --field-map: geometry is NOT field-warped; \
+                 positional accuracy depends on the machine's own correction"
+            );
+            shapes
+        }
+    };
 
     let mut layer = EmitLayer::fill("C00", a.params, cam::lbrn2::polys_to_elems(&shapes));
     layer.interval_mm = a.interval_mm;
@@ -942,7 +957,7 @@ struct RegisterArgs<'a> {
     margin_mm: f64,
     device: &'a str,
     max_rms_mm: f64,
-    field_map: &'a std::path::Path,
+    field_map: Option<&'a std::path::Path>,
     field_seg_mm: f64,
 }
 
@@ -1009,18 +1024,35 @@ fn register_cmd(a: RegisterArgs) -> Result<(), Box<dyn std::error::Error>> {
     )?;
     // Apply the fit to the design-frame geometry → machine frame. No
     // normalize_frame: registration places the job in absolute machine mm.
-    // Always pre-distort every vertex physical→commanded so the beam cancels
-    // the laser's field distortion. There is no affine-only production path.
-    let field = load_field_map(a.field_map)?;
-    validate_field_segment(a.field_seg_mm)?;
-    eprintln!(
-        "register: mandatory field warp on (fit RMS {:.1} µm, worst {:.1} µm), edges ≤{:.2} mm",
-        field.rms_um, field.max_um, a.field_seg_mm
-    );
-    let placed =
-        cam::register::transform_shapes_field(&job.shapes, &affine, a.field_seg_mm, |x, y| {
-            field.precompensate(x, y)
-        });
+    // With a field map, every vertex is pre-distorted physical→commanded so
+    // the beam cancels the laser's field distortion; without one the affine
+    // placement is emitted unwarped (warned).
+    let (placed, warped) = match a.field_map {
+        Some(path) => {
+            let field = load_field_map(path)?;
+            validate_field_segment(a.field_seg_mm)?;
+            eprintln!(
+                "register: field warp on (fit RMS {:.1} µm, worst {:.1} µm), edges ≤{:.2} mm",
+                field.rms_um, field.max_um, a.field_seg_mm
+            );
+            (
+                cam::register::transform_shapes_field(
+                    &job.shapes,
+                    &affine,
+                    a.field_seg_mm,
+                    |x, y| field.precompensate(x, y),
+                ),
+                true,
+            )
+        }
+        None => {
+            eprintln!(
+                "register: WARNING — no --field-map: geometry is NOT field-warped; \
+                 positional accuracy depends on the machine's own correction"
+            );
+            (cam::register::transform_shapes(&job.shapes, &affine), false)
+        }
+    };
 
     // Same default recipe as `emit`; the operator tunes it in LightBurn or
     // re-runs with a richer flag set later.
@@ -1048,8 +1080,13 @@ fn register_cmd(a: RegisterArgs) -> Result<(), Box<dyn std::error::Error>> {
         }
     }
     eprintln!(
-        "registered: {} shape(s), {rings} ring(s) in field-warped commanded coordinates",
-        placed.len()
+        "registered: {} shape(s), {rings} ring(s) in {} coordinates",
+        placed.len(),
+        if warped {
+            "field-warped commanded"
+        } else {
+            "unwarped machine"
+        }
     );
     if let Some((x0, y0, x1, y1)) = bb {
         eprintln!(

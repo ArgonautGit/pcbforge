@@ -227,7 +227,7 @@ impl ConsoleApp {
 
         ui.separator();
         ui.weak(
-            "Production .lbrn2 export requires an accepted ① Camera lens + ③ Laser field map and always field-warps every edge.",
+            "With an accepted ① Camera lens + ③ Laser field map the export field-warps every edge; without one it emits unwarped (warned in the log).",
         );
         if ui.button("⏭ Next stage (bring-up)").clicked() {
             self.run_verb(&["next".into(), "--bringup-stubs".into()]);
@@ -250,33 +250,6 @@ impl ConsoleApp {
             });
             return;
         }
-        let valid_field = self.calibration.field_accepted
-            && self
-                .calibration
-                .lens
-                .as_ref()
-                .zip(self.calibration.field.as_ref())
-                .is_some_and(|(lens, field)| {
-                    crate::calib::composed_projection_is_finite(&lens.lens, &field.field)
-                });
-        if !valid_field {
-            self.runtime.log.push(LogLine {
-                text: "emit: accepted ① Camera lens + ③ Laser field calibration required — refusing unwarped geometry export".into(),
-                err: true,
-            });
-            return;
-        }
-        let field_path = self.field_map_path();
-        if !field_path.exists() {
-            self.runtime.log.push(LogLine {
-                text: format!(
-                    "emit: mandatory field map {} is missing — refusing unwarped geometry export",
-                    field_path.display()
-                ),
-                err: true,
-            });
-            return;
-        }
         let mut args: Vec<String> = vec![
             "emit".into(),
             "--copper".into(),
@@ -285,9 +258,22 @@ impl ConsoleApp {
             crate::clean_path(&self.job.emit_lbrn2),
             "--offset-mm".into(),
             format!("{}", self.job.offset_mm),
-            "--field-map".into(),
-            field_path.to_string_lossy().into_owned(),
         ];
+        // Field-warp when a usable calibration + map file exist; otherwise
+        // emit unwarped with a warning (operator's call — the machine's own
+        // correction is then the only field compensation).
+        let field_path = self.field_map_path();
+        if self.has_usable_field_cal() && field_path.exists() {
+            args.push("--field-map".into());
+            args.push(field_path.to_string_lossy().into_owned());
+        } else {
+            self.runtime.log.push(LogLine {
+                text: "emit: no accepted ① Camera lens + ③ Laser field calibration — \
+                       emitting UNWARPED geometry"
+                    .into(),
+                err: true,
+            });
+        }
         if !outline.is_empty() {
             args.push("--outline".into());
             args.push(outline);

@@ -1889,6 +1889,51 @@ Changing the calibration polynomial would only fit those wrong observations.
   and the homography/residuals are re-fit immediately. Live re-anchoring pauses
   during correction so it cannot overwrite the operator's review.
 
+## 2026-07-19 — Calibration persists; export gate relaxed to a warning (operator direction)
+
+- **Persistence:** the ① camera-lens calibration (both bi-cubic Poly2 maps,
+  RMS/worst, found/total) and the lens frame signature are now saved in the
+  console settings blob and restored at startup; the accepted ③ laser field is
+  restored from the existing `pcbforge-field-map.txt` plus persisted
+  `field_to_px`/counts/`field_accepted` keys. Per-dot residual vectors are
+  display-only and not persisted (a restored cal shows no arrows until re-fit).
+  Staleness guards are unchanged: the frame-signature check refuses a restored
+  cal when resolution/crop/orientation differ, and a moved camera re-anchors.
+  The field verdict is not persisted — a restored FieldCal carries an
+  Inconclusive verdict until the next fit.
+- **Gate → warning (operator's explicit call, reversing the hard fail-closed
+  rule below):** `--field-map` on CLI `emit`/`register` is now optional; when
+  absent the geometry is emitted UNWARPED with a loud stderr warning
+  ("NOT field-warped"). Console "Etch here" and the Job-tab emit likewise
+  field-warp when an accepted ① + ③ calibration and the map file exist, and
+  otherwise export unwarped with an error-styled log line and a "⚠ UNWARPED
+  export" status label. The stale-signature case also warns-and-continues
+  unwarped rather than refusing. Rationale: the operator tests at the machine
+  and wants the workflow usable without a per-session recalibration; the
+  original hazard (two plausible files) is mitigated by the persistence above,
+  the warnings, and the placement-note frame label.
+
+## 2026-07-19 — Place preview decoupled from the export gate (operator-reported)
+
+- The operator reported "Load frame + job isn't loading an image": the
+  field-warp requirement (entry below) had made `place_projection` refuse
+  *everything* without an in-session accepted ① lens + ③ field calibration —
+  including merely displaying the frame — and since those calibrations are
+  session-only, Place was dead after every console restart. `load_place` also
+  returned before caching the frame, so the operator saw nothing but a small
+  gray note.
+- Fix, keeping the export gate intact (operator-approved): `place_projection`
+  falls back to the saved ② laser-anchor homography for *viewing and rough
+  placement* (note labels it "approximate homography"); with no calibration at
+  all, `load_place` still displays the bare frame with a note saying which
+  calibration is missing. "Etch here" is unchanged — it independently refuses
+  to export without accepted ① + ③ and the field-map file, so no unwarped
+  geometry can ship. The fail-closed tests moved from `place_projection` to
+  the export path accordingly (`anchor_only_place_previews_but_refuses_export`).
+- Also surfaced the placement frame/note in `debug_summary` so headless
+  driving can see whether a frame actually loaded (verified via debug_driver:
+  frame displays, note explains the gap).
+
 ## 2026-07-19 — Require field-warped production geometry
 
 Live output showed that the Place overlay could use calibrated coordinates while
