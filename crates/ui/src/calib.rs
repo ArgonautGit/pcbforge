@@ -17,8 +17,8 @@
 use image::GrayImage;
 use nalgebra::{Matrix3, Point2, Vector2};
 use vision::{
-    BedMap, FiducialProfile, FieldMap, FieldVerdict, Homography, LensMap, classify_field_error,
-    find_fiducials, fit_field, fit_homography, fit_lens,
+    BedMap, FiducialProfile, FieldMap, FieldVerdict, Homography, LensMap, Poly2,
+    classify_field_error, find_fiducials, fit_field, fit_homography, fit_lens,
 };
 
 /// How the grid dots read against their background. A **printed** reference
@@ -363,6 +363,146 @@ pub struct FieldCal {
     pub field_verdict: FieldVerdict,
 }
 
+/// Map a camera pixel into the laser's **commanded** coordinate frame by
+/// composing the metric camera calibration with the measured laser field.
+/// Returns `None` instead of allowing a non-finite calibration value to reach
+/// placement or an operator overlay.
+pub fn camera_px_to_commanded(
+    lens: &LensMap,
+    field: &FieldMap,
+    px: (f64, f64),
+) -> Option<(f64, f64)> {
+    finite_input(px)?;
+    let physical = finite_output(lens.px_to_mm.apply(px.0, px.1))?;
+    finite_output(field.to_commanded.apply(physical.0, physical.1))
+}
+
+/// Project a laser **commanded** coordinate to the camera by first predicting
+/// where the field optics physically land it, then imaging that physical point
+/// through the camera lens calibration.
+pub fn commanded_to_camera_px(
+    lens: &LensMap,
+    field: &FieldMap,
+    commanded: (f64, f64),
+) -> Option<(f64, f64)> {
+    finite_input(commanded)?;
+    let physical = invert_poly(&field.to_commanded, &field.to_physical, commanded)?;
+    physical_to_camera_px(lens, physical)
+}
+
+/// Camera pixel to desired physical bed millimeters. Field-corrected placement
+/// uses this direction: the emit path applies `FieldMap::to_commanded` later,
+/// exactly once.
+pub fn camera_px_to_physical(lens: &LensMap, px: (f64, f64)) -> Option<(f64, f64)> {
+    finite_input(px)?;
+    finite_output(lens.px_to_mm.apply(px.0, px.1))
+}
+
+/// Desired physical bed millimeters to camera pixels. This is the display half
+/// of field-corrected placement; composing the field map here as well would
+/// double-compensate the job.
+pub fn physical_to_camera_px(lens: &LensMap, physical: (f64, f64)) -> Option<(f64, f64)> {
+    finite_input(physical)?;
+    invert_poly(&lens.px_to_mm, &lens.mm_to_px, physical)
+}
+
+/// Whether every polynomial coefficient needed by the nonlinear camera ↔
+/// commanded projection is finite. Callers use this to disable a bad mapping
+/// before an overlay or placement starts, rather than falling back silently.
+pub fn composed_projection_is_finite(lens: &LensMap, field: &FieldMap) -> bool {
+    [
+        &lens.px_to_mm,
+        &lens.mm_to_px,
+        &field.to_commanded,
+        &field.to_physical,
+    ]
+    .into_iter()
+    .all(|p| p.to_coeffs().into_iter().all(f64::is_finite))
+}
+
+fn finite_input(point: (f64, f64)) -> Option<()> {
+    (point.0.is_finite() && point.1.is_finite()).then_some(())
+}
+
+fn finite_output(point: (f64, f64)) -> Option<(f64, f64)> {
+    (point.0.is_finite() && point.1.is_finite()).then_some(point)
+}
+
+/// Numerically invert `forward` at `target`, starting from the separately fit
+/// reverse polynomial. The reverse maps are excellent seeds but are not exact
+/// algebraic inverses; a few Newton steps remove their edge round-trip error.
+fn invert_poly(forward: &Poly2, reverse_seed: &Poly2, target: (f64, f64)) -> Option<(f64, f64)> {
+    let mut p = finite_output(reverse_seed.apply(target.0, target.1))?;
+    for _ in 0..8 {
+        let got = finite_output(forward.apply(p.0, p.1))?;
+        let error = (got.0 - target.0, got.1 - target.1);
+        if error.0.hypot(error.1) < 1e-9 {
+            return Some(p);
+        }
+
+        let h = 1e-5 * p.0.abs().max(p.1.abs()).max(1.0);
+        let fx = finite_output(forward.apply(p.0 + h, p.1))?;
+        let fy = finite_output(forward.apply(p.0, p.1 + h))?;
+        let j00 = (fx.0 - got.0) / h;
+        let j10 = (fx.1 - got.1) / h;
+        let j01 = (fy.0 - got.0) / h;
+        let j11 = (fy.1 - got.1) / h;
+        let det = j00 * j11 - j01 * j10;
+        if !det.is_finite() || det.abs() < 1e-12 {
+            return None;
+        }
+        let dx = (j11 * error.0 - j01 * error.1) / det;
+        let dy = (-j10 * error.0 + j00 * error.1) / det;
+        p = finite_output((p.0 - dx, p.1 - dy))?;
+    }
+
+    let got = finite_output(forward.apply(p.0, p.1))?;
+    ((got.0 - target.0).hypot(got.1 - target.1) < 1e-7).then_some(p)
+}
+
+/// Gate a real laser-field fit before it is allowed to drive corrected
+/// projection or emission. The four boundary corners keep a deceptively good
+/// center-only polynomial from being accepted.
+pub fn field_live_acceptance(cal: &FieldCal, grid: &GridSpec) -> Result<(), String> {
+    if cal.total == 0 || cal.found * 5 < cal.total * 4 {
+        let pct = if cal.total == 0 {
+            0
+        } else {
+            cal.found * 100 / cal.total
+        };
+        return Err(format!(
+            "detected {}/{} dots ({pct}%); need at least 80%",
+            cal.found, cal.total
+        ));
+    }
+
+    let missing_corners = grid
+        .corners_mm()
+        .into_iter()
+        .filter(|&(x, y)| {
+            !cal.dots
+                .iter()
+                .any(|d| (d.commanded_mm.0 - x).abs() < 1e-6 && (d.commanded_mm.1 - y).abs() < 1e-6)
+        })
+        .count();
+    if missing_corners != 0 {
+        return Err(format!(
+            "{missing_corners}/4 boundary corners did not lock; recapture before correcting"
+        ));
+    }
+    if !cal.field.rms_um.is_finite()
+        || !cal.field.max_um.is_finite()
+        || cal.field.rms_um > 50.0
+        || cal.field.max_um > 100.0
+    {
+        return Err(format!(
+            "fit residual RMS {:.0} µm, worst {:.0} µm; limits are 50/100 µm",
+            cal.field.rms_um, cal.field.max_um
+        ));
+    }
+    Ok(())
+}
+
 /// Fit the laser field pre-distortion from a frame of the **burned** grid and
 /// the four hand-marked corner-dot pixels. `lens` is the camera lens map (from
 /// [`fit_camera_lens`]) that turns the camera into a metric ruler: each burned
@@ -491,6 +631,66 @@ mod tests {
             .map(|&((mx, my), (px, py))| (Point2::new(mx, my), Point2::new(px, py)))
             .collect();
         fit_homography(&p).unwrap()
+    }
+
+    fn affine_poly(ax: [f64; 3], ay: [f64; 3]) -> vision::Poly2 {
+        let mut c = [0.0; 23];
+        c[0] = ax[2];
+        c[1] = ax[0];
+        c[2] = ax[1];
+        c[10] = ay[2];
+        c[11] = ay[0];
+        c[12] = ay[1];
+        c[22] = 1.0;
+        vision::Poly2::from_coeffs(&c)
+    }
+
+    fn affine_maps() -> (LensMap, FieldMap) {
+        // Camera: physical x=(px-20)/10, y=(800-py)/10.
+        let lens = LensMap {
+            px_to_mm: affine_poly([0.1, 0.0, -2.0], [0.0, -0.1, 80.0]),
+            mm_to_px: affine_poly([10.0, 0.0, 20.0], [0.0, -10.0, 800.0]),
+            rms_um: 0.0,
+            max_um: 0.0,
+            residuals: vec![],
+        };
+        // Field: command (x,y) lands physically at (1.02x+1, 0.98y-2).
+        let field = FieldMap {
+            to_commanded: affine_poly(
+                [1.0 / 1.02, 0.0, -1.0 / 1.02],
+                [0.0, 1.0 / 0.98, 2.0 / 0.98],
+            ),
+            to_physical: affine_poly([1.02, 0.0, 1.0], [0.0, 0.98, -2.0]),
+            rms_um: 0.0,
+            max_um: 0.0,
+        };
+        (lens, field)
+    }
+
+    #[test]
+    fn composed_camera_command_mapping_round_trips() {
+        let (lens, field) = affine_maps();
+        assert!(composed_projection_is_finite(&lens, &field));
+        let commanded = (37.0, 24.0);
+        let px = commanded_to_camera_px(&lens, &field, commanded).expect("finite projection");
+        let got = camera_px_to_commanded(&lens, &field, px).expect("finite inverse");
+        assert!((got.0 - commanded.0).abs() < 1e-9);
+        assert!((got.1 - commanded.1).abs() < 1e-9);
+
+        let physical = camera_px_to_physical(&lens, px).expect("metric camera");
+        let px2 = physical_to_camera_px(&lens, physical).expect("camera projection");
+        assert!((px2.0 - px.0).abs() < 1e-9 && (px2.1 - px.1).abs() < 1e-9);
+    }
+
+    #[test]
+    fn composed_camera_command_mapping_rejects_non_finite_values() {
+        let (lens, mut field) = affine_maps();
+        let mut coeffs = field.to_physical.to_coeffs();
+        coeffs[0] = f64::NAN;
+        field.to_physical = vision::Poly2::from_coeffs(&coeffs);
+        assert!(!composed_projection_is_finite(&lens, &field));
+        assert!(commanded_to_camera_px(&lens, &field, (10.0, 10.0)).is_none());
+        assert!(camera_px_to_commanded(&lens, &field, (f64::INFINITY, 2.0)).is_none());
     }
 
     #[test]
@@ -881,6 +1081,28 @@ mod tests {
             .expect("field fit");
         assert_eq!(cal.found, 49, "all dots detected");
         assert!(cal.field.rms_um < 60.0, "field RMS {} µm", cal.field.rms_um);
+        field_live_acceptance(&cal, &grid).expect("well-covered field fit is accepted");
+
+        let mut missing_corner = cal.clone();
+        missing_corner
+            .dots
+            .retain(|d| d.commanded_mm != grid.corners_mm()[0]);
+        missing_corner.found = missing_corner.dots.len();
+        assert!(
+            field_live_acceptance(&missing_corner, &grid)
+                .unwrap_err()
+                .contains("boundary corners"),
+            "a center-heavy fit cannot activate correction"
+        );
+
+        let mut inaccurate = cal.clone();
+        inaccurate.field.max_um = 101.0;
+        assert!(
+            field_live_acceptance(&inaccurate, &grid)
+                .unwrap_err()
+                .contains("limits are 50/100"),
+            "a high-residual polynomial cannot activate correction"
+        );
         // The distortion is real: corner dots are visibly off their command.
         let worst = cal.dots.iter().map(|d| d.field_um).fold(0.0_f64, f64::max);
         assert!(worst > 300.0, "field error present: worst {worst:.0} µm");
@@ -1029,6 +1251,45 @@ mod tests {
         assert!(
             max_distort > 5.0,
             "fixture should carry real distortion: {max_distort:.1} px"
+        );
+
+        // An identity laser field makes the composed commanded→camera map
+        // exactly the fitted camera-lens map. Compare it with the best single
+        // homography over the same detected dots: the homography still bows at
+        // the field edges, while the nonlinear composition stays within the
+        // calibration's 60 µm fixture tolerance.
+        let mm = grid.points();
+        let mm_px: Vec<_> = mm
+            .iter()
+            .zip(&cal.dots)
+            .map(|(&(x, y), d)| (Point2::new(x, y), Point2::new(d.px.0, d.px.1)))
+            .collect();
+        let hom = fit_homography(&mm_px).expect("perspective reference");
+        let identity_pairs: Vec<_> = mm
+            .iter()
+            .map(|&(x, y)| (Point2::new(x, y), Point2::new(x, y)))
+            .collect();
+        let field = fit_field(&identity_pairs).expect("identity field");
+        let mut hom_worst_um = 0.0_f64;
+        let mut composed_worst_um = 0.0_f64;
+        for &(x, y) in &mm {
+            let hp = hom.apply(Point2::new(x, y));
+            let hm = cal.lens.px_to_mm.apply(hp.x, hp.y);
+            hom_worst_um =
+                hom_worst_um.max(((hm.0 - x).powi(2) + (hm.1 - y).powi(2)).sqrt() * 1000.0);
+
+            let cp = commanded_to_camera_px(&cal.lens, &field, (x, y)).unwrap();
+            let cm = cal.lens.px_to_mm.apply(cp.0, cp.1);
+            composed_worst_um =
+                composed_worst_um.max(((cm.0 - x).powi(2) + (cm.1 - y).powi(2)).sqrt() * 1000.0);
+        }
+        assert!(
+            hom_worst_um > 200.0,
+            "the fixture's curvature should beat a homography: {hom_worst_um:.0} µm"
+        );
+        assert!(
+            composed_worst_um < 60.0,
+            "composed nonlinear projection stays calibrated: {composed_worst_um:.1} µm"
         );
     }
 }

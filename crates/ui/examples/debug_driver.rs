@@ -33,7 +33,9 @@ fn main() {
     // is `true` (shelling a CLI verb is a harmless no-op) unless PCBFORGE_CLI
     // names a real binary — set it to drive actual verbs, e.g. the KiCad Gerber
     // export: `PCBFORGE_CLI=./target/debug/pcbforge`.
-    let db = std::env::temp_dir().join("pcbforge-debug-driver.sqlite");
+    let db = std::env::var_os("PCBFORGE_DB")
+        .map(std::path::PathBuf::from)
+        .unwrap_or_else(|| std::env::temp_dir().join("pcbforge-debug-driver.sqlite"));
     let cli_cmd = std::env::var("PCBFORGE_CLI")
         .ok()
         .map(|s| s.split_whitespace().map(String::from).collect::<Vec<_>>())

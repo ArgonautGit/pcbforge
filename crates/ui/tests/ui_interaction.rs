@@ -36,6 +36,18 @@ fn clicking_a_tab_switches_the_central_view() {
 }
 
 #[test]
+fn camera_work_area_starts_auto_centered() {
+    let mut h = console();
+    h.get_by_label("📷 Camera").click();
+    h.run();
+    let state = h.state().debug_summary();
+    assert!(
+        state.contains("bed_overlay: show=true field=70mm center=(35.0,35.0) auto=true"),
+        "camera work area uses the operator default:\n{state}"
+    );
+}
+
+#[test]
 fn the_refresh_button_is_present_and_clickable() {
     let mut h = console();
     // Exact-label lookup finds the toolbar button; clicking it must not panic.
@@ -134,6 +146,18 @@ fn the_laser_field_calibration_step_is_selectable() {
     assert!(
         s.contains("calib_mode=LaserField") && s.contains("laser_field: none"),
         "③ selects the laser-field step, uncalibrated:\n{s}"
+    );
+}
+
+#[test]
+fn laser_anchor_is_explicitly_labelled_as_approximate() {
+    let mut h = console();
+    h.get_by_label_contains("Calibrate").click();
+    h.run();
+    assert!(
+        h.query_by_label_contains("② Laser anchor (approximate)")
+            .is_some(),
+        "the homography-only fallback must not imply lens/field correction"
     );
 }
 

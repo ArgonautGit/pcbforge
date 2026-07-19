@@ -1,0 +1,334 @@
+use super::*;
+
+impl ConsoleApp {
+    pub(super) fn status_panel(&mut self, ui: &mut egui::Ui) {
+        ui.heading("Status");
+        if let Some(err) = &self.runtime.status.error {
+            ui.colored_label(Color32::from_rgb(0xd0, 0x60, 0x50), err);
+        }
+        ui.separator();
+        ui.label(egui::RichText::new("Stages").strong());
+        for s in &self.runtime.status.stages {
+            let here = self.runtime.status.boards.iter().any(|b| &b.stage == s);
+            if here {
+                ui.colored_label(Color32::from_rgb(0x60, 0xb0, 0x70), format!("▶ {s}"));
+            } else {
+                ui.label(format!("   {s}"));
+            }
+        }
+        ui.separator();
+        ui.label(egui::RichText::new("Boards").strong());
+        if self.runtime.status.boards.is_empty() {
+            ui.weak("none — run `next` to admit a board");
+        }
+        for b in &self.runtime.status.boards {
+            let reg = if b.registered {
+                "✔ registered"
+            } else {
+                "unregistered"
+            };
+            ui.monospace(format!("#{} [{}] {}", b.id, b.stage, reg));
+            ui.weak(short_path(&b.design));
+        }
+    }
+
+    /// Export the copper + outline Gerbers from the KiCad project by shelling
+    /// `pcbforge gerbers` in the **background** (the export can take a second or
+    /// two — the window must not freeze). The output paths are deterministic
+    /// (`<board dir>/pcbforge-gerbers/{copper,outline}.gbr`), so the fields are
+    /// filled immediately; the files appear when the background job finishes,
+    /// whose progress/errors stream to the Log.
+    fn gerbers_from_kicad(&mut self) {
+        let proj = crate::clean_path(&self.job.kicad_project);
+        if proj.trim().is_empty() {
+            self.runtime.log.push(LogLine {
+                text: "gerbers: set a KiCad project path first".into(),
+                err: true,
+            });
+            return;
+        }
+        let (copper_layer, outline_layer) = match self.job.side {
+            Side::Front => ("F.Cu", "Edge.Cuts"),
+            Side::Back => ("B.Cu", "Edge.Cuts"),
+        };
+        // Resolve the board just to place the output dir; the CLI re-resolves it.
+        let board = match ingest::kicad_cli::resolve_board(std::path::Path::new(&proj)) {
+            Ok(b) => b,
+            Err(e) => {
+                self.runtime.log.push(LogLine {
+                    text: format!("gerbers: {e}"),
+                    err: true,
+                });
+                return;
+            }
+        };
+        let out_dir = board
+            .parent()
+            .map(|p| p.join("pcbforge-gerbers"))
+            .unwrap_or_else(|| PathBuf::from("pcbforge-gerbers"));
+        let copper = out_dir.join("copper.gbr").display().to_string();
+        let outline = out_dir.join("outline.gbr").display().to_string();
+        match self.job.side {
+            Side::Front => {
+                self.job.emit_copper = copper;
+                self.job.emit_outline = outline;
+            }
+            Side::Back => {
+                self.job.back_copper = copper;
+                self.job.back_outline = outline;
+            }
+        }
+        self.run_verb(&[
+            "gerbers".into(),
+            "--project".into(),
+            proj,
+            "--out".into(),
+            out_dir.display().to_string(),
+            "--copper-layer".into(),
+            copper_layer.into(),
+            "--outline-layer".into(),
+            outline_layer.into(),
+        ]);
+        self.job.preview_note =
+            format!("exporting {copper_layer} + {outline_layer} from KiCad… (see Log)");
+    }
+
+    pub(super) fn actions_panel(&mut self, ui: &mut egui::Ui) {
+        ui.heading("Actions");
+        ui.label(egui::RichText::new("These shell the `pcbforge` CLI.").weak());
+        ui.separator();
+
+        egui::Grid::new("kicad-form")
+            .num_columns(2)
+            .spacing([8.0, 6.0])
+            .show(ui, |ui| {
+                let l = ui.label("KiCad project");
+                ui.add(
+                    egui::TextEdit::singleline(&mut self.job.kicad_project).desired_width(180.0),
+                )
+                .labelled_by(l.id)
+                .on_hover_text(
+                    "A .kicad_pcb file or a project directory containing one. \
+                         ⚙ exports its copper + outline Gerbers via kicad-cli.",
+                );
+                ui.end_row();
+            });
+        if ui
+            .button("⚙ Gerbers from KiCad")
+            .on_hover_text(
+                "Run kicad-cli to export copper.gbr + outline.gbr and fill the fields below.",
+            )
+            .clicked()
+        {
+            self.gerbers_from_kicad();
+        }
+
+        egui::Grid::new("emit-form")
+            .num_columns(2)
+            .spacing([8.0, 6.0])
+            .show(ui, |ui| {
+                let l = ui.label("copper .gbr");
+                ui.add(egui::TextEdit::singleline(&mut self.job.emit_copper).desired_width(180.0))
+                    .labelled_by(l.id);
+                ui.end_row();
+                let l = ui.label("outline .gbr");
+                ui.add(egui::TextEdit::singleline(&mut self.job.emit_outline).desired_width(180.0))
+                    .labelled_by(l.id);
+                ui.end_row();
+                ui.label("out .lbrn2");
+                ui.add(egui::TextEdit::singleline(&mut self.job.emit_lbrn2).desired_width(180.0));
+                ui.end_row();
+                ui.label("offset mm");
+                ui.add(
+                    egui::DragValue::new(&mut self.job.offset_mm)
+                        .speed(0.005)
+                        .range(0.0..=10.0),
+                );
+                ui.end_row();
+            });
+
+        // Double-sided (ORC-6): side selector + back-side inputs.
+        ui.separator();
+        ui.horizontal(|ui| {
+            ui.label("side");
+            let mut side = self.job.side;
+            ui.selectable_value(&mut side, Side::Front, "Front");
+            ui.selectable_value(&mut side, Side::Back, "Back");
+            self.set_side(side);
+        });
+        if self.job.side == Side::Back {
+            egui::Grid::new("back-form")
+                .num_columns(2)
+                .spacing([8.0, 6.0])
+                .show(ui, |ui| {
+                    ui.label("back copper .gbr");
+                    ui.add(
+                        egui::TextEdit::singleline(&mut self.job.back_copper).desired_width(180.0),
+                    );
+                    ui.end_row();
+                    ui.label("back outline .gbr");
+                    ui.add(
+                        egui::TextEdit::singleline(&mut self.job.back_outline).desired_width(180.0),
+                    );
+                    ui.end_row();
+                    ui.label("thickness mm");
+                    ui.add(
+                        egui::DragValue::new(&mut self.job.board_thickness_mm)
+                            .speed(0.05)
+                            .range(0.0..=10.0),
+                    );
+                    ui.end_row();
+                    ui.label("focal mm");
+                    ui.add(
+                        egui::DragValue::new(&mut self.job.focal_mm)
+                            .speed(1.0)
+                            .range(1.0..=1000.0),
+                    );
+                    ui.end_row();
+                    ui.label("scan center");
+                    ui.horizontal(|ui| {
+                        ui.checkbox(&mut self.job.scan_center_auto, "auto")
+                            .on_hover_text(
+                                "Use the fiducial-layout centroid as the lens axis. \
+                                 Uncheck and enter the measured field center once known \
+                                 (VIS-3 will calibrate it).",
+                            );
+                        if !self.job.scan_center_auto {
+                            ui.add(
+                                egui::DragValue::new(&mut self.job.scan_center_mm.0)
+                                    .speed(0.5)
+                                    .prefix("x "),
+                            );
+                            ui.add(
+                                egui::DragValue::new(&mut self.job.scan_center_mm.1)
+                                    .speed(0.5)
+                                    .prefix("y "),
+                            );
+                        }
+                    });
+                    ui.end_row();
+                });
+            ui.weak(
+                "Back mirrors the design in X; fiducial markers carry the beam \
+                 entry→exit offset (thickness/focal, about the scan center) so \
+                 they land on the flipped holes.",
+            );
+        }
+
+        ui.horizontal(|ui| {
+            if ui.button("🖼 Render preview").clicked() {
+                let ctx = ui.ctx().clone();
+                self.render_preview(&ctx);
+            }
+            if ui.button("▶ Emit .lbrn2").clicked() {
+                self.emit_clicked();
+            }
+        });
+
+        ui.separator();
+        if ui.button("⏭ Next stage (bring-up)").clicked() {
+            self.run_verb(&["next".into(), "--bringup-stubs".into()]);
+        }
+        ui.separator();
+        ui.weak("Live camera → the “📷 Camera” tab.");
+    }
+
+    fn emit_clicked(&mut self) {
+        let (copper, outline) = self.active_gerbers();
+        let (copper, outline) = (crate::clean_path(copper), crate::clean_path(outline));
+        if copper.is_empty() {
+            let which = match self.job.side {
+                Side::Front => "copper Gerber",
+                Side::Back => "back copper Gerber",
+            };
+            self.runtime.log.push(LogLine {
+                text: format!("emit: set a {which} first"),
+                err: true,
+            });
+            return;
+        }
+        let mut args: Vec<String> = vec![
+            "emit".into(),
+            "--copper".into(),
+            copper,
+            "--lbrn2".into(),
+            crate::clean_path(&self.job.emit_lbrn2),
+            "--offset-mm".into(),
+            format!("{}", self.job.offset_mm),
+        ];
+        if !outline.is_empty() {
+            args.push("--outline".into());
+            args.push(outline);
+        }
+        // Back side: mirror the design in X to match the flipped board.
+        if self.job.side == Side::Back {
+            args.push("--mirror-x".into());
+        }
+        self.run_verb(&args);
+    }
+
+    pub(super) fn preview_panel(&mut self, ui: &mut egui::Ui) {
+        ui.horizontal(|ui| {
+            ui.selectable_value(&mut self.runtime.tab, CentralTab::Job, "🖼 Job preview");
+            ui.selectable_value(&mut self.runtime.tab, CentralTab::Camera, "📷 Camera");
+            ui.selectable_value(&mut self.runtime.tab, CentralTab::Calibrate, "🎯 Calibrate");
+            ui.selectable_value(
+                &mut self.runtime.tab,
+                CentralTab::Fiducials,
+                "◎ Fiducial check",
+            );
+            ui.selectable_value(
+                &mut self.runtime.tab,
+                CentralTab::Place,
+                "✋ Place on board",
+            );
+        });
+        ui.separator();
+        match self.runtime.tab {
+            CentralTab::Job => self.job_view(ui),
+            CentralTab::Camera => self.camera_view(ui),
+            CentralTab::Calibrate => self.calibrate_view(ui),
+            CentralTab::Fiducials => self.fiducial_view(ui),
+            CentralTab::Place => self.place_view(ui),
+        }
+    }
+
+    pub(super) fn job_view(&mut self, ui: &mut egui::Ui) {
+        ui.label(egui::RichText::new(&self.job.preview_note).weak());
+        if let Some(tex) = self.job.preview_tex.clone() {
+            self.show_image(ui, "preview", &tex);
+        } else {
+            ui.weak("(no preview rendered — see the Actions panel)");
+        }
+    }
+
+    pub(super) fn log_panel(&mut self, ui: &mut egui::Ui) {
+        ui.horizontal(|ui| {
+            ui.heading("Log");
+            if ui.button("clear").clicked() {
+                self.runtime.log.clear();
+            }
+        });
+        egui::ScrollArea::vertical()
+            .auto_shrink([false, false])
+            .stick_to_bottom(true)
+            .show(ui, |ui| {
+                for line in &self.runtime.log {
+                    if line.err {
+                        ui.colored_label(Color32::from_rgb(0xd0, 0x80, 0x60), &line.text);
+                    } else {
+                        ui.monospace(&line.text);
+                    }
+                }
+            });
+    }
+}
+
+/// Green when a calibration step is satisfied, amber otherwise.
+pub(super) fn status_color(ok: bool) -> Color32 {
+    if ok {
+        Color32::from_rgb(0x50, 0xb0, 0x60)
+    } else {
+        Color32::from_rgb(0xe0, 0x90, 0x20)
+    }
+}

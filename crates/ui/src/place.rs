@@ -111,26 +111,57 @@ pub fn composite_over(
     color: [u8; 3],
     alpha: f64,
 ) {
+    let [_, h] = img.size;
+    let project = |bx: f64, by: f64| match homography {
+        Some(hgt) => {
+            let p = hgt.apply(nalgebra::Point2::new(bx, by));
+            (p.x.is_finite() && p.y.is_finite()).then_some((p.x, p.y))
+        }
+        None => Some((bx * px_per_mm, h as f64 - by * px_per_mm)),
+    };
+    // Existing callers only supply fit homographies or a finite uniform scale;
+    // the fallible API below is used where an operator calibration can be bad.
+    let _ = composite_over_projected(img, shapes, placement, &project, color, alpha);
+}
+
+/// Alpha-blend a placement using an arbitrary nonlinear bed-mm → camera-px
+/// projection. Any non-finite/unprojectable vertex rejects the entire result so
+/// a bad calibration cannot leave a plausible-looking partial overlay.
+pub fn composite_projected(
+    frame: &GrayImage,
+    shapes: &[Poly],
+    placement: &Placement,
+    project: &dyn Fn(f64, f64) -> Option<(f64, f64)>,
+    color: [u8; 3],
+    alpha: f64,
+) -> Result<ColorImage, String> {
+    let (w, h) = (frame.width() as usize, frame.height() as usize);
+    let mut img = ColorImage {
+        size: [w, h],
+        pixels: frame.pixels().map(|p| Color32::from_gray(p[0])).collect(),
+    };
+    composite_over_projected(&mut img, shapes, placement, project, color, alpha)?;
+    Ok(img)
+}
+
+fn composite_over_projected(
+    img: &mut ColorImage,
+    shapes: &[Poly],
+    placement: &Placement,
+    project: &dyn Fn(f64, f64) -> Option<(f64, f64)>,
+    color: [u8; 3],
+    alpha: f64,
+) -> Result<(), String> {
     let [w, h] = img.size;
     let px = &mut img.pixels;
-
     let a = placement.affine();
-    // Gerber-nm point → bed-mm (placement) → bed-px (perspective or uniform).
-    // The uniform fallback flips y: bed mm is y-up from the frame's bottom
-    // (the machine/Gerber frame), image rows grow downward. A homography
-    // learned its orientation from real correspondences, so it maps as-is.
-    let to_px = |gx_nm: i64, gy_nm: i64| -> (f64, f64) {
+    let to_px = |gx_nm: i64, gy_nm: i64| -> Option<(f64, f64)> {
         let x = gx_nm as f64 / NM_PER_MM as f64;
         let y = gy_nm as f64 / NM_PER_MM as f64;
         let bx = a[0] * x + a[1] * y + a[2];
         let by = a[3] * x + a[4] * y + a[5];
-        match homography {
-            Some(hgt) => {
-                let p = hgt.apply(nalgebra::Point2::new(bx, by));
-                (p.x, p.y)
-            }
-            None => (bx * px_per_mm, h as f64 - by * px_per_mm),
-        }
+        let out = project(bx, by)?;
+        (out.0.is_finite() && out.1.is_finite()).then_some(out)
     };
     let rgb = (color[0] as f64, color[1] as f64, color[2] as f64);
     // A soft fill (so a solid region reads as area, not an opaque blob) with a
@@ -140,11 +171,12 @@ pub fn composite_over(
     let edge_a = (alpha * 1.8).clamp(0.0, 1.0);
 
     for poly in shapes {
-        let rings: Vec<Vec<(f64, f64)>> = std::iter::once(&poly.outer)
+        let rings: Option<Vec<Vec<(f64, f64)>>> = std::iter::once(&poly.outer)
             .chain(poly.holes.iter())
             .filter(|r| r.len() >= 3)
             .map(|r| r.iter().map(|p| to_px(p.x, p.y)).collect())
             .collect();
+        let rings = rings.ok_or("camera projection returned a non-finite polygon vertex")?;
         if rings.is_empty() {
             continue;
         }
@@ -187,6 +219,7 @@ pub fn composite_over(
             }
         }
     }
+    Ok(())
 }
 
 /// Alpha-blend `rgb` at pixel `(x, y)` (bounds-checked, no-op if off-image).
@@ -361,6 +394,32 @@ mod tests {
             "outline sits at the homography-mapped location"
         );
         assert!(!red(100, 100), "not at the uniform-scale location");
+    }
+
+    #[test]
+    fn composite_projected_uses_nonlinear_map_and_fails_closed() {
+        let frame = GrayImage::from_pixel(200, 200, image::Luma([120]));
+        let job = [sq(0, 0, MM)];
+        let p = Placement {
+            tx_mm: 10.0,
+            ty_mm: 10.0,
+            rot_deg: 0.0,
+            pivot_mm: (0.0, 0.0),
+        };
+        let curved = |x: f64, y: f64| Some((8.0 * x + 0.02 * x * x, 8.0 * y));
+        let img = composite_projected(&frame, &job, &p, &curved, [200, 60, 60], 0.9)
+            .expect("finite nonlinear projection");
+        let red = |x: usize, y: usize| img.pixels[y * 200 + x].r() > 150;
+        // Left edge x=9 mm → 73.62 px, distinct from both a linear 8 px/mm
+        // map (72) and the old uniform 10 px/mm fallback (90).
+        assert!(red(74, 80), "overlay uses the nonlinear projection");
+        assert!(!red(90, 100), "does not silently use the uniform fallback");
+
+        let invalid = |_x: f64, _y: f64| None;
+        assert!(
+            composite_projected(&frame, &job, &p, &invalid, [200, 60, 60], 0.9).is_err(),
+            "an unavailable projection returns no plausible partial image"
+        );
     }
 
     #[test]

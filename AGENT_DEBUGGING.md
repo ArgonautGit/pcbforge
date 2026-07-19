@@ -25,6 +25,9 @@ printf 'tree\nclick "📷 Camera"\nstate\n' | cargo run -p ui --example debug_dr
 cargo run -p ui --example debug_driver -- script.txt
 ```
 
+Set `PCBFORGE_DB` to drive a copy of a real console database and its adjacent
+`*.console-settings` file; otherwise the driver uses a fresh temporary DB.
+
 Each command prints `OK ...` or `ERR ...`. The process exits non-zero if any
 command failed. Lines starting with `#` and blank lines are ignored.
 

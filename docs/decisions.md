@@ -1807,3 +1807,62 @@ the operation. This entry supersedes that part of LR-09.
 - Stage graphs reject cycles and unreachable nodes. Persisted homographies must
   be finite and invertible. Rust 1.92 is pinned because the installed 1.96
   compiler ICEs while building the current dependency graph.
+
+## 2026-07-19 — Auto-center the operator's corner-origin work area
+
+Camera evidence showed the old generic default (`140 mm` centred at `0,0`)
+projecting most of the work-area outline outside the visible bed. This machine
+uses a 70 mm, lower-left-origin field: its `0..70` coordinates are centred at
+`(35,35)`.
+
+- The work area now defaults to 70 mm with **auto center** enabled. Changing the
+  size keeps `cx = cy = size/2`; disabling auto center exposes the persisted
+  manual coordinates for offset or centre-origin LightBurn configurations.
+- The exact former default (`140/0/0`) migrates to `70/35/35`. Other saved
+  tuples are treated as intentional operator settings and remain unchanged in
+  manual mode.
+- This does not alter the homography. A visibly shifted outline still means the
+  saved camera calibration needs **Re-anchor**; auto center only fixes the work
+  area's machine-coordinate convention.
+
+## 2026-07-19 — Compose camera-lens and laser-field maps for display/placement
+
+Real burned-grid evidence showed the ② anchor's red detections displaced from
+its blue lattice. That view was still a single homography: useful as a robust
+fallback, but incapable of representing camera-lens and galvo/f-theta curvature.
+
+- Commanded machine coordinates now project as `commanded → physical` through
+  `FieldMap`, then `physical → camera px` through `LensMap`; the inverse composes
+  `px → physical → commanded`. Work-area and uncorrected placement overlays
+  use this nonlinear pair when an accepted ③ fit exists.
+- Field-corrected placement remains in desired physical mm and therefore uses
+  only the lens map for display/drag; emit applies `physical → commanded` once.
+  Applying the field map in both places would double-compensate the burn.
+- ③ is accepted for active projection/emission only with at least 80% of dots,
+  all four boundary corners, RMS ≤ 50 µm, worst ≤ 100 µm, matching frame
+  dimensions/orientation, and finite polynomial coefficients. Rejected attempts
+  remain visible diagnostically but cannot arm correction or overwrite its file.
+- An accepted fit whose correction file cannot be saved is not activated, and
+  `Etch here` refuses to emit if correction is armed but that file is missing;
+  silently producing an uncorrected job would disagree with the placed overlay.
+- ② is now explicitly labelled an approximate homography fallback. The field
+  overlay shows the nonlinear predicted lattice, detected burns, raw field-error
+  vectors, and post-fit RMS/worst readout. The physical square calibration grid
+  and the fit algorithms are unchanged.
+
+## 2026-07-19 — Split the console by operator workflow
+
+`crates/ui/src/app.rs` had grown past 5,500 lines and mixed persistent settings,
+camera capture, calibration, fiducials, placement, command execution, rendering,
+and their tests in one implementation block. That made otherwise local changes
+hard to review and encouraged accidental coupling between workflows.
+
+- `ConsoleApp` remains the public application shell, but owns private grouped
+  state for runtime, job, camera, calibration, fiducials, placement, AR, and
+  image navigation. The public `db_path` and `cli_cmd` fields stay compatible.
+- Workflow controllers and views live in private `app/` child modules. Existing
+  geometry and fitting modules remain separate; this is an ownership refactor,
+  not a change to calibration algorithms or operator behavior.
+- Cross-workflow access is limited to private or `pub(super)` interfaces. The
+  settings keys, debug-summary tokens, public methods, and widget labels remain
+  stable so saved consoles and headless driving scripts continue to work.
