@@ -112,37 +112,6 @@ fn accepted_field_uses_nonlinear_projection_and_physical_corrected_place() {
 }
 
 #[test]
-fn direct_burn_anchor_is_used_before_full_lens_field_calibration() {
-    let mut app = nonlinear_app();
-    let anchor = app.calibration.lens.as_ref().unwrap().lens.clone();
-    app.calibration.lens = None;
-    app.calibration.field = None;
-    app.calibration.field_accepted = false;
-    app.calibration.anchor_nonlinear = Some(anchor);
-    app.calibration.anchor_frame_signature = Some(((800, 800), Orientation::Normal));
-
-    let projection = app.camera_projection((800, 800)).unwrap().unwrap();
-    assert!(matches!(
-        projection,
-        CameraProjection::AnchorNonlinear { .. }
-    ));
-    let px = projection.to_px((30.0, 40.0)).unwrap();
-    let mm = projection.from_px(px).unwrap();
-    assert!((mm.0 - 30.0).abs() < 0.1 && (mm.1 - 40.0).abs() < 0.1);
-    assert!(matches!(
-        app.place_projection(800, 800).unwrap(),
-        CameraProjection::AnchorNonlinear { .. }
-    ));
-
-    let map = app.calibration.anchor_nonlinear.as_mut().unwrap();
-    let mut coefficients = map.mm_to_px.to_coeffs();
-    coefficients[0] = f64::NAN;
-    map.mm_to_px = vision::Poly2::from_coeffs(&coefficients);
-    assert!(app.camera_projection((800, 800)).is_err());
-    assert!(app.place_projection(800, 800).is_err());
-}
-
-#[test]
 fn invalid_nonlinear_projection_fails_closed_without_homography_fallback() {
     let mut app = nonlinear_app();
     let field = &mut app.calibration.field.as_mut().unwrap().field;

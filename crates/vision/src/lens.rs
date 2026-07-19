@@ -11,10 +11,8 @@
 
 use nalgebra::{DMatrix, DVector, Point2, Vector2};
 
-/// Full 4×4 tensor-product bicubic basis of normalized coordinates. The first
-/// ten entries retain the legacy total-degree-cubic order; the final six add
-/// the cross terms needed to model perspective plus radial curvature together.
-fn basis(u: f64, v: f64) -> [f64; 16] {
+/// The 10 bi-cubic basis terms of normalized coordinates.
+fn basis(u: f64, v: f64) -> [f64; 10] {
     [
         1.0,
         u,
@@ -26,12 +24,6 @@ fn basis(u: f64, v: f64) -> [f64; 16] {
         u * u * v,
         u * v * v,
         v * v * v,
-        u * u * u * v,
-        u * v * v * v,
-        u * u * v * v,
-        u * u * u * v * v,
-        u * u * v * v * v,
-        u * u * u * v * v * v,
     ]
 }
 
@@ -39,8 +31,8 @@ fn basis(u: f64, v: f64) -> [f64; 16] {
 /// normalization for numerical conditioning.
 #[derive(Debug, Clone, PartialEq)]
 pub struct Poly2 {
-    cx: [f64; 16],
-    cy: [f64; 16],
+    cx: [f64; 10],
+    cy: [f64; 10],
     /// Input is normalized as `n = (raw − center) · scale` before the basis.
     center: (f64, f64),
     scale: f64,
@@ -61,50 +53,38 @@ impl Poly2 {
         (ox, oy)
     }
 
-    /// The 35 numbers that define this map: 16 `cx`, 16 `cy`, then `center.0`,
+    /// The 23 numbers that define this map: 10 `cx`, 10 `cy`, then `center.0`,
     /// `center.1`, `scale`. Round-trips through [`Poly2::from_coeffs`] — the
     /// serialization the field-correction file and the UI persist.
-    pub fn to_coeffs(&self) -> [f64; 35] {
-        let mut v = [0.0; 35];
-        v[..16].copy_from_slice(&self.cx);
-        v[16..32].copy_from_slice(&self.cy);
-        v[32] = self.center.0;
-        v[33] = self.center.1;
-        v[34] = self.scale;
+    pub fn to_coeffs(&self) -> [f64; 23] {
+        let mut v = [0.0; 23];
+        v[..10].copy_from_slice(&self.cx);
+        v[10..20].copy_from_slice(&self.cy);
+        v[20] = self.center.0;
+        v[21] = self.center.1;
+        v[22] = self.scale;
         v
     }
 
-    /// Rebuild a map from current 35-value coefficients, or promote the legacy
-    /// 23-value total-degree cubic by zero-filling the six new cross terms.
-    pub fn from_coeffs(v: &[f64]) -> Poly2 {
-        let mut cx = [0.0; 16];
-        let mut cy = [0.0; 16];
-        let (center, scale) = match v.len() {
-            35 => {
-                cx.copy_from_slice(&v[..16]);
-                cy.copy_from_slice(&v[16..32]);
-                ((v[32], v[33]), v[34])
-            }
-            23 => {
-                cx[..10].copy_from_slice(&v[..10]);
-                cy[..10].copy_from_slice(&v[10..20]);
-                ((v[20], v[21]), v[22])
-            }
-            n => panic!("Poly2 coefficients must contain 23 or 35 values, got {n}"),
-        };
+    /// Rebuild a map from [`Poly2::to_coeffs`] output.
+    pub fn from_coeffs(v: &[f64; 23]) -> Poly2 {
+        let mut cx = [0.0; 10];
+        let mut cy = [0.0; 10];
+        cx.copy_from_slice(&v[..10]);
+        cy.copy_from_slice(&v[10..20]);
         Poly2 {
             cx,
             cy,
-            center,
-            scale,
+            center: (v[20], v[21]),
+            scale: v[22],
         }
     }
 
-    /// Fit `src → dst` (both `(x, y)`) by least squares. Needs ≥ 16 points.
+    /// Fit `src → dst` (both `(x, y)`) by least squares. Needs ≥ 10 points.
     fn fit(src: &[(f64, f64)], dst: &[(f64, f64)]) -> Result<Poly2, String> {
         let n = src.len();
-        if n < 16 {
-            return Err(format!("bicubic fit needs ≥16 points, got {n}"));
+        if n < 10 {
+            return Err(format!("lens fit needs ≥10 points, got {n}"));
         }
         // Normalize the input to ~[-1, 1] so the design matrix is well
         // conditioned (raw pixels or mm span hundreds).
@@ -121,7 +101,7 @@ impl Poly2 {
         }
         let scale = 1.0 / half;
 
-        let mut a = DMatrix::<f64>::zeros(n, 16);
+        let mut a = DMatrix::<f64>::zeros(n, 10);
         for (i, &(x, y)) in src.iter().enumerate() {
             let b = basis((x - cx) * scale, (y - cy) * scale);
             for (j, bj) in b.iter().enumerate() {
@@ -141,16 +121,16 @@ impl Poly2 {
             .iter()
             .filter(|&&s| s > smax * 1e-9)
             .count();
-        if rank < 16 {
+        if rank < 10 {
             return Err(format!(
-                "bicubic fit is rank-deficient (rank {rank}/16): the points are \
+                "lens fit is rank-deficient (rank {rank}/10): the points are \
                  near-collinear or under-spread — image a full 2-D grid"
             ));
         }
         let sol_x = svd.solve(&bx, 1e-12).map_err(|e| format!("x fit: {e}"))?;
         let sol_y = svd.solve(&by, 1e-12).map_err(|e| format!("y fit: {e}"))?;
-        let mut coeff_x = [0.0; 16];
-        let mut coeff_y = [0.0; 16];
+        let mut coeff_x = [0.0; 10];
+        let mut coeff_y = [0.0; 10];
         for (i, (cx, cy)) in coeff_x.iter_mut().zip(coeff_y.iter_mut()).enumerate() {
             *cx = sol_x[i];
             *cy = sol_y[i];
@@ -188,7 +168,7 @@ mod rank_tests {
     /// rejects them instead of returning a confident wrong map.
     #[test]
     fn rank_deficient_collinear_fit_is_rejected() {
-        let pairs: Vec<(Point2<f64>, Point2<f64>)> = (0..20)
+        let pairs: Vec<(Point2<f64>, Point2<f64>)> = (0..12)
             .map(|i| {
                 let t = i as f64;
                 // All points on the line y = x in both frames.
@@ -201,7 +181,7 @@ mod rank_tests {
 }
 
 /// Fit a lens model from `(pixel, true_mm)` correspondences (the imaged known
-/// grid). Needs ≥ 16 non-degenerate points.
+/// grid). Needs ≥ 10 non-degenerate points.
 pub fn fit_lens(pairs: &[(Point2<f64>, Point2<f64>)]) -> Result<LensMap, String> {
     let px: Vec<(f64, f64)> = pairs.iter().map(|(p, _)| (p.x, p.y)).collect();
     let mm: Vec<(f64, f64)> = pairs.iter().map(|(_, m)| (m.x, m.y)).collect();
@@ -255,14 +235,14 @@ impl FieldMap {
     /// Serialize to the field-correction file format (whitespace-separated,
     /// one directive per line) that `pcbforge register --field-map` reads.
     pub fn serialize(&self) -> String {
-        let row = |c: [f64; 35]| {
+        let row = |c: [f64; 23]| {
             c.iter()
                 .map(|v| format!("{v:.10}"))
                 .collect::<Vec<_>>()
                 .join(" ")
         };
         format!(
-            "pcbforge-field 2\nto_commanded {}\nto_physical {}\nrms_um {:.6}\nmax_um {:.6}\n",
+            "pcbforge-field 1\nto_commanded {}\nto_physical {}\nrms_um {:.6}\nmax_um {:.6}\n",
             row(self.to_commanded.to_coeffs()),
             row(self.to_physical.to_coeffs()),
             self.rms_um,
@@ -272,14 +252,18 @@ impl FieldMap {
 
     /// Parse the field-correction file format written by [`FieldMap::serialize`].
     pub fn parse(text: &str) -> Result<FieldMap, String> {
-        let mut version = None;
-        let mut to_commanded: Option<Vec<f64>> = None;
-        let mut to_physical: Option<Vec<f64>> = None;
+        let mut to_commanded = None;
+        let mut to_physical = None;
         let (mut rms_um, mut max_um) = (0.0, 0.0);
-        let coeffs = |rest: &str| -> Result<Vec<f64>, String> {
-            rest.split_whitespace()
+        let coeffs = |rest: &str| -> Result<[f64; 23], String> {
+            let nums: Vec<f64> = rest
+                .split_whitespace()
                 .map(|s| s.parse::<f64>().map_err(|e| e.to_string()))
-                .collect::<Result<_, _>>()
+                .collect::<Result<_, _>>()?;
+            let arr: [f64; 23] = nums
+                .try_into()
+                .map_err(|_| "expected 23 coefficients".to_string())?;
+            Ok(arr)
         };
         for line in text.lines() {
             let line = line.trim();
@@ -288,34 +272,20 @@ impl FieldMap {
             };
             match key {
                 "pcbforge-field" => {
-                    let parsed = rest
-                        .trim()
-                        .parse::<u32>()
-                        .map_err(|_| format!("bad field-map version {rest:?}"))?;
-                    if !matches!(parsed, 1 | 2) {
+                    if rest.trim() != "1" {
                         return Err(format!("unsupported field-map version {rest:?}"));
                     }
-                    version = Some(parsed);
                 }
-                "to_commanded" => to_commanded = Some(coeffs(rest)?),
-                "to_physical" => to_physical = Some(coeffs(rest)?),
+                "to_commanded" => to_commanded = Some(Poly2::from_coeffs(&coeffs(rest)?)),
+                "to_physical" => to_physical = Some(Poly2::from_coeffs(&coeffs(rest)?)),
                 "rms_um" => rms_um = rest.trim().parse().map_err(|_| "bad rms_um")?,
                 "max_um" => max_um = rest.trim().parse().map_err(|_| "bad max_um")?,
                 _ => {}
             }
         }
-        let version = version.ok_or("missing pcbforge-field version")?;
-        let expected = if version == 1 { 23 } else { 35 };
-        let to_commanded = to_commanded.ok_or("missing to_commanded")?;
-        let to_physical = to_physical.ok_or("missing to_physical")?;
-        if to_commanded.len() != expected || to_physical.len() != expected {
-            return Err(format!(
-                "field-map v{version} expects {expected} coefficients per polynomial"
-            ));
-        }
         Ok(FieldMap {
-            to_commanded: Poly2::from_coeffs(&to_commanded),
-            to_physical: Poly2::from_coeffs(&to_physical),
+            to_commanded: to_commanded.ok_or("missing to_commanded")?,
+            to_physical: to_physical.ok_or("missing to_physical")?,
             rms_um,
             max_um,
         })
@@ -325,7 +295,7 @@ impl FieldMap {
 /// Fit a laser-field pre-distortion from `(physical_mm, commanded_mm)`
 /// correspondences: the physical position each burned dot actually landed at
 /// (read through the metric camera-lens map) paired with the commanded
-/// coordinate it was burned at. Needs ≥ 16 non-degenerate points.
+/// coordinate it was burned at. Needs ≥ 10 non-degenerate points.
 pub fn fit_field(pairs: &[(Point2<f64>, Point2<f64>)]) -> Result<FieldMap, String> {
     let phys: Vec<(f64, f64)> = pairs.iter().map(|(p, _)| (p.x, p.y)).collect();
     let cmd: Vec<(f64, f64)> = pairs.iter().map(|(_, c)| (c.x, c.y)).collect();
@@ -916,9 +886,7 @@ mod tests {
             })
             .collect();
         let field = fit_field(&pairs).unwrap();
-        let serialized = field.serialize();
-        assert!(serialized.starts_with("pcbforge-field 2\n"));
-        let restored = FieldMap::parse(&serialized).expect("parse");
+        let restored = FieldMap::parse(&field.serialize()).expect("parse");
         // The de/serialized map precompensates identically.
         let (a, b) = field.precompensate(33.0, 47.0);
         let (c, d) = restored.precompensate(33.0, 47.0);
@@ -927,24 +895,6 @@ mod tests {
             "round-trip precompensation: ({a},{b}) vs ({c},{d})"
         );
         assert!((restored.rms_um - field.rms_um).abs() < 1e-3);
-    }
-
-    #[test]
-    fn legacy_v1_field_map_still_parses() {
-        let mut coefficients = [0.0; 23];
-        coefficients[1] = 1.0;
-        coefficients[12] = 1.0;
-        coefficients[22] = 1.0;
-        let row = coefficients
-            .iter()
-            .map(f64::to_string)
-            .collect::<Vec<_>>()
-            .join(" ");
-        let text = format!(
-            "pcbforge-field 1\nto_commanded {row}\nto_physical {row}\nrms_um 0\nmax_um 0\n"
-        );
-        let restored = FieldMap::parse(&text).expect("legacy field map");
-        assert_eq!(restored.precompensate(2.0, 3.0), (2.0, 3.0));
     }
 
     #[test]

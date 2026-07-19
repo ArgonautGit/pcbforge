@@ -5,12 +5,11 @@
 //! Fiducials tie the design to the board; they do NOT tie the camera to the
 //! laser. That second link is what makes "place it here → burn it here" true,
 //! and this module measures it: the operator burns a grid of dots at known
-//! commanded coordinates, images it, and we fit a nonlinear **camera-px ↔
-//! commanded-mm** map. A homography remains the persisted search seed and
-//! fallback before a full lattice can be locked.
+//! commanded coordinates, images it, and we fit a **camera-px → commanded-mm**
+//! homography (perspective, so a tilted camera is absorbed).
 //!
 //! Flow: an initial homography from the four hand-marked corner dots predicts
-//! every dot's pixel position; square-aware detection refines each locally;
+//! every dot's pixel position; [`vision::find_fiducials`] refines each locally;
 //! the full set is re-fit for the final, accurate transform. Because the
 //! operator's camera moves between sessions, the fit is cheap to redo and the
 //! console flags a stale calibration.
@@ -40,8 +39,12 @@ impl DotKind {
     /// The detector profile for this polarity at `dot_mm` diameter.
     fn profile(self, dot_mm: f64) -> FiducialProfile {
         match self {
-            DotKind::Dark => FiducialProfile::DarkSquare { side_mm: dot_mm },
-            DotKind::Bright => FiducialProfile::BrightSquare { side_mm: dot_mm },
+            DotKind::Dark => FiducialProfile::DarkDot {
+                diameter_mm: dot_mm,
+            },
+            DotKind::Bright => FiducialProfile::Backlit {
+                diameter_mm: dot_mm,
+            },
         }
     }
 
@@ -118,146 +121,6 @@ pub struct Calibration {
 /// A detected dot as `(found_px, grid_mm)`.
 type DotPair = (Point2<f64>, Point2<f64>);
 
-#[derive(Debug, Clone, Copy)]
-struct SquareTarget {
-    px: Point2<f64>,
-    snr: f64,
-}
-
-/// Summed-area image used by the square-grid matched filter. Calibration marks
-/// are generated as filled squares, so comparing a square core with a local
-/// square annulus gives a polarity-independent response that is much less
-/// sensitive to specular copper than an intensity-weighted blob centroid.
-struct IntegralImage {
-    width: usize,
-    values: Vec<f64>,
-}
-
-impl IntegralImage {
-    fn new(frame: &GrayImage) -> Self {
-        let width = frame.width() as usize;
-        let height = frame.height() as usize;
-        let stride = width + 1;
-        let mut values = vec![0.0; stride * (height + 1)];
-        for y in 0..height {
-            let mut row = 0.0;
-            for x in 0..width {
-                row += frame.get_pixel(x as u32, y as u32)[0] as f64;
-                values[(y + 1) * stride + x + 1] = values[y * stride + x + 1] + row;
-            }
-        }
-        Self { width, values }
-    }
-
-    fn mean_square(&self, x: i32, y: i32, radius: i32) -> f64 {
-        let stride = self.width + 1;
-        let x0 = (x - radius) as usize;
-        let y0 = (y - radius) as usize;
-        let x1 = (x + radius + 1) as usize;
-        let y1 = (y + radius + 1) as usize;
-        let sum = self.values[y1 * stride + x1]
-            - self.values[y0 * stride + x1]
-            - self.values[y1 * stride + x0]
-            + self.values[y0 * stride + x0];
-        sum / ((2 * radius + 1) * (2 * radius + 1)) as f64
-    }
-}
-
-fn find_square_targets(
-    frame: &GrayImage,
-    expected_mm: &[Point2<f64>],
-    search_mm: f64,
-    dot_mm: f64,
-    project: impl Fn(Point2<f64>) -> Point2<f64>,
-) -> Vec<Option<SquareTarget>> {
-    let integral = IntegralImage::new(frame);
-    let (fw, fh) = (frame.width() as i32, frame.height() as i32);
-    expected_mm
-        .iter()
-        .map(|&expected| {
-            let center = project(expected);
-            let sx = (project(Point2::new(expected.x + 1.0, expected.y)) - center).norm();
-            let sy = (project(Point2::new(expected.x, expected.y + 1.0)) - center).norm();
-            let dot_px = dot_mm * 0.5 * (sx + sy);
-            if dot_px < 2.0 {
-                return None;
-            }
-            let search = (search_mm * sx.max(sy)).ceil() as i32;
-            // Sample well inside the nominal square and compare it with a
-            // surrounding annulus. The outer radius tolerates a slightly
-            // bloomed or under-filled burn without moving its center.
-            let inner = (dot_px * 0.45).round().max(1.0) as i32;
-            let outer = (dot_px * 1.25).round().max((inner + 2) as f64) as i32;
-            let cx = center.x.round() as i32;
-            let cy = center.y.round() as i32;
-            let x0 = (cx - search).max(outer);
-            let x1 = (cx + search).min(fw - outer - 1);
-            let y0 = (cy - search).max(outer);
-            let y1 = (cy + search).min(fh - outer - 1);
-            if x0 > x1 || y0 > y1 {
-                return None;
-            }
-
-            let inner_area = ((2 * inner + 1) * (2 * inner + 1)) as f64;
-            let outer_area = ((2 * outer + 1) * (2 * outer + 1)) as f64;
-            let mut responses = Vec::with_capacity(((x1 - x0 + 1) * (y1 - y0 + 1)) as usize);
-            for y in y0..=y1 {
-                for x in x0..=x1 {
-                    let core = integral.mean_square(x, y, inner);
-                    let outer_mean = integral.mean_square(x, y, outer);
-                    let ring =
-                        (outer_mean * outer_area - core * inner_area) / (outer_area - inner_area);
-                    responses.push((x, y, core - ring));
-                }
-            }
-            let magnitudes: Vec<f64> = responses.iter().map(|(_, _, r)| r.abs()).collect();
-            let baseline = median_value(&magnitudes);
-            let deviations: Vec<f64> = magnitudes.iter().map(|v| (v - baseline).abs()).collect();
-            let sigma = (1.4826 * median_value(&deviations)).max(0.5);
-            let (_, _, peak_signed) = responses.iter().copied().max_by(|a, b| {
-                let score = |(x, y, response): (i32, i32, f64)| {
-                    let distance = ((x - cx).pow(2) + (y - cy).pow(2)) as f64;
-                    response.abs() / (1.0 + 0.20 * distance / (search * search).max(1) as f64)
-                };
-                score(*a).total_cmp(&score(*b))
-            })?;
-            let peak = peak_signed.abs();
-            let snr = (peak - baseline) / sigma;
-            if peak < 3.0 || snr < 3.0 {
-                return None;
-            }
-
-            // Average the compact response peak for sub-pixel stability. Use
-            // only the selected polarity so a bright specular edge cannot
-            // pull a dark square's center (or vice versa).
-            let sign = peak_signed.signum();
-            let threshold = baseline + 0.55 * (peak - baseline);
-            let (peak_x, peak_y, _) = responses.iter().copied().max_by(|a, b| {
-                let score = |(x, y, response): (i32, i32, f64)| {
-                    let distance = ((x - cx).pow(2) + (y - cy).pow(2)) as f64;
-                    response.abs() / (1.0 + 0.20 * distance / (search * search).max(1) as f64)
-                };
-                score(*a).total_cmp(&score(*b))
-            })?;
-            let radius = (dot_px * 0.75).ceil() as i32;
-            let (mut weight, mut wx, mut wy) = (0.0, 0.0, 0.0);
-            for &(x, y, response) in &responses {
-                if (x - peak_x).abs() > radius || (y - peak_y).abs() > radius {
-                    continue;
-                }
-                let w = (response * sign - threshold).max(0.0);
-                weight += w;
-                wx += w * x as f64;
-                wy += w * y as f64;
-            }
-            (weight > 0.0).then_some(SquareTarget {
-                px: Point2::new(wx / weight, wy / weight),
-                snr,
-            })
-        })
-        .collect()
-}
-
 /// Detect every grid dot: `mm_to_px_seed` (grid-mm → px) places the local
 /// search windows, `find_fiducials` refines each. Returns the pairs for the
 /// dots that locked, plus the commanded total.
@@ -276,136 +139,16 @@ fn detect_grid_dots(
     let commanded = grid.points();
     let expected: Vec<Point2<f64>> = commanded.iter().map(|&(x, y)| Point2::new(x, y)).collect();
     let profile = kind.profile(dot_mm);
-    let alternate = match kind {
-        DotKind::Dark => DotKind::Bright,
-        DotKind::Bright => DotKind::Dark,
-    }
-    .profile(dot_mm);
     // ~0.4·pitch so windows don't overlap, but at least the dot size. This also
     // bounds how far the camera may drift between re-anchors and still lock on.
     let search_mm = (grid.pitch_mm * 0.4).max(dot_mm);
-    // Bare metal changes apparent polarity across the field under oblique
-    // illumination: the same square can be dark in one row and specular-bright
-    // in another. Keep the operator's choice as a small preference, but try
-    // both polarities at every lattice site and retain the stronger target.
-    let preferred = find_fiducials(frame, &expected, search_mm, &profile, &bed);
-    let fallback = find_fiducials(frame, &expected, search_mm, &alternate, &bed);
-    let squares = find_square_targets(frame, &expected, search_mm, dot_mm, |p| bed.mm_to_px(p));
+    let results = find_fiducials(frame, &expected, search_mm, &profile, &bed);
     let pairs: Vec<(Point2<f64>, Point2<f64>)> = commanded
         .iter()
-        .zip(preferred.into_iter().zip(fallback).zip(squares))
-        .filter_map(|(&(mx, my), ((preferred, fallback), square))| {
-            let blob = match (preferred.ok(), fallback.ok()) {
-                (Some(a), Some(b)) => {
-                    let quality = |f: &vision::Fiducial| {
-                        f.confidence.score
-                            + 0.05 * (f.confidence.snr / 10.0).clamp(0.0, 1.0)
-                            + 0.05 * f.confidence.circularity.clamp(0.0, 1.0)
-                    };
-                    // A slight bias preserves the selected polarity when both
-                    // detectors describe equally plausible centers.
-                    if quality(&b) > quality(&a) + 0.03 {
-                        b
-                    } else {
-                        a
-                    }
-                }
-                (Some(a), None) => a,
-                (None, Some(b)) => b,
-                (None, None) => return None,
-            };
-            // Use the square-specific center only as corroboration: when both
-            // methods agree, average them to suppress quantization. It cannot
-            // create or replace a lock by itself on textured copper.
-            let found_px = match square {
-                Some(square) => {
-                    let gap = (square.px - blob.found_px).norm();
-                    if square.snr >= 4.0
-                        && gap
-                            <= dot_mm.max(0.1)
-                                * 0.5
-                                * (bed.mm_to_px(Point2::new(mx + 1.0, my))
-                                    - bed.mm_to_px(Point2::new(mx, my)))
-                                .norm()
-                    {
-                        Point2::from((square.px.coords + blob.found_px.coords) * 0.5)
-                    } else {
-                        blob.found_px
-                    }
-                }
-                None => blob.found_px,
-            };
-            Some((found_px, Point2::new(mx, my)))
-        })
+        .zip(&results)
+        .filter_map(|(&(mx, my), r)| r.as_ref().ok().map(|f| (f.found_px, Point2::new(mx, my))))
         .collect();
-    Ok((
-        reject_grid_outliers(pairs, mm_to_px_seed, grid),
-        commanded.len(),
-    ))
-}
-
-/// Remove isolated false locks before a homography or cubic map can be pulled
-/// toward them. A real camera/laser distortion field is spatially smooth and a
-/// bi-cubic model follows it; glare specks and scratches remain large reverse-
-/// projection residuals. Thresholds scale with the imaged grid pitch so this
-/// works at both preview and full camera resolutions.
-fn reject_grid_outliers(
-    mut pairs: Vec<DotPair>,
-    mm_to_px_seed: &Homography,
-    grid: &GridSpec,
-) -> Vec<DotPair> {
-    if pairs.len() < 20 {
-        return pairs;
-    }
-    let center = grid.origin_mm.0 + (grid.n.saturating_sub(1) as f64 * grid.pitch_mm) / 2.0;
-    let center_y = grid.origin_mm.1 + (grid.n.saturating_sub(1) as f64 * grid.pitch_mm) / 2.0;
-    let p0 = mm_to_px_seed.apply(Point2::new(center, center_y));
-    let px = mm_to_px_seed.apply(Point2::new(center + grid.pitch_mm, center_y));
-    let py = mm_to_px_seed.apply(Point2::new(center, center_y + grid.pitch_mm));
-    let pitch_px = ((px - p0).norm() + (py - p0).norm()) * 0.5;
-
-    for _ in 0..3 {
-        if pairs.len() < 20 {
-            break;
-        }
-        let Ok(model) = fit_lens(&pairs) else {
-            break;
-        };
-        let residuals: Vec<f64> = pairs
-            .iter()
-            .map(|(found, mm)| {
-                let predicted = model.mm_to_px.apply(mm.x, mm.y);
-                (predicted.0 - found.x).hypot(predicted.1 - found.y)
-            })
-            .collect();
-        let median = median_value(&residuals);
-        let deviations: Vec<f64> = residuals.iter().map(|r| (r - median).abs()).collect();
-        let sigma = 1.4826 * median_value(&deviations);
-        let limit = (median + 4.0 * sigma)
-            .max((pitch_px * 0.015).max(1.5))
-            .min((pitch_px * 0.25).max(3.0));
-        let next: Vec<_> = pairs
-            .iter()
-            .cloned()
-            .zip(residuals)
-            .filter_map(|(pair, residual)| (residual <= limit).then_some(pair))
-            .collect();
-        if next.len() < 16 || next.len() == pairs.len() || fit_lens(&next).is_err() {
-            break;
-        }
-        pairs = next;
-    }
-    pairs
-}
-
-fn median_value(values: &[f64]) -> f64 {
-    if values.is_empty() {
-        return 0.0;
-    }
-    let mut sorted = values.to_vec();
-    let mid = sorted.len() / 2;
-    let (_, value, _) = sorted.select_nth_unstable_by(mid, f64::total_cmp);
-    *value
+    Ok((pairs, commanded.len()))
 }
 
 /// Corner homography (grid-mm → px) from the four hand-marked corner dots.
@@ -462,57 +205,6 @@ fn refit(
     })
 }
 
-/// Fit both the persisted homography fallback and a direct nonlinear
-/// camera-pixel ↔ commanded-machine map from the same detected burn lattice.
-/// The latter absorbs camera-lens plus laser-field curvature immediately in
-/// step ②; step ③ still decomposes those effects for physical pre-distortion.
-fn refit_precise(
-    frame: &GrayImage,
-    mm_to_px_seed: &Homography,
-    grid: &GridSpec,
-    dot_mm: f64,
-    kind: DotKind,
-) -> Result<(Calibration, LensMap), String> {
-    let (pairs, total) = detect_grid_dots(frame, mm_to_px_seed, grid, dot_mm, kind)?;
-    if pairs.len() < 20 {
-        return Err(format!(
-            "only {}/{} grid dots detected — nonlinear anchor needs ≥20",
-            pairs.len(),
-            total
-        ));
-    }
-    let nonlinear = fit_lens(&pairs).map_err(|e| format!("nonlinear anchor: {e}"))?;
-    let mut calibration = calibration_from_pairs(&pairs, total)?;
-    calibration.rms_um = nonlinear.rms_um;
-    for (dot, &(_, _, residual)) in calibration.dots.iter_mut().zip(&nonlinear.residuals) {
-        dot.resid_um = residual;
-    }
-    Ok((calibration, nonlinear))
-}
-
-fn calibration_from_pairs(pairs: &[DotPair], total: usize) -> Result<Calibration, String> {
-    let found = pairs.len();
-    let px_to_mm = fit_homography(pairs).map_err(|e| format!("grid fit: {e}"))?;
-    let dots: Vec<AnchorDot> = pairs
-        .iter()
-        .map(|(fpx, mm)| {
-            let got = px_to_mm.apply(*fpx);
-            AnchorDot {
-                px: (fpx.x, fpx.y),
-                mm: (mm.x, mm.y),
-                resid_um: ((got.x - mm.x).powi(2) + (got.y - mm.y).powi(2)).sqrt() * 1000.0,
-            }
-        })
-        .collect();
-    Ok(Calibration {
-        px_to_mm,
-        rms_um: 0.0,
-        found,
-        total,
-        dots,
-    })
-}
-
 // ---- camera lens distortion (printed grid) --------------------------------
 
 /// One dot's calibration feedback for the overlay: where it was detected, the
@@ -550,9 +242,9 @@ pub fn fit_camera_lens(
     let seed = corner_seed(corners_px, grid)?;
     let (pairs, total) = detect_grid_dots(frame, &seed, grid, dot_mm, kind)?;
     let found = pairs.len();
-    if found < 20 {
+    if found < 10 {
         return Err(format!(
-            "only {found}/{total} grid dots detected — the lens fit needs ≥20 \
+            "only {found}/{total} grid dots detected — the lens fit needs ≥10 \
              (check the printed grid, the corner clicks, and the dot size)"
         ));
     }
@@ -608,22 +300,6 @@ pub fn fit_camera_to_machine(
     refit(frame, &seed, grid, dot_mm, kind)
 }
 
-/// Camera-to-machine calibration with a direct nonlinear anchor in addition
-/// to the persisted homography fallback. Prefer this for live console use.
-pub fn fit_camera_to_machine_precise(
-    frame: &GrayImage,
-    corners_px: [(f64, f64); 4],
-    grid: &GridSpec,
-    dot_mm: f64,
-    kind: DotKind,
-) -> Result<(Calibration, LensMap), String> {
-    if grid.n < 2 {
-        return Err("grid must be at least 2×2".into());
-    }
-    let seed = corner_seed(corners_px, grid)?;
-    refit_precise(frame, &seed, grid, dot_mm, kind)
-}
-
 /// Re-anchor an existing calibration to a fresh frame — no corner clicks. Uses
 /// the previous calibration to place the search windows, so as long as the
 /// burned grid is still in view and the camera hasn't jumped more than ~0.4·
@@ -646,27 +322,6 @@ pub fn re_anchor(
         rms: 0.0,
     };
     refit(frame, &mm_to_px, grid, dot_mm, kind)
-}
-
-/// Re-anchor and rebuild the direct nonlinear camera↔machine map without new
-/// corner clicks. The previous homography remains the search-window seed.
-pub fn re_anchor_precise(
-    frame: &GrayImage,
-    previous: &Calibration,
-    grid: &GridSpec,
-    dot_mm: f64,
-    kind: DotKind,
-) -> Result<(Calibration, LensMap), String> {
-    let mm_to_px = Homography {
-        matrix: previous
-            .px_to_mm
-            .matrix
-            .try_inverse()
-            .ok_or("calibration is singular")?,
-        residuals: Vec::new(),
-        rms: 0.0,
-    };
-    refit_precise(frame, &mm_to_px, grid, dot_mm, kind)
 }
 
 // ---- laser field distortion (burned grid through the metric camera) -------
@@ -865,15 +520,15 @@ pub fn fit_laser_field(
     kind: DotKind,
     lens: &LensMap,
 ) -> Result<FieldCal, String> {
-    if grid.n < 5 {
-        return Err("laser-field fit needs at least a 5×5 grid".into());
+    if grid.n < 4 {
+        return Err("laser-field fit needs at least a 4×4 grid".into());
     }
     let seed = corner_seed(corners_px, grid)?;
     let (pairs, total) = detect_grid_dots(frame, &seed, grid, dot_mm, kind)?;
     let found = pairs.len();
-    if found < 20 {
+    if found < 10 {
         return Err(format!(
-            "only {found}/{total} grid dots detected — the field fit needs ≥20 \
+            "only {found}/{total} grid dots detected — the field fit needs ≥10 \
              (check the burned grid, the corner clicks, the dot size, and polarity)"
         ));
     }
@@ -964,32 +619,6 @@ mod tests {
                 }
             }
             image::Luma([(210.0 - 150.0 * cover) as u8])
-        })
-    }
-
-    fn render_mixed_square_grid(
-        grid: &GridSpec,
-        project: impl Fn(f64, f64) -> (f64, f64),
-        dot_px: f64,
-        w: u32,
-        h: u32,
-    ) -> GrayImage {
-        let centers: Vec<_> = grid
-            .points()
-            .into_iter()
-            .enumerate()
-            .map(|(i, (mx, my))| {
-                let (x, y) = project(mx, my);
-                (x, y, (i / grid.n + i % grid.n) % 2 == 0)
-            })
-            .collect();
-        GrayImage::from_fn(w, h, |x, y| {
-            let background = 95.0 + 70.0 * x as f64 / w as f64 + 15.0 * y as f64 / h as f64;
-            let value = centers.iter().find_map(|&(cx, cy, bright)| {
-                ((x as f64 - cx).abs() <= dot_px / 2.0 && (y as f64 - cy).abs() <= dot_px / 2.0)
-                    .then_some(if bright { 240.0 } else { 25.0 })
-            });
-            image::Luma([value.unwrap_or(background).round() as u8])
         })
     }
 
@@ -1173,75 +802,6 @@ mod tests {
             "center maps to ~(30,30): ({:.3},{:.3})",
             back.x,
             back.y
-        );
-    }
-
-    #[test]
-    fn mixed_polarity_squares_get_a_tight_nonlinear_anchor() {
-        let grid = GridSpec {
-            origin_mm: (0.0, 0.0),
-            pitch_mm: 10.0,
-            n: 7,
-        };
-        let base = homog(&[
-            ((0.0, 0.0), (70.0, 620.0)),
-            ((60.0, 0.0), (620.0, 610.0)),
-            ((60.0, 60.0), (600.0, 70.0)),
-            ((0.0, 60.0), (90.0, 80.0)),
-        ]);
-        let project = |mx: f64, my: f64| {
-            let p = base.apply(Point2::new(mx, my));
-            let (u, v) = ((mx - 30.0) / 30.0, (my - 30.0) / 30.0);
-            let r2 = u * u + v * v;
-            (p.x + 10.0 * u * r2, p.y - 8.0 * v * r2)
-        };
-        let img = render_mixed_square_grid(&grid, project, 9.0, 700, 700);
-        let corners = grid.corners_mm().map(|(x, y)| project(x, y));
-        let exact_pairs: Vec<_> = grid
-            .points()
-            .into_iter()
-            .map(|(x, y)| {
-                let p = project(x, y);
-                (Point2::new(p.0, p.1), Point2::new(x, y))
-            })
-            .collect();
-        let exact = fit_lens(&exact_pairs).unwrap();
-        assert!(
-            exact.max_um < 80.0,
-            "bicubic model underfit exact grid at {:.1} µm",
-            exact.max_um
-        );
-
-        // Prefer bright, matching the real console setting. Half the squares
-        // are deliberately dark; the calibration-specific fallback must still
-        // recover them instead of turning every other site into a red X.
-        let (cal, nonlinear) =
-            fit_camera_to_machine_precise(&img, corners, &grid, 1.0, DotKind::Bright)
-                .expect("mixed-reflection grid fit");
-        assert!(
-            cal.found >= 45,
-            "locked {}/{} squares",
-            cal.found,
-            cal.total
-        );
-        assert!(
-            nonlinear.max_um < 80.0,
-            "nonlinear worst residual {:.1} µm",
-            nonlinear.max_um
-        );
-
-        let hom_worst = cal
-            .dots
-            .iter()
-            .map(|dot| {
-                let p = cal.px_to_mm.apply(Point2::new(dot.px.0, dot.px.1));
-                (p.x - dot.mm.0).hypot(p.y - dot.mm.1) * 1000.0
-            })
-            .fold(0.0_f64, f64::max);
-        assert!(
-            hom_worst > nonlinear.max_um * 3.0,
-            "curved fixture should expose homography error: hom={hom_worst:.1}µm nonlinear={:.1}µm",
-            nonlinear.max_um
         );
     }
 

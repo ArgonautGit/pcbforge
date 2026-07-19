@@ -1845,10 +1845,10 @@ fallback, but incapable of representing camera-lens and galvo/f-theta curvature.
 - An accepted fit whose correction file cannot be saved is not activated, and
   `Etch here` refuses to emit if correction is armed but that file is missing;
   silently producing an uncorrected job would disagree with the placed overlay.
-- ② keeps its persisted homography as the startup/re-anchor seed and fallback;
-  the later decision below adds a direct nonlinear burn anchor for the active
-  session. The field overlay shows the nonlinear predicted lattice, detected
-  burns, raw field-error vectors, and post-fit RMS/worst readout.
+- ② is now explicitly labelled an approximate homography fallback. The field
+  overlay shows the nonlinear predicted lattice, detected burns, raw field-error
+  vectors, and post-fit RMS/worst readout. The physical square calibration grid
+  and the fit algorithms are unchanged.
 
 ## 2026-07-19 — Split the console by operator workflow
 
@@ -1866,29 +1866,3 @@ hard to review and encouraged accidental coupling between workflows.
 - Cross-workflow access is limited to private or `pub(super)` interfaces. The
   settings keys, debug-summary tokens, public methods, and widget labels remain
   stable so saved consoles and headless driving scripts continue to work.
-
-## 2026-07-19 — Fit and detect the burned square lattice as measured
-
-Live copper images showed two independent sources of anchor error: the same
-burn changes from dark to bright under field glare, and the former ten-term
-"bicubic" omitted mixed fourth-through-sixth-order terms needed when perspective
-and radial distortion are present together.
-
-- Calibration searches both polarities at every expected site while preserving
-  the operator's selection as a small tie-breaker. The generated targets have
-  explicit bright/dark square profiles, and candidate ranking favors nominal
-  size and compactness before proximity so a nearby speck cannot displace the
-  actual burn merely because field distortion moved it farther from the seed.
-- A polarity-independent square core-versus-ring response is used as a
-  corroborating centroid only when it agrees with the generic component
-  detector. It is not allowed to manufacture a lock by itself on textured
-  copper.
-- `Poly2` is now the full 4×4 tensor-product bicubic (16 coefficients per
-  output axis). The original ten terms keep their ordering; legacy 23-value
-  maps are promoted by zero-filling the six new cross terms.
-- Operator calibration requires at least 20 locks, and laser-field calibration
-  at least a 5×5 grid, so the 16-term model remains overdetermined and its
-  residuals still measure error instead of an exact 4×4 interpolation.
-- Field-map serialization advances to `pcbforge-field 2` with 35 coefficients
-  per direction. Version 1 files remain readable, so existing correction files
-  are not invalidated.
