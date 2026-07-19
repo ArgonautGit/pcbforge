@@ -30,6 +30,23 @@ pub struct Homography {
 }
 
 impl Homography {
+    /// Construct a persisted homography only if it is finite, invertible, and
+    /// can be normalized without dividing by a near-zero projective scale.
+    pub fn from_matrix(mut matrix: Matrix3<f64>) -> Result<Self, HomographyError> {
+        if !matrix.iter().all(|v| v.is_finite()) {
+            return Err(HomographyError::NonFinite);
+        }
+        if matrix[(2, 2)].abs() < 1e-12 || matrix.try_inverse().is_none() {
+            return Err(HomographyError::InvalidMatrix);
+        }
+        matrix /= matrix[(2, 2)];
+        Ok(Self {
+            matrix,
+            residuals: Vec::new(),
+            rms: 0.0,
+        })
+    }
+
     /// Apply to a point: `[x y 1]ᵀ → H·[x y 1]ᵀ`, then divide by `w`.
     pub fn apply(&self, p: Point2<f64>) -> Point2<f64> {
         let m = &self.matrix;
@@ -71,6 +88,10 @@ pub enum HomographyError {
     Degenerate,
     /// The SVD failed to produce singular vectors.
     SolveFailed,
+    /// At least one input coordinate was NaN or infinite.
+    NonFinite,
+    /// A persisted or fitted matrix was singular or could not be normalized.
+    InvalidMatrix,
 }
 
 impl std::fmt::Display for HomographyError {
@@ -87,6 +108,8 @@ impl std::fmt::Display for HomographyError {
                  coincident (need 4 in general position, no 3 on a line)"
             ),
             Self::SolveFailed => write!(f, "homography SVD solve failed"),
+            Self::NonFinite => write!(f, "homography inputs must all be finite"),
+            Self::InvalidMatrix => write!(f, "homography matrix is singular or invalid"),
         }
     }
 }
@@ -130,6 +153,11 @@ pub fn fit_homography(pairs: &[(Point2<f64>, Point2<f64>)]) -> Result<Homography
     let n = pairs.len();
     if n < 4 {
         return Err(HomographyError::TooFewPoints { got: n });
+    }
+    if pairs.iter().any(|(src, dst)| {
+        !src.x.is_finite() || !src.y.is_finite() || !dst.x.is_finite() || !dst.y.is_finite()
+    }) {
+        return Err(HomographyError::NonFinite);
     }
     let src: Vec<Point2<f64>> = pairs.iter().map(|p| p.0).collect();
     let dst: Vec<Point2<f64>> = pairs.iter().map(|p| p.1).collect();
@@ -177,6 +205,9 @@ pub fn fit_homography(pairs: &[(Point2<f64>, Point2<f64>)]) -> Result<Homography
         return Err(HomographyError::SolveFailed);
     }
     m /= m[(2, 2)];
+    if !m.iter().all(|v| v.is_finite()) || m.try_inverse().is_none() {
+        return Err(HomographyError::InvalidMatrix);
+    }
 
     let mut h = Homography {
         matrix: m,
@@ -185,7 +216,14 @@ pub fn fit_homography(pairs: &[(Point2<f64>, Point2<f64>)]) -> Result<Homography
     };
     let mut sq = 0.0;
     for (s, d) in pairs {
+        let w = m[(2, 0)] * s.x + m[(2, 1)] * s.y + m[(2, 2)];
+        if !w.is_finite() || w.abs() < 1e-12 {
+            return Err(HomographyError::InvalidMatrix);
+        }
         let r = (h.apply(*s) - d).norm();
+        if !r.is_finite() {
+            return Err(HomographyError::InvalidMatrix);
+        }
         sq += r * r;
         h.residuals.push(r);
     }
@@ -241,6 +279,27 @@ mod tests {
         let want = apply(&t, q);
         assert_relative_eq!(h.apply(q).x, want.x, epsilon = 1e-6);
         assert_relative_eq!(h.apply(q).y, want.y, epsilon = 1e-6);
+    }
+
+    #[test]
+    fn rejects_non_finite_correspondences_and_saved_matrices() {
+        let mut pairs: Vec<_> = square_plus()
+            .into_iter()
+            .map(|p| (p, Point2::new(p.x, p.y)))
+            .collect();
+        pairs[0].0.x = f64::NAN;
+        assert_eq!(fit_homography(&pairs), Err(HomographyError::NonFinite));
+
+        let mut matrix = Matrix3::identity();
+        matrix[(0, 0)] = f64::INFINITY;
+        assert_eq!(
+            Homography::from_matrix(matrix),
+            Err(HomographyError::NonFinite)
+        );
+        assert_eq!(
+            Homography::from_matrix(Matrix3::zeros()),
+            Err(HomographyError::InvalidMatrix)
+        );
     }
 
     #[test]

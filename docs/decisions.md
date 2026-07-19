@@ -1781,3 +1781,29 @@ rationale below. Fixes of note:
 - **LR-34** (exact `s==e` full-circle detection): spec-compliant for a
   non-KiCad emitter; the suggested fix is a warning, but the parser has no
   diagnostic/warn channel.
+
+## 2026-07-18 — Fail-closed job generation and crash-safe stage attempts
+
+The repo-wide implementation review found that several boundaries silently
+accepted invalid machine inputs, and that LR-09's single transaction enclosed
+the executor itself. A database rollback cannot undo a physical burn: a crash
+after hardware completion could roll back `stage_start` and cause an automatic
+replay, while the long transaction also held SQLite's writer lock throughout
+the operation. This entry supersedes that part of LR-09.
+
+- Laser recipes and cut machine facts now validate centrally. Invalid/non-finite
+  inputs, zero passes, and cut schedules above 100,000 passes are errors rather
+  than clamps or accidental job-file floods. LightBurn text is XML-escaped and
+  generated files/settings use same-directory temporary files plus rename.
+- Stage execution is a durable three-phase protocol: commit a monotonic attempt
+  as `running`; execute without a DB transaction; then verify and finalize that
+  exact attempt. `running`/`needs_attention` blocks automatic replay after a
+  crash or ambiguous halt. Operators reconcile explicitly with retry or
+  mark-done, both recorded in the runlog.
+- The default executor registry now halts. Auto-advancing manual/clearance
+  stages and skipped airflow exist only through explicit bring-up APIs and the
+  CLI's `--bringup-stubs` flag. A new physical board is admitted explicitly
+  with `--new-board` after the prior board reaches a clean terminal.
+- Stage graphs reject cycles and unreachable nodes. Persisted homographies must
+  be finite and invertible. Rust 1.92 is pinned because the installed 1.96
+  compiler ICEs while building the current dependency graph.

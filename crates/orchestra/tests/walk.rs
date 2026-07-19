@@ -8,7 +8,7 @@ use std::sync::atomic::{AtomicU64, Ordering};
 
 use orchestra::db::Db;
 use orchestra::engine::{
-    self, BoardDefaults, ExecutorRegistry, FixedPalletSource, FlipMode, StepReport,
+    self, BoardDefaults, ExecutorRegistry, FixedPalletSource, FlipMode, RecoveryAction, StepReport,
 };
 use orchestra::stages::StageGraph;
 
@@ -27,7 +27,7 @@ fn temp_db_path(tag: &str) -> PathBuf {
 fn invoke_with(path: &PathBuf, pallet: &FixedPalletSource, flip: FlipMode) -> StepReport {
     let db = Db::open(path).expect("open db");
     let graph = StageGraph::load().expect("load graph");
-    let registry = ExecutorRegistry::with_flip_mode(flip);
+    let registry = ExecutorRegistry::bringup_stubs_with_flip_mode(flip);
     let defaults = BoardDefaults::default();
     engine::step(&db, &graph, &registry, pallet, &defaults).expect("step")
     // `db` drops here — the connection closes, as at process exit.
@@ -237,4 +237,56 @@ fn distinct_pallets_get_distinct_boards() {
     // Re-reading pallet 1 resolves back to its board, not pallet 2's.
     let a2 = invoke(&path, &FixedPalletSource(1));
     assert_eq!(a2.board_id(), a.board_id());
+}
+
+#[test]
+fn production_default_fails_closed_and_blocks_automatic_replay() {
+    let path = temp_db_path("fail-closed");
+    let db = Db::open(&path).unwrap();
+    let graph = StageGraph::load().unwrap();
+    let pallet = FixedPalletSource(3003);
+    let defaults = BoardDefaults::default();
+    let registry = ExecutorRegistry::default();
+
+    let first = engine::step(&db, &graph, &registry, &pallet, &defaults).unwrap();
+    assert!(matches!(first, StepReport::Halted { .. }));
+    let id = first.board_id();
+    assert_eq!(
+        db.get_board(id).unwrap().unwrap().stage_phase,
+        "needs_attention"
+    );
+
+    let second = engine::step(&db, &graph, &registry, &pallet, &defaults).unwrap();
+    assert!(matches!(second, StepReport::NeedsRecovery { .. }));
+    let log = db.list_runlog_for_board(id).unwrap();
+    assert_eq!(
+        log.iter()
+            .filter(|e| e.event == "executor_unavailable")
+            .count(),
+        1,
+        "blocked retry must not invoke the executor again"
+    );
+
+    let recovered = engine::recover_board(&db, &graph, id, RecoveryAction::Retry).unwrap();
+    assert_eq!(recovered.stage, "fiducials");
+    assert_eq!(recovered.stage_phase, "ready");
+}
+
+#[test]
+fn completed_pallet_can_explicitly_start_a_new_board() {
+    let path = temp_db_path("new-board");
+    let pallet = FixedPalletSource(4004);
+    let first = invoke(&path, &pallet);
+    for _ in 0..3 {
+        invoke(&path, &pallet);
+    }
+    assert!(matches!(invoke(&path, &pallet), StepReport::Halted { .. }));
+
+    let db = Db::open(&path).unwrap();
+    let graph = StageGraph::load().unwrap();
+    let new_board =
+        engine::start_new_board(&db, &graph, &pallet, &BoardDefaults::default()).unwrap();
+    assert_ne!(new_board.id, first.board_id());
+    assert_eq!(new_board.stage, graph.entry);
+    assert_eq!(new_board.stage_phase, "ready");
 }

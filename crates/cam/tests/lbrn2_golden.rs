@@ -33,7 +33,7 @@ fn emitted_path_matches_committed_sample() {
         closed: true,
     };
     let layer = EmitLayer::line("C01", base_params(), vec![elem]);
-    let doc = lbrn2::lbrn2_string("BSLFiber", &[layer]);
+    let doc = lbrn2::lbrn2_string("BSLFiber", &[layer]).unwrap();
 
     // The exact VertList + PrimList the sample contains must appear in ours.
     let vertlist = "<VertList>V14 45c0x1c1x1V15 53c0x1c1x1V22 53c0x1c1x1V22 47c0x1c1x1V17 49c0x1c1x1</VertList>";
@@ -50,7 +50,7 @@ fn emitted_path_matches_committed_sample() {
 fn emitted_cutsetting_reproduces_base_values() {
     let base = std::fs::read_to_string(sample("base.lbrn2")).unwrap();
     let layer = EmitLayer::fill("C00", base_params(), Vec::new());
-    let doc = lbrn2::lbrn2_string("BSLFiber", &[layer]);
+    let doc = lbrn2::lbrn2_string("BSLFiber", &[layer]).unwrap();
 
     // Every process value present in base.lbrn2's CutSetting is reproduced.
     for field in [

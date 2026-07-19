@@ -144,6 +144,47 @@ pub struct AblationParams {
     pub passes: u32,
 }
 
+/// Validation failure for parameters that can reach a laser or generate a job.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct ParamError(pub &'static str);
+
+impl std::fmt::Display for ParamError {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.write_str(self.0)
+    }
+}
+
+impl std::error::Error for ParamError {}
+
+impl AblationParams {
+    /// Reject recipes that are silent no-ops or expand into unreasonable work.
+    pub fn validate(&self) -> Result<(), ParamError> {
+        if !self.power_pct.is_finite() || !(0.0..=100.0).contains(&self.power_pct) {
+            return Err(ParamError("power_pct must be finite and in 0..=100"));
+        }
+        if self.power_pct == 0.0 {
+            return Err(ParamError("power_pct must be greater than zero"));
+        }
+        if !self.speed_mm_s.is_finite() || self.speed_mm_s <= 0.0 {
+            return Err(ParamError(
+                "speed_mm_s must be finite and greater than zero",
+            ));
+        }
+        if !self.frequency_khz.is_finite() || self.frequency_khz <= 0.0 {
+            return Err(ParamError(
+                "frequency_khz must be finite and greater than zero",
+            ));
+        }
+        if self.passes == 0 {
+            return Err(ParamError("passes must be at least one"));
+        }
+        if self.passes > 100_000 {
+            return Err(ParamError("passes must not exceed 100000"));
+        }
+        Ok(())
+    }
+}
+
 /// How passes are grouped into checkpointed job files.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub struct PassPlan {
@@ -212,6 +253,33 @@ impl Default for CutOpts {
     }
 }
 
+impl CutOpts {
+    /// Validate measured machine facts before computing a focus schedule.
+    pub fn validate(&self, thickness_nm: Nm) -> Result<(), ParamError> {
+        if thickness_nm <= 0 {
+            return Err(ParamError("board thickness must be greater than zero"));
+        }
+        if !self.kerf_mm.is_finite() || self.kerf_mm <= 0.0 {
+            return Err(ParamError("kerf_mm must be finite and greater than zero"));
+        }
+        if !self.tab_mm.is_finite() || self.tab_mm < 0.0 {
+            return Err(ParamError("tab_mm must be finite and non-negative"));
+        }
+        if !self.mm_per_pass.is_finite() || self.mm_per_pass <= 0.0 {
+            return Err(ParamError(
+                "mm_per_pass must be finite and greater than zero",
+            ));
+        }
+        if !self.z_step_mm.is_finite() || self.z_step_mm <= 0.0 {
+            return Err(ParamError("z_step_mm must be finite and greater than zero"));
+        }
+        if !self.overcut_mm.is_finite() || self.overcut_mm < 0.0 {
+            return Err(ParamError("overcut_mm must be finite and non-negative"));
+        }
+        Ok(())
+    }
+}
+
 /// One focus step of a through-cut: run `passes` passes at the current focal
 /// plane, then lower the head (or raise the bed) by `focus_drop_mm` so focus
 /// tracks the descending cut floor. `focus_drop_mm` is `0.0` on the final
@@ -248,5 +316,22 @@ mod tests {
         let p = P::new(1_000_000_000, -1_000_000_000); // ±1 m in nm
         assert_eq!(p.x.checked_mul(4), Some(4_000_000_000)); // room to spare
         let _ = p;
+    }
+
+    #[test]
+    fn laser_params_reject_noops_and_non_finite_values() {
+        let mut params = AblationParams {
+            power_pct: 20.0,
+            speed_mm_s: 1000.0,
+            frequency_khz: 30.0,
+            pulse_ns: 0,
+            passes: 1,
+        };
+        assert!(params.validate().is_ok());
+        params.passes = 0;
+        assert!(params.validate().is_err());
+        params.passes = 1;
+        params.speed_mm_s = f64::NAN;
+        assert!(params.validate().is_err());
     }
 }

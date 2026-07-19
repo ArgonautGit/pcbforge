@@ -113,8 +113,22 @@ pub fn tile(paths: &Paths, field_mm: f64, overlap_mm: f64) -> TilePlan {
     for (i, e) in paths.elems.iter().enumerate() {
         let c = centroid(&e.pts);
         let (ex0, ey0, ex1, ey1) = elem_bbox(e);
-        let col = containing_cell(ex0 - minx, ex1 - minx, c.x - minx, stride_nm, field_nm, cols);
-        let row = containing_cell(ey0 - miny, ey1 - miny, c.y - miny, stride_nm, field_nm, rows);
+        let col = containing_cell(
+            ex0 - minx,
+            ex1 - minx,
+            c.x - minx,
+            stride_nm,
+            field_nm,
+            cols,
+        );
+        let row = containing_cell(
+            ey0 - miny,
+            ey1 - miny,
+            c.y - miny,
+            stride_nm,
+            field_nm,
+            rows,
+        );
         let bcol = col.unwrap_or_else(|| cell(c.x - minx, stride_nm, cols));
         let brow = row.unwrap_or_else(|| cell(c.y - miny, stride_nm, rows));
         buckets[(brow * cols + bcol) as usize].push(i);
@@ -381,7 +395,10 @@ mod tests {
         // window 0 contains it, so clamp down to 0 (the LR-06 mis-tiling fix).
         assert_eq!(containing_cell(95, 135, 115, stride, field, count), Some(0));
         // A centred element keeps its natural cell.
-        assert_eq!(containing_cell(110, 230, 170, stride, field, count), Some(1));
+        assert_eq!(
+            containing_cell(110, 230, 170, stride, field, count),
+            Some(1)
+        );
         // The [87,187] case at stride 138 straddles every window edge → None.
         assert_eq!(containing_cell(87, 187, 137, 138, 140, 2), None);
         // Wider than the field → no window holds it.
@@ -405,8 +422,14 @@ mod tests {
             FIELD_MM,
             STITCH_OVERLAP_MM,
         );
-        assert!(plan.oversized.is_empty(), "100 mm < 140 mm field, not oversized");
-        assert!(plan.unfittable.contains(&0), "the wide element is flagged unfittable");
+        assert!(
+            plan.oversized.is_empty(),
+            "100 mm < 140 mm field, not oversized"
+        );
+        assert!(
+            plan.unfittable.contains(&0),
+            "the wide element is flagged unfittable"
+        );
         assert_eq!(plan.total_elems(), 2, "still assigned, not dropped");
     }
 

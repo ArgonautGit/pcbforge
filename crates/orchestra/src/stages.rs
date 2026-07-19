@@ -84,6 +84,10 @@ pub enum GraphError {
     /// A stage has `next_alt` but no `next`: the branch would have no default
     /// path, so a plain `Advance` from its executor could not be honored.
     AltWithoutNext { from: String },
+    /// A transition points back into the active DFS path.
+    Cycle { at: String },
+    /// A defined stage can never be reached from `entry`.
+    Unreachable { stage: String },
 }
 
 impl std::fmt::Display for GraphError {
@@ -100,6 +104,12 @@ impl std::fmt::Display for GraphError {
                 f,
                 "stage `{from}` has a `next_alt` branch but no default `next`"
             ),
+            GraphError::Cycle { at } => {
+                write!(f, "stage graph contains a cycle through `{at}`")
+            }
+            GraphError::Unreachable { stage } => {
+                write!(f, "stage `{stage}` is unreachable from the entry stage")
+            }
         }
     }
 }
@@ -146,6 +156,53 @@ impl StageGraph {
             if def.next_alt.is_some() && def.next.is_none() {
                 return Err(GraphError::AltWithoutNext { from: name.clone() });
             }
+        }
+
+        fn visit(
+            graph: &StageGraph,
+            name: &str,
+            colors: &mut BTreeMap<String, u8>,
+        ) -> Result<(), GraphError> {
+            match colors.get(name).copied().unwrap_or(0) {
+                1 => return Err(GraphError::Cycle { at: name.into() }),
+                2 => return Ok(()),
+                _ => {}
+            }
+            colors.insert(name.into(), 1);
+            let def = &graph.stages[name];
+            for successor in [&def.next, &def.next_alt].into_iter().flatten() {
+                visit(graph, successor, colors)?;
+            }
+            colors.insert(name.into(), 2);
+            Ok(())
+        }
+
+        let mut colors = BTreeMap::new();
+        for name in self.stages.keys() {
+            visit(self, name, &mut colors)?;
+        }
+
+        let mut reachable = std::collections::BTreeSet::new();
+        let mut pending = vec![self.entry.as_str()];
+        while let Some(name) = pending.pop() {
+            if !reachable.insert(name) {
+                continue;
+            }
+            let def = &self.stages[name];
+            pending.extend(
+                [def.next.as_deref(), def.next_alt.as_deref()]
+                    .into_iter()
+                    .flatten(),
+            );
+        }
+        if let Some(stage) = self
+            .stages
+            .keys()
+            .find(|name| !reachable.contains(name.as_str()))
+        {
+            return Err(GraphError::Unreachable {
+                stage: stage.clone(),
+            });
         }
         Ok(())
     }
@@ -277,6 +334,29 @@ mod tests {
         assert!(matches!(
             err,
             LoadError::Invalid(GraphError::DanglingNext { .. })
+        ));
+    }
+
+    #[test]
+    fn cycles_are_rejected() {
+        let src = r#"Stages(entry: "a", stages: {
+            "a": (kind: Manual, detail: "x", next: Some("b")),
+            "b": (kind: Manual, detail: "x", next: Some("a")),
+        })"#;
+        let err = StageGraph::from_ron(src).unwrap_err();
+        assert!(matches!(err, LoadError::Invalid(GraphError::Cycle { .. })));
+    }
+
+    #[test]
+    fn unreachable_stages_are_rejected() {
+        let src = r#"Stages(entry: "a", stages: {
+            "a": (kind: Manual, detail: "x", next: None),
+            "orphan": (kind: Manual, detail: "x", next: None),
+        })"#;
+        let err = StageGraph::from_ron(src).unwrap_err();
+        assert!(matches!(
+            err,
+            LoadError::Invalid(GraphError::Unreachable { .. })
         ));
     }
 }

@@ -7,7 +7,9 @@
 //! the file is forward/backward compatible as fields come and go.
 
 use std::collections::BTreeMap;
+use std::io::{self, Write};
 use std::path::{Path, PathBuf};
+use std::sync::atomic::{AtomicU64, Ordering};
 
 const HEADER: &str = "pcbforge console settings v1";
 
@@ -56,6 +58,33 @@ pub fn load(path: &Path) -> BTreeMap<String, String> {
         .unwrap_or_default()
 }
 
+static TEMP_NONCE: AtomicU64 = AtomicU64::new(0);
+
+/// Durably replace a settings file without exposing a partially-written blob.
+pub fn save(path: &Path, contents: &str) -> io::Result<()> {
+    let parent = path.parent().unwrap_or_else(|| Path::new("."));
+    let name = path
+        .file_name()
+        .and_then(|n| n.to_str())
+        .ok_or_else(|| io::Error::new(io::ErrorKind::InvalidInput, "invalid settings filename"))?;
+    let nonce = TEMP_NONCE.fetch_add(1, Ordering::Relaxed);
+    let tmp = parent.join(format!(".{name}.tmp-{}-{nonce}", std::process::id()));
+    let result = (|| {
+        let mut file = std::fs::OpenOptions::new()
+            .write(true)
+            .create_new(true)
+            .open(&tmp)?;
+        file.write_all(contents.as_bytes())?;
+        file.sync_all()?;
+        drop(file);
+        std::fs::rename(&tmp, path)
+    })();
+    if result.is_err() {
+        let _ = std::fs::remove_file(&tmp);
+    }
+    result
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -89,5 +118,20 @@ mod tests {
     fn settings_path_sits_beside_the_db() {
         let p = path_for_db(Path::new("/data/pcbforge.sqlite"));
         assert_eq!(p, PathBuf::from("/data/pcbforge.console-settings"));
+    }
+
+    #[test]
+    fn save_replaces_the_complete_file() {
+        let dir = std::env::temp_dir().join(format!(
+            "pcbforge-settings-test-{}-{}",
+            std::process::id(),
+            TEMP_NONCE.fetch_add(1, Ordering::Relaxed)
+        ));
+        std::fs::create_dir_all(&dir).unwrap();
+        let path = dir.join("settings");
+        save(&path, "first").unwrap();
+        save(&path, "second").unwrap();
+        assert_eq!(std::fs::read_to_string(&path).unwrap(), "second");
+        std::fs::remove_dir_all(dir).unwrap();
     }
 }

@@ -35,6 +35,10 @@ CREATE TABLE IF NOT EXISTS board (
     -- stage-engine state (stage names come from docs/stages.ron)
     stage TEXT NOT NULL DEFAULT 'start',
     stage_state TEXT NOT NULL DEFAULT '{}', -- JSON: executor-owned resume data
+    -- Durable execution lease. `running` after stage_start survives a process
+    -- crash and blocks automatic replay until an operator reconciles it.
+    stage_phase TEXT NOT NULL DEFAULT 'ready',
+    stage_attempt INTEGER NOT NULL DEFAULT 0,
     -- registration
     board_affine TEXT, -- JSON: 3x3 row-major, board->bed mm, NULL until registered
     created_at TEXT NOT NULL DEFAULT (strftime('%Y-%m-%dT%H:%M:%SZ', 'now')),

@@ -197,6 +197,9 @@ pub struct ConsoleApp {
     /// The last-saved settings blob — the fields are re-persisted only when
     /// this changes, so typing a path survives a restart without per-frame IO.
     last_settings: String,
+    /// Last persistence failure, retained to avoid logging the same retry on
+    /// every frame. Cleared after the next successful write.
+    settings_error: Option<String>,
     status: StatusSnapshot,
     log: Vec<LogLine>,
     tab: CentralTab,
@@ -378,6 +381,7 @@ impl ConsoleApp {
             cli_cmd,
             settings_path,
             last_settings: String::new(),
+            settings_error: None,
             status,
             log: Vec::new(),
             tab: CentralTab::Job,
@@ -575,7 +579,11 @@ impl ConsoleApp {
         str_field(&m, "fid_layout", &mut self.fid_layout);
         str_field(&m, "cam_file", &mut self.cam_file);
         let f64_field = |m: &std::collections::BTreeMap<String, String>, k: &str, dst: &mut f64| {
-            if let Some(v) = m.get(k).and_then(|s| s.trim().parse().ok()) {
+            if let Some(v) = m
+                .get(k)
+                .and_then(|s| s.trim().parse().ok())
+                .filter(|v: &f64| v.is_finite())
+            {
                 *dst = v;
             }
         };
@@ -596,7 +604,11 @@ impl ConsoleApp {
         }
         str_field(&m, "calib_grid_out", &mut self.calib_grid_out);
         let f32_field = |m: &std::collections::BTreeMap<String, String>, k: &str, dst: &mut f32| {
-            if let Some(v) = m.get(k).and_then(|s| s.trim().parse().ok()) {
+            if let Some(v) = m
+                .get(k)
+                .and_then(|s| s.trim().parse().ok())
+                .filter(|v: &f32| v.is_finite())
+            {
                 *dst = v;
             }
         };
@@ -639,12 +651,12 @@ impl ConsoleApp {
             let mat = nalgebra::Matrix3::new(
                 vals[0], vals[1], vals[2], vals[3], vals[4], vals[5], vals[6], vals[7], vals[8],
             );
+            let Ok(px_to_mm) = vision::Homography::from_matrix(mat) else {
+                self.calib_note = "ignored an invalid saved calibration matrix".into();
+                return;
+            };
             self.calib = Some(crate::calib::Calibration {
-                px_to_mm: vision::Homography {
-                    matrix: mat,
-                    residuals: Vec::new(),
-                    rms: 0.0,
-                },
+                px_to_mm,
                 rms_um: 0.0,
                 found: 0,
                 total: self.calib_n * self.calib_n,
@@ -672,8 +684,22 @@ impl ConsoleApp {
         }
         let blob = self.settings_blob();
         if blob != self.last_settings {
-            let _ = std::fs::write(&self.settings_path, &blob);
-            self.last_settings = blob;
+            match crate::settings::save(&self.settings_path, &blob) {
+                Ok(()) => {
+                    self.last_settings = blob;
+                    self.settings_error = None;
+                }
+                Err(err) => {
+                    let msg = format!("settings save failed: {err}");
+                    if self.settings_error.as_deref() != Some(&msg) {
+                        self.log.push(LogLine {
+                            text: msg.clone(),
+                            err: true,
+                        });
+                    }
+                    self.settings_error = Some(msg);
+                }
+            }
         }
     }
 
@@ -1947,7 +1973,8 @@ impl ConsoleApp {
              bed_overlay: show={} field={:.0}mm center=({:.1},{:.1})\n\
              place: x={:.2} y={:.2} rot={:.1}°\n\
              calib_grid: n={} pitch={:.2}mm dot={:.2}mm contrast={} corners_marked={} origin=({:.1},{:.1})\n\
-             fiducials: {} markers",
+             fiducials: {} markers\n\
+             settings: {}",
             self.tab,
             self.side,
             self.calib_mode,
@@ -1967,6 +1994,7 @@ impl ConsoleApp {
             self.calib_grid_origin_mm.0,
             self.calib_grid_origin_mm.1,
             self.fid_search.len(),
+            self.settings_error.as_deref().unwrap_or("saved"),
         )
     }
 
@@ -2189,8 +2217,8 @@ impl ConsoleApp {
         });
 
         ui.separator();
-        if ui.button("⏭ Next stage (pcbforge next)").clicked() {
-            self.run_verb(&["next".into()]);
+        if ui.button("⏭ Next stage (bring-up)").clicked() {
+            self.run_verb(&["next".into(), "--bringup-stubs".into()]);
         }
         ui.separator();
         ui.weak("Live camera → the “📷 Camera” tab.");

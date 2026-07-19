@@ -16,7 +16,7 @@ use rusqlite::{Connection, OptionalExtension, Row, params};
 const SCHEMA_SQL: &str = include_str!("../../../docs/schema.sql");
 
 /// Current schema version stamped into `schema_version` on first creation.
-const SCHEMA_VERSION: i64 = 1;
+const SCHEMA_VERSION: i64 = 2;
 
 /// Result alias for this module.
 pub type Result<T> = rusqlite::Result<T>;
@@ -47,6 +47,10 @@ pub struct Board {
     pub stage: String,
     /// JSON: executor-owned resume data.
     pub stage_state: String,
+    /// `ready`, `running`, or `needs_attention`.
+    pub stage_phase: String,
+    /// Monotonic attempt identity used to reject stale finalization.
+    pub stage_attempt: i64,
     /// JSON: 3x3 row-major, board->bed mm; `None` until registered.
     pub board_affine: Option<String>,
     pub created_at: String,
@@ -131,7 +135,15 @@ impl Db {
             // query later when a migration changed the shape (LR-29).
             let stored: i64 =
                 conn.query_row("SELECT version FROM schema_version", [], |r| r.get(0))?;
-            if stored != SCHEMA_VERSION {
+            if stored == 1 {
+                conn.execute_batch(
+                    "BEGIN IMMEDIATE;
+                     ALTER TABLE board ADD COLUMN stage_phase TEXT NOT NULL DEFAULT 'ready';
+                     ALTER TABLE board ADD COLUMN stage_attempt INTEGER NOT NULL DEFAULT 0;
+                     UPDATE schema_version SET version = 2;
+                     COMMIT;",
+                )?;
+            } else if stored != SCHEMA_VERSION {
                 return Err(rusqlite::Error::SqliteFailure(
                     rusqlite::ffi::Error::new(rusqlite::ffi::SQLITE_ERROR),
                     Some(format!(
@@ -267,7 +279,7 @@ impl Db {
         self.conn
             .query_row(
                 "SELECT id, pallet_id, design_path, design_hash, stage, stage_state,
-                        board_affine, created_at, updated_at
+                        stage_phase, stage_attempt, board_affine, created_at, updated_at
                  FROM board WHERE id = ?1",
                 params![id],
                 board_from_row,
@@ -275,18 +287,19 @@ impl Db {
             .optional()
     }
 
-    /// Update a board's mutable fields (`pallet_id`, `stage`, `stage_state`,
-    /// `board_affine`); `updated_at` is bumped by SQLite.
+    /// Update a board's mutable fields; `updated_at` is bumped by SQLite.
     pub fn update_board(&self, board: &Board) -> Result<()> {
         self.conn.execute(
             "UPDATE board SET pallet_id = ?1, stage = ?2, stage_state = ?3,
-                    board_affine = ?4,
+                    stage_phase = ?4, stage_attempt = ?5, board_affine = ?6,
                     updated_at = strftime('%Y-%m-%dT%H:%M:%SZ', 'now')
-             WHERE id = ?5",
+             WHERE id = ?7",
             params![
                 board.pallet_id,
                 board.stage,
                 board.stage_state,
+                board.stage_phase,
+                board.stage_attempt,
                 board.board_affine,
                 board.id
             ],
@@ -298,7 +311,7 @@ impl Db {
     pub fn list_boards(&self) -> Result<Vec<Board>> {
         let mut stmt = self.conn.prepare(
             "SELECT id, pallet_id, design_path, design_hash, stage, stage_state,
-                    board_affine, created_at, updated_at
+                    stage_phase, stage_attempt, board_affine, created_at, updated_at
              FROM board ORDER BY id",
         )?;
         let rows = stmt.query_map([], board_from_row)?;
@@ -427,9 +440,11 @@ fn board_from_row(row: &Row<'_>) -> rusqlite::Result<Board> {
         design_hash: row.get(3)?,
         stage: row.get(4)?,
         stage_state: row.get(5)?,
-        board_affine: row.get(6)?,
-        created_at: row.get(7)?,
-        updated_at: row.get(8)?,
+        stage_phase: row.get(6)?,
+        stage_attempt: row.get(7)?,
+        board_affine: row.get(8)?,
+        created_at: row.get(9)?,
+        updated_at: row.get(10)?,
     })
 }
 
@@ -498,16 +513,47 @@ mod tests {
     fn open_stamps_schema_version_and_is_idempotent() {
         let path = temp_db_path("version");
         let db = Db::open(&path).unwrap();
-        assert_eq!(db.schema_version().unwrap(), 1);
+        assert_eq!(db.schema_version().unwrap(), 2);
         drop(db);
-        // Second open: no error, version unchanged (single row, still 1).
+        // Second open: no error, version unchanged (single row, still 2).
         let db2 = Db::open(&path).unwrap();
-        assert_eq!(db2.schema_version().unwrap(), 1);
+        assert_eq!(db2.schema_version().unwrap(), 2);
         let rows: i64 = db2
             .conn
             .query_row("SELECT COUNT(*) FROM schema_version", [], |r| r.get(0))
             .unwrap();
         assert_eq!(rows, 1);
+    }
+
+    #[test]
+    fn migrates_v1_boards_to_durable_attempt_state() {
+        let path = temp_db_path("migrate-v1");
+        let conn = Connection::open(&path).unwrap();
+        conn.execute_batch(
+            "CREATE TABLE schema_version (version INTEGER NOT NULL);
+             INSERT INTO schema_version VALUES (1);
+             CREATE TABLE board (
+                 id INTEGER PRIMARY KEY,
+                 pallet_id INTEGER,
+                 design_path TEXT NOT NULL,
+                 design_hash TEXT NOT NULL,
+                 stage TEXT NOT NULL DEFAULT 'start',
+                 stage_state TEXT NOT NULL DEFAULT '{}',
+                 board_affine TEXT,
+                 created_at TEXT NOT NULL DEFAULT '',
+                 updated_at TEXT NOT NULL DEFAULT ''
+             );
+             INSERT INTO board (design_path, design_hash, stage)
+             VALUES ('old.kicad_pcb', 'abc', 'fiducials');",
+        )
+        .unwrap();
+        drop(conn);
+
+        let db = Db::open(&path).unwrap();
+        assert_eq!(db.schema_version().unwrap(), 2);
+        let board = db.get_board(1).unwrap().unwrap();
+        assert_eq!(board.stage_phase, "ready");
+        assert_eq!(board.stage_attempt, 0);
     }
 
     #[test]

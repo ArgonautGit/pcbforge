@@ -16,7 +16,9 @@ use clap::{Parser, Subcommand};
 mod drillguide;
 
 use orchestra::db::Db;
-use orchestra::engine::{self, BoardDefaults, EnvPalletSource, ExecutorRegistry, StepReport};
+use orchestra::engine::{
+    self, BoardDefaults, EnvPalletSource, ExecutorRegistry, RecoveryAction, StepReport,
+};
 use orchestra::stages::StageGraph;
 
 use cam::lbrn2::{self, EmitLayer};
@@ -43,6 +45,21 @@ enum Command {
         /// Placeholder design path used when a pallet is first seen.
         #[arg(long)]
         design: Option<String>,
+        /// Use the non-hardware bring-up executors.
+        #[arg(long)]
+        bringup_stubs: bool,
+        /// Admit a new board after the previous board is cleanly complete.
+        #[arg(long)]
+        new_board: bool,
+    },
+    /// Reconcile an interrupted stage after physical inspection.
+    Recover {
+        #[arg(long)]
+        board_id: i64,
+        #[arg(long, conflicts_with = "mark_done")]
+        retry: bool,
+        #[arg(long, conflicts_with = "retry")]
+        mark_done: bool,
     },
     /// Invert a KiCad copper Gerber into fillable non-copper shapes (SVG/DXF
     /// for LightBurn or EZCAD) — replaces the FlatCAM step.
@@ -421,7 +438,16 @@ fn main() -> ExitCode {
 
 fn run(cli: &Cli) -> Result<(), Box<dyn std::error::Error>> {
     match &cli.command {
-        Command::Next { design } => next(&cli.db, design.as_deref()),
+        Command::Next {
+            design,
+            bringup_stubs,
+            new_board,
+        } => next(&cli.db, design.as_deref(), *bringup_stubs, *new_board),
+        Command::Recover {
+            board_id,
+            retry,
+            mark_done,
+        } => recover(&cli.db, *board_id, *retry, *mark_done),
         Command::Noncopper {
             copper,
             outline,
@@ -1140,12 +1166,11 @@ fn cut_cmd(a: CutArgs) -> Result<(), Box<dyn std::error::Error>> {
         return Err("outline encloses no board area".into());
     }
 
+    let sched = cam::cut::schedule(&opts, thickness_nm)?;
     let paths = cam::cut::cut_paths(&board_region, &opts);
     if paths.elems.is_empty() {
         return Err("no cut geometry produced (kerf too large for the board?)".into());
     }
-    let sched = cam::cut::schedule(&opts, thickness_nm);
-
     std::fs::create_dir_all(a.out)?;
     // v1: every focus step traces the same geometry; the per-step files exist
     // so the operator runs exactly `passes` of each and the stopping points
@@ -1440,10 +1465,20 @@ fn noncopper_cmd(
     Ok(())
 }
 
-fn next(db_path: &str, design: Option<&str>) -> Result<(), Box<dyn std::error::Error>> {
+fn next(
+    db_path: &str,
+    design: Option<&str>,
+    bringup_stubs: bool,
+    new_board: bool,
+) -> Result<(), Box<dyn std::error::Error>> {
+    if !bringup_stubs {
+        return Err(
+            "no production executors are configured; pass --bringup-stubs for simulation".into(),
+        );
+    }
     let db = Db::open(db_path)?;
     let graph = StageGraph::load()?;
-    let registry = ExecutorRegistry::with_defaults();
+    let registry = ExecutorRegistry::bringup_stubs();
     // Pallet id comes from VIS-11 (camera/AprilTag) later; for now the stub
     // source reads PCBFORGE_PALLET_TAG or a fixed default.
     let pallet = EnvPalletSource::default();
@@ -1451,6 +1486,11 @@ fn next(db_path: &str, design: Option<&str>) -> Result<(), Box<dyn std::error::E
     let mut defaults = BoardDefaults::default();
     if let Some(d) = design {
         defaults.design_path = d.to_owned();
+    }
+
+    if new_board {
+        let board = engine::start_new_board(&db, &graph, &pallet, &defaults)?;
+        println!("started board {} at {}", board.id, board.stage);
     }
 
     let report = engine::step(&db, &graph, &registry, &pallet, &defaults)?;
@@ -1468,6 +1508,37 @@ fn next(db_path: &str, design: Option<&str>) -> Result<(), Box<dyn std::error::E
         StepReport::Halted { board_id, stage } => {
             println!("board {board_id}: halted at {stage} (complete or escalated)");
         }
+        StepReport::NeedsRecovery {
+            board_id,
+            stage,
+            attempt,
+            phase,
+        } => {
+            println!(
+                "board {board_id}: {stage} attempt {attempt} is {phase}; inspect then use `recover`"
+            );
+        }
     }
+    Ok(())
+}
+
+fn recover(
+    db_path: &str,
+    board_id: i64,
+    retry: bool,
+    mark_done: bool,
+) -> Result<(), Box<dyn std::error::Error>> {
+    let action = match (retry, mark_done) {
+        (true, false) => RecoveryAction::Retry,
+        (false, true) => RecoveryAction::MarkDone,
+        _ => return Err("choose exactly one of --retry or --mark-done".into()),
+    };
+    let db = Db::open(db_path)?;
+    let graph = StageGraph::load()?;
+    let board = engine::recover_board(&db, &graph, board_id, action)?;
+    println!(
+        "board {} recovered at {} ({})",
+        board.id, board.stage, board.stage_phase
+    );
     Ok(())
 }

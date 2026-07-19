@@ -32,6 +32,8 @@ pub enum MarkerError {
     /// [`configure`](Marker::configure) got invalid process parameters (e.g.
     /// zero passes, which would no-op `mark` yet still report `Complete`).
     InvalidParams(String),
+    /// Geometry would require an unsafe or unbounded amount of simulator work.
+    InvalidGeometry(String),
 }
 
 impl std::fmt::Display for MarkerError {
@@ -42,6 +44,7 @@ impl std::fmt::Display for MarkerError {
             }
             MarkerError::Backend(msg) => write!(f, "marker backend fault: {msg}"),
             MarkerError::InvalidParams(msg) => write!(f, "invalid marker parameters: {msg}"),
+            MarkerError::InvalidGeometry(msg) => write!(f, "invalid marker geometry: {msg}"),
         }
     }
 }
@@ -139,6 +142,10 @@ impl SimMarker {
     /// accumulated line profile smooth).
     const STEP_FRAC: f64 = 0.25;
 
+    /// A corrupt coordinate or implausibly small spot must not turn one
+    /// segment into a multi-billion-iteration loop.
+    const MAX_STAMPS_PER_SEGMENT: u64 = 10_000_000;
+
     /// New simulator over the frame `[min, max]` (nm) at `um_per_px`
     /// micrometers/pixel, with a Gaussian spot of `spot_um` 1/e² diameter.
     ///
@@ -149,9 +156,23 @@ impl SimMarker {
     /// Panics if `um_per_px == 0` or the frame would exceed `u32` dimensions.
     pub fn new(min: P, max: P, um_per_px: u32, spot_um: f64) -> Self {
         assert!(um_per_px > 0, "um_per_px must be positive");
+        assert!(
+            spot_um.is_finite() && spot_um >= 0.001,
+            "spot_um must be finite and at least 0.001 um"
+        );
+        assert!(max.x >= min.x && max.y >= min.y, "invalid simulator frame");
         let px: Nm = Nm::from(um_per_px) * NM_PER_UM;
-        let w = span_px(max.x - min.x, px);
-        let h = span_px(max.y - min.y, px);
+        let w = span_px(
+            max.x.checked_sub(min.x).expect("frame x extent overflow"),
+            px,
+        );
+        let h = span_px(
+            max.y.checked_sub(min.y).expect("frame y extent overflow"),
+            px,
+        );
+        let len = (w as usize)
+            .checked_mul(h as usize)
+            .expect("simulator raster allocation overflow");
         Self {
             um_per_px,
             spot_um,
@@ -162,7 +183,7 @@ impl SimMarker {
             passes: 0,
             configured: false,
             marked: false,
-            dose: vec![0.0; w as usize * h as usize],
+            dose: vec![0.0; len],
         }
     }
 
@@ -186,37 +207,45 @@ impl SimMarker {
         img
     }
 
-    fn stamp_elem(&mut self, elem: &PathElem) {
+    fn stamp_elem(&mut self, elem: &PathElem) -> Result<(), MarkerError> {
         let pts = &elem.pts;
         let n = pts.len();
         if n == 0 {
-            return;
+            return Ok(());
         }
         if n == 1 {
             self.stamp_point(pts[0].x as f64, pts[0].y as f64);
-            return;
+            return Ok(());
         }
         let last = if elem.closed { n } else { n - 1 };
         for k in 0..last {
-            self.stamp_segment(pts[k], pts[(k + 1) % n]);
+            self.stamp_segment(pts[k], pts[(k + 1) % n])?;
         }
         // Open polylines: segments sample [a, b), so the final vertex is never
         // a segment start — stamp it explicitly.
         if !elem.closed {
             self.stamp_point(pts[n - 1].x as f64, pts[n - 1].y as f64);
         }
+        Ok(())
     }
 
-    fn stamp_segment(&mut self, a: P, b: P) {
+    fn stamp_segment(&mut self, a: P, b: P) -> Result<(), MarkerError> {
         let (ax, ay) = (a.x as f64, a.y as f64);
         let (bx, by) = (b.x as f64, b.y as f64);
         let step = self.spot_um * Self::STEP_FRAC * NM_PER_UM as f64;
         let len = (bx - ax).hypot(by - ay);
         let steps = (len / step).ceil().max(1.0) as u64;
+        if steps > Self::MAX_STAMPS_PER_SEGMENT {
+            return Err(MarkerError::InvalidGeometry(format!(
+                "segment requires {steps} samples (limit {})",
+                Self::MAX_STAMPS_PER_SEGMENT
+            )));
+        }
         for k in 0..steps {
             let t = k as f64 / steps as f64;
             self.stamp_point(ax + (bx - ax) * t, ay + (by - ay) * t);
         }
+        Ok(())
     }
 
     fn stamp_point(&mut self, sx: f64, sy: f64) {
@@ -257,6 +286,9 @@ impl SimMarker {
 
 impl Marker for SimMarker {
     fn configure(&mut self, params: &AblationParams) -> Result<(), MarkerError> {
+        params
+            .validate()
+            .map_err(|e| MarkerError::InvalidParams(e.to_string()))?;
         // Zero passes would make `mark` a silent no-op that still reports
         // Complete — a board that never got ablated but looks done (LR-30).
         if params.passes == 0 {
@@ -274,7 +306,7 @@ impl Marker for SimMarker {
         // Honor passes: re-stamp the whole job so dose accumulates.
         for _ in 0..self.passes {
             for elem in &paths.elems {
-                self.stamp_elem(elem);
+                self.stamp_elem(elem)?;
             }
         }
         self.marked = true;
@@ -357,6 +389,29 @@ mod tests {
             Err(MarkerError::InvalidParams(_))
         ));
         assert!(sim.configure(&cfg(1)).is_ok());
+    }
+
+    #[test]
+    #[should_panic(expected = "spot_um must be finite")]
+    fn zero_spot_is_rejected_at_construction() {
+        let _ = SimMarker::new(P::new(0, 0), P::new(1, 1), 10, 0.0);
+    }
+
+    #[test]
+    fn implausibly_long_segment_is_rejected_before_sampling() {
+        let mut sim = SimMarker::new(P::new(0, 0), P::from_mm(1.0, 1.0), 10, 45.0);
+        sim.configure(&cfg(1)).unwrap();
+        let paths = Paths {
+            elems: vec![PathElem {
+                kind: PathKind::Mark,
+                pts: vec![P::new(Nm::MIN, 0), P::new(Nm::MAX, 0)],
+                closed: false,
+            }],
+        };
+        assert!(matches!(
+            sim.mark(&paths),
+            Err(MarkerError::InvalidGeometry(_))
+        ));
     }
 
     // (1) A single straight path marks a stripe of ~spot width. -----------

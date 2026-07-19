@@ -8,6 +8,11 @@
 //! from the DB, "separate process invocations" are just repeated `step` calls
 //! against a freshly opened [`Db`] — state survives restarts.
 //!
+//! A stage attempt is committed as `running` before its executor starts. The
+//! executor runs without a database transaction (physical work cannot be
+//! rolled back), then the exact attempt is finalized in a second short
+//! transaction. A crash therefore blocks replay until explicit recovery.
+//!
 //! Executors are trait objects ([`StageExecutor`]) so the real Laser emission
 //! (ORC-3/DRV-6) and the real clearance loop (ORC-3) can land later without
 //! touching the engine. The three shipped here are bring-up stubs whose only
@@ -48,6 +53,14 @@ pub enum EngineError {
     Pallet(PalletError),
     /// A configuration value (e.g. a bring-up env var) was malformed.
     Config(String),
+    /// Another process or an operator changed the board while an executor ran.
+    StaleAttempt {
+        board_id: i64,
+        stage: String,
+        attempt: i64,
+    },
+    /// A pallet already has a board that has not reached a clean terminal.
+    ActiveBoard(i64),
 }
 
 impl std::fmt::Display for EngineError {
@@ -63,6 +76,17 @@ impl std::fmt::Display for EngineError {
             ),
             EngineError::Pallet(e) => write!(f, "could not read pallet tag: {e}"),
             EngineError::Config(m) => write!(f, "configuration error: {m}"),
+            EngineError::StaleAttempt {
+                board_id,
+                stage,
+                attempt,
+            } => write!(
+                f,
+                "board {board_id} stage `{stage}` attempt {attempt} changed before finalization"
+            ),
+            EngineError::ActiveBoard(id) => {
+                write!(f, "pallet already has active board {id}")
+            }
         }
     }
 }
@@ -74,7 +98,9 @@ impl std::error::Error for EngineError {
             EngineError::Pallet(e) => Some(e),
             EngineError::UnknownStage(_)
             | EngineError::NoAltSuccessor(_)
-            | EngineError::Config(_) => None,
+            | EngineError::Config(_)
+            | EngineError::ActiveBoard(_)
+            | EngineError::StaleAttempt { .. } => None,
         }
     }
 }
@@ -348,6 +374,23 @@ impl StageExecutor for ClearanceLoopExecutor {
     }
 }
 
+/// Production-safe placeholder used until a real executor is wired. It never
+/// advances and leaves an auditable reason for the operator.
+pub struct HaltExecutor;
+
+impl StageExecutor for HaltExecutor {
+    fn run(&self, ctx: &mut StageCtx) -> Result<StageOutcome> {
+        ctx.record(
+            "executor_unavailable",
+            &json_detail(&[(
+                "reason",
+                "no production executor configured; use explicit bring-up mode only for simulation",
+            )]),
+        )?;
+        Ok(StageOutcome::Halt)
+    }
+}
+
 /// How the [`FlipExecutor`] decides whether the board on the bed is
 /// double-sided (whether the flip stage branches into the bottom-side flow).
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -420,9 +463,9 @@ pub struct ExecutorRegistry {
 }
 
 impl ExecutorRegistry {
-    /// The default registry: the bring-up executors shipped in this module.
-    /// The flip decision reads [`ENV_DOUBLE_SIDED`].
-    pub fn with_defaults() -> Self {
+    /// Explicitly unsafe-for-production bring-up executors. The flip decision
+    /// reads [`ENV_DOUBLE_SIDED`].
+    pub fn bringup_stubs() -> Self {
         Self {
             manual: Box::new(ManualExecutor),
             laser: Box::new(LaserExecutor {
@@ -437,10 +480,10 @@ impl ExecutorRegistry {
 
     /// A registry with an explicit flip decision (deterministic tests — env
     /// vars are process-global and hazardous under parallel test runs).
-    pub fn with_flip_mode(mode: FlipMode) -> Self {
+    pub fn bringup_stubs_with_flip_mode(mode: FlipMode) -> Self {
         Self {
             flip: Box::new(FlipExecutor { mode }),
-            ..Self::with_defaults()
+            ..Self::bringup_stubs()
         }
     }
 
@@ -457,7 +500,12 @@ impl ExecutorRegistry {
 
 impl Default for ExecutorRegistry {
     fn default() -> Self {
-        Self::with_defaults()
+        Self {
+            manual: Box::new(HaltExecutor),
+            laser: Box::new(HaltExecutor),
+            clearance: Box::new(HaltExecutor),
+            flip: Box::new(HaltExecutor),
+        }
     }
 }
 
@@ -476,6 +524,14 @@ pub enum StepReport {
     Stayed { board_id: i64, stage: String },
     /// Nothing to do: the board is at a terminal stage (or an executor halted).
     Halted { board_id: i64, stage: String },
+    /// A previous attempt may have reached hardware; automatic replay is
+    /// blocked until an operator explicitly reconciles it.
+    NeedsRecovery {
+        board_id: i64,
+        stage: String,
+        attempt: i64,
+        phase: String,
+    },
 }
 
 impl StepReport {
@@ -484,7 +540,8 @@ impl StepReport {
         match self {
             StepReport::Advanced { board_id, .. }
             | StepReport::Stayed { board_id, .. }
-            | StepReport::Halted { board_id, .. } => *board_id,
+            | StepReport::Halted { board_id, .. }
+            | StepReport::NeedsRecovery { board_id, .. } => *board_id,
         }
     }
 }
@@ -504,32 +561,68 @@ pub fn step(
     pallet: &dyn PalletSource,
     defaults: &BoardDefaults,
 ) -> Result<StepReport> {
-    // Run the whole step — pallet/board resolution and the stage transition —
-    // in one `BEGIN IMMEDIATE` transaction. This makes the stage_start /
-    // executor / stage_done / update_board writes atomic (a crash can't leave
-    // the runlog and board.stage disagreeing and re-run the stage — LR-09),
-    // makes the new-board insert-then-set-entry atomic so no board is ever
-    // persisted at the placeholder `'start'` stage (LR-10), and serializes
-    // concurrent steppers so two `next`s can't both run and advance (LR-11).
+    // Phase 1 is deliberately short: serialize steppers and durably claim an
+    // attempt before any executor can reach hardware.
+    let tag = pallet.read_tag()?;
     db.begin_immediate()?;
-    let result = step_txn(db, graph, registry, pallet, defaults);
-    match &result {
-        Ok(_) => db.commit()?,
-        Err(_) => {
+    let prepared = prepare_step(db, graph, tag, defaults);
+    let prepared = match prepared {
+        Ok(value) => {
+            db.commit()?;
+            value
+        }
+        Err(err) => {
             let _ = db.rollback();
+            return Err(err);
+        }
+    };
+
+    let Prepared::Run(run) = prepared else {
+        let Prepared::Report(report) = prepared else {
+            unreachable!()
+        };
+        return Ok(report);
+    };
+
+    let mut stage_state = run.board.stage_state.clone();
+    let outcome = {
+        let mut ctx = StageCtx {
+            db,
+            board_id: run.board.id,
+            stage: &run.stage_name,
+            def: &run.def,
+            stage_state: &mut stage_state,
+        };
+        registry.get(run.def.kind).run(&mut ctx)
+    };
+
+    match outcome {
+        Ok(outcome) => finalize_attempt(db, run, stage_state, outcome),
+        Err(err) => {
+            mark_attempt_failed(db, &run, stage_state, &err.to_string())?;
+            Err(err)
         }
     }
-    result
 }
 
-fn step_txn(
+enum Prepared {
+    Report(StepReport),
+    Run(PreparedAttempt),
+}
+
+struct PreparedAttempt {
+    board: Board,
+    stage_name: String,
+    def: StageDef,
+    attempt: i64,
+}
+
+fn prepare_step(
     db: &Db,
     graph: &StageGraph,
-    registry: &ExecutorRegistry,
-    pallet: &dyn PalletSource,
+    tag: i64,
     defaults: &BoardDefaults,
-) -> Result<StepReport> {
-    let tag = pallet.read_tag()?;
+) -> Result<Prepared> {
     let pallet_id = resolve_pallet(db, tag)?;
     let mut board = resolve_board(db, graph, pallet_id, defaults)?;
 
@@ -540,85 +633,261 @@ fn step_txn(
         .clone();
 
     // A terminal stage has no successor: the board is complete. Nothing to run.
-    if def.is_terminal() {
-        return Ok(StepReport::Halted {
+    if board.stage_phase != "ready" {
+        return Ok(Prepared::Report(StepReport::NeedsRecovery {
             board_id: board.id,
             stage: stage_name,
-        });
+            attempt: board.stage_attempt,
+            phase: board.stage_phase,
+        }));
     }
 
+    if def.is_terminal() {
+        return Ok(Prepared::Report(StepReport::Halted {
+            board_id: board.id,
+            stage: stage_name,
+        }));
+    }
+
+    board.stage_attempt = board
+        .stage_attempt
+        .checked_add(1)
+        .ok_or_else(|| EngineError::Config("stage attempt counter overflow".into()))?;
+    board.stage_phase = "running".into();
+    let attempt = board.stage_attempt;
+    let attempt_text = attempt.to_string();
     db.append_runlog(
         Some(board.id),
         &stage_name,
         "stage_start",
-        &json_detail(&[("detail", &def.detail)]),
+        &json_detail(&[("detail", &def.detail), ("attempt", &attempt_text)]),
     )?;
+    db.update_board(&board)?;
 
-    let mut stage_state = board.stage_state.clone();
-    let outcome = {
-        let mut ctx = StageCtx {
-            db,
-            board_id: board.id,
-            stage: &stage_name,
-            def: &def,
-            stage_state: &mut stage_state,
+    Ok(Prepared::Run(PreparedAttempt {
+        board,
+        stage_name,
+        def,
+        attempt,
+    }))
+}
+
+fn finalize_attempt(
+    db: &Db,
+    run: PreparedAttempt,
+    stage_state: String,
+    outcome: StageOutcome,
+) -> Result<StepReport> {
+    db.begin_immediate()?;
+    let result = (|| {
+        let mut board = matching_attempt(db, &run)?;
+        board.stage_state = stage_state;
+        let report = match outcome {
+            StageOutcome::Advance | StageOutcome::AdvanceAlt => {
+                let next = if outcome == StageOutcome::Advance {
+                    run.def
+                        .next
+                        .clone()
+                        .expect("non-terminal stage has a successor")
+                } else {
+                    run.def
+                        .next_alt
+                        .clone()
+                        .ok_or_else(|| EngineError::NoAltSuccessor(run.stage_name.clone()))?
+                };
+                db.append_runlog(
+                    Some(board.id),
+                    &run.stage_name,
+                    "stage_done",
+                    &json_detail(&[("to", &next)]),
+                )?;
+                board.stage = next.clone();
+                board.stage_phase = "ready".into();
+                StepReport::Advanced {
+                    board_id: board.id,
+                    stage: run.stage_name.clone(),
+                    to: next,
+                }
+            }
+            StageOutcome::Stay => {
+                board.stage_phase = "ready".into();
+                StepReport::Stayed {
+                    board_id: board.id,
+                    stage: run.stage_name.clone(),
+                }
+            }
+            StageOutcome::Halt => {
+                board.stage_phase = "needs_attention".into();
+                let attempt = run.attempt.to_string();
+                db.append_runlog(
+                    Some(board.id),
+                    &run.stage_name,
+                    "stage_halted",
+                    &json_detail(&[("attempt", &attempt)]),
+                )?;
+                StepReport::Halted {
+                    board_id: board.id,
+                    stage: run.stage_name.clone(),
+                }
+            }
         };
-        registry.get(def.kind).run(&mut ctx)?
-    };
-    board.stage_state = stage_state;
+        db.update_board(&board)?;
+        Ok(report)
+    })();
+    finish_transaction(db, result)
+}
 
-    // Advance the board to `next`, writing the `stage_done` row.
-    let advance_to = |mut board: Board, next: String| -> Result<StepReport> {
+fn mark_attempt_failed(
+    db: &Db,
+    run: &PreparedAttempt,
+    stage_state: String,
+    error: &str,
+) -> Result<()> {
+    db.begin_immediate()?;
+    let result = (|| {
+        let mut board = matching_attempt(db, run)?;
+        board.stage_state = stage_state;
+        board.stage_phase = "needs_attention".into();
+        let attempt = run.attempt.to_string();
         db.append_runlog(
             Some(board.id),
-            &stage_name,
-            "stage_done",
-            &json_detail(&[("to", &next)]),
+            &run.stage_name,
+            "stage_failed",
+            &json_detail(&[("error", error), ("attempt", &attempt)]),
         )?;
-        board.stage = next.clone();
         db.update_board(&board)?;
-        Ok(StepReport::Advanced {
-            board_id: board.id,
-            stage: stage_name.clone(),
-            to: next,
-        })
-    };
+        Ok(())
+    })();
+    finish_transaction(db, result)
+}
 
-    match outcome {
-        StageOutcome::Advance => {
-            // `is_terminal` was false above, so `next` is Some here.
-            let next = def
-                .next
-                .clone()
-                .expect("non-terminal stage has a successor");
-            advance_to(board, next)
+fn matching_attempt(db: &Db, run: &PreparedAttempt) -> Result<Board> {
+    let board = db
+        .get_board(run.board.id)?
+        .ok_or_else(|| EngineError::Config(format!("board {} disappeared", run.board.id)))?;
+    if board.stage != run.stage_name
+        || board.stage_attempt != run.attempt
+        || board.stage_phase != "running"
+    {
+        return Err(EngineError::StaleAttempt {
+            board_id: run.board.id,
+            stage: run.stage_name.clone(),
+            attempt: run.attempt,
+        });
+    }
+    Ok(board)
+}
+
+fn finish_transaction<T>(db: &Db, result: Result<T>) -> Result<T> {
+    match result {
+        Ok(value) => {
+            db.commit()?;
+            Ok(value)
         }
-        StageOutcome::AdvanceAlt => {
-            // The branch path (ORC-6 flip → bottom-side flow). Unlike `next`,
-            // `next_alt` is optional, so an executor branching on a stage
-            // without one is a graph/executor mismatch — a hard error.
-            let next = def
-                .next_alt
-                .clone()
-                .ok_or_else(|| EngineError::NoAltSuccessor(stage_name.clone()))?;
-            advance_to(board, next)
-        }
-        StageOutcome::Stay => {
-            // Persist any checkpointed resume data; stage is unchanged.
-            db.update_board(&board)?;
-            Ok(StepReport::Stayed {
-                board_id: board.id,
-                stage: stage_name,
-            })
-        }
-        StageOutcome::Halt => {
-            db.update_board(&board)?;
-            Ok(StepReport::Halted {
-                board_id: board.id,
-                stage: stage_name,
-            })
+        Err(err) => {
+            let _ = db.rollback();
+            Err(err)
         }
     }
+}
+
+/// Explicit operator decision for an interrupted or ambiguous attempt.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum RecoveryAction {
+    /// Inspection showed that the physical operation did not happen; allow a
+    /// new attempt of the same stage.
+    Retry,
+    /// Inspection showed that the operation completed; advance along the
+    /// stage's default successor without repeating it.
+    MarkDone,
+}
+
+pub fn recover_board(
+    db: &Db,
+    graph: &StageGraph,
+    board_id: i64,
+    action: RecoveryAction,
+) -> Result<Board> {
+    db.begin_immediate()?;
+    let result = (|| {
+        let mut board = db
+            .get_board(board_id)?
+            .ok_or_else(|| EngineError::Config(format!("board {board_id} does not exist")))?;
+        if board.stage_phase == "ready" {
+            return Err(EngineError::Config(format!(
+                "board {board_id} has no interrupted attempt to recover"
+            )));
+        }
+        let def = graph
+            .stage(&board.stage)
+            .ok_or_else(|| EngineError::UnknownStage(board.stage.clone()))?;
+        let old_stage = board.stage.clone();
+        let event = match action {
+            RecoveryAction::Retry => {
+                board.stage_phase = "ready".into();
+                "recovery_retry"
+            }
+            RecoveryAction::MarkDone => {
+                let next = def.next.clone().ok_or_else(|| {
+                    EngineError::Config(format!("stage `{}` is already terminal", board.stage))
+                })?;
+                board.stage = next;
+                board.stage_phase = "ready".into();
+                "recovery_mark_done"
+            }
+        };
+        db.append_runlog(
+            Some(board.id),
+            &old_stage,
+            event,
+            &json_detail(&[("operator", "explicit")]),
+        )?;
+        db.update_board(&board)?;
+        Ok(board)
+    })();
+    finish_transaction(db, result)
+}
+
+/// Admit a new physical board on a pallet only after its previous board has
+/// reached a clean terminal stage.
+pub fn start_new_board(
+    db: &Db,
+    graph: &StageGraph,
+    pallet: &dyn PalletSource,
+    defaults: &BoardDefaults,
+) -> Result<Board> {
+    let tag = pallet.read_tag()?;
+    db.begin_immediate()?;
+    let result = (|| {
+        let pallet_id = resolve_pallet(db, tag)?;
+        if let Some(previous) = db
+            .list_boards()?
+            .into_iter()
+            .rfind(|b| b.pallet_id == Some(pallet_id))
+        {
+            let terminal = graph
+                .stage(&previous.stage)
+                .is_some_and(StageDef::is_terminal);
+            if !terminal || previous.stage_phase != "ready" {
+                return Err(EngineError::ActiveBoard(previous.id));
+            }
+        }
+        let mut board = db.insert_board(
+            Some(pallet_id),
+            &defaults.design_path,
+            &defaults.design_hash,
+        )?;
+        board.stage = graph.entry.clone();
+        db.update_board(&board)?;
+        db.append_runlog(
+            Some(board.id),
+            &board.stage,
+            "board_started",
+            &json_detail(&[("source", "operator")]),
+        )?;
+        Ok(board)
+    })();
+    finish_transaction(db, result)
 }
 
 /// Find the pallet with `tag`, creating a bare one if it is new.
@@ -702,7 +971,10 @@ mod tests {
     fn parse_machine_is_fail_closed_on_unknown() {
         assert_eq!(parse_machine("fiber").unwrap(), pcb_core::Machine::Fiber);
         assert_eq!(parse_machine(" UV ").unwrap(), pcb_core::Machine::Uv);
-        assert!(matches!(parse_machine("plasma"), Err(EngineError::Config(_))));
+        assert!(matches!(
+            parse_machine("plasma"),
+            Err(EngineError::Config(_))
+        ));
         assert!(matches!(parse_machine(""), Err(EngineError::Config(_))));
     }
 

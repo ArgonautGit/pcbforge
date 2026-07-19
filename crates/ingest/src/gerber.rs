@@ -1599,7 +1599,10 @@ mod tests {
         let src = "%TF.FileFunction,Copper,L1,Top*%\n%FSLAX46Y46*%\n%MOMM*%\n\
                    %ADD10C,1.000000*%\nD10*\n%LPC*LPD*%\nX0Y0D03*\nM02*\n";
         let layer = parse_gerber(src).expect("parse");
-        assert!(!layer.polys.is_empty(), "final polarity must be dark (LPD won)");
+        assert!(
+            !layer.polys.is_empty(),
+            "final polarity must be dark (LPD won)"
+        );
     }
 
     #[test]

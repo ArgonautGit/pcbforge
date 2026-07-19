@@ -181,17 +181,23 @@ pub fn tab_ring(ring: &Ring, gap_w_nm: Nm, tab_count: u32) -> Vec<PathElem> {
 /// the cut floor. The final step reaches `thickness + overcut` and its
 /// `focus_drop_mm` is 0. Commanded depth Σ(passes·mm_per_pass) is ≥ the target
 /// and less than one pass over it.
-pub fn schedule(opts: &CutOpts, thickness_nm: Nm) -> CutSchedule {
+pub fn schedule(opts: &CutOpts, thickness_nm: Nm) -> Result<CutSchedule, pcb_core::ParamError> {
+    opts.validate(thickness_nm)?;
     let thickness_mm = thickness_nm as f64 / NM_PER_MM as f64;
     let total_depth_mm = thickness_mm + opts.overcut_mm;
-    let mpp = opts.mm_per_pass.max(1e-6);
-    let passes_per_step = ((opts.z_step_mm / mpp).floor() as i64).max(1) as u32;
+    let mpp = opts.mm_per_pass;
+    let total_passes = (total_depth_mm / mpp).ceil() as u64;
+    if total_passes > 100_000 {
+        return Err(pcb_core::ParamError(
+            "cut schedule must not exceed 100000 passes",
+        ));
+    }
+    let passes_per_step = (opts.z_step_mm / mpp).floor().max(1.0) as u32;
     let step_depth = passes_per_step as f64 * mpp;
 
     let mut steps = Vec::new();
     let mut full = 0u32;
-    // Backstop against a pathological (non-positive) step size.
-    while (full as usize) < 100_000 {
+    while full < 100_000 {
         // Recompute `done` from the step count each iteration rather than
         // accumulating, so drift never shifts the step boundary.
         let done = full as f64 * step_depth;
@@ -215,16 +221,10 @@ pub fn schedule(opts: &CutOpts, thickness_nm: Nm) -> CutSchedule {
         });
         full += 1;
     }
-    if steps.is_empty() {
-        steps.push(CutStep {
-            passes: 1,
-            focus_drop_mm: 0.0,
-        });
-    }
-    CutSchedule {
+    Ok(CutSchedule {
         steps,
         total_depth_mm,
-    }
+    })
 }
 
 /// Smaller bounding-box dimension of a ring, mm — used to flag cutouts whose
@@ -633,7 +633,7 @@ mod tests {
     fn schedule_sums_to_thickness_plus_overcut_with_bounded_drops() {
         let opts = CutOpts::default(); // mpp 0.05, z_step 0.2, overcut 0.1
         let thickness = (1.6 * MM as f64) as Nm;
-        let sched = schedule(&opts, thickness);
+        let sched = schedule(&opts, thickness).unwrap();
         assert!((sched.total_depth_mm - 1.7).abs() < 1e-9);
 
         // 8 full steps of 4 passes (1.6 mm) + a final 2-pass step (0.1 mm).
@@ -674,10 +674,26 @@ mod tests {
             ..CutOpts::default()
         };
         // Thickness under one step's depth (0.2 mm): one final step, no drop.
-        let sched = schedule(&opts, (0.1 * MM as f64) as Nm);
+        let sched = schedule(&opts, (0.1 * MM as f64) as Nm).unwrap();
         assert_eq!(sched.steps.len(), 1);
         assert_eq!(sched.steps[0].focus_drop_mm, 0.0);
         assert_eq!(sched.steps[0].passes, 2); // ceil(0.1 / 0.05)
+    }
+
+    #[test]
+    fn schedule_rejects_invalid_or_unbounded_inputs() {
+        let thickness = (1.6 * MM as f64) as Nm;
+        let mut opts = CutOpts::default();
+        opts.mm_per_pass = 0.0;
+        assert!(schedule(&opts, thickness).is_err());
+
+        opts.mm_per_pass = 1e-9;
+        assert!(schedule(&opts, thickness).is_err());
+
+        opts = CutOpts::default();
+        opts.overcut_mm = f64::NAN;
+        assert!(schedule(&opts, thickness).is_err());
+        assert!(schedule(&CutOpts::default(), 0).is_err());
     }
 
     #[test]

@@ -357,7 +357,12 @@ mod tests {
         // Consecutive emissions are never adjacent in the coherent nn order, so
         // the round-robin tail can't fire two adjacent hatch lines back-to-back.
         for w in s.windows(2) {
-            assert!(w[0].abs_diff(w[1]) >= 2, "{} and {} are adjacent", w[0], w[1]);
+            assert!(
+                w[0].abs_diff(w[1]) >= 2,
+                "{} and {} are adjacent",
+                w[0],
+                w[1]
+            );
         }
     }
 

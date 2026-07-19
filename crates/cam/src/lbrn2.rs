@@ -26,8 +26,9 @@
 //! observed (the sample drew a closed shape); closed paths — all the
 //! non-copper fill workflow needs — are byte-verified against the sample.
 
-use std::io::Write;
+use std::io::{self, Write};
 use std::path::Path;
+use std::sync::atomic::{AtomicU64, Ordering};
 
 use pcb_core::{AblationParams, NM_PER_MM, PathElem, PathKind, Poly};
 
@@ -209,16 +210,43 @@ pub fn polys_to_elems(polys: &[Poly]) -> Vec<PathElem> {
 
 /// Write `layers` as a `.lbrn2` project to `path`.
 pub fn write_lbrn2(device: &str, layers: &[EmitLayer], path: &Path) -> std::io::Result<()> {
-    std::fs::File::create(path)?.write_all(lbrn2_string(device, layers).as_bytes())
+    atomic_write(path, lbrn2_string(device, layers)?.as_bytes())
 }
 
 /// Render the full `.lbrn2` document as a string.
-pub fn lbrn2_string(device: &str, layers: &[EmitLayer]) -> String {
+pub fn lbrn2_string(device: &str, layers: &[EmitLayer]) -> io::Result<String> {
+    if device.is_empty() {
+        return Err(io::Error::new(
+            io::ErrorKind::InvalidInput,
+            "device name must not be empty",
+        ));
+    }
+    for layer in layers {
+        layer
+            .params
+            .validate()
+            .map_err(|e| io::Error::new(io::ErrorKind::InvalidInput, e))?;
+        if layer.mode == LayerMode::Fill
+            && (!layer.interval_mm.is_finite() || layer.interval_mm <= 0.0)
+        {
+            return Err(io::Error::new(
+                io::ErrorKind::InvalidInput,
+                "fill interval_mm must be finite and greater than zero",
+            ));
+        }
+        if !layer.angle_deg.is_finite() || !layer.fill_angle_step_deg.is_finite() {
+            return Err(io::Error::new(
+                io::ErrorKind::InvalidInput,
+                "fill angles must be finite",
+            ));
+        }
+    }
     let mut s = String::new();
     s.push_str("<?xml version=\"1.0\" encoding=\"UTF-8\"?>\n");
     s.push_str(&format!(
-        "<LightBurnProject AppVersion=\"2.1.03\" DeviceName=\"{device}\" FormatVersion=\"1\" \
-         MaterialHeight=\"0\" MirrorX=\"False\" MirrorY=\"False\" AskForSendName=\"True\">\n"
+        "<LightBurnProject AppVersion=\"2.1.03\" DeviceName=\"{}\" FormatVersion=\"1\" \
+         MaterialHeight=\"0\" MirrorX=\"False\" MirrorY=\"False\" AskForSendName=\"True\">\n",
+        xml_attr(device)
     ));
     s.push_str(EDITOR_BLOCKS);
     for (i, layer) in layers.iter().enumerate() {
@@ -239,7 +267,48 @@ pub fn lbrn2_string(device: &str, layers: &[EmitLayer]) -> String {
     }
     s.push_str("    <Notes ShowOnLoad=\"0\" Notes=\"\"/>\n");
     s.push_str("</LightBurnProject>\n");
-    s
+    Ok(s)
+}
+
+static TEMP_NONCE: AtomicU64 = AtomicU64::new(0);
+
+fn atomic_write(path: &Path, bytes: &[u8]) -> io::Result<()> {
+    let parent = path.parent().unwrap_or_else(|| Path::new("."));
+    let name = path
+        .file_name()
+        .and_then(|n| n.to_str())
+        .ok_or_else(|| io::Error::new(io::ErrorKind::InvalidInput, "invalid output filename"))?;
+    let nonce = TEMP_NONCE.fetch_add(1, Ordering::Relaxed);
+    let tmp = parent.join(format!(".{name}.tmp-{}-{nonce}", std::process::id()));
+    let result = (|| {
+        let mut file = std::fs::OpenOptions::new()
+            .write(true)
+            .create_new(true)
+            .open(&tmp)?;
+        file.write_all(bytes)?;
+        file.sync_all()?;
+        drop(file);
+        std::fs::rename(&tmp, path)
+    })();
+    if result.is_err() {
+        let _ = std::fs::remove_file(&tmp);
+    }
+    result
+}
+
+fn xml_attr(value: &str) -> String {
+    let mut escaped = String::with_capacity(value.len());
+    for ch in value.chars() {
+        match ch {
+            '&' => escaped.push_str("&amp;"),
+            '<' => escaped.push_str("&lt;"),
+            '>' => escaped.push_str("&gt;"),
+            '\"' => escaped.push_str("&quot;"),
+            '\'' => escaped.push_str("&apos;"),
+            _ => escaped.push(ch),
+        }
+    }
+    escaped
 }
 
 /// The constant VariableText + UIPrefs blocks LightBurn writes; reproduced so
@@ -280,13 +349,16 @@ fn cut_setting_xml(index: u32, layer: &EmitLayer) -> String {
     let mut field =
         |name: &str, val: String| s.push_str(&format!("        <{name} Value=\"{val}\"/>\n"));
     field("index", index.to_string());
-    field("name", layer.name.clone());
+    field("name", xml_attr(&layer.name));
     field("maxPower", num(p.power_pct));
     field("maxPower2", num(p.power_pct));
     field("speed", num(p.speed_mm_s));
     // Hz is an integer field: round, don't stringify a 17-digit float
     // (`1.001 kHz` → `1000.9999999999999`) (LR-23).
-    field("frequency", ((p.frequency_khz * 1000.0).round() as i64).to_string());
+    field(
+        "frequency",
+        ((p.frequency_khz * 1000.0).round() as i64).to_string(),
+    );
     if p.pulse_ns > 0 {
         field("QPulseWidth", p.pulse_ns.to_string());
     }
@@ -294,7 +366,10 @@ fn cut_setting_xml(index: u32, layer: &EmitLayer) -> String {
     // must not inherit a device profile that defaults wobble on (LR-36).
     field("wobbleEnable", if layer.wobble { "1" } else { "0" }.into());
     if layer.mode == LayerMode::Fill {
-        field("crossHatch", if layer.cross_hatch { "1" } else { "0" }.into());
+        field(
+            "crossHatch",
+            if layer.cross_hatch { "1" } else { "0" }.into(),
+        );
         field("interval", num(layer.interval_mm));
         if layer.angle_deg != 0.0 {
             field("angle", num(layer.angle_deg));
@@ -307,7 +382,7 @@ fn cut_setting_xml(index: u32, layer: &EmitLayer) -> String {
         field("numPasses", p.passes.to_string());
     }
     if let Some(sub) = &layer.subname {
-        field("subname", sub.clone());
+        field("subname", xml_attr(sub));
     }
     field("priority", index.to_string());
     field("tabCount", "1".into());
@@ -368,7 +443,7 @@ mod tests {
         // 1.001 kHz used to stringify as `1000.9999999999999` (LR-23).
         let mut params = base_params();
         params.frequency_khz = 1.001;
-        let doc = lbrn2_string("BSLFiber", &[EmitLayer::line("C00", params, Vec::new())]);
+        let doc = lbrn2_string("BSLFiber", &[EmitLayer::line("C00", params, Vec::new())]).unwrap();
         assert!(doc.contains("<frequency Value=\"1001\"/>"), "{doc}");
         assert!(!doc.contains("1000.99"), "no float Hz");
     }
@@ -377,8 +452,35 @@ mod tests {
     fn wobble_off_is_emitted_explicitly() {
         // A Line layer with wobble off emits `wobbleEnable Value="0"` rather
         // than omitting it and inheriting a device default (LR-36).
-        let doc = lbrn2_string("BSLFiber", &[EmitLayer::line("C00", base_params(), Vec::new())]);
+        let doc = lbrn2_string(
+            "BSLFiber",
+            &[EmitLayer::line("C00", base_params(), Vec::new())],
+        )
+        .unwrap();
         assert!(doc.contains("<wobbleEnable Value=\"0\"/>"), "{doc}");
+    }
+
+    #[test]
+    fn rejects_invalid_recipe_instead_of_silently_omitting_it() {
+        let mut params = base_params();
+        params.passes = 0;
+        let err =
+            lbrn2_string("BSLFiber", &[EmitLayer::line("C00", params, Vec::new())]).unwrap_err();
+        assert_eq!(err.kind(), io::ErrorKind::InvalidInput);
+
+        params = base_params();
+        params.power_pct = f64::NAN;
+        assert!(lbrn2_string("BSLFiber", &[EmitLayer::line("C00", params, Vec::new())]).is_err());
+    }
+
+    #[test]
+    fn escapes_text_used_in_xml_attributes() {
+        let mut layer = EmitLayer::line("A&B<\"", base_params(), Vec::new());
+        layer.subname = Some("x'y".into());
+        let doc = lbrn2_string("rig & one", &[layer]).unwrap();
+        assert!(doc.contains("DeviceName=\"rig &amp; one\""), "{doc}");
+        assert!(doc.contains("Value=\"A&amp;B&lt;&quot;\""), "{doc}");
+        assert!(doc.contains("Value=\"x&apos;y\""), "{doc}");
     }
 
     /// The VertList/PrimList this emitter produces for the operator's exact
@@ -466,7 +568,7 @@ mod tests {
             closed: true,
         };
         let layers = vec![EmitLayer::fill("C00", base_params(), vec![square])];
-        let doc = lbrn2_string(DEFAULT_DEVICE, &layers);
+        let doc = lbrn2_string(DEFAULT_DEVICE, &layers).unwrap();
         assert!(doc.starts_with("<?xml"));
         assert!(doc.contains("DeviceName=\"BSLFiber\""));
         assert!(doc.trim_end().ends_with("</LightBurnProject>"));
@@ -558,7 +660,7 @@ mod tests {
             EmitLayer::fill("C00", base_params(), vec![tri(0), tri(5), tri(10)]),
             EmitLayer::line("C01", base_params(), vec![tri(15)]),
         ];
-        let doc = lbrn2_string(DEFAULT_DEVICE, &layers);
+        let doc = lbrn2_string(DEFAULT_DEVICE, &layers).unwrap();
         let mut ids: Vec<&str> = doc
             .split("VertID=\"")
             .skip(1)

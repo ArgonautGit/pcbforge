@@ -93,7 +93,7 @@ fn valdemo2_outline_cuts_the_cutout_before_the_perimeter() {
     );
 
     // Schedule for 1.6 + 0.1 mm at defaults (0.05 mm/pass, 0.2 mm steps).
-    let sched = cut::schedule(&opts, (1.6 * NM_PER_MM as f64) as i64);
+    let sched = cut::schedule(&opts, (1.6 * NM_PER_MM as f64) as i64).unwrap();
     assert_eq!(sched.steps.len(), 9);
     assert_eq!(sched.steps[0].passes, 4);
     assert_eq!(sched.steps.last().unwrap().focus_drop_mm, 0.0);

@@ -331,7 +331,10 @@ mod tests {
         let r = require_airflow_with(&mut lines, Machine::Fiber, "/dev/ttyUSB0");
         assert!(r.is_ok());
         // Drove RTS both ways: the self-test deassert plus the assert.
-        assert!(lines.set_rts_calls >= 2, "RTS must be toggled for the self-test");
+        assert!(
+            lines.set_rts_calls >= 2,
+            "RTS must be toggled for the self-test"
+        );
     }
 
     #[test]
