@@ -583,6 +583,7 @@ pub fn step(
         };
         return Ok(report);
     };
+    let run = *run;
 
     let mut stage_state = run.board.stage_state.clone();
     let outcome = {
@@ -607,7 +608,7 @@ pub fn step(
 
 enum Prepared {
     Report(StepReport),
-    Run(PreparedAttempt),
+    Run(Box<PreparedAttempt>),
 }
 
 struct PreparedAttempt {
@@ -664,12 +665,12 @@ fn prepare_step(
     )?;
     db.update_board(&board)?;
 
-    Ok(Prepared::Run(PreparedAttempt {
+    Ok(Prepared::Run(Box::new(PreparedAttempt {
         board,
         stage_name,
         def,
         attempt,
-    }))
+    })))
 }
 
 fn finalize_attempt(

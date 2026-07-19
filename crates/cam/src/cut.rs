@@ -683,15 +683,22 @@ mod tests {
     #[test]
     fn schedule_rejects_invalid_or_unbounded_inputs() {
         let thickness = (1.6 * MM as f64) as Nm;
-        let mut opts = CutOpts::default();
-        opts.mm_per_pass = 0.0;
+        let opts = CutOpts {
+            mm_per_pass: 0.0,
+            ..CutOpts::default()
+        };
         assert!(schedule(&opts, thickness).is_err());
 
-        opts.mm_per_pass = 1e-9;
+        let opts = CutOpts {
+            mm_per_pass: 1e-9,
+            ..CutOpts::default()
+        };
         assert!(schedule(&opts, thickness).is_err());
 
-        opts = CutOpts::default();
-        opts.overcut_mm = f64::NAN;
+        let opts = CutOpts {
+            overcut_mm: f64::NAN,
+            ..CutOpts::default()
+        };
         assert!(schedule(&opts, thickness).is_err());
         assert!(schedule(&CutOpts::default(), 0).is_err());
     }
