@@ -3,6 +3,9 @@ use super::*;
 /// Bidirectional projection used by camera overlays and drag-to-place.
 /// Production geometry is always expressed in physical millimeters; the
 /// homography remains a diagnostic-only fallback for camera overlays.
+// Short-lived per-frame value, never stored in bulk — the variant size gap
+// (polynomial maps vs two 3×3 homographies) has no practical cost.
+#[allow(clippy::large_enum_variant)]
 #[derive(Debug, Clone)]
 pub(super) enum CameraProjection {
     /// Commanded machine mm ↔ camera px. Machine-space overlays use the
@@ -36,6 +39,9 @@ impl CameraProjection {
         finite_pair(p)
     }
 
+    // The natural inverse of `to_px`; the `from_` prefix reads as direction,
+    // not conversion-constructor.
+    #[allow(clippy::wrong_self_convention)]
     pub(super) fn from_px(&self, px: (f64, f64)) -> Option<(f64, f64)> {
         let p = match self {
             Self::CommandedField { lens, field } => {
