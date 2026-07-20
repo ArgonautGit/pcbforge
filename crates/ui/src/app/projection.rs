@@ -144,7 +144,11 @@ impl ConsoleApp {
         dimensions: (u32, u32),
     ) -> Result<Option<CameraProjection>, String> {
         if let Some((lens, frame, field)) = self.nonlinear_maps_for_frame(dimensions)? {
-            return Ok(Some(CameraProjection::CommandedField { lens, frame, field }));
+            return Ok(Some(CameraProjection::CommandedField {
+                lens,
+                frame,
+                field,
+            }));
         }
         let Some(px_to_mm) = self.calibration.anchor.as_ref().map(|c| c.px_to_mm.clone()) else {
             return Ok(None);

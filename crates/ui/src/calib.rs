@@ -413,7 +413,10 @@ impl Rigid2 {
     /// Machine mm → paper mm (rotations invert by transpose).
     pub fn inverse_apply(&self, p: (f64, f64)) -> (f64, f64) {
         let (dx, dy) = (p.0 - self.tx, p.1 - self.ty);
-        (self.cos * dx + self.sin * dy, -self.sin * dx + self.cos * dy)
+        (
+            self.cos * dx + self.sin * dy,
+            -self.sin * dx + self.cos * dy,
+        )
     }
 
     pub fn is_finite(&self) -> bool {
@@ -543,11 +546,7 @@ pub fn commanded_to_camera_px(
 /// into the paper's metric frame, then the burned-grid rigid alignment into
 /// the machine frame. Field-corrected placement uses this direction: the emit
 /// path applies `FieldMap::to_commanded` later, exactly once.
-pub fn camera_px_to_physical(
-    lens: &LensMap,
-    frame: &Rigid2,
-    px: (f64, f64),
-) -> Option<(f64, f64)> {
+pub fn camera_px_to_physical(lens: &LensMap, frame: &Rigid2, px: (f64, f64)) -> Option<(f64, f64)> {
     finite_input(px)?;
     let paper = finite_output(lens.px_to_mm.apply(px.0, px.1))?;
     finite_output(frame.apply(paper))
@@ -872,8 +871,8 @@ mod tests {
             tx: 5.0,
             ty: -3.0,
         };
-        let px = commanded_to_camera_px(&lens, &frame, &field, commanded)
-            .expect("finite projection");
+        let px =
+            commanded_to_camera_px(&lens, &frame, &field, commanded).expect("finite projection");
         let got = camera_px_to_commanded(&lens, &frame, &field, px).expect("finite inverse");
         assert!((got.0 - commanded.0).abs() < 1e-9);
         assert!((got.1 - commanded.1).abs() < 1e-9);
