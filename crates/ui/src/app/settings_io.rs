@@ -2,10 +2,7 @@ use super::*;
 
 /// Space-joined full-precision coefficient row (round-trips through `parse`).
 fn coeff_row(c: &[f64; 23]) -> String {
-    c.iter()
-        .map(f64::to_string)
-        .collect::<Vec<_>>()
-        .join(" ")
+    c.iter().map(f64::to_string).collect::<Vec<_>>().join(" ")
 }
 
 /// Parse a [`coeff_row`] back to the 23 coefficients; `None` on any
@@ -125,7 +122,12 @@ impl ConsoleApp {
                 self.calibration
                     .lens
                     .as_ref()
-                    .map(|c| format!("{} {} {} {}", c.lens.rms_um, c.lens.max_um, c.found, c.total))
+                    .map(|c| {
+                        format!(
+                            "{} {} {} {}",
+                            c.lens.rms_um, c.lens.max_um, c.found, c.total
+                        )
+                    })
                     .unwrap_or_default(),
             ),
             (
@@ -338,9 +340,8 @@ impl ConsoleApp {
                     .filter(|v: &f64| v.is_finite())
                     .collect();
                 let v: [f64; 9] = vals.try_into().ok()?;
-                let mat = nalgebra::Matrix3::new(
-                    v[0], v[1], v[2], v[3], v[4], v[5], v[6], v[7], v[8],
-                );
+                let mat =
+                    nalgebra::Matrix3::new(v[0], v[1], v[2], v[3], v[4], v[5], v[6], v[7], v[8]);
                 vision::Homography::from_matrix(mat).ok()
             });
             let field = std::fs::read_to_string(self.field_map_path())

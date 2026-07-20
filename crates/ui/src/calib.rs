@@ -212,10 +212,7 @@ fn refit(
 /// Refit an anchor after the operator has corrected one or more detected
 /// square centers. The grid identity (`mm`) of every point is retained; only
 /// its observed pixel center changes.
-pub(crate) fn refit_anchor_dots(
-    dots: &[AnchorDot],
-    total: usize,
-) -> Result<Calibration, String> {
+pub(crate) fn refit_anchor_dots(dots: &[AnchorDot], total: usize) -> Result<Calibration, String> {
     if dots.len() < 4 {
         return Err(format!(
             "only {}/{} anchor dots remain — need ≥4",

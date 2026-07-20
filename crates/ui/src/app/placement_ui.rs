@@ -163,8 +163,7 @@ impl ConsoleApp {
                 };
                 self.placement.job.clear();
                 self.placement.frame_img = Some(img);
-                self.placement.tex =
-                    Some(ctx.load_texture("place", bare, TextureOptions::NEAREST));
+                self.placement.tex = Some(ctx.load_texture("place", bare, TextureOptions::NEAREST));
                 return;
             }
         };
