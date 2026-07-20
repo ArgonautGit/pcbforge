@@ -140,7 +140,9 @@ fn the_laser_field_calibration_step_is_selectable() {
     let mut h = console();
     h.get_by_label("🎯 Calibrate").click();
     h.run();
-    h.get_by_label_contains("③ Laser field").click();
+    // Exact label: the substring "③ Laser field" also appears in the Job-tab
+    // export help text, and substring queries panic on multiple matches.
+    h.get_by_label("③ Laser field (burned grid)").click();
     h.run();
     let s = h.state().debug_summary();
     assert!(
@@ -180,14 +182,17 @@ fn laser_anchor_exposes_manual_dot_correction() {
 }
 
 #[test]
-fn place_reports_that_field_warp_is_mandatory() {
+fn place_advertises_conditional_field_warp() {
     let mut h = console();
     h.get_by_label_contains("Place on board").click();
     h.run();
+    // The export gate is a warning, not a lockout: uncalibrated exports emit
+    // unwarped geometry and say so, rather than blocking the operator.
     assert!(
-        h.query_by_label_contains("export disabled until").is_some(),
-        "Place must visibly fail closed until a field map is active"
+        h.query_by_label_contains("else exports unwarped").is_some(),
+        "Place must state that exports without a field map are unwarped"
     );
+    assert!(h.query_by_label_contains("export disabled until").is_none());
     assert!(h.query_by_label("compensate field").is_none());
 }
 
