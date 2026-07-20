@@ -964,12 +964,14 @@ mod tests {
         );
     }
 
-    /// An **ablated** grid images as bright dots on a dark plate. With the
-    /// default `DotKind::Dark` the detector finds nothing; `DotKind::Bright`
-    /// recovers the commanded coordinates — this is the burned-grid case the
-    /// operator hit (0/49 detected until the polarity was switched).
+    /// An **ablated** grid images as bright dots on a dark plate. Polarity is
+    /// a hint, not a gate: `DotKind::Bright` locks it directly, and the
+    /// square-grid fallback rescues a mistaken `DotKind::Dark` selection when
+    /// the generic dark detector finds too little — so the burned-grid case
+    /// the operator hit (0/49 with the wrong polarity) now locks either way.
+    /// Both settings must converge on the same commanded mapping.
     #[test]
-    fn bright_on_dark_needs_the_bright_polarity() {
+    fn bright_on_dark_locks_with_either_polarity() {
         let grid = GridSpec {
             origin_mm: (0.0, 0.0),
             pitch_mm: 10.0,
@@ -1012,24 +1014,22 @@ mod tests {
             (p.x, p.y)
         });
 
-        // Dark detector on a bright-on-dark grid finds nothing usable.
-        assert!(
-            fit_camera_to_machine(&img, corners_px, &grid, dot_mm, DotKind::Dark).is_err(),
-            "dark polarity should fail on an ablated (bright-on-dark) grid"
-        );
-        // Bright detector locks the ablated dots and fits.
-        let cal = fit_camera_to_machine(&img, corners_px, &grid, dot_mm, DotKind::Bright)
+        let dark = fit_camera_to_machine(&img, corners_px, &grid, dot_mm, DotKind::Dark)
+            .expect("square-grid fallback rescues the mistaken dark polarity");
+        let bright = fit_camera_to_machine(&img, corners_px, &grid, dot_mm, DotKind::Bright)
             .expect("bright fit");
-        assert!(cal.found >= 45, "locked most dots: {}", cal.found);
-        assert!(cal.rms_um < 200.0, "tight fit: {} µm", cal.rms_um);
-        let center_px = mm_to_px.apply(Point2::new(30.0, 30.0));
-        let back = cal.px_to_mm.apply(center_px);
-        assert!(
-            (back.x - 30.0).abs() < 0.3 && (back.y - 30.0).abs() < 0.3,
-            "center maps to ~(30,30): ({:.3},{:.3})",
-            back.x,
-            back.y
-        );
+        for (label, cal) in [("dark-fallback", &dark), ("bright", &bright)] {
+            assert!(cal.found >= 45, "{label} locked most dots: {}", cal.found);
+            assert!(cal.rms_um < 200.0, "{label} tight fit: {} µm", cal.rms_um);
+            let center_px = mm_to_px.apply(Point2::new(30.0, 30.0));
+            let back = cal.px_to_mm.apply(center_px);
+            assert!(
+                (back.x - 30.0).abs() < 0.3 && (back.y - 30.0).abs() < 0.3,
+                "{label} center maps to ~(30,30): ({:.3},{:.3})",
+                back.x,
+                back.y
+            );
+        }
     }
 
     /// The camera lens fit locks the printed grid, corrects the barrel
