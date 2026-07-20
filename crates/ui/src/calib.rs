@@ -379,6 +379,100 @@ pub fn re_anchor(
 
 // ---- laser field distortion (burned grid through the metric camera) -------
 
+/// A rigid (rotation + translation, no scale) frame alignment. The ① printed
+/// paper grid characterizes the lens *distortion* and the metric *scale*, but
+/// its pose in the camera view is arbitrary — it's just taped somewhere on
+/// top. The **burned laser grid** is the coordinate reference: this transform
+/// carries the paper's metric frame onto the machine's commanded frame, fit
+/// from the burned dots. Scale is deliberately excluded so a genuine galvo
+/// scale error stays measurable against the paper's printed pitch.
+#[derive(Debug, Clone, Copy, PartialEq)]
+pub struct Rigid2 {
+    pub cos: f64,
+    pub sin: f64,
+    pub tx: f64,
+    pub ty: f64,
+}
+
+impl Rigid2 {
+    pub const IDENTITY: Rigid2 = Rigid2 {
+        cos: 1.0,
+        sin: 0.0,
+        tx: 0.0,
+        ty: 0.0,
+    };
+
+    /// Paper mm → machine mm.
+    pub fn apply(&self, p: (f64, f64)) -> (f64, f64) {
+        (
+            self.cos * p.0 - self.sin * p.1 + self.tx,
+            self.sin * p.0 + self.cos * p.1 + self.ty,
+        )
+    }
+
+    /// Machine mm → paper mm (rotations invert by transpose).
+    pub fn inverse_apply(&self, p: (f64, f64)) -> (f64, f64) {
+        let (dx, dy) = (p.0 - self.tx, p.1 - self.ty);
+        (
+            self.cos * dx + self.sin * dy,
+            -self.sin * dx + self.cos * dy,
+        )
+    }
+
+    pub fn is_finite(&self) -> bool {
+        [self.cos, self.sin, self.tx, self.ty]
+            .iter()
+            .all(|v| v.is_finite())
+    }
+
+    /// Rotation angle, degrees — for operator feedback.
+    pub fn angle_deg(&self) -> f64 {
+        self.sin.atan2(self.cos).to_degrees()
+    }
+}
+
+/// Least-squares rigid alignment `src → dst` (2-D Kabsch/Procrustes without
+/// scale). Needs ≥2 points with non-zero spread.
+pub fn fit_rigid(pairs: &[(Point2<f64>, Point2<f64>)]) -> Result<Rigid2, String> {
+    let n = pairs.len();
+    if n < 2 {
+        return Err(format!("rigid alignment needs ≥2 points, got {n}"));
+    }
+    let nf = n as f64;
+    let (mut ax, mut ay, mut bx, mut by) = (0.0, 0.0, 0.0, 0.0);
+    for (a, b) in pairs {
+        ax += a.x;
+        ay += a.y;
+        bx += b.x;
+        by += b.y;
+    }
+    let (ax, ay, bx, by) = (ax / nf, ay / nf, bx / nf, by / nf);
+    // θ maximizing Σ (a−a̅)·R(θ)ᵀ(b−b̅): atan2 of the cross/dot accumulators.
+    let (mut dot, mut cross, mut spread) = (0.0, 0.0, 0.0_f64);
+    for (a, b) in pairs {
+        let (ux, uy) = (a.x - ax, a.y - ay);
+        let (vx, vy) = (b.x - bx, b.y - by);
+        dot += ux * vx + uy * vy;
+        cross += ux * vy - uy * vx;
+        spread = spread.max(ux.hypot(uy));
+    }
+    if spread < 1e-9 || (dot == 0.0 && cross == 0.0) {
+        return Err("rigid alignment is degenerate: the points have no spread".into());
+    }
+    let theta = cross.atan2(dot);
+    let (sin, cos) = theta.sin_cos();
+    let rigid = Rigid2 {
+        cos,
+        sin,
+        tx: bx - (cos * ax - sin * ay),
+        ty: by - (sin * ax + cos * ay),
+    };
+    rigid
+        .is_finite()
+        .then_some(rigid)
+        .ok_or_else(|| "rigid alignment produced non-finite values".into())
+}
+
 /// One burned-grid dot's laser-field feedback for the overlay: where it was
 /// detected in the frame, the true physical mm it landed at (read through the
 /// camera-lens map), the commanded mm it was burned at, and the field error
@@ -404,6 +498,10 @@ pub struct FieldDot {
 pub struct FieldCal {
     /// Physical machine mm → commanded mm (apply to emitted geometry).
     pub field: FieldMap,
+    /// Paper-frame mm (the ① lens map's output) → machine mm, anchored to the
+    /// burned grid. Every camera↔machine conversion goes through this; the
+    /// paper's pose in the view is arbitrary and carries no meaning.
+    pub paper_to_machine: Rigid2,
     /// Physical machine mm → camera px (a linear approximation, for the Place
     /// overlay so it positions in the same metric frame the emit corrects in).
     pub to_px: Homography,
@@ -422,11 +520,11 @@ pub struct FieldCal {
 /// placement or an operator overlay.
 pub fn camera_px_to_commanded(
     lens: &LensMap,
+    frame: &Rigid2,
     field: &FieldMap,
     px: (f64, f64),
 ) -> Option<(f64, f64)> {
-    finite_input(px)?;
-    let physical = finite_output(lens.px_to_mm.apply(px.0, px.1))?;
+    let physical = camera_px_to_physical(lens, frame, px)?;
     finite_output(field.to_commanded.apply(physical.0, physical.1))
 }
 
@@ -435,28 +533,37 @@ pub fn camera_px_to_commanded(
 /// through the camera lens calibration.
 pub fn commanded_to_camera_px(
     lens: &LensMap,
+    frame: &Rigid2,
     field: &FieldMap,
     commanded: (f64, f64),
 ) -> Option<(f64, f64)> {
     finite_input(commanded)?;
     let physical = invert_poly(&field.to_commanded, &field.to_physical, commanded)?;
-    physical_to_camera_px(lens, physical)
+    physical_to_camera_px(lens, frame, physical)
 }
 
-/// Camera pixel to desired physical bed millimeters. Field-corrected placement
-/// uses this direction: the emit path applies `FieldMap::to_commanded` later,
-/// exactly once.
-pub fn camera_px_to_physical(lens: &LensMap, px: (f64, f64)) -> Option<(f64, f64)> {
+/// Camera pixel to desired physical machine millimeters: through the lens map
+/// into the paper's metric frame, then the burned-grid rigid alignment into
+/// the machine frame. Field-corrected placement uses this direction: the emit
+/// path applies `FieldMap::to_commanded` later, exactly once.
+pub fn camera_px_to_physical(lens: &LensMap, frame: &Rigid2, px: (f64, f64)) -> Option<(f64, f64)> {
     finite_input(px)?;
-    finite_output(lens.px_to_mm.apply(px.0, px.1))
+    let paper = finite_output(lens.px_to_mm.apply(px.0, px.1))?;
+    finite_output(frame.apply(paper))
 }
 
-/// Desired physical bed millimeters to camera pixels. This is the display half
-/// of field-corrected placement; composing the field map here as well would
-/// double-compensate the job.
-pub fn physical_to_camera_px(lens: &LensMap, physical: (f64, f64)) -> Option<(f64, f64)> {
+/// Desired physical machine millimeters to camera pixels (inverse of
+/// [`camera_px_to_physical`]). This is the display half of field-corrected
+/// placement; composing the field map here as well would double-compensate
+/// the job.
+pub fn physical_to_camera_px(
+    lens: &LensMap,
+    frame: &Rigid2,
+    physical: (f64, f64),
+) -> Option<(f64, f64)> {
     finite_input(physical)?;
-    invert_poly(&lens.px_to_mm, &lens.mm_to_px, physical)
+    let paper = finite_output(frame.inverse_apply(physical))?;
+    invert_poly(&lens.px_to_mm, &lens.mm_to_px, paper)
 }
 
 /// Whether every polynomial coefficient needed by the nonlinear camera ↔
@@ -558,13 +665,16 @@ pub fn field_live_acceptance(cal: &FieldCal, grid: &GridSpec) -> Result<(), Stri
 
 /// Fit the laser field pre-distortion from a frame of the **burned** grid and
 /// the four hand-marked corner-dot pixels. `lens` is the camera lens map (from
-/// [`fit_camera_lens`]) that turns the camera into a metric ruler: each burned
-/// dot's detected pixel is mapped to its true physical mm, paired with the
-/// commanded coordinate it was burned at, and a `physical → commanded`
-/// polynomial is fit. Emitting geometry through it cancels the field distortion.
+/// [`fit_camera_lens`]) used purely as a distortion-corrected metric ruler:
+/// each burned dot's detected pixel is mapped into the paper's metric frame,
+/// rigidly re-anchored to the machine frame via the burned grid itself
+/// ([`fit_rigid`]), paired with the commanded coordinate it was burned at, and
+/// a `physical → commanded` polynomial is fit. Emitting geometry through it
+/// cancels the field distortion.
 ///
-/// The camera must not have moved between the lens fit and this frame — both
-/// share the metric frame the lens map defines.
+/// The printed paper's position/rotation in the view is arbitrary — only its
+/// pitch (metric scale) and the lens curvature it characterizes matter. The
+/// camera must not have moved between the lens fit and this frame.
 pub fn fit_laser_field(
     frame: &GrayImage,
     corners_px: [(f64, f64); 4],
@@ -585,15 +695,43 @@ pub fn fit_laser_field(
              (check the burned grid, the corner clicks, the dot size, and polarity)"
         ));
     }
-    // Detected px → true physical mm (camera-lens metric), paired with the
-    // commanded coordinate each dot was burned at.
-    let field_pairs: Vec<(Point2<f64>, Point2<f64>)> = pairs
+    // Detected px → paper-frame mm through the lens ruler. The printed paper
+    // only characterizes distortion + metric scale; its pose in the view is
+    // arbitrary (it's taped on top). The BURNED GRID anchors the coordinate
+    // frame: fit the rigid paper→machine alignment from the burned dots, so
+    // the residual against the commanded lattice is genuine field error, not
+    // where the operator happened to tape the paper.
+    let paper_pairs: Vec<(Point2<f64>, Point2<f64>)> = pairs
         .iter()
         .map(|(fpx, cmd)| {
             let (phx, phy) = lens.px_to_mm.apply(fpx.x, fpx.y);
             (Point2::new(phx, phy), Point2::new(cmd.x, cmd.y))
         })
         .collect();
+    let paper_to_machine =
+        fit_rigid(&paper_pairs).map_err(|e| format!("burned-grid frame alignment: {e}"))?;
+    let field_pairs: Vec<(Point2<f64>, Point2<f64>)> = paper_pairs
+        .iter()
+        .map(|(paper, cmd)| {
+            let (mx, my) = paper_to_machine.apply((paper.x, paper.y));
+            (Point2::new(mx, my), *cmd)
+        })
+        .collect();
+    // A mirrored view (or scrambled corner clicks) cannot be aligned by a
+    // rotation — surface it instead of reporting a nonsense "field error".
+    let align_rms_mm = (field_pairs
+        .iter()
+        .map(|(p, c)| (p.x - c.x).powi(2) + (p.y - c.y).powi(2))
+        .sum::<f64>()
+        / field_pairs.len() as f64)
+        .sqrt();
+    if align_rms_mm > grid.pitch_mm {
+        return Err(format!(
+            "burned-grid frame alignment left {align_rms_mm:.1} mm RMS (≥ one grid pitch) — \
+             the dots don't match the commanded lattice; check the corner click order and the \
+             camera orientation (a mirrored view cannot be rigidly aligned)"
+        ));
+    }
     let field = fit_field(&field_pairs).map_err(|e| format!("field fit: {e}"))?;
     // A linear physical-mm → px map for the Place overlay: fit a homography
     // from each dot's physical position to its detected pixel.
@@ -629,6 +767,7 @@ pub fn fit_laser_field(
         .collect();
     Ok(FieldCal {
         field,
+        paper_to_machine,
         to_px,
         dots,
         found,
@@ -725,14 +864,55 @@ mod tests {
         let (lens, field) = affine_maps();
         assert!(composed_projection_is_finite(&lens, &field));
         let commanded = (37.0, 24.0);
-        let px = commanded_to_camera_px(&lens, &field, commanded).expect("finite projection");
-        let got = camera_px_to_commanded(&lens, &field, px).expect("finite inverse");
+        // A non-trivial paper→machine anchor: 90° rotation + offset.
+        let frame = Rigid2 {
+            cos: 0.0,
+            sin: 1.0,
+            tx: 5.0,
+            ty: -3.0,
+        };
+        let px =
+            commanded_to_camera_px(&lens, &frame, &field, commanded).expect("finite projection");
+        let got = camera_px_to_commanded(&lens, &frame, &field, px).expect("finite inverse");
         assert!((got.0 - commanded.0).abs() < 1e-9);
         assert!((got.1 - commanded.1).abs() < 1e-9);
 
-        let physical = camera_px_to_physical(&lens, px).expect("metric camera");
-        let px2 = physical_to_camera_px(&lens, physical).expect("camera projection");
+        let physical = camera_px_to_physical(&lens, &frame, px).expect("metric camera");
+        let px2 = physical_to_camera_px(&lens, &frame, physical).expect("camera projection");
         assert!((px2.0 - px.0).abs() < 1e-9 && (px2.1 - px.1).abs() < 1e-9);
+    }
+
+    /// The rigid fit recovers a known rotation+translation and refuses
+    /// degenerate input; apply/inverse_apply round-trip.
+    #[test]
+    fn rigid_alignment_recovers_pose_and_round_trips() {
+        let truth = Rigid2 {
+            cos: (0.3_f64).cos(),
+            sin: (0.3_f64).sin(),
+            tx: 12.5,
+            ty: -7.25,
+        };
+        let pairs: Vec<(Point2<f64>, Point2<f64>)> = (0..5)
+            .flat_map(|r| (0..5).map(move |c| (c as f64 * 10.0, r as f64 * 10.0)))
+            .map(|p| {
+                let q = truth.apply(p);
+                (Point2::new(p.0, p.1), Point2::new(q.0, q.1))
+            })
+            .collect();
+        let fit = fit_rigid(&pairs).expect("rigid fit");
+        assert!((fit.cos - truth.cos).abs() < 1e-12);
+        assert!((fit.sin - truth.sin).abs() < 1e-12);
+        assert!((fit.tx - truth.tx).abs() < 1e-9);
+        assert!((fit.ty - truth.ty).abs() < 1e-9);
+
+        let p = (3.7, -1.2);
+        let round = fit.inverse_apply(fit.apply(p));
+        assert!((round.0 - p.0).abs() < 1e-12 && (round.1 - p.1).abs() < 1e-12);
+
+        let coincident: Vec<_> = (0..4)
+            .map(|_| (Point2::new(1.0, 1.0), Point2::new(2.0, 2.0)))
+            .collect();
+        assert!(fit_rigid(&coincident).is_err(), "no spread is refused");
     }
 
     #[test]
@@ -742,8 +922,9 @@ mod tests {
         coeffs[0] = f64::NAN;
         field.to_physical = vision::Poly2::from_coeffs(&coeffs);
         assert!(!composed_projection_is_finite(&lens, &field));
-        assert!(commanded_to_camera_px(&lens, &field, (10.0, 10.0)).is_none());
-        assert!(camera_px_to_commanded(&lens, &field, (f64::INFINITY, 2.0)).is_none());
+        let frame = Rigid2::IDENTITY;
+        assert!(commanded_to_camera_px(&lens, &frame, &field, (10.0, 10.0)).is_none());
+        assert!(camera_px_to_commanded(&lens, &frame, &field, (f64::INFINITY, 2.0)).is_none());
     }
 
     #[test]
@@ -1374,7 +1555,7 @@ mod tests {
             hom_worst_um =
                 hom_worst_um.max(((hm.0 - x).powi(2) + (hm.1 - y).powi(2)).sqrt() * 1000.0);
 
-            let cp = commanded_to_camera_px(&cal.lens, &field, (x, y)).unwrap();
+            let cp = commanded_to_camera_px(&cal.lens, &Rigid2::IDENTITY, &field, (x, y)).unwrap();
             let cm = cal.lens.px_to_mm.apply(cp.0, cp.1);
             composed_worst_um =
                 composed_worst_um.max(((cm.0 - x).powi(2) + (cm.1 - y).powi(2)).sqrt() * 1000.0);

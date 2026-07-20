@@ -1889,6 +1889,33 @@ Changing the calibration polynomial would only fit those wrong observations.
   and the homography/residuals are re-fit immediately. Live re-anchoring pauses
   during correction so it cannot overwrite the operator's review.
 
+## 2026-07-19 — Field frame anchored to the burned grid, not the paper (operator-reported)
+
+- The operator's first real ③ Laser-field fit "failed" with raw worst 52 mm
+  and all error arrows sweeping one diagonal: the fit paired commanded coords
+  with positions read through the ① lens map, whose metric frame is the
+  **printed paper's** — wherever the paper happened to be taped. The paper
+  cannot occupy the same spot as the burned grid (it sits on top), so its pose
+  offset/rotation appeared as a giant fake "field error" the polynomial had to
+  absorb, and the residual noise still tripped the 50/100 µm gate.
+- Operator-stated principle, now implemented: **the printed paper is only for
+  lens characterization; every coordinate/anchor reference comes from the
+  burned laser grid.** `fit_laser_field` maps detected dots px→paper-mm, fits
+  a rigid (rotation+translation, `calib::fit_rigid`, 2-D Kabsch) paper→machine
+  alignment against the commanded lattice, and defines physical mm as the
+  aligned coords. Scale is deliberately excluded from the alignment so the
+  paper's printed pitch stays the metric authority and a genuine galvo scale
+  error remains measurable (the UniformScale verdict then points at
+  printer/galvo scale). An alignment residual ≥ one grid pitch errors out
+  ("mirrored view / corner order") instead of fitting nonsense.
+- The rigid anchor (`FieldCal::paper_to_machine`) threads through every
+  camera↔machine conversion: `camera_px_to_physical`/`physical_to_camera_px`/
+  `camera_px_to_commanded`/`commanded_to_camera_px` take it, and
+  `CameraProjection::{PhysicalLens, CommandedField}` carry it — so Place and
+  the overlays are burned-grid-anchored too (previously they silently used
+  the paper frame). Persisted as the `field_frame` settings key; a saved field
+  calibration without it (pre-fix, paper-anchored) is NOT restored.
+
 ## 2026-07-19 — Calibration persists; export gate relaxed to a warning (operator direction)
 
 - **Persistence:** the ① camera-lens calibration (both bi-cubic Poly2 maps,

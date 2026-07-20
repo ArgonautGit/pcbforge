@@ -13,11 +13,15 @@ pub(super) enum CameraProjection {
     /// the field optics actually land each commanded point.
     CommandedField {
         lens: vision::LensMap,
+        frame: crate::calib::Rigid2,
         field: vision::FieldMap,
     },
     /// Desired physical mm ↔ camera px. Production export applies
     /// physical→commanded field warping exactly once afterward.
-    PhysicalLens { lens: vision::LensMap },
+    PhysicalLens {
+        lens: vision::LensMap,
+        frame: crate::calib::Rigid2,
+    },
     Homography {
         mm_to_px: vision::Homography,
         px_to_mm: vision::Homography,
@@ -27,10 +31,12 @@ pub(super) enum CameraProjection {
 impl CameraProjection {
     pub(super) fn to_px(&self, mm: (f64, f64)) -> Option<(f64, f64)> {
         let p = match self {
-            Self::CommandedField { lens, field } => {
-                crate::calib::commanded_to_camera_px(lens, field, mm)?
+            Self::CommandedField { lens, frame, field } => {
+                crate::calib::commanded_to_camera_px(lens, frame, field, mm)?
             }
-            Self::PhysicalLens { lens } => crate::calib::physical_to_camera_px(lens, mm)?,
+            Self::PhysicalLens { lens, frame } => {
+                crate::calib::physical_to_camera_px(lens, frame, mm)?
+            }
             Self::Homography { mm_to_px, .. } => {
                 let p = mm_to_px.apply(nalgebra::Point2::new(mm.0, mm.1));
                 (p.x, p.y)
@@ -44,10 +50,12 @@ impl CameraProjection {
     #[allow(clippy::wrong_self_convention)]
     pub(super) fn from_px(&self, px: (f64, f64)) -> Option<(f64, f64)> {
         let p = match self {
-            Self::CommandedField { lens, field } => {
-                crate::calib::camera_px_to_commanded(lens, field, px)?
+            Self::CommandedField { lens, frame, field } => {
+                crate::calib::camera_px_to_commanded(lens, frame, field, px)?
             }
-            Self::PhysicalLens { lens } => crate::calib::camera_px_to_physical(lens, px)?,
+            Self::PhysicalLens { lens, frame } => {
+                crate::calib::camera_px_to_physical(lens, frame, px)?
+            }
             Self::Homography { px_to_mm, .. } => {
                 let p = px_to_mm.apply(nalgebra::Point2::new(px.0, px.1));
                 (p.x, p.y)
@@ -59,7 +67,7 @@ impl CameraProjection {
     pub(super) fn label(&self) -> &'static str {
         match self {
             Self::CommandedField { .. } => "commanded mm (lens + laser-field warp)",
-            Self::PhysicalLens { .. } => "physical mm (mandatory field-warped export)",
+            Self::PhysicalLens { .. } => "physical mm (burned-grid frame, field-warped export)",
             Self::Homography { .. } => "machine mm (approximate homography)",
         }
     }
@@ -96,7 +104,7 @@ impl ConsoleApp {
     pub(super) fn nonlinear_maps_for_frame(
         &self,
         dimensions: (u32, u32),
-    ) -> Result<Option<(vision::LensMap, vision::FieldMap)>, String> {
+    ) -> Result<Option<(vision::LensMap, crate::calib::Rigid2, vision::FieldMap)>, String> {
         if !self.calibration.field_accepted {
             return Ok(None);
         }
@@ -117,20 +125,30 @@ impl ConsoleApp {
                 self.calibration.lens_frame_signature, signature
             ));
         }
-        if !crate::calib::composed_projection_is_finite(&lens.lens, &field.field) {
+        if !crate::calib::composed_projection_is_finite(&lens.lens, &field.field)
+            || !field.paper_to_machine.is_finite()
+        {
             return Err(
                 "nonlinear camera/field calibration contains non-finite coefficients".into(),
             );
         }
-        Ok(Some((lens.lens.clone(), field.field.clone())))
+        Ok(Some((
+            lens.lens.clone(),
+            field.paper_to_machine,
+            field.field.clone(),
+        )))
     }
 
     pub(super) fn camera_projection(
         &self,
         dimensions: (u32, u32),
     ) -> Result<Option<CameraProjection>, String> {
-        if let Some((lens, field)) = self.nonlinear_maps_for_frame(dimensions)? {
-            return Ok(Some(CameraProjection::CommandedField { lens, field }));
+        if let Some((lens, frame, field)) = self.nonlinear_maps_for_frame(dimensions)? {
+            return Ok(Some(CameraProjection::CommandedField {
+                lens,
+                frame,
+                field,
+            }));
         }
         let Some(px_to_mm) = self.calibration.anchor.as_ref().map(|c| c.px_to_mm.clone()) else {
             return Ok(None);
@@ -146,8 +164,8 @@ impl ConsoleApp {
         width: u32,
         height: u32,
     ) -> Result<CameraProjection, String> {
-        if let Some((lens, _field)) = self.nonlinear_maps_for_frame((width, height))? {
-            return Ok(CameraProjection::PhysicalLens { lens });
+        if let Some((lens, frame, _field)) = self.nonlinear_maps_for_frame((width, height))? {
+            return Ok(CameraProjection::PhysicalLens { lens, frame });
         }
         // Without an accepted nonlinear calibration, fall back to the saved
         // laser-anchor homography so the operator can still see the frame and

@@ -67,6 +67,7 @@ fn nonlinear_app() -> ConsoleApp {
     });
     app.calibration.field = Some(crate::calib::FieldCal {
         field,
+        paper_to_machine: crate::calib::Rigid2::IDENTITY,
         to_px: vision::Homography {
             matrix: Matrix3::new(10.0, 0.0, 20.0, 0.0, -10.0, 800.0, 0.0, 0.0, 1.0),
             residuals: vec![],
@@ -987,7 +988,8 @@ lens_stats=\n\
 lens_frame_sig=\n\
 field_accepted=false\n\
 field_to_px=\n\
-field_stats=\n";
+field_stats=\n\
+field_frame=\n";
     std::fs::write(&settings, legacy).unwrap();
 
     let app = ConsoleApp::new(db, vec!["true".into()]);

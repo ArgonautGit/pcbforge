@@ -639,8 +639,13 @@ impl ConsoleApp {
             let nonlinear: Option<Vec<egui::Pos2>> = pts
                 .iter()
                 .map(|&mm| {
-                    crate::calib::commanded_to_camera_px(&lens.lens, &cal.field, mm)
-                        .map(|p| to_screen(p.0, p.1))
+                    crate::calib::commanded_to_camera_px(
+                        &lens.lens,
+                        &cal.paper_to_machine,
+                        &cal.field,
+                        mm,
+                    )
+                    .map(|p| to_screen(p.0, p.1))
                 })
                 .collect();
             if let Some(nodes) = nonlinear {
@@ -664,9 +669,11 @@ impl ConsoleApp {
                 let red = Color32::from_rgb(0xd0, 0x40, 0x40);
                 for d in &cal.dots {
                     let det = to_screen(d.px.0, d.px.1);
-                    if let Some(desired) =
-                        crate::calib::physical_to_camera_px(&lens.lens, d.commanded_mm)
-                    {
+                    if let Some(desired) = crate::calib::physical_to_camera_px(
+                        &lens.lens,
+                        &cal.paper_to_machine,
+                        d.commanded_mm,
+                    ) {
                         painter.line_segment([to_screen(desired.0, desired.1), det], (1.2, orange));
                     }
                     let col = if d.resid_um < 50.0 {
