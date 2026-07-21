@@ -20,3 +20,6 @@ paper-grid.svg
 pcbforge-field-map.txt
 pcbforge.console-settings
 pcbforge.sqlite
+
+# KiCad per-user local prefs generated next to sample boards
+*.kicad_prl
