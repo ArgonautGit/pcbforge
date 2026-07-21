@@ -687,6 +687,43 @@ fn gerbers_cmd(
     Ok(())
 }
 
+/// The calibration burn grid as squares: the n×n commanded lattice plus two
+/// off-lattice orientation markers (a lone dot diagonally outside the
+/// lower-left corner, and one below the bottom-edge midpoint) that break the
+/// lattice's mirror symmetry so the burned grid's orientation is unambiguous.
+fn calib_grid_dots(n: usize, pitch_mm: f64, ox: f64, oy: f64, dot_mm: f64) -> Vec<pcb_core::Poly> {
+    let mm = |v: f64| (v * NM_PER_MM as f64).round() as Nm;
+    let half = mm(dot_mm / 2.0);
+    let square = |cx: Nm, cy: Nm| pcb_core::Poly {
+        outer: vec![
+            pcb_core::P::new(cx - half, cy - half),
+            pcb_core::P::new(cx + half, cy - half),
+            pcb_core::P::new(cx + half, cy + half),
+            pcb_core::P::new(cx - half, cy + half),
+        ],
+        holes: vec![],
+    };
+
+    let mut dots: Vec<pcb_core::Poly> = Vec::with_capacity(n * n + 2);
+    for row in 0..n {
+        for col in 0..n {
+            dots.push(square(
+                mm(ox + col as f64 * pitch_mm),
+                mm(oy + row as f64 * pitch_mm),
+            ));
+        }
+    }
+    // Two off-lattice orientation markers (nearest lattice site is ≥0.5·pitch
+    // away, so per-site detector windows never lock onto them): one diagonally
+    // outside the lower-left corner, one below the bottom-edge midpoint.
+    dots.push(square(mm(ox - pitch_mm * 0.5), mm(oy - pitch_mm * 0.5)));
+    dots.push(square(
+        mm(ox + (n - 1) as f64 * pitch_mm / 2.0),
+        mm(oy - pitch_mm * 0.5),
+    ));
+    dots
+}
+
 fn calib_grid_cmd(
     out: &std::path::Path,
     n: usize,
@@ -706,26 +743,7 @@ fn calib_grid_cmd(
         .and_then(|(a, b)| Some((a.trim().parse::<f64>().ok()?, b.trim().parse::<f64>().ok()?)))
         .ok_or_else(|| format!("--origin must be \"x,y\", got {origin:?}"))?;
 
-    let mm = |v: f64| (v * NM_PER_MM as f64).round() as Nm;
-    let half = mm(dot_mm / 2.0);
-    let mut dots: Vec<pcb_core::Poly> = Vec::with_capacity(n * n);
-    for row in 0..n {
-        for col in 0..n {
-            let (cx, cy) = (
-                mm(ox + col as f64 * pitch_mm),
-                mm(oy + row as f64 * pitch_mm),
-            );
-            dots.push(pcb_core::Poly {
-                outer: vec![
-                    pcb_core::P::new(cx - half, cy - half),
-                    pcb_core::P::new(cx + half, cy - half),
-                    pcb_core::P::new(cx + half, cy + half),
-                    pcb_core::P::new(cx - half, cy + half),
-                ],
-                holes: vec![],
-            });
-        }
-    }
+    let dots = calib_grid_dots(n, pitch_mm, ox, oy, dot_mm);
     // A modest fill recipe; the operator tunes power for a clean dark dot.
     let params = AblationParams {
         power_pct: 20.0,
@@ -1867,5 +1885,84 @@ mod tests {
         assert!(paper_grid_svg(1, 10.0, 2.0).is_err());
         assert!(paper_grid_svg(9, 0.0, 2.0).is_err());
         assert!(paper_grid_svg(9, 10.0, 0.0).is_err());
+    }
+
+    /// Convert mm to nm exactly as `calib_grid_dots` does, for expectation math.
+    fn nm(v: f64) -> Nm {
+        (v * NM_PER_MM as f64).round() as Nm
+    }
+
+    /// The centre of a square Poly = the average of its 4 outer vertices.
+    fn poly_center(p: &pcb_core::Poly) -> (Nm, Nm) {
+        let sx: i128 = p.outer.iter().map(|v| v.x as i128).sum();
+        let sy: i128 = p.outer.iter().map(|v| v.y as i128).sum();
+        ((sx / 4) as Nm, (sy / 4) as Nm)
+    }
+
+    #[test]
+    fn calib_grid_dots_has_n_squared_plus_two_squares() {
+        for n in [2usize, 5, 7] {
+            let dots = calib_grid_dots(n, 10.0, 0.0, 0.0, 0.4);
+            assert_eq!(
+                dots.len(),
+                n * n + 2,
+                "n={n} yields n×n lattice + 2 markers"
+            );
+            for d in &dots {
+                assert_eq!(d.outer.len(), 4, "every dot is a square");
+            }
+        }
+    }
+
+    #[test]
+    fn calib_grid_dots_markers_at_specified_off_lattice_positions() {
+        for (ox, oy) in [(0.0, 0.0), (-30.0, -30.0)] {
+            let (n, pitch, dot) = (7usize, 10.0, 0.4);
+            let dots = calib_grid_dots(n, pitch, ox, oy, dot);
+            let diag = poly_center(&dots[n * n]);
+            let mid = poly_center(&dots[n * n + 1]);
+
+            let diag_exp = (nm(ox - pitch * 0.5), nm(oy - pitch * 0.5));
+            let mid_exp = (nm(ox + (n - 1) as f64 * pitch / 2.0), nm(oy - pitch * 0.5));
+            assert!(
+                (diag.0 - diag_exp.0).abs() <= 1 && (diag.1 - diag_exp.1).abs() <= 1,
+                "diagonal marker at {diag:?}, expected {diag_exp:?} (ox={ox}, oy={oy})"
+            );
+            assert!(
+                (mid.0 - mid_exp.0).abs() <= 1 && (mid.1 - mid_exp.1).abs() <= 1,
+                "bottom-mid marker at {mid:?}, expected {mid_exp:?} (ox={ox}, oy={oy})"
+            );
+        }
+    }
+
+    #[test]
+    fn calib_grid_dots_markers_are_off_lattice() {
+        let (n, pitch, ox, oy, dot) = (7usize, 10.0, 0.0, 0.0, 0.4);
+        let dots = calib_grid_dots(n, pitch, ox, oy, dot);
+        let sites: Vec<(Nm, Nm)> = (0..n)
+            .flat_map(|row| {
+                (0..n).map(move |col| (nm(ox + col as f64 * pitch), nm(oy + row as f64 * pitch)))
+            })
+            .collect();
+        let half_pitch_nm = (pitch * 0.5 * NM_PER_MM as f64) as f64;
+
+        for marker in [poly_center(&dots[n * n]), poly_center(&dots[n * n + 1])] {
+            let nearest = sites
+                .iter()
+                .map(|s| {
+                    let dx = (s.0 - marker.0) as f64;
+                    let dy = (s.1 - marker.1) as f64;
+                    (dx * dx + dy * dy).sqrt()
+                })
+                .fold(f64::INFINITY, f64::min);
+            assert!(
+                !sites.contains(&marker),
+                "marker {marker:?} coincides with a lattice site"
+            );
+            assert!(
+                nearest >= half_pitch_nm - 1.0,
+                "marker {marker:?} is {nearest} nm from nearest site, expected ≥ {half_pitch_nm}"
+            );
+        }
     }
 }

@@ -157,6 +157,11 @@ pub(super) struct CalibrationState {
     pub(super) lens_frame_signature: Option<((u32, u32), Orientation)>,
     pub(super) field: Option<crate::calib::FieldCal>,
     pub(super) field_accepted: bool,
+    /// Operator-configurable step 3 laser-field acceptance limits (µm): a fit
+    /// whose residual RMS / worst per-dot error exceeds these is rejected. The
+    /// defaults accept the rig's demonstrated measurement floor.
+    pub(super) accept_rms_um: f64,
+    pub(super) accept_worst_um: f64,
     /// Operator opt-in: absorb a large uniform burn-vs-paper scale (an oversized
     /// machine field) into the ③ field correction instead of refusing the fit.
     /// Off by default — fixing the field size in LightBurn is the cleaner fix.

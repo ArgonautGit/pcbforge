@@ -184,6 +184,8 @@ impl ConsoleApp {
                 lens_frame_signature: None,
                 field: None,
                 field_accepted: false,
+                accept_rms_um: 100.0,
+                accept_worst_um: 250.0,
                 allow_machine_scale: false,
                 lens_arrow_scale: 20.0,
                 anchor_resid_scale: 30.0,
@@ -321,12 +323,17 @@ impl ConsoleApp {
         };
         let field = match &self.calibration.field {
             Some(c) => format!(
-                "{} dots, RMS/worst {:.0}/{:.0}µm, verdict={}, scale={:+.1}%, extrapolated={}, {}",
+                "{} dots, RMS/worst {:.0}/{:.0}µm, verdict={}, scale={:+.1}%, mirrored={}, extrapolated={}, {}",
                 c.found,
                 c.field.rms_um,
                 c.field.max_um,
                 field_verdict_token(&c.field_verdict),
                 (c.scale - 1.0) * 100.0,
+                if c.paper_to_machine.flip_x {
+                    "yes"
+                } else {
+                    "no"
+                },
                 c.extrapolated,
                 if self.calibration.field_accepted {
                     "accepted"
@@ -383,7 +390,7 @@ impl ConsoleApp {
              gerbers: {gerbers}\n\
              calib_anchor: {calib}\n\
              camera_lens: {lens}\n\
-             laser_field: {field} field_correct={} scale_comp={}\n\
+             laser_field: {field} field_correct={} scale_comp={} limits={:.0}/{:.0}µm\n\
              camera_projection: {projection}\n\
              camera_frame: {cam}\n\
              calib_frame: {calib_frame}\n\
@@ -402,6 +409,8 @@ impl ConsoleApp {
             } else {
                 "off"
             },
+            self.calibration.accept_rms_um,
+            self.calibration.accept_worst_um,
             self.camera.show_bed,
             self.camera.field_mm,
             self.camera.field_cx_mm,

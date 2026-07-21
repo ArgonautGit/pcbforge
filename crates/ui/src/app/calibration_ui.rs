@@ -129,8 +129,22 @@ impl ConsoleApp {
             Some(ctx.load_texture("calib-frame", color, TextureOptions::NEAREST));
         self.calibration.frame_img = Some(img);
         self.calibration.corners.clear();
-        self.calibration.note =
-            "click the 4 corner dots: lower-left, lower-right, upper-right, upper-left".into();
+        self.calibration.note = format!("click the 4 corner dots: {}", self.corner_click_order());
+    }
+
+    /// The corner-click order instruction, mode-aware. The step-1 printed paper
+    /// has an arbitrary pose by design, so its corners are named by visual
+    /// position. The burned laser grid (steps 2/3) carries orientation markers
+    /// that break its mirror symmetry, so its corners are named by those markers
+    /// — this is what stops a mirrored-X machine from being silently absorbed
+    /// into the labelling (the flip must reach the fit as a real reflection).
+    pub(super) fn corner_click_order(&self) -> &'static str {
+        if self.calibration.mode == CalibMode::CameraLens {
+            "lower-left, lower-right, upper-right, upper-left"
+        } else {
+            "LL = the corner nearest the lone diagonal marker; LR = the far corner of the edge \
+             with the midpoint marker; then UR, UL"
+        }
     }
 
     /// Fit the camera→laser calibration from the 4 clicked corners.
@@ -141,8 +155,9 @@ impl ConsoleApp {
         };
         if self.calibration.corners.len() != 4 {
             self.calibration.note = format!(
-                "click all 4 corner dots (have {}) — LL, LR, UR, UL",
-                self.calibration.corners.len()
+                "click all 4 corner dots (have {}) — {}",
+                self.calibration.corners.len(),
+                self.corner_click_order()
             );
             return;
         }
@@ -239,7 +254,12 @@ impl ConsoleApp {
                 ) {
                     Ok(cal) => {
                         let worst = cal.dots.iter().map(|d| d.field_um).fold(0.0_f64, f64::max);
-                        let acceptance = crate::calib::field_live_acceptance(&cal, &grid);
+                        let acceptance = crate::calib::field_live_acceptance(
+                            &cal,
+                            &grid,
+                            self.calibration.accept_rms_um,
+                            self.calibration.accept_worst_um,
+                        );
                         self.calibration.field_accepted = acceptance.is_ok();
                         self.placement.field_correct = false;
                         // classify_field_error assumes the grid is centred on
@@ -298,8 +318,21 @@ impl ConsoleApp {
                                                 )
                                             })
                                             .unwrap_or_default();
+                                        // A fitted mirror means the machine's X
+                                        // axis runs backwards vs commanded
+                                        // coordinates (a LightBurn axis-negate /
+                                        // galvo mapping). The correction accounts
+                                        // for it, but say so loudly so the
+                                        // operator can undo it at the source.
+                                        let mirror_note = cal
+                                            .paper_to_machine
+                                            .flip_x
+                                            .then_some(
+                                                "machine X axis is MIRRORED relative to commanded coordinates — the correction accounts for it; clearing the axis negate in LightBurn and recalibrating removes this; ",
+                                            )
+                                            .unwrap_or_default();
                                         format!(
-                                            "field accepted: {}/{} dots, raw worst {:.0} µm, fit RMS/worst {:.0}/{:.0} µm — {scale_absorbed}{}{off_center_note}{extrapolated_note}",
+                                            "field accepted: {}/{} dots, raw worst {:.0} µm, fit RMS/worst {:.0}/{:.0} µm — {mirror_note}{scale_absorbed}{}{off_center_note}{extrapolated_note}",
                                             cal.found,
                                             cal.total,
                                             worst,
@@ -1017,6 +1050,31 @@ impl ConsoleApp {
                     });
                     ui.end_row();
                 }
+                if self.calibration.mode == CalibMode::LaserField {
+                    let rms_label = ui.label("accept RMS µm");
+                    ui.add(
+                        egui::DragValue::new(&mut self.calibration.accept_rms_um)
+                            .speed(1.0)
+                            .range(10.0..=1000.0),
+                    )
+                    .labelled_by(rms_label.id)
+                    .on_hover_text(
+                        "Reject the step 3 field fit when its residual RMS exceeds this. \
+                         Raise it to accept a fit as good as the camera/optics can measure.",
+                    );
+                    ui.end_row();
+                    let worst_label = ui.label("accept worst µm");
+                    ui.add(
+                        egui::DragValue::new(&mut self.calibration.accept_worst_um)
+                            .speed(1.0)
+                            .range(10.0..=1000.0),
+                    )
+                    .labelled_by(worst_label.id)
+                    .on_hover_text(
+                        "Reject the step 3 field fit when its worst per-dot residual exceeds this.",
+                    );
+                    ui.end_row();
+                }
                 let lbl = ui.label("grid frame (optional)");
                 ui.add(
                     egui::TextEdit::singleline(&mut self.calibration.frame).desired_width(240.0),
@@ -1250,9 +1308,13 @@ impl ConsoleApp {
                         ),
                     );
                     let hint = if !self.calibration.field_accepted {
-                        "This fit did not meet 80% + four-corner + 50/100 µm acceptance; recapture before use."
+                        format!(
+                            "This fit did not meet 80% + four-corner + {:.0}/{:.0} µm acceptance; recapture before use.",
+                            self.calibration.accept_rms_um, self.calibration.accept_worst_um
+                        )
                     } else {
                         "Field warping is mandatory and active for every production console export."
+                            .to_string()
                     };
                     if self.calibration.field_accepted {
                         ui.weak(format!(
@@ -1266,9 +1328,10 @@ impl ConsoleApp {
             }
         }
         ui.label(egui::RichText::new(&self.calibration.note).weak());
-        ui.weak(
-            "Click the 4 corner dots in order: lower-left, lower-right, upper-right, upper-left.",
-        );
+        ui.weak(format!(
+            "Click the 4 corner dots in order: {}.",
+            self.corner_click_order()
+        ));
         ui.weak(NAV_HINT);
         ui.separator();
         self.calib_frame_overlay(ui);

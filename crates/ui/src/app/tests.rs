@@ -1018,6 +1018,8 @@ field_frame=\n";
     assert_eq!(
         new_keys,
         vec![
+            "calib_accept_rms_um",
+            "calib_accept_worst_um",
             "calib_allow_machine_scale",
             "calib_paper_dot_kind",
             "calib_paper_dot_mm",
@@ -1036,6 +1038,151 @@ field_frame=\n";
     for (key, value) in before {
         assert_eq!(after.get(&key), Some(&value), "setting {key}");
     }
+}
+
+/// The operator-configurable step 3 field acceptance limits round-trip.
+#[test]
+fn field_acceptance_limits_persist() {
+    let db = tmp_db();
+    {
+        let mut a = ConsoleApp::new(db.clone(), vec!["true".into()]);
+        a.calibration.accept_rms_um = 120.0;
+        a.calibration.accept_worst_um = 300.0;
+        a.save_settings_if_changed();
+    }
+    let b = ConsoleApp::new(db, vec!["true".into()]);
+    assert!((b.calibration.accept_rms_um - 120.0).abs() < 1e-9);
+    assert!((b.calibration.accept_worst_um - 300.0).abs() < 1e-9);
+}
+
+/// The burned-grid frame anchor's mirror flag round-trips as a 5th
+/// `field_frame` token (`… 1`), and a legacy 4-token blob (written before X
+/// mirroring was representable) restores as un-mirrored.
+#[test]
+fn field_frame_mirror_flag_round_trips() {
+    use nalgebra::{Matrix3, Point2};
+    let coords = [0.0, 20.0, 40.0, 60.0];
+    let lens = {
+        let pairs: Vec<_> = coords
+            .iter()
+            .flat_map(|&y| {
+                coords.iter().map(move |&x| {
+                    (
+                        Point2::new(10.0 * x + 20.0, 800.0 - 10.0 * y),
+                        Point2::new(x, y),
+                    )
+                })
+            })
+            .collect();
+        vision::fit_lens(&pairs).unwrap()
+    };
+    let field = {
+        let pairs: Vec<_> = coords
+            .iter()
+            .flat_map(|&y| {
+                coords
+                    .iter()
+                    .map(move |&x| (Point2::new(x, y), Point2::new(x, y)))
+            })
+            .collect();
+        vision::fit_field(&pairs).unwrap()
+    };
+    let to_px = vision::Homography {
+        matrix: Matrix3::new(10.0, 0.0, 20.0, 0.0, -10.0, 800.0, 0.0, 0.0, 1.0),
+        residuals: vec![],
+        rms: 0.0,
+    };
+    let flipped = crate::calib::Rigid2 {
+        cos: (0.2_f64).cos(),
+        sin: (0.2_f64).sin(),
+        tx: 3.5,
+        ty: -1.25,
+        flip_x: true,
+    };
+    let make_app = |db: &PathBuf, frame: crate::calib::Rigid2| {
+        let mut a = ConsoleApp::new(db.clone(), vec!["true".into()]);
+        a.calibration.lens = Some(crate::calib::CameraCal {
+            lens: lens.clone(),
+            dots: vec![],
+            found: 16,
+            total: 16,
+        });
+        a.calibration.field = Some(crate::calib::FieldCal {
+            field: field.clone(),
+            paper_to_machine: frame,
+            to_px: to_px.clone(),
+            dots: vec![],
+            found: 16,
+            total: 16,
+            field_verdict: vision::classify_field_error(&[]),
+            scale: 1.0,
+            extrapolated: 0,
+        });
+        a.calibration.field_accepted = true;
+        a.calibration.lens_frame_signature = Some(((800, 800), Orientation::Normal));
+        // The reload path reads the FieldMap from the field-map file.
+        std::fs::write(a.field_map_path(), field.serialize()).unwrap();
+        a
+    };
+
+    // Save a mirrored frame, reload: flip_x survives as the 5th token = 1.
+    let db = tmp_db();
+    let blob = {
+        let mut a = make_app(&db, flipped);
+        a.save_settings_if_changed();
+        a.settings_blob()
+    };
+    assert!(
+        blob.lines()
+            .any(|l| l.starts_with("field_frame=") && l.trim_end().ends_with(" 1")),
+        "flip serializes as the 5th field_frame token = 1:\n{blob}"
+    );
+    let b = ConsoleApp::new(db, vec!["true".into()]);
+    let r = b
+        .calibration
+        .field
+        .as_ref()
+        .expect("field restored")
+        .paper_to_machine;
+    assert!(r.flip_x, "the mirror flag is restored");
+    assert!(
+        (r.cos - flipped.cos).abs() < 1e-9
+            && (r.sin - flipped.sin).abs() < 1e-9
+            && (r.tx - flipped.tx).abs() < 1e-9
+            && (r.ty - flipped.ty).abs() < 1e-9,
+        "the frame parameters survive alongside the flag"
+    );
+
+    // A legacy 4-token field_frame (no flip token) restores as un-mirrored.
+    let legacy_db = tmp_db();
+    let blob4: String = {
+        let a = make_app(
+            &legacy_db,
+            crate::calib::Rigid2 {
+                flip_x: false,
+                ..flipped
+            },
+        );
+        a.settings_blob()
+            .lines()
+            .map(|l| match l.strip_prefix("field_frame=") {
+                Some(v) => {
+                    let toks: Vec<&str> = v.split_whitespace().take(4).collect();
+                    format!("field_frame={}\n", toks.join(" "))
+                }
+                None => format!("{l}\n"),
+            })
+            .collect()
+    };
+    std::fs::write(crate::settings::path_for_db(&legacy_db), blob4).unwrap();
+    let c = ConsoleApp::new(legacy_db, vec!["true".into()]);
+    let rc = c
+        .calibration
+        .field
+        .as_ref()
+        .expect("legacy field restored")
+        .paper_to_machine;
+    assert!(!rc.flip_x, "a 4-token field_frame restores un-mirrored");
 }
 
 /// The two parameter sets persist independently once both exist.

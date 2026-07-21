@@ -88,6 +88,14 @@ impl ConsoleApp {
                 "calib_allow_machine_scale",
                 self.calibration.allow_machine_scale.to_string(),
             ),
+            (
+                "calib_accept_rms_um",
+                self.calibration.accept_rms_um.to_string(),
+            ),
+            (
+                "calib_accept_worst_um",
+                self.calibration.accept_worst_um.to_string(),
+            ),
             ("cam_show_bed", self.camera.show_bed.to_string()),
             (
                 "place_field_correct",
@@ -205,7 +213,9 @@ impl ConsoleApp {
                     .map(|f| format!("{} {} {}", f.found, f.total, f.scale))
                     .unwrap_or_default(),
             ),
-            // The burned-grid frame anchor (paper mm → machine mm rigid).
+            // The burned-grid frame anchor (paper mm → machine mm rigid). Five
+            // tokens: cos sin tx ty flip, flip as 0/1 (a mirrored machine axis).
+            // A legacy four-token save loads as flip=0 (not mirrored).
             (
                 "field_frame",
                 self.calibration
@@ -214,7 +224,14 @@ impl ConsoleApp {
                     .filter(|_| self.calibration.field_accepted)
                     .map(|f| {
                         let r = &f.paper_to_machine;
-                        format!("{} {} {} {}", r.cos, r.sin, r.tx, r.ty)
+                        format!(
+                            "{} {} {} {} {}",
+                            r.cos,
+                            r.sin,
+                            r.tx,
+                            r.ty,
+                            if r.flip_x { 1 } else { 0 }
+                        )
                     })
                     .unwrap_or_default(),
             ),
@@ -317,6 +334,20 @@ impl ConsoleApp {
             .and_then(|s| s.trim().parse().ok())
         {
             self.calibration.allow_machine_scale = v;
+        }
+        if let Some(v) = m
+            .get("calib_accept_rms_um")
+            .and_then(|s| s.trim().parse().ok())
+            .filter(|v: &f64| v.is_finite())
+        {
+            self.calibration.accept_rms_um = v.clamp(10.0, 1000.0);
+        }
+        if let Some(v) = m
+            .get("calib_accept_worst_um")
+            .and_then(|s| s.trim().parse().ok())
+            .filter(|v: &f64| v.is_finite())
+        {
+            self.calibration.accept_worst_um = v.clamp(10.0, 1000.0);
         }
         // A persisted field-correction preference is only honored once a field
         // cal exists this session (the placement frame needs it), so this just
@@ -451,12 +482,18 @@ impl ConsoleApp {
                     .filter_map(|t| t.parse().ok())
                     .filter(|v: &f64| v.is_finite())
                     .collect();
-                let v: [f64; 4] = vals.try_into().ok()?;
+                // 4 tokens (legacy) → flip_x=false; 5 tokens → last is 0/1.
+                let (cos, sin, tx, ty, flip_x) = match *vals.as_slice() {
+                    [cos, sin, tx, ty] => (cos, sin, tx, ty, false),
+                    [cos, sin, tx, ty, flip] => (cos, sin, tx, ty, flip != 0.0),
+                    _ => return None,
+                };
                 Some(crate::calib::Rigid2 {
-                    cos: v[0],
-                    sin: v[1],
-                    tx: v[2],
-                    ty: v[3],
+                    cos,
+                    sin,
+                    tx,
+                    ty,
+                    flip_x,
                 })
             });
             let field = std::fs::read_to_string(self.field_map_path())

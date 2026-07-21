@@ -34,8 +34,12 @@ fn calib_grid_emits_the_expected_dot_lattice() {
     );
 
     let doc = std::fs::read_to_string(&out).unwrap();
-    // 49 dots, each a closed Path.
-    assert_eq!(doc.matches("Type=\"Path\"").count(), 49, "7×7 = 49 dots");
+    // 49 lattice dots + 2 off-lattice orientation markers, each a closed Path.
+    assert_eq!(
+        doc.matches("Type=\"Path\"").count(),
+        51,
+        "7×7 lattice + 2 orientation markers"
+    );
     assert!(doc.contains("<PrimList>LineClosed</PrimList>"));
     // The lattice reaches the far corner (a dot centered at (60,60) has an edge
     // at 60.2 mm).
