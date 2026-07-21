@@ -62,6 +62,43 @@ impl ConsoleApp {
         );
     }
 
+    /// Emit the ① printed-paper calibration grid by shelling `pcbforge
+    /// paper-grid` — the operator prints it at 100%, calipers the printed pitch,
+    /// enters that as the step-1 measured pitch, then images it.
+    pub(super) fn calibrate_generate_paper_grid(&mut self) {
+        let out = crate::clean_path(&self.calibration.paper_out);
+        if out.is_empty() {
+            self.calibration.note = "set an output path for the paper grid".into();
+            return;
+        }
+        let params = self.calibration.paper;
+        self.run_verb(&[
+            "paper-grid".into(),
+            "--out".into(),
+            out,
+            "--n".into(),
+            params.n.to_string(),
+            "--pitch-mm".into(),
+            format!("{}", params.pitch_mm),
+            "--dot-mm".into(),
+            format!("{}", params.dot_mm),
+        ]);
+        // Mirror generate-grid: warn but still shell, so the CLI's own
+        // span-too-large error surfaces in the Log.
+        let span = (params.n.saturating_sub(1)) as f64 * params.pitch_mm;
+        let warn = if span > 190.0 {
+            " ⚠ span exceeds the 190 mm printable width — lower pitch or dots per side"
+        } else {
+            ""
+        };
+        self.calibration.note = format!(
+            "generating {n}×{n} paper grid, nominal pitch {p} mm — print at 100%, then CALIPER \
+             the printed pitch and enter it above before fitting — see Log for the file path{warn}",
+            n = params.n,
+            p = params.pitch_mm,
+        );
+    }
+
     /// Load the burned-grid frame — from the camera (source picked in the
     /// Camera tab) when the frame path is empty, else from that file — and
     /// clear any prior corner clicks.
@@ -925,6 +962,18 @@ impl ConsoleApp {
                     .on_hover_text("Ablated mark on a dark plate, or a backlit hole.");
                 });
                 ui.end_row();
+                if self.calibration.mode == CalibMode::CameraLens {
+                    let lbl = ui.label("paper out .svg");
+                    ui.add(
+                        egui::TextEdit::singleline(&mut self.calibration.paper_out)
+                            .desired_width(240.0),
+                    )
+                    .labelled_by(lbl.id)
+                    .on_hover_text(
+                        "Where the printable A4 dot-grid SVG is written. Print it at 100%.",
+                    );
+                    ui.end_row();
+                }
                 if self.calibration.mode != CalibMode::CameraLens {
                     ui.label("grid out .lbrn2");
                     ui.add(
@@ -977,6 +1026,14 @@ impl ConsoleApp {
                 ui.end_row();
             });
         ui.horizontal(|ui| {
+            if self.calibration.mode == CalibMode::CameraLens
+                && ui
+                    .button("Generate paper grid")
+                    .on_hover_text("Emit a print-ready A4 SVG dot grid — print it at 100%.")
+                    .clicked()
+            {
+                self.calibrate_generate_paper_grid();
+            }
             if self.calibration.mode != CalibMode::CameraLens
                 && ui
                     .button("Generate grid")

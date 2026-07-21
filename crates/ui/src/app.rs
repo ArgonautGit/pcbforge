@@ -174,6 +174,7 @@ impl ConsoleApp {
                 },
                 grid_origin_mm: (0.0, 0.0),
                 grid_out: "calib-grid.lbrn2".into(),
+                paper_out: "paper-grid.svg".into(),
                 frame: String::new(),
                 frame_img: None,
                 frame_tex: None,
@@ -388,7 +389,7 @@ impl ConsoleApp {
              calib_frame: {calib_frame}\n\
              bed_overlay: show={} field={:.0}mm center=({:.1},{:.1}) auto={}\n\
              place: x={:.2} y={:.2} rot={:.1}° frame={} note={:?}\n\
-             calib_paper: n={} pitch={:.2}mm dot={:.2}mm contrast={}\n\
+             calib_paper: n={} pitch={:.2}mm dot={:.2}mm contrast={} out={}\n\
              calib_burn: n={} pitch={:.2}mm dot={:.2}mm contrast={} corners_marked={} edit_anchor_dots={} origin=({:.1},{:.1})\n\
              fiducials: {} markers\n\
              settings: {}",
@@ -419,6 +420,7 @@ impl ConsoleApp {
             self.calibration.paper.pitch_mm,
             self.calibration.paper.dot_mm,
             self.calibration.paper.dot_kind.label(),
+            base(&self.calibration.paper_out),
             self.calibration.burn.n,
             self.calibration.burn.pitch_mm,
             self.calibration.burn.dot_mm,

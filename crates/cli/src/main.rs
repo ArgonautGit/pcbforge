@@ -348,6 +348,28 @@ enum Command {
         #[arg(long, default_value = lbrn2::DEFAULT_DEVICE)]
         device: String,
     },
+    /// Emit a PRINT-READY camera-lens calibration dot grid as an A4 SVG (metric
+    /// true: 1 user unit = 1 mm). Print it at 100% (never fit-to-page), tape the
+    /// sheet to the bed, image it with the PCBForge camera, and the console's
+    /// step-1 Camera-lens fit turns the camera into a metric px→mm ruler. Unlike
+    /// the burned `calib-grid`, dots are printed larger (a diameter, not a laser
+    /// spot) so the detector locks reliably on paper.
+    PaperGrid {
+        /// Output SVG path.
+        #[arg(long)]
+        out: PathBuf,
+        /// Dots per side (n×n).
+        #[arg(long, default_value_t = 9)]
+        n: usize,
+        /// Nominal printed grid pitch, mm (measure the print with calipers — the
+        /// step-1 fit wants the MEASURED pitch, since printers scale).
+        #[arg(long, default_value_t = 10.0)]
+        pitch_mm: f64,
+        /// Dot DIAMETER, mm (printed dots are larger than burned ones so the
+        /// camera detector finds them reliably).
+        #[arg(long, default_value_t = 2.0)]
+        dot_mm: f64,
+    },
     /// Camera capture (VIS-1): list devices or grab a single frame. The webcam
     /// backend needs the `camera` feature; `--file` re-reads an image path and
     /// works everywhere (any capture app that writes a frame to disk).
@@ -595,6 +617,12 @@ fn run(cli: &Cli) -> Result<(), Box<dyn std::error::Error>> {
             dot_mm,
             device,
         } => calib_grid_cmd(out, *n, *pitch_mm, origin, *dot_mm, device),
+        Command::PaperGrid {
+            out,
+            n,
+            pitch_mm,
+            dot_mm,
+        } => paper_grid_cmd(out, *n, *pitch_mm, *dot_mm),
         Command::Cam {
             list,
             grab,
@@ -714,6 +742,139 @@ fn calib_grid_cmd(
     let span = (n - 1) as f64 * pitch_mm;
     eprintln!(
         "calib grid: {n}×{n} dots, {pitch_mm} mm pitch, from ({ox}, {oy}) over {span}×{span} mm"
+    );
+    // Print the absolute path so it's findable regardless of the working dir.
+    let abs = std::path::absolute(out).unwrap_or_else(|_| out.to_path_buf());
+    println!("wrote {}", abs.display());
+    Ok(())
+}
+
+/// Largest printed span (outermost dot-centre to outermost dot-centre) that
+/// still fits the printable width once centred on the A4 sheet — chosen so a
+/// US-Letter printer (narrower than A4) reproduces it too.
+const PAPER_MAX_SPAN_MM: f64 = 190.0;
+
+/// Build a print-ready camera-lens calibration grid as an A4 SVG string
+/// (portrait, 1 user unit = 1 mm). Returns the SVG text, or an error when the
+/// parameters are invalid or the lattice can't fit the printable width. Pure
+/// (no I/O) so the geometry is unit-testable.
+fn paper_grid_svg(n: usize, pitch_mm: f64, dot_mm: f64) -> Result<String, String> {
+    if n < 2 {
+        return Err("--n must be at least 2".into());
+    }
+    if pitch_mm <= 0.0 || dot_mm <= 0.0 {
+        return Err("--pitch-mm and --dot-mm must be positive".into());
+    }
+    let span = (n - 1) as f64 * pitch_mm;
+    if span > PAPER_MAX_SPAN_MM {
+        return Err(format!(
+            "requested span (n−1)·pitch = {span} mm exceeds the {PAPER_MAX_SPAN_MM} mm printable \
+             width — reduce --n or --pitch-mm"
+        ));
+    }
+
+    // A4 portrait, mm-true. Everything is kept inside a 190×250 mm box centred
+    // on the sheet so a US-Letter printer fits it as well.
+    const PAGE_W: f64 = 210.0;
+    const CX: f64 = PAGE_W / 2.0; // horizontal page centre (105 mm)
+    let r = dot_mm / 2.0;
+
+    // Lattice: n×n dots, centred horizontally, block in the upper/middle area.
+    let grid_top = 60.0; // first-row dot-centre y
+    let x0 = CX - span / 2.0; // leftmost dot-centre x
+    let grid_bottom = grid_top + span + r; // lowest painted extent
+
+    // Caliper-check bar: a horizontal line with two vertical end ticks whose
+    // CENTRES are exactly 100 mm apart, centred on the page and kept well clear
+    // of the lattice below it.
+    const CALIPER_MM: f64 = 100.0;
+    let tick_lx = CX - CALIPER_MM / 2.0; // 55 mm
+    let tick_rx = CX + CALIPER_MM / 2.0; // 155 mm
+    let bar_y = grid_bottom + 20.0;
+    let tick_h = 4.0; // half-height of each vertical tick
+
+    let mut s = String::new();
+    s.push_str(
+        "<svg xmlns=\"http://www.w3.org/2000/svg\" width=\"210mm\" height=\"297mm\" \
+         viewBox=\"0 0 210 297\">\n",
+    );
+    // White background so the sheet prints clean even in a dark viewer.
+    s.push_str("<rect x=\"0\" y=\"0\" width=\"210\" height=\"297\" fill=\"#fff\"/>\n");
+
+    // Header + instructions (small, outside the lattice).
+    s.push_str(&format!(
+        "<text x=\"{CX}\" y=\"30\" text-anchor=\"middle\" font-family=\"sans-serif\" \
+         font-size=\"4.5\" fill=\"#000\">PCBForge camera-lens paper grid</text>\n"
+    ));
+    s.push_str(&format!(
+        "<text x=\"{CX}\" y=\"38\" text-anchor=\"middle\" font-family=\"sans-serif\" \
+         font-size=\"3.2\" fill=\"#000\">print at 100% / Actual size — never fit-to-page</text>\n"
+    ));
+    s.push_str(&format!(
+        "<text x=\"{CX}\" y=\"44\" text-anchor=\"middle\" font-family=\"sans-serif\" \
+         font-size=\"3.2\" fill=\"#000\">measured pitch = outermost dot-centre span ÷ (n−1) — \
+         enter this as step-1 measured pitch</text>\n"
+    ));
+    s.push_str(&format!(
+        "<text x=\"{CX}\" y=\"50\" text-anchor=\"middle\" font-family=\"sans-serif\" \
+         font-size=\"3.0\" fill=\"#000\">{n}×{n} dots · nominal pitch {pitch_mm} mm · dot ⌀ \
+         {dot_mm} mm</text>\n"
+    ));
+
+    // The dot lattice — the ONLY <circle> elements in the document, so a test
+    // can count them as n×n.
+    s.push_str("<g fill=\"#000\">\n");
+    for row in 0..n {
+        for col in 0..n {
+            let cx = x0 + col as f64 * pitch_mm;
+            let cy = grid_top + row as f64 * pitch_mm;
+            s.push_str(&format!(
+                "<circle cx=\"{cx:.4}\" cy=\"{cy:.4}\" r=\"{r:.4}\"/>\n"
+            ));
+        }
+    }
+    s.push_str("</g>\n");
+
+    // Caliper bar: connecting line + two class-tagged vertical end ticks.
+    s.push_str(&format!(
+        "<line x1=\"{tick_lx:.4}\" y1=\"{bar_y:.4}\" x2=\"{tick_rx:.4}\" y2=\"{bar_y:.4}\" \
+         stroke=\"#000\" stroke-width=\"0.3\"/>\n"
+    ));
+    for tx in [tick_lx, tick_rx] {
+        s.push_str(&format!(
+            "<line class=\"caliper-tick\" x1=\"{tx:.4}\" y1=\"{:.4}\" x2=\"{tx:.4}\" \
+             y2=\"{:.4}\" stroke=\"#000\" stroke-width=\"0.3\"/>\n",
+            bar_y - tick_h,
+            bar_y + tick_h
+        ));
+    }
+    s.push_str(&format!(
+        "<text x=\"{CX}\" y=\"{:.4}\" text-anchor=\"middle\" font-family=\"sans-serif\" \
+         font-size=\"3.2\" fill=\"#000\">tick centres = 100.00 mm — verify the print is at true \
+         scale</text>\n",
+        bar_y + 8.0
+    ));
+
+    s.push_str("</svg>\n");
+    Ok(s)
+}
+
+/// `pcbforge paper-grid` — write a print-ready camera-lens dot grid SVG.
+fn paper_grid_cmd(
+    out: &std::path::Path,
+    n: usize,
+    pitch_mm: f64,
+    dot_mm: f64,
+) -> Result<(), Box<dyn std::error::Error>> {
+    let svg = paper_grid_svg(n, pitch_mm, dot_mm)?;
+    if let Some(dir) = out.parent().filter(|d| !d.as_os_str().is_empty()) {
+        std::fs::create_dir_all(dir).ok();
+    }
+    std::fs::write(out, svg)?;
+    let span = (n - 1) as f64 * pitch_mm;
+    eprintln!(
+        "paper grid: {n}×{n} dots, {pitch_mm} mm nominal pitch, dot ⌀ {dot_mm} mm, \
+         outermost span {span} mm — print at 100%"
     );
     // Print the absolute path so it's findable regardless of the working dir.
     let abs = std::path::absolute(out).unwrap_or_else(|_| out.to_path_buf());
@@ -1629,4 +1790,82 @@ fn recover(
         board.id, board.stage, board.stage_phase
     );
     Ok(())
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    /// Parse the `f64` value of the first `key="..."` attribute in `seg`.
+    fn attr(seg: &str, key: &str) -> f64 {
+        let start = seg.find(key).expect("attribute present") + key.len();
+        let rest = &seg[start..];
+        let end = rest.find('"').expect("attribute closes");
+        rest[..end].parse().expect("attribute is a number")
+    }
+
+    /// The `cx` (or `cy`) of every dot circle, in document order.
+    fn circle_axis(svg: &str, axis: &str) -> Vec<f64> {
+        svg.match_indices("<circle")
+            .map(|(i, _)| attr(&svg[i..], &format!("{axis}=\"")))
+            .collect()
+    }
+
+    #[test]
+    fn paper_grid_has_n_squared_dots() {
+        for n in [2usize, 5, 9] {
+            let svg = paper_grid_svg(n, 10.0, 2.0).unwrap();
+            assert_eq!(
+                svg.matches("<circle").count(),
+                n * n,
+                "n={n} yields n×n dots"
+            );
+        }
+    }
+
+    #[test]
+    fn paper_grid_outermost_span_is_n_minus_one_times_pitch() {
+        let (n, pitch) = (9usize, 10.0);
+        let svg = paper_grid_svg(n, pitch, 2.0).unwrap();
+        let expected = (n - 1) as f64 * pitch;
+        for axis in ["cx", "cy"] {
+            let vals = circle_axis(&svg, axis);
+            let min = vals.iter().cloned().fold(f64::INFINITY, f64::min);
+            let max = vals.iter().cloned().fold(f64::NEG_INFINITY, f64::max);
+            assert!(
+                (max - min - expected).abs() < 1e-3,
+                "{axis} span {} should equal (n−1)·pitch {expected}",
+                max - min
+            );
+        }
+    }
+
+    #[test]
+    fn paper_grid_caliper_ticks_are_100mm_apart() {
+        let svg = paper_grid_svg(9, 10.0, 2.0).unwrap();
+        let xs: Vec<f64> = svg
+            .match_indices("caliper-tick")
+            .map(|(i, _)| attr(&svg[i..], "x1=\""))
+            .collect();
+        assert_eq!(xs.len(), 2, "exactly two caliper ticks");
+        assert!(
+            ((xs[0] - xs[1]).abs() - 100.0).abs() < 1e-6,
+            "tick centres {} and {} are 100 mm apart",
+            xs[0],
+            xs[1]
+        );
+        // The scale bar advertises the reference length to the operator.
+        assert!(svg.contains("tick centres = 100.00 mm"));
+    }
+
+    #[test]
+    fn paper_grid_rejects_an_oversize_span() {
+        // 30×30 at 10 mm → 290 mm span, past the 190 mm printable width.
+        let err = paper_grid_svg(30, 10.0, 2.0).unwrap_err();
+        assert!(err.contains("exceeds"), "oversize error: {err}");
+        // And the basic validation still fires.
+        assert!(paper_grid_svg(1, 10.0, 2.0).is_err());
+        assert!(paper_grid_svg(9, 0.0, 2.0).is_err());
+        assert!(paper_grid_svg(9, 10.0, 0.0).is_err());
+    }
 }

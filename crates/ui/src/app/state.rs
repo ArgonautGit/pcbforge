@@ -146,6 +146,8 @@ pub(super) struct CalibrationState {
     pub(super) burn: GridParams,
     pub(super) grid_origin_mm: (f64, f64),
     pub(super) grid_out: String,
+    /// ① printed-paper grid SVG output path (`paper-grid` verb).
+    pub(super) paper_out: String,
     pub(super) frame: String,
     pub(super) frame_img: Option<image::GrayImage>,
     pub(super) frame_tex: Option<TextureHandle>,

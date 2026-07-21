@@ -74,6 +74,7 @@ impl ConsoleApp {
                 "calib_paper_dot_kind",
                 dot_kind_token(self.calibration.paper.dot_kind).to_string(),
             ),
+            ("calib_paper_out", self.calibration.paper_out.clone()),
             (
                 "calib_grid_origin_x",
                 self.calibration.grid_origin_mm.0.to_string(),
@@ -273,6 +274,7 @@ impl ConsoleApp {
             };
         }
         str_field(&m, "calib_grid_out", &mut self.calibration.grid_out);
+        str_field(&m, "calib_paper_out", &mut self.calibration.paper_out);
         let f32_field = |m: &std::collections::BTreeMap<String, String>, k: &str, dst: &mut f32| {
             if let Some(v) = m
                 .get(k)

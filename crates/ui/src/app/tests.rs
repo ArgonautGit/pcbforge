@@ -1022,6 +1022,7 @@ field_frame=\n";
             "calib_paper_dot_kind",
             "calib_paper_dot_mm",
             "calib_paper_n",
+            "calib_paper_out",
             "calib_paper_pitch_mm",
             "lens_px_bounds",
         ]
@@ -1606,6 +1607,52 @@ fn generate_grid_centers_on_the_field() {
         "grid recentres on the work area: {}",
         app.calibration.note
     );
+}
+
+/// The step-1 paper-grid button shells `paper-grid` and leaves a note that
+/// tells the operator to caliper the printed pitch before fitting.
+#[test]
+fn generate_paper_grid_notes_the_caliper_step() {
+    let mut app = ConsoleApp::new(tmp_db(), vec!["true".into()]);
+    app.calibration.mode = CalibMode::CameraLens;
+    app.calibration.paper.n = 9;
+    app.calibration.paper.pitch_mm = 10.0;
+    app.calibration.paper_out = "paper-grid.svg".into();
+    app.calibrate_generate_paper_grid();
+    assert!(
+        app.calibration.note.contains("9×9 paper grid") && app.calibration.note.contains("CALIPER"),
+        "note reminds the operator to caliper: {}",
+        app.calibration.note
+    );
+    // A comfortable 80 mm span is not flagged.
+    assert!(
+        !app.calibration.note.contains("span exceeds"),
+        "an in-bounds span is not warned: {}",
+        app.calibration.note
+    );
+
+    // A too-large span (29×10 = 280 mm) warns but still shells (the CLI reports
+    // the hard error in the Log).
+    app.calibration.paper.n = 29;
+    app.calibrate_generate_paper_grid();
+    assert!(
+        app.calibration.note.contains("span exceeds the 190 mm"),
+        "an oversize span is warned: {}",
+        app.calibration.note
+    );
+}
+
+/// The ① paper-grid output path round-trips through save + reload.
+#[test]
+fn paper_out_path_persists() {
+    let db = tmp_db();
+    {
+        let mut a = ConsoleApp::new(db.clone(), vec!["true".into()]);
+        a.calibration.paper_out = "sheets/lens-grid.svg".into();
+        a.save_settings_if_changed();
+    }
+    let b = ConsoleApp::new(db, vec!["true".into()]);
+    assert_eq!(b.calibration.paper_out, "sheets/lens-grid.svg");
 }
 
 /// A failed re-fit (wrong corners/polarity — the operator's 0/49 case)
