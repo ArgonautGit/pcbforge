@@ -149,7 +149,7 @@ impl ConsoleApp {
                 ui.add(
                     egui::DragValue::new(&mut self.job.speed_mm_s)
                         .speed(10.0)
-                        .range(1.0..=6000.0),
+                        .range(1.0..=15000.0),
                 )
                 .labelled_by(l.id);
                 ui.end_row();

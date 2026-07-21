@@ -297,7 +297,7 @@ impl ConsoleApp {
             .and_then(|s| s.trim().parse().ok())
             .filter(|v: &f64| v.is_finite())
         {
-            self.job.speed_mm_s = v.clamp(1.0, 6000.0);
+            self.job.speed_mm_s = v.clamp(1.0, 15000.0);
         }
         u32_field(&m, "job_pulse_ns", 0, 500, &mut self.job.pulse_ns);
         if let Some(v) = m
