@@ -311,7 +311,7 @@ enum Command {
         max_rms_mm: f64,
 
         /// Laser field-distortion correction file (from the console's
-        /// ③ Laser-field calibration). When given, every emitted vertex is
+        /// step-3 Laser-field calibration). When given, every emitted vertex is
         /// pre-distorted physical→commanded so the beam cancels the galvo/
         /// f-theta field error; edges are densified so the pre-curvature is
         /// preserved. When omitted, the affine-registered geometry is emitted
