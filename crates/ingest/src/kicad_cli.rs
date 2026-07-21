@@ -304,6 +304,19 @@ impl KicadCli {
 /// (so the program can be pointed at a KiCad *project*, not just a board).
 pub fn resolve_board(path: &Path) -> Result<PathBuf, KicadCliError> {
     if path.is_file() {
+        // A project file (.kicad_pro) can't be loaded as a board — resolve it
+        // to the sibling .kicad_pcb it always sits next to.
+        if path.extension().is_some_and(|x| x == "kicad_pro") {
+            let board = path.with_extension("kicad_pcb");
+            if board.is_file() {
+                return Ok(board);
+            }
+            return Err(KicadCliError::NotFound(format!(
+                "{} is a project file and no board sits next to it ({} not found)",
+                path.display(),
+                board.display()
+            )));
+        }
         return Ok(path.to_path_buf());
     }
     if path.is_dir() {
@@ -407,6 +420,18 @@ mod tests {
         // A board file resolves to itself.
         let board = repo_root().join("samples/kicad/valdemo2.kicad_pcb");
         assert_eq!(resolve_board(&board).unwrap(), board);
+        // A project file resolves to the board sitting next to it.
+        let proj_dir = tmp_dir("pro-resolves");
+        let pro = proj_dir.join("proj.kicad_pro");
+        let pcb = proj_dir.join("proj.kicad_pcb");
+        std::fs::write(&pro, "{}").unwrap();
+        std::fs::copy(&board, &pcb).unwrap();
+        assert_eq!(resolve_board(&pro).unwrap(), pcb);
+        // A project file with no sibling board is a named error, not a
+        // "Failed to load board" from kicad-cli downstream.
+        std::fs::remove_file(&pcb).unwrap();
+        let err = resolve_board(&pro).unwrap_err().to_string();
+        assert!(err.contains("proj.kicad_pcb"), "must name the missing board: {err}");
         // The samples/kicad dir has >1 board → ambiguous, a named error.
         let dir = repo_root().join("samples/kicad");
         assert!(resolve_board(&dir).is_err());
