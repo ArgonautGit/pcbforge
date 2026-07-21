@@ -13,6 +13,7 @@ mod commands;
 mod fiducial_ui;
 mod image_ui;
 mod job_ui;
+mod lightburn_run;
 mod placement_ui;
 mod projection;
 mod settings_io;
@@ -41,6 +42,7 @@ use commands::spawn_verb;
 use commands::{JobShapes, VerbJob};
 pub use commands::{job_shapes, preview_image, run_capture};
 use job_ui::status_color;
+use lightburn_run::{LightburnRun, spawn_lightburn_run};
 use projection::CameraProjection;
 use state::*;
 
@@ -121,6 +123,8 @@ impl ConsoleApp {
                 log: Vec::new(),
                 tab: CentralTab::Job,
                 verb_job: None,
+                pending_lightburn: None,
+                lightburn_run: None,
             },
             job: JobState {
                 kicad_project: String::new(),
@@ -239,6 +243,7 @@ impl ConsoleApp {
                 tex: None,
                 note: "Load a frame + job, then drag / rotate to place it on the board.".into(),
                 field_correct: false,
+                lightburn_device: cam::lbrn2::DEFAULT_DEVICE.to_string(),
             },
             ar: ArState {
                 overlay: false,
@@ -263,6 +268,7 @@ impl ConsoleApp {
     /// under a bare `egui::Context` in tests.
     pub fn ui(&mut self, ctx: &Context) {
         self.pump_verb(ctx);
+        self.pump_lightburn(ctx);
         // Pump the live-capture loops regardless of the visible tab, or a
         // tab-switch during ● Live leaves the device held with no consumer and
         // stop-requests unexecuted until the tab is revisited (LR-45). Each is
@@ -410,7 +416,7 @@ impl ConsoleApp {
              camera_frame: {cam}\n\
              calib_frame: {calib_frame}\n\
              bed_overlay: show={} field={:.0}mm center=({:.1},{:.1}) auto={}\n\
-             place: x={:.2} y={:.2} rot={:.1}° frame={} note={:?}\n\
+             place: x={:.2} y={:.2} rot={:.1}° frame={} lightburn={} device={} note={:?}\n\
              calib_paper: n={} pitch={:.2}mm dot={:.2}mm contrast={} out={}\n\
              calib_burn: n={} pitch={:.2}mm dot={:.2}mm contrast={} corners_marked={} edit_anchor_dots={} feedback={} origin=({:.1},{:.1})\n\
              fiducials: {} markers shape={} w={} h={} profile={} search={} out={}\n\
@@ -439,6 +445,8 @@ impl ConsoleApp {
                 (Some(_), None) => "loaded-no-tex".into(),
                 (None, _) => "none".into(),
             },
+            self.lightburn_token(),
+            self.placement.lightburn_device,
             self.placement.note,
             self.calibration.paper.n,
             self.calibration.paper.pitch_mm,

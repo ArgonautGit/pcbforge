@@ -174,7 +174,11 @@ fn load_place_prefers_a_fresh_camera_grab_over_the_saved_frame_path() {
     app.job.emit_outline = format!("{fixtures}/uv_test-Edge_Cuts.gbr");
     let ctx = Context::default();
     let _ = ctx.run(egui::RawInput::default(), |ctx| app.load_place(ctx));
-    let frame = app.placement.frame_img.as_ref().expect("camera frame cached");
+    let frame = app
+        .placement
+        .frame_img
+        .as_ref()
+        .expect("camera frame cached");
     assert_eq!(
         (frame.width(), frame.height()),
         (64, 48),
@@ -213,7 +217,7 @@ fn anchor_only_place_previews_and_exports_unwarped_with_warning() {
     app.placement.job = vec![pcb_core::Poly::default()];
     app.placement.frame_img = Some(image::GrayImage::new(800, 800));
     app.job.emit_copper = "board.gbr".into();
-    app.emit_at_placement();
+    app.emit_at_placement(false);
     assert!(
         app.runtime
             .log
@@ -248,7 +252,7 @@ fn field_corrected_emit_with_a_missing_map_file_warns_and_emits_unwarped() {
     app.placement.frame_img = Some(image::GrayImage::new(800, 800));
     app.job.emit_copper = "board.gbr".into();
     assert!(!app.field_map_path().exists());
-    app.emit_at_placement();
+    app.emit_at_placement(false);
     assert!(!app.placement.field_correct, "field warp is not armed");
     assert!(
         app.runtime
@@ -275,7 +279,7 @@ fn place_export_always_arms_the_field_warp_when_the_map_exists() {
     let map = app.calibration.field.as_ref().unwrap().field.serialize();
     std::fs::write(app.field_map_path(), map).unwrap();
 
-    app.emit_at_placement();
+    app.emit_at_placement(false);
     assert!(app.placement.field_correct);
     assert!(
         app.runtime
@@ -386,7 +390,10 @@ fn fiducial_tab_lays_out_with_rect_shape() {
     app.fiducials.height_mm = 1.5;
     let ctx = Context::default();
     let out = ctx.run(egui::RawInput::default(), |ctx| app.ui(ctx));
-    assert!(!out.shapes.is_empty(), "rect-shape fiducial tab must render");
+    assert!(
+        !out.shapes.is_empty(),
+        "rect-shape fiducial tab must render"
+    );
     assert!(
         app.debug_summary().contains("shape=rect w=2 h=1.5"),
         "summary reports the rect footprint: {}",
@@ -1104,6 +1111,7 @@ field_frame=\n";
             "job_pulse_ns",
             "job_speed_mm_s",
             "lens_px_bounds",
+            "place_lightburn_device",
         ]
     );
     assert_eq!(after.get("calib_paper_n"), Some(&"9".to_string()));
@@ -2054,13 +2062,107 @@ fn initial_placement_centers_in_the_physical_lens_frame() {
 fn back_side_etch_is_refused() {
     let mut app = ConsoleApp::new(tmp_db(), vec!["true".into()]);
     app.job.side = Side::Back;
-    app.emit_at_placement();
+    app.emit_at_placement(false);
     let last = app.runtime.log.last().expect("a log line was pushed");
     assert!(
         last.err && last.text.contains("back-side"),
         "expected a back-side refusal, got: {}",
         last.text
     );
+}
+
+/// "Etch + run in LightBurn" (run_after=true) queues an ABSOLUTE .lbrn2 path
+/// once the export actually launches, so `pump_verb` can chain the run.
+#[test]
+fn etch_and_run_arms_an_absolute_pending_path() {
+    let mut app = ConsoleApp::new(tmp_db(), vec!["true".into()]);
+    app.calibration.anchor = Some(crate::calib::Calibration {
+        px_to_mm: vision::Homography {
+            matrix: nalgebra::Matrix3::new(0.1, 0.0, 0.0, 0.0, -0.1, 80.0, 0.0, 0.0, 1.0),
+            residuals: vec![],
+            rms: 0.0,
+        },
+        rms_um: 0.0,
+        found: 0,
+        total: 49,
+        dots: Vec::new(),
+    });
+    app.placement.job = vec![pcb_core::Poly::default()];
+    app.placement.frame_img = Some(image::GrayImage::new(800, 800));
+    app.job.emit_copper = "board.gbr".into();
+
+    app.emit_at_placement(true);
+    let pending = app
+        .runtime
+        .pending_lightburn
+        .as_ref()
+        .expect("a LightBurn run was queued");
+    assert!(
+        pending.is_absolute(),
+        "queued path is absolute: {pending:?}"
+    );
+    assert!(app.debug_summary().contains("lightburn=pending"));
+}
+
+/// The placement guard (no frame/job loaded) refuses before the export starts,
+/// so the run_after click arms nothing.
+#[test]
+fn guard_refusal_does_not_arm_a_lightburn_run() {
+    let mut app = ConsoleApp::new(tmp_db(), vec!["true".into()]);
+    // Front side, but no placement job loaded → the "load a frame + job" guard.
+    app.emit_at_placement(true);
+    assert!(
+        app.runtime.pending_lightburn.is_none(),
+        "nothing queued when the guard refuses"
+    );
+    assert!(
+        app.runtime
+            .log
+            .iter()
+            .any(|l| l.err && l.text.contains("load a frame")),
+        "the guard error was logged"
+    );
+    assert!(app.debug_summary().contains("lightburn=idle"));
+}
+
+/// A failed export clears the queued run and says it was skipped, rather than
+/// etching a file the export never wrote.
+#[test]
+fn failed_export_skips_the_queued_lightburn_run() {
+    let mut app = ConsoleApp::new(tmp_db(), vec!["true".into()]);
+    app.runtime.pending_lightburn = Some(std::path::PathBuf::from("/tmp/placed.lbrn2"));
+    app.chain_lightburn_after_verb(false);
+    assert!(
+        app.runtime.pending_lightburn.is_none(),
+        "the queued path is cleared on failure"
+    );
+    assert!(app.runtime.lightburn_run.is_none(), "no run started");
+    assert!(
+        app.runtime
+            .log
+            .iter()
+            .any(|l| l.err && l.text.contains("skipped")),
+        "the skip is logged"
+    );
+}
+
+/// The LightBurn device name round-trips through a save + reload, and a fresh
+/// console reports the default in its summary.
+#[test]
+fn lightburn_device_persists() {
+    let db = tmp_db();
+    {
+        let mut a = ConsoleApp::new(db.clone(), vec!["true".into()]);
+        assert!(
+            a.debug_summary().contains("device=BSLFiber"),
+            "fresh console reports the default device: {}",
+            a.debug_summary()
+        );
+        a.placement.lightburn_device = "MyGalvo".into();
+        a.save_settings_if_changed();
+    }
+    let b = ConsoleApp::new(db, vec!["true".into()]);
+    assert_eq!(b.placement.lightburn_device, "MyGalvo");
 }
 
 /// The calibration status distinguishes "never anchored" from a *saved*

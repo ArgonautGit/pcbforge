@@ -3732,6 +3732,7 @@ dependencies = [
  "accesskit_consumer",
  "cam",
  "capture",
+ "drivers",
  "eframe",
  "egui",
  "egui_kittest",

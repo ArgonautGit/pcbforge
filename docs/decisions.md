@@ -2144,3 +2144,26 @@ culled (Cohen–Sutherland trivial reject), the gray→RGBA base frame is
 converted once at load and cloned per recompose, and the GPU texture is
 updated in place instead of reallocated. Output pixels are unchanged —
 clip-boundary regression tests lock the fill/stroke semantics.
+
+## 2026-07-21 — One-click "Etch + run in LightBurn" from Place
+
+The operator was exporting the registered .lbrn2 from Place, then hand-loading
+and starting it in LightBurn. Place now has a second button, "Etch + run in
+LightBurn": it runs the same register export and, on success, drives LightBurn
+over its officially documented UDP automation interface (datagrams to
+127.0.0.1:19840, replies on the fixed port 19841) to PING, LASER:<device>,
+FORCELOAD the absolute path, gate on STATUS, START, then poll STATUS to
+completion. On this galvo the STATUS busy->idle edge tracks the real burn, so
+"once busy has been seen, the next idle = done" is a valid completion signal
+(a job that never registers busy within 10 s finishes with a warning).
+
+The UDP client lives in the `drivers` crate (`drivers::lightburn`), kept out of
+the UI so the native JCZ/EZCAD driver (DRV-6) can replace it later without
+touching the console. The target address + reply port default to the documented
+ports but are overridable via `PCBFORGE_LIGHTBURN_ADDR` /
+`PCBFORGE_LIGHTBURN_REPLY_PORT`, which lets headless tests point the run at a
+fake LightBurn on ephemeral ports. The run is a background job mirroring the
+existing verb job: it chains off the export only when the export actually
+started and exited cleanly, so a refused or failed export never etches a stale
+file. FORCELOAD uses `std::path::absolute` (not canonicalize) to avoid the
+`\\?\` prefix, which LightBurn mishandles, on a file that may not exist yet.

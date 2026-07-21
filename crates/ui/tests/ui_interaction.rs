@@ -293,6 +293,52 @@ fn place_advertises_conditional_field_warp() {
 }
 
 #[test]
+fn etch_and_run_in_lightburn_button_is_present_and_guards_without_a_job() {
+    let mut h = console();
+    h.get_by_label_contains("Place on board").click();
+    h.run();
+    // A fresh console reports the LightBurn defaults on the place: line.
+    let s = h.state().debug_summary();
+    assert!(
+        summary_line(&s, "place:").contains("lightburn=idle") && s.contains("device=BSLFiber"),
+        "place line reports idle LightBurn + the default device:\n{s}"
+    );
+    // The one-click button exists and is drivable by label.
+    assert!(
+        h.query_by_label("▶ Etch + run in LightBurn").is_some(),
+        "the Etch + run button must be present and labelled"
+    );
+    // Clicking with no frame + job loaded hits the existing guard: nothing is
+    // armed, so the summary still reports lightburn=idle.
+    h.get_by_label("▶ Etch + run in LightBurn").click();
+    h.run();
+    assert!(
+        summary_line(&h.state().debug_summary(), "place:").contains("lightburn=idle"),
+        "the guard refused: no LightBurn run was queued:\n{}",
+        h.state().debug_summary()
+    );
+}
+
+#[test]
+fn lightburn_device_field_is_labelled_and_editable() {
+    let mut h = console();
+    h.get_by_label_contains("Place on board").click();
+    h.run();
+    // The device field is labelled_by its label, so it's drivable.
+    let field = h.get_by_label("LightBurn device");
+    field.focus();
+    field.type_text("Galvo9");
+    h.run();
+    // The field is wired to state (typing lands in the device name, which flows
+    // into the summary); the default is pre-filled, so typing extends it.
+    assert!(
+        summary_line(&h.state().debug_summary(), "place:").contains("Galvo9"),
+        "typing into the device field updates the state:\n{}",
+        h.state().debug_summary()
+    );
+}
+
+#[test]
 fn the_accessibility_tree_exposes_labeled_widgets() {
     let h = console();
     // Buttons carry labels, so they're queryable/drivable by an agent. Use

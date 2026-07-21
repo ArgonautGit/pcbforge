@@ -86,6 +86,12 @@ pub(super) struct RuntimeState {
     pub(super) log: Vec<LogLine>,
     pub(super) tab: CentralTab,
     pub(super) verb_job: Option<VerbJob>,
+    /// A "run in LightBurn" queued to fire when `verb_job` finishes (the
+    /// absolute .lbrn2 the export is writing). Cleared once consumed or skipped.
+    pub(super) pending_lightburn: Option<PathBuf>,
+    /// The active (or most recent) LightBurn run — kept after it finishes so the
+    /// terminal state stays visible; a new run replaces it.
+    pub(super) lightburn_run: Option<LightburnRun>,
 }
 
 pub(super) struct JobState {
@@ -240,6 +246,8 @@ pub(super) struct PlacementState {
     pub(super) tex: Option<TextureHandle>,
     pub(super) note: String,
     pub(super) field_correct: bool,
+    /// LightBurn device name for the one-click "Etch + run in LightBurn".
+    pub(super) lightburn_device: String,
 }
 
 pub(super) struct ArState {

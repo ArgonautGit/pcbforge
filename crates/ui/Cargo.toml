@@ -9,6 +9,7 @@ egui = "0.30"
 capture = { path = "../capture" }
 orchestra = { path = "../orchestra" }
 cam = { path = "../cam" }
+drivers = { path = "../drivers" }
 ingest = { path = "../ingest" }
 vision = { path = "../vision" }
 pcb-core = { workspace = true }

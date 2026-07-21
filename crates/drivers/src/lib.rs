@@ -16,6 +16,8 @@
 //!
 //! See [`SimMarker`] for the spot/dose model and the image frame convention.
 
+pub mod lightburn;
+
 use image::{GrayImage, Luma};
 use pcb_core::{AblationParams, NM_PER_UM, Nm, P, PathElem, Paths};
 

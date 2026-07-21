@@ -259,8 +259,10 @@ impl ConsoleApp {
     }
 
     /// Emit the job registered to the current manual placement by encoding it
-    /// as fiducial correspondences and shelling `pcbforge register`.
-    pub(super) fn emit_at_placement(&mut self) {
+    /// as fiducial correspondences and shelling `pcbforge register`. When
+    /// `run_after` is set, queue a LightBurn "load + run" of the exported file
+    /// to fire once the export succeeds (see [`pump_verb`](Self::pump_verb)).
+    pub(super) fn emit_at_placement(&mut self, run_after: bool) {
         // Back-side etch is not wired: this path hardcodes the FRONT Gerbers and
         // shells `register`, which has no mirror pass — it would emit the front
         // copper's ablate set, unmirrored, translated by the mirrored job's
@@ -325,8 +327,8 @@ impl ConsoleApp {
         // to the copper Gerber — beside their inputs — not in the console's
         // launch directory, which is otherwise a mystery on a GUI.
         let copper = crate::clean_path(&self.job.emit_copper);
-        let out = self.resolve_place_output(&copper);
-        let out = out.to_string_lossy().into_owned();
+        let out_path = self.resolve_place_output(&copper);
+        let out = out_path.to_string_lossy().into_owned();
         let mut args: Vec<String> = vec![
             "register".into(),
             "--copper".into(),
@@ -374,7 +376,30 @@ impl ConsoleApp {
             ),
             err: false,
         });
-        self.run_verb(&args);
+        let started = self.run_verb(&args);
+        // Queue the LightBurn run only when the export actually launched — a
+        // refused click (a job already running) must not arm the chain against
+        // a file this click never wrote. Resolve to an ABSOLUTE path without
+        // canonicalizing: the file may not exist yet, and \\?\ prefixes upset
+        // LightBurn's FORCELOAD.
+        if run_after && started {
+            match std::path::absolute(&out_path) {
+                Ok(abs) => {
+                    self.runtime.pending_lightburn = Some(abs);
+                    self.runtime.log.push(LogLine {
+                        text: "queued: load + run in LightBurn once the export finishes".into(),
+                        err: false,
+                    });
+                }
+                Err(e) => self.runtime.log.push(LogLine {
+                    text: format!(
+                        "place: couldn't resolve an absolute path for the LightBurn run ({e}) — \
+                         the export will still be written"
+                    ),
+                    err: true,
+                }),
+            }
+        }
     }
 
     /// Absolute output path for "Etch here". An absolute `place_lbrn2` is used
@@ -415,6 +440,18 @@ impl ConsoleApp {
                          Gerber; the log prints the full path it wrote.",
                     );
                 ui.end_row();
+                let dev = ui.label("LightBurn device");
+                ui.add(
+                    egui::TextEdit::singleline(&mut self.placement.lightburn_device)
+                        .desired_width(240.0),
+                )
+                .labelled_by(dev.id)
+                .on_hover_text(
+                    "Device name for \"Etch + run in LightBurn\" — must match a \
+                     configured LightBurn device (the LASER: automation command \
+                     selects it before loading the file).",
+                );
+                ui.end_row();
             });
         ui.horizontal(|ui| {
             if ui
@@ -430,7 +467,26 @@ impl ConsoleApp {
                 self.load_place(&ctx);
             }
             if ui.button("▶ Etch here (register)").clicked() {
-                self.emit_at_placement();
+                self.emit_at_placement(false);
+            }
+            // One-click: export, then load + run it in LightBurn. Disabled while
+            // a run is in flight so a second click can't stack a second job.
+            let lb_running = self
+                .runtime
+                .lightburn_run
+                .as_ref()
+                .is_some_and(|r| !r.finished());
+            if ui
+                .add_enabled(!lb_running, egui::Button::new("▶ Etch + run in LightBurn"))
+                .on_hover_text(
+                    "Runs the register export, then drives LightBurn over its UDP \
+                     automation interface to load the file and START the job — \
+                     reporting progress in the log. LightBurn must be open with \
+                     the device configured.",
+                )
+                .clicked()
+            {
+                self.emit_at_placement(true);
             }
             let has_field = self.has_usable_field_cal();
             self.placement.field_correct = has_field;

@@ -8,7 +8,10 @@ impl ConsoleApp {
     /// Start `pcbforge <args>` on a background thread; its output streams into
     /// the log via [`pump_verb`](Self::pump_verb). Non-blocking — the GUI stays
     /// responsive. One verb at a time; a second is refused while one runs.
-    pub fn run_verb(&mut self, args: &[String]) {
+    /// Returns `true` if the job actually started (so a caller chaining more
+    /// work — e.g. the LightBurn run — can tell a refused click from a real
+    /// launch and not arm the follow-up against a job it never started).
+    pub fn run_verb(&mut self, args: &[String]) -> bool {
         if self
             .runtime
             .verb_job
@@ -19,9 +22,10 @@ impl ConsoleApp {
                 text: "a job is already running — wait for it to finish".into(),
                 err: true,
             });
-            return;
+            return false;
         }
         self.runtime.verb_job = Some(spawn_verb(&self.cli_cmd, args));
+        true
     }
 
     /// Drain any streamed verb output into the log; on completion, refresh the
@@ -34,6 +38,10 @@ impl ConsoleApp {
         if finished {
             lines.extend(job.drain()); // catch any stragglers after the flag
         }
+        // Read the exit result before clearing the job below, so the follow-up
+        // LightBurn chain sees the true success/failure of the run that just
+        // finished (not a default).
+        let succeeded = finished && job.succeeded();
         for l in lines {
             self.runtime.log.push(l);
         }
@@ -44,9 +52,47 @@ impl ConsoleApp {
         if finished {
             self.runtime.verb_job = None;
             self.refresh();
+            self.chain_lightburn_after_verb(succeeded);
         } else {
             ctx.request_repaint();
         }
+    }
+
+    /// After a verb finishes, kick off a queued "run in LightBurn" if the
+    /// placement export requested one. A failed export skips the run (and says
+    /// so); a success spawns the [`LightburnRun`], unless one is already going.
+    pub(super) fn chain_lightburn_after_verb(&mut self, succeeded: bool) {
+        let Some(path) = self.runtime.pending_lightburn.take() else {
+            return;
+        };
+        if !succeeded {
+            self.runtime.log.push(LogLine {
+                text: "LightBurn run skipped — the register export did not finish cleanly".into(),
+                err: true,
+            });
+            return;
+        }
+        if self
+            .runtime
+            .lightburn_run
+            .as_ref()
+            .is_some_and(|r| !r.finished())
+        {
+            self.runtime.log.push(LogLine {
+                text: "LightBurn run skipped — one is already in progress".into(),
+                err: true,
+            });
+            return;
+        }
+        let device = self.placement.lightburn_device.clone();
+        self.runtime.log.push(LogLine {
+            text: format!(
+                "LightBurn: loading {} and running on {device}",
+                path.display()
+            ),
+            err: false,
+        });
+        self.runtime.lightburn_run = Some(spawn_lightburn_run(path, device));
     }
 
     /// (Re)build the preview texture from the active side's Gerbers (the back
@@ -146,6 +192,12 @@ pub fn run_capture(cmd: &[String], args: &[String]) -> Vec<LogLine> {
 pub struct VerbJob {
     rx: Receiver<LogLine>,
     done: Arc<AtomicBool>,
+    /// The child's exit status was success. Meaningful once [`finished`] is
+    /// true; the spawner sets it *before* flipping `done`, so a frame that sees
+    /// `finished()` also sees the settled result.
+    ///
+    /// [`finished`]: VerbJob::finished
+    succeeded: Arc<AtomicBool>,
 }
 
 impl VerbJob {
@@ -160,6 +212,11 @@ impl VerbJob {
     pub(super) fn finished(&self) -> bool {
         self.done.load(Ordering::Relaxed)
     }
+    /// Whether the child exited successfully (exit code 0). Only meaningful once
+    /// [`finished`](VerbJob::finished) is true.
+    pub(super) fn succeeded(&self) -> bool {
+        self.succeeded.load(Ordering::Relaxed)
+    }
 }
 
 /// Spawn `cmd[0] cmd[1..] args`, streaming stdout (info) and stderr (warn)
@@ -168,6 +225,8 @@ pub fn spawn_verb(cmd: &[String], args: &[String]) -> VerbJob {
     let (tx, rx) = mpsc::channel::<LogLine>();
     let done = Arc::new(AtomicBool::new(false));
     let done_t = done.clone();
+    let succeeded = Arc::new(AtomicBool::new(false));
+    let succeeded_t = succeeded.clone();
     let cmd = cmd.to_vec();
     let args = args.to_vec();
     thread::spawn(move || {
@@ -237,9 +296,16 @@ pub fn spawn_verb(cmd: &[String], args: &[String]) -> VerbJob {
             text: format!("[exit {code}]"),
             err: !ok,
         });
+        // Publish the result BEFORE `done`, so a poller that observes
+        // `finished()` also observes the settled `succeeded()`.
+        succeeded_t.store(ok, Ordering::Relaxed);
         done_t.store(true, Ordering::Relaxed);
     });
-    VerbJob { rx, done }
+    VerbJob {
+        rx,
+        done,
+        succeeded,
+    }
 }
 
 /// (board, kept-copper, to-ablate) region sets in the Gerber frame.

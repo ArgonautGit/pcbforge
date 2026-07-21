@@ -45,6 +45,10 @@ impl ConsoleApp {
             ("focal_mm", self.job.focal_mm.to_string()),
             ("place_frame", self.placement.frame.clone()),
             ("place_lbrn2", self.placement.lbrn2.clone()),
+            (
+                "place_lightburn_device",
+                self.placement.lightburn_device.clone(),
+            ),
             ("place_px_per_mm", self.placement.px_per_mm.to_string()),
             ("fid_frame", self.fiducials.frame.clone()),
             ("fid_layout", self.fiducials.layout.clone()),
@@ -266,6 +270,11 @@ impl ConsoleApp {
         str_field(&m, "back_outline", &mut self.job.back_outline);
         str_field(&m, "place_frame", &mut self.placement.frame);
         str_field(&m, "place_lbrn2", &mut self.placement.lbrn2);
+        str_field(
+            &m,
+            "place_lightburn_device",
+            &mut self.placement.lightburn_device,
+        );
         str_field(&m, "fid_frame", &mut self.fiducials.frame);
         str_field(&m, "fid_layout", &mut self.fiducials.layout);
         str_field(&m, "fid_out", &mut self.fiducials.out);
@@ -283,16 +292,15 @@ impl ConsoleApp {
         // LightBurn export recipe, clamped to the DragValue ranges so a
         // hand-edited/corrupt blob can't push them out of bounds. Absent keys
         // keep the defaults (backward compatible).
-        let u32_field =
-            |m: &std::collections::BTreeMap<String, String>,
-             k: &str,
-             lo: u32,
-             hi: u32,
-             dst: &mut u32| {
-                if let Some(v) = m.get(k).and_then(|s| s.trim().parse::<u32>().ok()) {
-                    *dst = v.clamp(lo, hi);
-                }
-            };
+        let u32_field = |m: &std::collections::BTreeMap<String, String>,
+                         k: &str,
+                         lo: u32,
+                         hi: u32,
+                         dst: &mut u32| {
+            if let Some(v) = m.get(k).and_then(|s| s.trim().parse::<u32>().ok()) {
+                *dst = v.clamp(lo, hi);
+            }
+        };
         if let Some(v) = m
             .get("job_speed_mm_s")
             .and_then(|s| s.trim().parse().ok())

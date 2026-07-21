@@ -86,6 +86,56 @@ LightBurn Bridge (Raspberry Pi network relay) is **for Ruida DSP controllers onl
 - **LightBurn ships Linux builds again** (no sign of this; docs reaffirm the drop as of 2026-07) → re-evaluate for 2.x features.
 - **DRV-6 lands** → retire the whole path; nothing here creates lock-in (the daemon is ~100 lines and the .lbrn2 pipeline is unchanged).
 
+## Addendum 2026-07-21 — Windows operator box, official UDP docs, galvo completion signal
+
+Context change since the original report: the machine-identity correction
+(decisions.md, 2026-07-14) established the real setup as a ComMarker Omni X
+(UV galvo, JCZ/EzCad2 family) driven by **LightBurn Pro 2.1.03 on Windows 11**,
+not Linux. That dissolves the Linux-specific constraints above (frozen 1.7.08,
+unverified Linux UDP listener) and changes several verdicts. All URLs accessed
+2026-07-21.
+
+1. **The UDP interface is now officially documented.** LightBurn publishes an
+   "Automation With UDP" guide — command list, ports, and a Python example:
+   <https://docs.lightburnsoftware.com/latest/Guides/AutomationWithUDP/>.
+   The "undocumented/unsupported" caveat in §2.2 no longer applies. Commands to
+   UDP **19840**, replies on **19841** (bind a socket there), plain ASCII, ports
+   still not configurable. No settings toggle — the listener is always on while
+   LightBurn runs.
+2. **Two commands missing from §2.2's list:** `IMPORT:<path>` (import centered
+   in workspace — avoid; use absolute-positioned `.lbrn2` + `FORCELOAD`) and
+   `LASER:<name>` (select device by name — for us `LASER:BSLFiber`). Replies:
+   `OK` = success/idle, `!` = failed/busy, `?` = unknown command.
+3. **Completion detection is trustworthy on galvo.** For galvo devices
+   LightBurn itself executes the job, so `STATUS` returning `!` (busy) → `OK`
+   (idle) reflects the actual burn — staff-endorsed polling loop:
+   <https://forum.lightburnsoftware.com/t/lightburn-udp-automation-gcode-import-questions/174595>.
+   (The known unreliability is Ruida/DSP, where LightBurn loses the job after
+   sending it: <https://forum.lightburnsoftware.com/t/automation-in-lightburn/103319> —
+   irrelevant to us.) `STATUS` requires the device selected and connected;
+   `PING` returns `OK` only when no modal dialog is open, so always use
+   `FORCELOAD`, never `LOADFILE`, to avoid a save-prompt wedging the loop.
+4. **Galvo hardware I/O as a belt-and-braces option:** LightBurn's galvo
+   support can drive a "Done Marking" output pin and accept a "Start Marking"
+   input pin on the JCZ board — a hardware-level job-done/trigger signal
+   independent of UDP (same staff thread as above).
+5. **Still no other surface.** Release notes through 2.0.05/2.1.x add no CLI,
+   scripting, REST API, or watch folder; `SendUDP.exe` remains a load-only
+   wrapper with no `START`. An open feature request for a real CLI confirms the
+   gap: <https://forum.lightburnsoftware.com/t/request-command-line-interface-cli-tool-for-batch-exporting-lbrn2-projects/176431>.
+
+**Revised recommendation:** drive the existing Windows LightBurn 2.1.03
+directly from PCBForge over loopback UDP — no VM, no version pinning, ~zero
+dependencies from Rust (`std::net::UdpSocket`, bind `127.0.0.1:19841`, ~2 s
+read timeout): `PING` (readiness) → `LASER:BSLFiber` → `FORCELOAD:<job.lbrn2>`
+→ `START` → poll `STATUS` until `!`→`OK`. Natural home is a `Marker`
+implementation in `crates/drivers` so orchestra's Laser stages can fire jobs
+unattended. **Bench gate (unchanged in spirit):** verify `START` actually fires
+a job on the Omni X galvo profile before wiring it into the stage engine — the
+staff confirmations don't name the galvo device family explicitly. DRV-6
+(native JCZ driver) remains the eventual replacement; this path adds no
+lock-in.
+
 ## 5. Source log
 
 All accessed 2026-07-08. Forum posts marked (A) = anecdotal.
