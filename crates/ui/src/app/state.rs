@@ -195,9 +195,15 @@ pub(super) struct FiducialState {
     pub(super) frame: String,
     pub(super) layout: String,
     pub(super) px_per_mm: f64,
+    pub(super) shape: crate::fiducial::ShapeKind,
+    /// Circle diameter, or rectangle width (`shape == Rect`).
     pub(super) diameter_mm: f64,
+    /// Rectangle height (ignored when `shape == Circle`).
+    pub(super) height_mm: f64,
     pub(super) search_mm: f64,
     pub(super) profile: crate::fiducial::ProfileKind,
+    /// Output path for the generated fiducial-holes .lbrn2 (`fid-holes` verb).
+    pub(super) out: String,
     pub(super) click_place: bool,
     pub(super) note: String,
     pub(super) rows: Vec<FidRow>,

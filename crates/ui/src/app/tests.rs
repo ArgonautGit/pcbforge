@@ -330,6 +330,25 @@ fn fiducial_tab_lays_out_headless() {
     assert!(!out.shapes.is_empty(), "fiducial tab must render");
 }
 
+/// The Fiducial tab lays out with the Rect shape selected — the width/height
+/// form branch renders (and the summary reports the rect footprint).
+#[test]
+fn fiducial_tab_lays_out_with_rect_shape() {
+    let mut app = ConsoleApp::new(tmp_db(), vec!["true".into()]);
+    app.runtime.tab = CentralTab::Fiducials;
+    app.fiducials.shape = crate::fiducial::ShapeKind::Rect;
+    app.fiducials.diameter_mm = 2.0;
+    app.fiducials.height_mm = 1.5;
+    let ctx = Context::default();
+    let out = ctx.run(egui::RawInput::default(), |ctx| app.ui(ctx));
+    assert!(!out.shapes.is_empty(), "rect-shape fiducial tab must render");
+    assert!(
+        app.debug_summary().contains("shape=rect w=2 h=1.5"),
+        "summary reports the rect footprint: {}",
+        app.debug_summary()
+    );
+}
+
 /// The Place-on-board tab lays out headless (form + placement controls).
 #[test]
 fn place_tab_lays_out_headless() {
@@ -698,7 +717,8 @@ fn profile_selector_changes_detection_polarity() {
         &img,
         &holes,
         ppm,
-        &crate::fiducial::ProfileKind::Backlit.to_profile(1.0),
+        &crate::fiducial::ProfileKind::Backlit
+            .to_profile(vision::FidShape::Circle { diameter_mm: 1.0 }),
         2.0,
     );
     assert_eq!(backlit.tally.0, 3, "backlit finds the bright blobs");
@@ -707,7 +727,8 @@ fn profile_selector_changes_detection_polarity() {
         &img,
         &holes,
         ppm,
-        &crate::fiducial::ProfileKind::DarkDot.to_profile(1.0),
+        &crate::fiducial::ProfileKind::DarkDot
+            .to_profile(vision::FidShape::Circle { diameter_mm: 1.0 }),
         2.0,
     );
     assert!(
@@ -1026,6 +1047,12 @@ field_frame=\n";
             "calib_paper_n",
             "calib_paper_out",
             "calib_paper_pitch_mm",
+            "fid_diameter_mm",
+            "fid_height_mm",
+            "fid_out",
+            "fid_profile",
+            "fid_search_mm",
+            "fid_shape",
             "lens_px_bounds",
         ]
     );
@@ -1183,6 +1210,46 @@ fn field_frame_mirror_flag_round_trips() {
         .expect("legacy field restored")
         .paper_to_machine;
     assert!(!rc.flip_x, "a 4-token field_frame restores un-mirrored");
+}
+
+/// The fiducial shape/footprint/search/profile/out fields round-trip through
+/// a save + reload, and a fresh app reports the circle default in its summary.
+#[test]
+fn fiducial_shape_and_footprint_persist() {
+    let db = tmp_db();
+    {
+        let mut a = ConsoleApp::new(db.clone(), vec!["true".into()]);
+        a.fiducials.shape = crate::fiducial::ShapeKind::Rect;
+        a.fiducials.diameter_mm = 2.5;
+        a.fiducials.height_mm = 1.75;
+        a.fiducials.search_mm = 4.0;
+        a.fiducials.profile = crate::fiducial::ProfileKind::Backlit;
+        a.fiducials.out = "holes.lbrn2".into();
+        a.save_settings_if_changed();
+    }
+    let b = ConsoleApp::new(db, vec!["true".into()]);
+    assert_eq!(b.fiducials.shape, crate::fiducial::ShapeKind::Rect);
+    assert!((b.fiducials.diameter_mm - 2.5).abs() < 1e-9);
+    assert!((b.fiducials.height_mm - 1.75).abs() < 1e-9);
+    assert!((b.fiducials.search_mm - 4.0).abs() < 1e-9);
+    assert_eq!(b.fiducials.profile, crate::fiducial::ProfileKind::Backlit);
+    assert_eq!(b.fiducials.out, "holes.lbrn2");
+}
+
+/// A fresh console's summary reports the fiducial shape (circle by default),
+/// so the headless `state` command surfaces the new fields.
+#[test]
+fn fresh_app_summary_reports_circle_shape() {
+    let app = ConsoleApp::new(tmp_db(), vec!["true".into()]);
+    let summary = app.debug_summary();
+    assert!(
+        summary.contains("shape=circle"),
+        "summary carries the shape token: {summary}"
+    );
+    assert!(
+        summary.contains("profile=dark_dot"),
+        "summary carries the profile token: {summary}"
+    );
 }
 
 /// The two parameter sets persist independently once both exist.

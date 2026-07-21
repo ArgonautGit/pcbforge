@@ -21,7 +21,7 @@
 use egui::{Color32, ColorImage};
 use image::GrayImage;
 use nalgebra::Point2;
-use vision::{BedMap, FiducialProfile, Miss, find_fiducials};
+use vision::{BedMap, FidShape, FiducialProfile, Miss, find_fiducials};
 
 /// Confidence score at or above which a detection is drawn as "strong" (green).
 pub const SCORE_OK: f64 = 0.25;
@@ -40,12 +40,12 @@ pub enum ProfileKind {
 }
 
 impl ProfileKind {
-    /// Build the vision [`FiducialProfile`] for this kind at `diameter_mm`.
-    pub fn to_profile(self, diameter_mm: f64) -> FiducialProfile {
+    /// Build the vision [`FiducialProfile`] for this kind with `shape`.
+    pub fn to_profile(self, shape: FidShape) -> FiducialProfile {
         match self {
-            ProfileKind::DarkDot => FiducialProfile::DarkDot { diameter_mm },
-            ProfileKind::Annulus => FiducialProfile::Annulus { diameter_mm },
-            ProfileKind::Backlit => FiducialProfile::Backlit { diameter_mm },
+            ProfileKind::DarkDot => FiducialProfile::DarkDot { shape },
+            ProfileKind::Annulus => FiducialProfile::Annulus { shape },
+            ProfileKind::Backlit => FiducialProfile::Backlit { shape },
         }
     }
 
@@ -58,12 +58,75 @@ impl ProfileKind {
         }
     }
 
+    /// Stable token for persistence.
+    pub fn token(self) -> &'static str {
+        match self {
+            ProfileKind::DarkDot => "dark_dot",
+            ProfileKind::Annulus => "annulus",
+            ProfileKind::Backlit => "backlit",
+        }
+    }
+
+    /// Parse a [`token`](Self::token) back to a kind.
+    pub fn from_token(s: &str) -> Option<ProfileKind> {
+        ProfileKind::ALL.into_iter().find(|k| k.token() == s)
+    }
+
     /// The three kinds, for populating the combo box.
     pub const ALL: [ProfileKind; 3] = [
         ProfileKind::DarkDot,
         ProfileKind::Annulus,
         ProfileKind::Backlit,
     ];
+}
+
+/// Which [`FidShape`] footprint the operator selected, kept as a plain `Copy`
+/// enum for the UI's combo box (the vision shape carries the actual mm sizes;
+/// this pairs with the diameter/width + height fields to build one).
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub(crate) enum ShapeKind {
+    /// Round hole / dot — sized by a single diameter.
+    Circle,
+    /// Axis-aligned rectangle — sized by width and height.
+    Rect,
+}
+
+impl ShapeKind {
+    /// Short label for the combo box.
+    pub fn label(self) -> &'static str {
+        match self {
+            ShapeKind::Circle => "Circle ⌀",
+            ShapeKind::Rect => "Rectangle",
+        }
+    }
+
+    /// Stable token for persistence and the CLI `--shape` flag.
+    pub fn token(self) -> &'static str {
+        match self {
+            ShapeKind::Circle => "circle",
+            ShapeKind::Rect => "rect",
+        }
+    }
+
+    /// Parse a [`token`](Self::token) back to a kind.
+    pub fn from_token(s: &str) -> Option<ShapeKind> {
+        ShapeKind::ALL.into_iter().find(|k| k.token() == s)
+    }
+
+    /// Build the vision [`FidShape`]: a circle uses `diameter_mm`; a rectangle
+    /// uses `diameter_mm` as its width and `height_mm` as its height.
+    pub fn to_fid_shape(self, diameter_mm: f64, height_mm: f64) -> FidShape {
+        match self {
+            ShapeKind::Circle => FidShape::Circle { diameter_mm },
+            ShapeKind::Rect => FidShape::Rect {
+                w_mm: diameter_mm,
+                h_mm: height_mm,
+            },
+        }
+    }
+
+    /// The two kinds, for populating the combo box.
+    pub const ALL: [ShapeKind; 2] = [ShapeKind::Circle, ShapeKind::Rect];
 }
 
 const CYAN: Color32 = Color32::from_rgb(0x22, 0xcc, 0xdd);
@@ -168,10 +231,10 @@ pub fn check_frame(
         .iter()
         .map(|&(x, y)| Point2::new(x, y))
         .collect();
-    let diameter_mm = profile.diameter_mm();
+    let shape = profile.shape();
     let results = find_fiducials(frame, &expected, search_mm, profile, &bed);
 
-    let overlay = render_overlay(frame, &expected, &results, &bed, diameter_mm, px_per_mm);
+    let overlay = render_overlay(frame, &expected, &results, &bed, shape, px_per_mm);
     let (rows, tally) = summarize(expected_mm, &results);
     // Measured scale from the detected fiducials' spacing.
     let found: Vec<DesignPx> = expected_mm
@@ -301,7 +364,7 @@ fn render_overlay(
     expected: &[Point2<f64>],
     results: &[Result<vision::Fiducial, Miss>],
     bed: &BedMap,
-    diameter_mm: f64,
+    shape: FidShape,
     px_per_mm: f64,
 ) -> ColorImage {
     let (w, h) = (frame.width() as usize, frame.height() as usize);
@@ -311,8 +374,18 @@ fn render_overlay(
     }
     let mut ov = Overlay { px, w, h };
 
-    let r = (diameter_mm * px_per_mm * 0.5).max(3.0) as i32;
-    let arm = (diameter_mm * px_per_mm * 0.9).max(5.0) as i32;
+    // Footprint mm extents; a circle is square. The crosshair arms are sized
+    // off the largest extent so a rectangle's arms still clear its outline.
+    let (w_mm, h_mm) = match shape {
+        FidShape::Circle { diameter_mm } => (diameter_mm, diameter_mm),
+        FidShape::Rect { w_mm, h_mm } => (w_mm, h_mm),
+    };
+    let maxdim = w_mm.max(h_mm);
+    let r = (maxdim * px_per_mm * 0.5).max(3.0) as i32;
+    let arm = (maxdim * px_per_mm * 0.9).max(5.0) as i32;
+    // Rectangle half-extents in pixels (only used for the Rect footprint).
+    let half_w = (w_mm * px_per_mm * 0.5).max(2.0) as i32;
+    let half_h = (h_mm * px_per_mm * 0.5).max(2.0) as i32;
 
     // Expected crosshairs first (under the detections).
     for e in expected {
@@ -329,7 +402,12 @@ fn render_overlay(
                     AMBER
                 };
                 let (cx, cy) = (f.found_px.x as i32, f.found_px.y as i32);
-                ov.ring(cx, cy, r, c);
+                // A circle draws its ring; a rectangle draws its axis-aligned
+                // outline (w×h), both centered on the detected point.
+                match shape {
+                    FidShape::Circle { .. } => ov.ring(cx, cy, r, c),
+                    FidShape::Rect { .. } => ov.rect(cx, cy, half_w, half_h, c),
+                }
                 ov.disk(cx, cy, 2, c);
             }
             Err(_) => {
@@ -403,6 +481,24 @@ impl Overlay {
             }
         }
     }
+    /// An axis-aligned rectangle outline, half-extents `hw`×`hh`, thickened
+    /// one pixel inward so it reads at small sizes (mirrors [`ring`]).
+    fn rect(&mut self, cx: i32, cy: i32, hw: i32, hh: i32, c: Color32) {
+        for t in 0..2 {
+            let (l, r, top, bot) = (cx - hw + t, cx + hw - t, cy - hh + t, cy + hh - t);
+            if l > r || top > bot {
+                continue;
+            }
+            for x in l..=r {
+                self.put(x, top, c);
+                self.put(x, bot, c);
+            }
+            for y in top..=bot {
+                self.put(l, y, c);
+                self.put(r, y, c);
+            }
+        }
+    }
     /// A small filled disk of radius `r`.
     fn disk(&mut self, cx: i32, cy: i32, r: i32, c: Color32) {
         for dy in -r..=r {
@@ -463,7 +559,9 @@ mod tests {
 
     /// The operator's default profile (1 mm drilled hole → dark dot).
     fn dark() -> FiducialProfile {
-        FiducialProfile::DarkDot { diameter_mm: 1.0 }
+        FiducialProfile::DarkDot {
+            shape: FidShape::Circle { diameter_mm: 1.0 },
+        }
     }
 
     /// The operator's L-layout: all three holes found, small offsets, strong

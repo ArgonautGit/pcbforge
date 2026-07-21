@@ -44,6 +44,12 @@ impl ConsoleApp {
             ("fid_frame", self.fiducials.frame.clone()),
             ("fid_layout", self.fiducials.layout.clone()),
             ("fid_px_per_mm", self.fiducials.px_per_mm.to_string()),
+            ("fid_shape", self.fiducials.shape.token().to_string()),
+            ("fid_diameter_mm", self.fiducials.diameter_mm.to_string()),
+            ("fid_height_mm", self.fiducials.height_mm.to_string()),
+            ("fid_search_mm", self.fiducials.search_mm.to_string()),
+            ("fid_profile", self.fiducials.profile.token().to_string()),
+            ("fid_out", self.fiducials.out.clone()),
             ("cam_file", self.camera.file.clone()),
             (
                 "cam_orientation",
@@ -257,6 +263,7 @@ impl ConsoleApp {
         str_field(&m, "place_lbrn2", &mut self.placement.lbrn2);
         str_field(&m, "fid_frame", &mut self.fiducials.frame);
         str_field(&m, "fid_layout", &mut self.fiducials.layout);
+        str_field(&m, "fid_out", &mut self.fiducials.out);
         str_field(&m, "cam_file", &mut self.camera.file);
         let f64_field = |m: &std::collections::BTreeMap<String, String>, k: &str, dst: &mut f64| {
             if let Some(v) = m
@@ -272,6 +279,41 @@ impl ConsoleApp {
         f64_field(&m, "focal_mm", &mut self.job.focal_mm);
         f64_field(&m, "place_px_per_mm", &mut self.placement.px_per_mm);
         f64_field(&m, "fid_px_per_mm", &mut self.fiducials.px_per_mm);
+        // Fiducial footprint + search window, clamped to the DragValue ranges
+        // (a hand-edited or corrupt blob can't push them out of bounds).
+        if let Some(v) = m
+            .get("fid_diameter_mm")
+            .and_then(|s| s.trim().parse().ok())
+            .filter(|v: &f64| v.is_finite())
+        {
+            self.fiducials.diameter_mm = v.clamp(0.05, 20.0);
+        }
+        if let Some(v) = m
+            .get("fid_height_mm")
+            .and_then(|s| s.trim().parse().ok())
+            .filter(|v: &f64| v.is_finite())
+        {
+            self.fiducials.height_mm = v.clamp(0.05, 20.0);
+        }
+        if let Some(v) = m
+            .get("fid_search_mm")
+            .and_then(|s| s.trim().parse().ok())
+            .filter(|v: &f64| v.is_finite())
+        {
+            self.fiducials.search_mm = v.clamp(0.1, 20.0);
+        }
+        if let Some(k) = m
+            .get("fid_shape")
+            .and_then(|s| crate::fiducial::ShapeKind::from_token(s.trim()))
+        {
+            self.fiducials.shape = k;
+        }
+        if let Some(k) = m
+            .get("fid_profile")
+            .and_then(|s| crate::fiducial::ProfileKind::from_token(s.trim()))
+        {
+            self.fiducials.profile = k;
+        }
         f64_field(&m, "calib_pitch_mm", &mut self.calibration.burn.pitch_mm);
         f64_field(
             &m,

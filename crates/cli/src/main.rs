@@ -370,6 +370,30 @@ enum Command {
         #[arg(long, default_value_t = 2.0)]
         dot_mm: f64,
     },
+    /// Emit a LightBurn job that burns fiducial holes at the given positions.
+    FidHoles {
+        /// Output `.lbrn2` path.
+        #[arg(long)]
+        out: PathBuf,
+        /// Fiducial positions in machine mm, "x,y; x,y; ..." (semicolons
+        /// separate points; whitespace is tolerated) — the same format the
+        /// console's Fiducials tab uses.
+        #[arg(long, allow_hyphen_values = true)]
+        layout: String,
+        /// Hole shape: "circle" or "rect".
+        #[arg(long, default_value = "circle")]
+        shape: String,
+        /// Circle diameter, or rect width, mm.
+        #[arg(long, default_value_t = 1.0)]
+        w_mm: f64,
+        /// Rect height, mm; 0 means "same as --w-mm" (a square). Circles take
+        /// only --w-mm.
+        #[arg(long, default_value_t = 0.0)]
+        h_mm: f64,
+        /// LightBurn device name.
+        #[arg(long, default_value = lbrn2::DEFAULT_DEVICE)]
+        device: String,
+    },
     /// Camera capture (VIS-1): list devices or grab a single frame. The webcam
     /// backend needs the `camera` feature; `--file` re-reads an image path and
     /// works everywhere (any capture app that writes a frame to disk).
@@ -623,6 +647,14 @@ fn run(cli: &Cli) -> Result<(), Box<dyn std::error::Error>> {
             pitch_mm,
             dot_mm,
         } => paper_grid_cmd(out, *n, *pitch_mm, *dot_mm),
+        Command::FidHoles {
+            out,
+            layout,
+            shape,
+            w_mm,
+            h_mm,
+            device,
+        } => fid_holes_cmd(out, layout, shape, *w_mm, *h_mm, device),
         Command::Cam {
             list,
             grab,
@@ -893,6 +925,142 @@ fn paper_grid_cmd(
     eprintln!(
         "paper grid: {n}×{n} dots, {pitch_mm} mm nominal pitch, dot ⌀ {dot_mm} mm, \
          outermost span {span} mm — print at 100%"
+    );
+    // Print the absolute path so it's findable regardless of the working dir.
+    let abs = std::path::absolute(out).unwrap_or_else(|_| out.to_path_buf());
+    println!("wrote {}", abs.display());
+    Ok(())
+}
+
+/// Parse `"10,10; 60.5,-10"` into fiducial positions (machine mm). Trims
+/// whitespace, skips an empty trailing token, and names the offending token
+/// on failure. Mirrors `ui::fiducial::parse_layout`'s contract but is
+/// implemented locally so `cli` doesn't depend on `ui`.
+fn parse_fid_layout(s: &str) -> Result<Vec<(f64, f64)>, String> {
+    let mut out = Vec::new();
+    for tok in s.split(';').map(str::trim).filter(|t| !t.is_empty()) {
+        let (xs, ys) = tok
+            .split_once(',')
+            .ok_or_else(|| format!("--layout: bad point {tok:?}, expected \"x,y\""))?;
+        let x: f64 = xs
+            .trim()
+            .parse()
+            .map_err(|_| format!("--layout: bad x in {tok:?}"))?;
+        let y: f64 = ys
+            .trim()
+            .parse()
+            .map_err(|_| format!("--layout: bad y in {tok:?}"))?;
+        out.push((x, y));
+    }
+    if out.is_empty() {
+        return Err("--layout is empty — expected e.g. \"10,10; 60,10; 10,60\"".into());
+    }
+    Ok(out)
+}
+
+/// Minimum segment count for the circle-hole polygon approximation, chosen so
+/// even the smallest holes still look round.
+const FID_CIRCLE_MIN_SEGMENTS: usize = 16;
+
+/// Max allowed chord (sagitta) error for the circle approximation, mm.
+const FID_CIRCLE_CHORD_ERR_MM: f64 = 0.002;
+
+/// Build the fiducial-hole polygons: one ring per position, either an
+/// axis-aligned rect (w×h) or a regular-polygon circle approximation
+/// (diameter `w_mm`). `shape` must already be validated to "circle" or
+/// "rect"; anything else is treated as "circle".
+fn fid_holes_polys(
+    shape: &str,
+    w_mm: f64,
+    h_mm: f64,
+    positions: &[(f64, f64)],
+) -> Vec<pcb_core::Poly> {
+    let mm = |v: f64| (v * NM_PER_MM as f64).round() as Nm;
+
+    if shape == "rect" {
+        let hw = w_mm / 2.0;
+        let hh = h_mm / 2.0;
+        positions
+            .iter()
+            .map(|&(x, y)| pcb_core::Poly {
+                outer: vec![
+                    pcb_core::P::new(mm(x - hw), mm(y - hh)),
+                    pcb_core::P::new(mm(x + hw), mm(y - hh)),
+                    pcb_core::P::new(mm(x + hw), mm(y + hh)),
+                    pcb_core::P::new(mm(x - hw), mm(y + hh)),
+                ],
+                holes: vec![],
+            })
+            .collect()
+    } else {
+        let r = w_mm / 2.0;
+        let ratio = (1.0 - FID_CIRCLE_CHORD_ERR_MM / r).clamp(-1.0, 1.0);
+        let n_seg = (std::f64::consts::PI / ratio.acos())
+            .ceil()
+            .max(FID_CIRCLE_MIN_SEGMENTS as f64) as usize;
+        positions
+            .iter()
+            .map(|&(x, y)| {
+                let outer = (0..n_seg)
+                    .map(|i| {
+                        let theta = 2.0 * std::f64::consts::PI * i as f64 / n_seg as f64;
+                        pcb_core::P::new(mm(x + r * theta.cos()), mm(y + r * theta.sin()))
+                    })
+                    .collect();
+                pcb_core::Poly {
+                    outer,
+                    holes: vec![],
+                }
+            })
+            .collect()
+    }
+}
+
+/// `pcbforge fid-holes` — burn fiducial holes at operator-supplied positions.
+fn fid_holes_cmd(
+    out: &std::path::Path,
+    layout: &str,
+    shape: &str,
+    w_mm: f64,
+    h_mm: f64,
+    device: &str,
+) -> Result<(), Box<dyn std::error::Error>> {
+    if shape != "circle" && shape != "rect" {
+        return Err(format!("--shape must be \"circle\" or \"rect\", got {shape:?}").into());
+    }
+    if w_mm <= 0.0 {
+        return Err("--w-mm must be positive".into());
+    }
+    if shape == "circle" && h_mm != 0.0 && h_mm != w_mm {
+        return Err("--h-mm is ignored for --shape circle (circles take only --w-mm); \
+                     pass 0 or omit it, or match --w-mm"
+            .into());
+    }
+    let resolved_h = if h_mm == 0.0 { w_mm } else { h_mm };
+    if resolved_h <= 0.0 {
+        return Err("--h-mm must be positive".into());
+    }
+    if layout.trim().is_empty() {
+        return Err("--layout must not be empty".into());
+    }
+    let positions = parse_fid_layout(layout)?;
+
+    let polys = fid_holes_polys(shape, w_mm, resolved_h, &positions);
+    let params = AblationParams {
+        power_pct: 20.0,
+        speed_mm_s: 1000.0,
+        frequency_khz: 30.0,
+        pulse_ns: 1,
+        passes: 1,
+    };
+    let layer = EmitLayer::fill("FID", params, lbrn2::polys_to_elems(&polys));
+    if let Some(dir) = out.parent().filter(|d| !d.as_os_str().is_empty()) {
+        std::fs::create_dir_all(dir).ok();
+    }
+    lbrn2::write_lbrn2(device, &[layer], out)?;
+    eprintln!(
+        "fid holes: {} {shape} hole(s), {w_mm}×{resolved_h} mm",
+        positions.len()
     );
     // Print the absolute path so it's findable regardless of the working dir.
     let abs = std::path::absolute(out).unwrap_or_else(|_| out.to_path_buf());
@@ -1348,7 +1516,9 @@ fn detect_correspondences(
     // mapping image rows to bed y directly would make the design→machine fit
     // a reflection, which the negative-determinant gate rejects.
     let bed = vision::BedMap::uniform_scale_y_flip(px_per_mm, frame.height() as f64);
-    let profile = vision::FiducialProfile::DarkDot { diameter_mm };
+    let profile = vision::FiducialProfile::DarkDot {
+        shape: vision::FidShape::Circle { diameter_mm },
+    };
     let results = vision::find_fiducials(&frame, &design, 2.0, &profile, &bed);
 
     // Collect (design mm, detected px) for every hit.
@@ -1964,5 +2134,70 @@ mod tests {
                 "marker {marker:?} is {nearest} nm from nearest site, expected ≥ {half_pitch_nm}"
             );
         }
+    }
+
+    #[test]
+    fn fid_holes_polys_rect_has_correct_extents() {
+        let positions = [(10.0, 20.0), (-5.0, 60.5)];
+        let (w, h) = (2.0, 3.0);
+        let polys = fid_holes_polys("rect", w, h, &positions);
+        assert_eq!(polys.len(), positions.len());
+        for (poly, &(x, y)) in polys.iter().zip(positions.iter()) {
+            assert_eq!(poly.outer.len(), 4, "rect hole is a 4-vertex ring");
+            let cx = nm(x);
+            let cy = nm(y);
+            let hw = nm(w / 2.0);
+            let hh = nm(h / 2.0);
+            let expect = [
+                (cx - hw, cy - hh),
+                (cx + hw, cy - hh),
+                (cx + hw, cy + hh),
+                (cx - hw, cy + hh),
+            ];
+            for (v, e) in poly.outer.iter().zip(expect.iter()) {
+                assert!(
+                    (v.x - e.0).abs() <= 1 && (v.y - e.1).abs() <= 1,
+                    "vertex {v:?}, expected {e:?}"
+                );
+            }
+        }
+    }
+
+    #[test]
+    fn fid_holes_polys_circle_has_enough_segments_and_correct_radius() {
+        let positions = [(0.0, 0.0), (12.3, -4.5)];
+        let w = 1.0; // diameter
+        let r_nm = nm(w / 2.0) as f64;
+        let polys = fid_holes_polys("circle", w, w, &positions);
+        assert_eq!(polys.len(), positions.len());
+        for (poly, &(x, y)) in polys.iter().zip(positions.iter()) {
+            assert!(
+                poly.outer.len() >= 16,
+                "circle hole has {} vertices, expected >= 16",
+                poly.outer.len()
+            );
+            let cx = nm(x) as f64;
+            let cy = nm(y) as f64;
+            for v in &poly.outer {
+                let dx = v.x as f64 - cx;
+                let dy = v.y as f64 - cy;
+                let dist = (dx * dx + dy * dy).sqrt();
+                assert!(
+                    (dist - r_nm).abs() <= 1.0,
+                    "vertex at radius {dist}, expected {r_nm}"
+                );
+            }
+        }
+    }
+
+    #[test]
+    fn parse_fid_layout_accepts_valid_and_rejects_malformed() {
+        let ok = parse_fid_layout("10,10; 60.5,-10").expect("valid layout should parse");
+        assert_eq!(ok, vec![(10.0, 10.0), (60.5, -10.0)]);
+
+        assert!(
+            parse_fid_layout("10;10").is_err(),
+            "missing comma should be rejected"
+        );
     }
 }

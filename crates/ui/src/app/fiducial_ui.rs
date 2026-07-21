@@ -189,6 +189,43 @@ impl ConsoleApp {
         ctx.request_repaint();
     }
 
+    /// Emit fiducial holes at the expected positions by shelling `pcbforge
+    /// fid-holes` — the operator burns them, then images them back for the
+    /// check. Uses the same layout string the check drives from, so the burned
+    /// holes land exactly where detection looks for them.
+    pub(super) fn fiducial_generate_holes(&mut self) {
+        if let Err(e) = crate::fiducial::parse_layout(&self.fiducials.layout) {
+            self.fiducials.note = format!("layout: {e}");
+            return;
+        }
+        let out = crate::clean_path(&self.fiducials.out);
+        if out.is_empty() {
+            self.fiducials.note = "set an output path for the fiducial holes".into();
+            return;
+        }
+        // Circles pass --h-mm 0 (the CLI reads the diameter as the square
+        // side); rectangles pass their real height.
+        let h_mm = match self.fiducials.shape {
+            crate::fiducial::ShapeKind::Circle => 0.0,
+            crate::fiducial::ShapeKind::Rect => self.fiducials.height_mm,
+        };
+        self.run_verb(&[
+            "fid-holes".into(),
+            "--out".into(),
+            out,
+            "--layout".into(),
+            self.fiducials.layout.clone(),
+            "--shape".into(),
+            self.fiducials.shape.token().into(),
+            "--w-mm".into(),
+            format!("{}", self.fiducials.diameter_mm),
+            "--h-mm".into(),
+            format!("{h_mm}"),
+        ]);
+        self.fiducials.note =
+            "generating fiducial holes at the expected positions — see Log for the file path".into();
+    }
+
     /// Run detection on the current in-memory frame around the search markers,
     /// updating rows/found/measured/homography. Shared by the static Check and
     /// the live-tracking loop (FLD-11).
@@ -196,10 +233,11 @@ impl ConsoleApp {
         let Some(frame) = &self.fiducials.frame_img else {
             return;
         };
-        let profile = self
-            .fiducials
-            .profile
-            .to_profile(self.fiducials.diameter_mm);
+        let profile = self.fiducials.profile.to_profile(
+            self.fiducials
+                .shape
+                .to_fid_shape(self.fiducials.diameter_mm, self.fiducials.height_mm),
+        );
         let r = fiducial::check_frame(
             frame,
             &self.fiducials.search,
@@ -300,18 +338,58 @@ impl ConsoleApp {
                         }
                     });
                 ui.end_row();
-                ui.label("hole ⌀ mm");
-                ui.add(
-                    egui::DragValue::new(&mut self.fiducials.diameter_mm)
-                        .speed(0.05)
-                        .range(0.05..=20.0),
-                );
+                ui.label("shape");
+                egui::ComboBox::from_id_salt("fid-shape")
+                    .selected_text(self.fiducials.shape.label())
+                    .show_ui(ui, |ui| {
+                        for k in crate::fiducial::ShapeKind::ALL {
+                            ui.selectable_value(&mut self.fiducials.shape, k, k.label());
+                        }
+                    });
                 ui.end_row();
+                match self.fiducials.shape {
+                    crate::fiducial::ShapeKind::Circle => {
+                        ui.label("hole ⌀ mm");
+                        ui.add(
+                            egui::DragValue::new(&mut self.fiducials.diameter_mm)
+                                .speed(0.05)
+                                .range(0.05..=20.0),
+                        );
+                        ui.end_row();
+                    }
+                    crate::fiducial::ShapeKind::Rect => {
+                        ui.label("width mm");
+                        ui.horizontal(|ui| {
+                            ui.add(
+                                egui::DragValue::new(&mut self.fiducials.diameter_mm)
+                                    .speed(0.05)
+                                    .range(0.05..=20.0),
+                            );
+                            let hl = ui.label("height mm");
+                            ui.add(
+                                egui::DragValue::new(&mut self.fiducials.height_mm)
+                                    .speed(0.05)
+                                    .range(0.05..=20.0),
+                            )
+                            .labelled_by(hl.id);
+                        });
+                        ui.end_row();
+                    }
+                }
                 ui.label("search mm");
                 ui.add(
                     egui::DragValue::new(&mut self.fiducials.search_mm)
                         .speed(0.1)
                         .range(0.1..=20.0),
+                );
+                ui.end_row();
+                let lbl = ui.label("holes out");
+                ui.add(
+                    egui::TextEdit::singleline(&mut self.fiducials.out).desired_width(240.0),
+                )
+                .labelled_by(lbl.id)
+                .on_hover_text(
+                    "Where the generated fiducial-holes .lbrn2 is written (⚙ Generate holes).",
                 );
                 ui.end_row();
             });
@@ -354,6 +432,16 @@ impl ConsoleApp {
                 self.fiducials.found.clear();
                 self.sync_fid_markers();
             }
+            if ui
+                .button("⚙ Generate holes")
+                .on_hover_text(
+                    "Burn a .lbrn2 with a hole at each expected position above — the same \
+                     layout the check uses.",
+                )
+                .clicked()
+            {
+                self.fiducial_generate_holes();
+            }
             if let Some(ppm) = self.fiducials.measured_ppm
                 && ui
                     .button(format!("↧ use measured {ppm:.2} px/mm"))
@@ -365,6 +453,7 @@ impl ConsoleApp {
             }
         });
         ui.label(egui::RichText::new(&self.fiducials.note).weak());
+        ui.weak("⚙ Generate holes burns holes at the expected positions above — same layout the check uses.");
         ui.weak("Drag each ✛ near its hole; the detector searches locally around it. The typed px/mm only seeds the search — registration is anchored to the measured scale.");
         ui.weak(NAV_HINT);
         ui.separator();
@@ -490,7 +579,23 @@ impl ConsoleApp {
                     _ => Color32::from_rgb(0xe0, 0x90, 0x20),
                 };
                 let fc = px_to_screen(*fx, *fy);
-                painter.circle_stroke(fc, ring_r, egui::Stroke::new(2.0_f32, col));
+                let stroke = egui::Stroke::new(2.0_f32, col);
+                // A circle draws its ring; a rectangle draws its axis-aligned
+                // outline (width×height) centered on the detected point.
+                match self.fiducials.shape {
+                    crate::fiducial::ShapeKind::Circle => {
+                        painter.circle_stroke(fc, ring_r, stroke);
+                    }
+                    crate::fiducial::ShapeKind::Rect => {
+                        let hw = (self.fiducials.diameter_mm as f32 * ppm * 0.5 * xf.scale).max(3.0);
+                        let hh = (self.fiducials.height_mm as f32 * ppm * 0.5 * xf.scale).max(3.0);
+                        let (l, r, t, b) = (fc.x - hw, fc.x + hw, fc.y - hh, fc.y + hh);
+                        painter.line_segment([egui::pos2(l, t), egui::pos2(r, t)], stroke);
+                        painter.line_segment([egui::pos2(r, t), egui::pos2(r, b)], stroke);
+                        painter.line_segment([egui::pos2(r, b), egui::pos2(l, b)], stroke);
+                        painter.line_segment([egui::pos2(l, b), egui::pos2(l, t)], stroke);
+                    }
+                }
                 painter.circle_filled(fc, 2.0, col);
             }
         }

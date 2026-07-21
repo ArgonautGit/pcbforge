@@ -11,7 +11,7 @@ mod lens;
 mod warp;
 
 pub use affine::{AffineError, AffineFit, fit_affine};
-pub use fiducial::{BedMap, Confidence, Fiducial, FiducialProfile, Miss, find_fiducials};
+pub use fiducial::{BedMap, Confidence, FidShape, Fiducial, FiducialProfile, Miss, find_fiducials};
 pub use homography::{Homography, HomographyError, fit_homography};
 pub use lens::{
     FieldMap, FieldPattern, FieldVerdict, InconclusiveReason, LensMap, Poly2, classify_field_error,

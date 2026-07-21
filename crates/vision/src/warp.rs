@@ -94,7 +94,7 @@ fn bilinear(frame: &GrayImage, x: f64, y: f64, fw: u32, fh: u32) -> u8 {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::fiducial::{FiducialProfile, find_fiducials};
+    use crate::fiducial::{FidShape, FiducialProfile, find_fiducials};
 
     /// A source frame with a single anti-aliased bright disc at `(cx, cy)` px.
     fn frame_with_dot(w: u32, h: u32, cx: f64, cy: f64, d: f64) -> GrayImage {
@@ -163,7 +163,9 @@ mod tests {
             &warped,
             &[board_pt],
             3.0,
-            &FiducialProfile::Backlit { diameter_mm: 0.5 },
+            &FiducialProfile::Backlit {
+                shape: FidShape::Circle { diameter_mm: 0.5 },
+            },
             &design_bed,
         )
         .remove(0)
