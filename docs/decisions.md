@@ -2058,3 +2058,43 @@ burn plane, or a genuine machine field-size misconfiguration.
   sits more than 25% of the work-area size from the configured field centre:
   `classify_field_error` assumes a centred grid, and an off-axis grid's
   curvature otherwise reads as uniform scale.
+
+## 2026-07-21 — Mirror-blind calibration fixed with an asymmetric grid + reflective frame (bench-caught)
+
+An exported job burned on the mirrored side of the field while the whole
+calibration chain reported a clean, self-consistent fit. The operator caught
+it by comparing the emitted coordinates, LightBurn's preview, and the physical
+burn: the machine negates X (galvo axis config), and calibration never saw it.
+
+- Root cause is structural: an n×n dot lattice is mirror-symmetric, and the
+  corner-click instruction labeled dots by *visual* position, so a machine
+  X-flip merely relabels dots — the fitted map is internally consistent and
+  the mirrored-view guard has nothing to catch. The flip only reappears when
+  true commanded coordinates reach the real machine at export.
+- Fix, part 1: `calib-grid` now burns two off-lattice orientation markers
+  (diagonally outside the LL corner; below the bottom-edge midpoint), and the
+  laser-mode corner clicks are keyed to them (LL = corner nearest the lone
+  diagonal marker). Dots therefore get their TRUE commanded labels, making a
+  machine mirror visible as a genuinely mirrored correspondence. Markers sit
+  ≥0.5·pitch off-lattice, outside the detector's search windows. The paper
+  grid stays unmarked — its frame is arbitrary by design.
+- Fix, part 2: `fit_rigid`/`fit_similarity` are now full Procrustes with
+  reflection (try det=+1 and det=−1, keep the better); `Rigid2` carries
+  `flip_x` (applied before rotation) through every camera↔machine conversion
+  and the persisted `field_frame` (fifth token; absent = no flip). A mirrored
+  machine calibrates cleanly with a loud note naming the mirror; clearing the
+  axis negate in LightBurn and recalibrating removes it.
+- Corner-order scrambles are still rejected, but the mechanism split: square-
+  symmetry permutations are geometrically identical to machine flips/rotations
+  and are now absorbed by design; non-isometric scrambles bowtie the corner
+  seed and fail at dot detection, and a sheared correspondence still trips the
+  alignment-residual guard (which now mentions the orientation markers).
+- Collateral hardening: a bowtied seed produced a near-singular homography
+  whose blown-up local scale panicked the fiducial search-window arithmetic
+  (i64 overflow); degenerate centers/scales now return a miss.
+- Same session, operator direction: the ③ acceptance limits (residual
+  RMS/worst) became editable + persisted (`calib_accept_rms_um`/`_worst_um`,
+  default 100/250 µm). The rig's demonstrated measurement floor is ~69/182 µm,
+  so the old hardcoded 50/100 rejected every fit the hardware could produce;
+  limits now sit at what the operator's process actually needs, and rejection
+  text quotes the configured values.
