@@ -125,13 +125,25 @@ pub(super) struct CameraState {
     pub(super) capture_src: Option<crate::camera::Source>,
 }
 
-pub(super) struct CalibrationState {
-    pub(super) anchor: Option<crate::calib::Calibration>,
-    pub(super) saved_at: Option<u64>,
+/// One grid-parameter set (dots per side, pitch, dot size, contrast). The ①
+/// printed paper and the ②③ burned grid each get their own — sharing one set
+/// across the steps let a burned-grid pitch silently mis-scale the ① metric
+/// ruler (and vice versa).
+#[derive(Debug, Clone, Copy, PartialEq)]
+pub(super) struct GridParams {
     pub(super) n: usize,
     pub(super) pitch_mm: f64,
     pub(super) dot_mm: f64,
     pub(super) dot_kind: crate::calib::DotKind,
+}
+
+pub(super) struct CalibrationState {
+    pub(super) anchor: Option<crate::calib::Calibration>,
+    pub(super) saved_at: Option<u64>,
+    /// ① printed paper: the MEASURED pitch (calipers — printers scale).
+    pub(super) paper: GridParams,
+    /// ②③ burned grid: the COMMANDED pitch.
+    pub(super) burn: GridParams,
     pub(super) grid_origin_mm: (f64, f64),
     pub(super) grid_out: String,
     pub(super) frame: String,
@@ -150,6 +162,17 @@ pub(super) struct CalibrationState {
     pub(super) capture: Option<crate::camera::Capture>,
     pub(super) capture_src: Option<crate::camera::Source>,
     pub(super) note: String,
+}
+
+impl CalibrationState {
+    /// The grid-parameter set the active step edits and fits with: ① Camera
+    /// lens uses the paper set, ②③ use the burned-grid set.
+    pub(super) fn active_params_mut(&mut self) -> &mut GridParams {
+        match self.mode {
+            CalibMode::CameraLens => &mut self.paper,
+            _ => &mut self.burn,
+        }
+    }
 }
 
 pub(super) struct FiducialState {

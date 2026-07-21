@@ -1984,3 +1984,41 @@ files look plausible in LightBurn.
   compatibility but no longer selects an unwarped production path.
 - Calibration grids remain deliberately unwarped: their commanded-vs-physical
   error is the measurement used to construct the field map.
+
+## 2026-07-20 — Per-step grid parameters + similarity-scale setup guard
+
+A live ③ Laser-field fit was rejected with an apparent ~35% "uniform scale"
+error (9.8 mm RMS systematic against a 968 µm scatter floor), and the console
+gave the operator no way to tell which of several plausible causes was at
+fault: a shared pitch/dot-size field reused between calibration steps, the
+camera having moved or zoomed since ①, the printed paper sitting proud of the
+burn plane, or a genuine machine field-size misconfiguration.
+
+- Root cause: `CalibrationState` held one n/pitch/dot⌀/contrast set for both
+  ① (measured, printed pitch) and ②③ (commanded, burned pitch), so fitting ①
+  with the burned-grid pitch silently mis-scaled the metric ruler. Split into
+  distinct `paper` and `burn` parameter sets; the form now shows whichever is
+  active for the step being run. The legacy `calib_*` settings keys keep
+  meaning the burn set; new `calib_paper_*` keys hold the paper set; on first
+  load without paper keys, paper is seeded from burn (that was what ① was
+  last fit against).
+- Added `fit_similarity` (2-D Procrustes with uniform scale) strictly as a
+  diagnostic — the paper→machine anchor itself stays rigid, per the 2026-07-19
+  entry above, so the printed pitch remains the metric authority and galvo
+  scale errors stay measurable. A |scale − 1| beyond `FIELD_SCALE_FAIL_FRAC`
+  (5%) now fails ③ early with a ranked-causes message pointing at the likely
+  culprit; genuine galvo scale error is only ever ~1–2%, so 5% cleanly
+  separates "setup mistake" from "real field distortion." Scale error inside
+  1–5% still proceeds, but `FieldCal::scale` now carries the measurement
+  through the verdict phrase, `debug_summary`, and the persisted
+  `field_stats` (third token; missing on old data implies 1.0).
+- The new scale gate runs before the existing rigid-fit alignment-RMS guard,
+  not after: over this grid's ~28 mm RMS radius, a 35% scale error alone
+  produces ~9.9 mm alignment RMS, which sits right on top of the one-pitch
+  (10 mm) mirrored-view threshold. Left in the old order, the same fault could
+  either trip a misleading "mirrored view" error or narrowly duck under the
+  guard and masquerade as a field-distortion failure.
+- The ③ fit note also gains an off-centre warning when the fitted grid centre
+  sits more than 25% of the work-area size from the configured field centre:
+  `classify_field_error` assumes a centred grid, and an off-axis grid's
+  curvature otherwise reads as uniform scale.

@@ -157,6 +157,13 @@ pub struct LensMap {
     pub max_um: f64,
     /// Per fit point: `(px_x, px_y, residual_µm)` — for the heat-map / vectors.
     pub residuals: Vec<(f64, f64, f64)>,
+    /// Axis-aligned pixel bounds of the inputs this fit covered:
+    /// `[min_x, min_y, max_x, max_y]`. Reads through `px_to_mm` far outside this
+    /// box extrapolate the polynomial unreliably; a downstream consumer (the
+    /// laser-field fit) uses it to flag burned dots that land outside the region
+    /// the ruler was actually fit over. `None` for maps not built by
+    /// [`fit_lens`] (restored-from-settings or hand-constructed test maps).
+    pub calib_px_bounds: Option<[f64; 4]>,
 }
 
 #[cfg(test)]
@@ -188,6 +195,18 @@ pub fn fit_lens(pairs: &[(Point2<f64>, Point2<f64>)]) -> Result<LensMap, String>
     let px_to_mm = Poly2::fit(&px, &mm)?;
     let mm_to_px = Poly2::fit(&mm, &px)?;
 
+    // Pixel extent the fit actually covered — the region the polynomial ruler
+    // is trustworthy over.
+    let (mut min_x, mut min_y) = (f64::INFINITY, f64::INFINITY);
+    let (mut max_x, mut max_y) = (f64::NEG_INFINITY, f64::NEG_INFINITY);
+    for &(x, y) in &px {
+        min_x = min_x.min(x);
+        min_y = min_y.min(y);
+        max_x = max_x.max(x);
+        max_y = max_y.max(y);
+    }
+    let calib_px_bounds = Some([min_x, min_y, max_x, max_y]);
+
     let mut residuals = Vec::with_capacity(pairs.len());
     let mut sumsq = 0.0;
     let mut max = 0.0_f64;
@@ -205,6 +224,7 @@ pub fn fit_lens(pairs: &[(Point2<f64>, Point2<f64>)]) -> Result<LensMap, String>
         rms_um,
         max_um: max,
         residuals,
+        calib_px_bounds,
     })
 }
 
@@ -820,6 +840,31 @@ mod tests {
             (u2 - u).abs() < 1.5 && (v2 - v).abs() < 1.5,
             "round trip px ({u2:.1},{v2:.1})"
         );
+    }
+
+    #[test]
+    fn fit_records_calibration_pixel_bounds() {
+        let mm = grid_mm();
+        let pairs: Vec<(Point2<f64>, Point2<f64>)> = mm
+            .iter()
+            .map(|&(x, y)| {
+                let (u, v) = image((x, y));
+                (Point2::new(u, v), Point2::new(x, y))
+            })
+            .collect();
+        let lens = fit_lens(&pairs).unwrap();
+        let [min_x, min_y, max_x, max_y] = lens.calib_px_bounds.expect("bounds recorded");
+        // The recorded box must contain every input pixel exactly (no slack).
+        let (mut ex_lo, mut ey_lo) = (f64::INFINITY, f64::INFINITY);
+        let (mut ex_hi, mut ey_hi) = (f64::NEG_INFINITY, f64::NEG_INFINITY);
+        for (p, _) in &pairs {
+            ex_lo = ex_lo.min(p.x);
+            ey_lo = ey_lo.min(p.y);
+            ex_hi = ex_hi.max(p.x);
+            ey_hi = ey_hi.max(p.y);
+            assert!(p.x >= min_x && p.x <= max_x && p.y >= min_y && p.y <= max_y);
+        }
+        assert_eq!((min_x, min_y, max_x, max_y), (ex_lo, ey_lo, ex_hi, ey_hi));
     }
 
     #[test]

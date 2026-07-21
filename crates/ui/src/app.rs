@@ -160,10 +160,18 @@ impl ConsoleApp {
             calibration: CalibrationState {
                 anchor: None,
                 saved_at: None,
-                n: 7,
-                pitch_mm: 10.0,
-                dot_mm: 0.4,
-                dot_kind: crate::calib::DotKind::Dark,
+                paper: GridParams {
+                    n: 7,
+                    pitch_mm: 10.0,
+                    dot_mm: 0.4,
+                    dot_kind: crate::calib::DotKind::Dark,
+                },
+                burn: GridParams {
+                    n: 7,
+                    pitch_mm: 10.0,
+                    dot_mm: 0.4,
+                    dot_kind: crate::calib::DotKind::Dark,
+                },
                 grid_origin_mm: (0.0, 0.0),
                 grid_out: "calib-grid.lbrn2".into(),
                 frame: String::new(),
@@ -311,11 +319,13 @@ impl ConsoleApp {
         };
         let field = match &self.calibration.field {
             Some(c) => format!(
-                "{} dots, RMS/worst {:.0}/{:.0}µm, verdict={}, {}",
+                "{} dots, RMS/worst {:.0}/{:.0}µm, verdict={}, scale={:+.1}%, extrapolated={}, {}",
                 c.found,
                 c.field.rms_um,
                 c.field.max_um,
                 field_verdict_token(&c.field_verdict),
+                (c.scale - 1.0) * 100.0,
+                c.extrapolated,
                 if self.calibration.field_accepted {
                     "accepted"
                 } else {
@@ -377,7 +387,8 @@ impl ConsoleApp {
              calib_frame: {calib_frame}\n\
              bed_overlay: show={} field={:.0}mm center=({:.1},{:.1}) auto={}\n\
              place: x={:.2} y={:.2} rot={:.1}° frame={} note={:?}\n\
-             calib_grid: n={} pitch={:.2}mm dot={:.2}mm contrast={} corners_marked={} edit_anchor_dots={} origin=({:.1},{:.1})\n\
+             calib_paper: n={} pitch={:.2}mm dot={:.2}mm contrast={}\n\
+             calib_burn: n={} pitch={:.2}mm dot={:.2}mm contrast={} corners_marked={} edit_anchor_dots={} origin=({:.1},{:.1})\n\
              fiducials: {} markers\n\
              settings: {}",
             self.runtime.tab,
@@ -398,10 +409,14 @@ impl ConsoleApp {
                 (None, _) => "none".into(),
             },
             self.placement.note,
-            self.calibration.n,
-            self.calibration.pitch_mm,
-            self.calibration.dot_mm,
-            self.calibration.dot_kind.label(),
+            self.calibration.paper.n,
+            self.calibration.paper.pitch_mm,
+            self.calibration.paper.dot_mm,
+            self.calibration.paper.dot_kind.label(),
+            self.calibration.burn.n,
+            self.calibration.burn.pitch_mm,
+            self.calibration.burn.dot_mm,
+            self.calibration.burn.dot_kind.label(),
             self.calibration.corners.len(),
             self.calibration.edit_anchor_dots,
             self.calibration.grid_origin_mm.0,
@@ -413,9 +428,12 @@ impl ConsoleApp {
 }
 
 /// Operator-facing phrase for a laser-field pincushion-vs-noise verdict.
-fn field_verdict_phrase(v: &vision::FieldVerdict) -> String {
+/// `scale` is the measured/commanded uniform scale from the fit (see
+/// `FieldCal::scale`); a notable deviation is appended so the operator sees
+/// the actual percentage, not just "uniform scale error".
+fn field_verdict_phrase(v: &vision::FieldVerdict, scale: f64) -> String {
     use vision::{FieldPattern, InconclusiveReason};
-    match v.pattern {
+    let phrase = match v.pattern {
         FieldPattern::Systematic { pincushion } => format!(
             "{} detected ({:.1}× noise floor, {:.0} µm signal vs {:.0} µm scatter) — \
              correction should help",
@@ -457,6 +475,16 @@ fn field_verdict_phrase(v: &vision::FieldVerdict) -> String {
                 InconclusiveReason::NonFinite => "bad (non-finite) sample data",
             }
         ),
+    };
+    if (scale - 1.0).abs() > crate::calib::FIELD_SCALE_NOTE_FRAC {
+        format!(
+            "{phrase}; burn reads {:.1}% {} than commanded — check the machine's field-size \
+             setting",
+            (scale - 1.0).abs() * 100.0,
+            if scale > 1.0 { "larger" } else { "smaller" }
+        )
+    } else {
+        phrase
     }
 }
 

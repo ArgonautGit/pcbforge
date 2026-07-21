@@ -1,5 +1,13 @@
 use super::*;
 
+/// Settings token for a dot polarity (round-trips through the loaders).
+fn dot_kind_token(kind: crate::calib::DotKind) -> &'static str {
+    match kind {
+        crate::calib::DotKind::Dark => "dark",
+        crate::calib::DotKind::Bright => "bright",
+    }
+}
+
 /// Space-joined full-precision coefficient row (round-trips through `parse`).
 fn coeff_row(c: &[f64; 23]) -> String {
     c.iter().map(f64::to_string).collect::<Vec<_>>().join(" ")
@@ -43,15 +51,28 @@ impl ConsoleApp {
             ),
             ("cam_use_device", self.camera.use_device.to_string()),
             ("cam_device", self.camera.device.to_string()),
-            ("calib_n", self.calibration.n.to_string()),
-            ("calib_pitch_mm", self.calibration.pitch_mm.to_string()),
-            ("calib_dot_mm", self.calibration.dot_mm.to_string()),
+            // Legacy calib_* names carry the ②③ burned-grid set (their
+            // long-standing meaning); the ① printed-paper set gets its own
+            // calib_paper_* keys.
+            ("calib_n", self.calibration.burn.n.to_string()),
+            ("calib_pitch_mm", self.calibration.burn.pitch_mm.to_string()),
+            ("calib_dot_mm", self.calibration.burn.dot_mm.to_string()),
             (
                 "calib_dot_kind",
-                match self.calibration.dot_kind {
-                    crate::calib::DotKind::Dark => "dark".to_string(),
-                    crate::calib::DotKind::Bright => "bright".to_string(),
-                },
+                dot_kind_token(self.calibration.burn.dot_kind).to_string(),
+            ),
+            ("calib_paper_n", self.calibration.paper.n.to_string()),
+            (
+                "calib_paper_pitch_mm",
+                self.calibration.paper.pitch_mm.to_string(),
+            ),
+            (
+                "calib_paper_dot_mm",
+                self.calibration.paper.dot_mm.to_string(),
+            ),
+            (
+                "calib_paper_dot_kind",
+                dot_kind_token(self.calibration.paper.dot_kind).to_string(),
             ),
             (
                 "calib_grid_origin_x",
@@ -130,6 +151,18 @@ impl ConsoleApp {
                     })
                     .unwrap_or_default(),
             ),
+            // Pixel bounds the ① lens fit covered, so the ③ field fit's
+            // out-of-region extrapolation check survives a restart. Empty when
+            // the restored/hand-built map carries no bounds.
+            (
+                "lens_px_bounds",
+                self.calibration
+                    .lens
+                    .as_ref()
+                    .and_then(|c| c.lens.calib_px_bounds)
+                    .map(|[min_x, min_y, max_x, max_y]| format!("{min_x} {min_y} {max_x} {max_y}"))
+                    .unwrap_or_default(),
+            ),
             (
                 "lens_frame_sig",
                 self.calibration
@@ -164,7 +197,7 @@ impl ConsoleApp {
                     .field
                     .as_ref()
                     .filter(|_| self.calibration.field_accepted)
-                    .map(|f| format!("{} {}", f.found, f.total))
+                    .map(|f| format!("{} {} {}", f.found, f.total, f.scale))
                     .unwrap_or_default(),
             ),
             // The burned-grid frame anchor (paper mm → machine mm rigid).
@@ -217,7 +250,7 @@ impl ConsoleApp {
         f64_field(&m, "focal_mm", &mut self.job.focal_mm);
         f64_field(&m, "place_px_per_mm", &mut self.placement.px_per_mm);
         f64_field(&m, "fid_px_per_mm", &mut self.fiducials.px_per_mm);
-        f64_field(&m, "calib_pitch_mm", &mut self.calibration.pitch_mm);
+        f64_field(&m, "calib_pitch_mm", &mut self.calibration.burn.pitch_mm);
         f64_field(
             &m,
             "calib_grid_origin_x",
@@ -228,9 +261,9 @@ impl ConsoleApp {
             "calib_grid_origin_y",
             &mut self.calibration.grid_origin_mm.1,
         );
-        f64_field(&m, "calib_dot_mm", &mut self.calibration.dot_mm);
+        f64_field(&m, "calib_dot_mm", &mut self.calibration.burn.dot_mm);
         if let Some(v) = m.get("calib_dot_kind") {
-            self.calibration.dot_kind = match v.trim() {
+            self.calibration.burn.dot_kind = match v.trim() {
                 "bright" => crate::calib::DotKind::Bright,
                 _ => crate::calib::DotKind::Dark,
             };
@@ -301,7 +334,39 @@ impl ConsoleApp {
             .get("calib_n")
             .and_then(|s| s.trim().parse::<usize>().ok())
         {
-            self.calibration.n = v.clamp(2, 15);
+            self.calibration.burn.n = v.clamp(2, 15);
+        }
+        // The ① printed-paper parameter set: overlay its own keys when any are
+        // present; otherwise seed it from the (already-loaded) burned-grid set
+        // — a pre-split save had one shared set, so that's what ① was last
+        // fit with.
+        let paper_keys = [
+            "calib_paper_n",
+            "calib_paper_pitch_mm",
+            "calib_paper_dot_mm",
+            "calib_paper_dot_kind",
+        ];
+        if paper_keys.iter().any(|k| m.contains_key(*k)) {
+            f64_field(
+                &m,
+                "calib_paper_pitch_mm",
+                &mut self.calibration.paper.pitch_mm,
+            );
+            f64_field(&m, "calib_paper_dot_mm", &mut self.calibration.paper.dot_mm);
+            if let Some(v) = m.get("calib_paper_dot_kind") {
+                self.calibration.paper.dot_kind = match v.trim() {
+                    "bright" => crate::calib::DotKind::Bright,
+                    _ => crate::calib::DotKind::Dark,
+                };
+            }
+            if let Some(v) = m
+                .get("calib_paper_n")
+                .and_then(|s| s.trim().parse::<usize>().ok())
+            {
+                self.calibration.paper.n = v.clamp(2, 15);
+            }
+        } else {
+            self.calibration.paper = self.calibration.burn;
         }
         // Restore the ① camera-lens calibration so the camera distortion
         // survives a restart. Staleness is guarded at use time: the
@@ -323,6 +388,14 @@ impl ConsoleApp {
                     rms_um: stats.next().and_then(|s| s.parse().ok()).unwrap_or(0.0),
                     max_um: stats.next().and_then(|s| s.parse().ok()).unwrap_or(0.0),
                     residuals: Vec::new(),
+                    calib_px_bounds: m.get("lens_px_bounds").and_then(|s| {
+                        let vals: Vec<f64> = s
+                            .split_whitespace()
+                            .filter_map(|t| t.parse().ok())
+                            .filter(|v: &f64| v.is_finite())
+                            .collect();
+                        <[f64; 4]>::try_from(vals).ok()
+                    }),
                 },
                 dots: Vec::new(),
                 found: stats.next().and_then(|s| s.parse().ok()).unwrap_or(0),
@@ -391,6 +464,16 @@ impl ConsoleApp {
                     found: stats.next().and_then(|s| s.parse().ok()).unwrap_or(0),
                     total: stats.next().and_then(|s| s.parse().ok()).unwrap_or(0),
                     field_verdict: vision::classify_field_error(&[]),
+                    // Third token is new; older two-token saves read as 1.0
+                    // (pitch-true).
+                    scale: stats
+                        .next()
+                        .and_then(|s| s.parse().ok())
+                        .filter(|v: &f64| v.is_finite() && *v > 0.0)
+                        .unwrap_or(1.0),
+                    // Per-fit feedback like `dots` — not persisted; a restored
+                    // field has no fresh detection to count against.
+                    extrapolated: 0,
                 });
                 self.calibration.field_accepted = true;
             }
@@ -415,7 +498,7 @@ impl ConsoleApp {
                 px_to_mm,
                 rms_um: 0.0,
                 found: 0,
-                total: self.calibration.n * self.calibration.n,
+                total: self.calibration.burn.n * self.calibration.burn.n,
                 dots: Vec::new(),
             });
             self.calibration.saved_at = m.get("calib_saved_at").and_then(|s| s.trim().parse().ok());

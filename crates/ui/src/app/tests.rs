@@ -82,6 +82,8 @@ fn nonlinear_app() -> ConsoleApp {
                 .map(|(p, c)| (*c, Vector2::new(p.x - c.x, p.y - c.y)))
                 .collect::<Vec<_>>(),
         ),
+        scale: 1.0,
+        extrapolated: 0,
     });
     app.calibration.field_accepted = true;
     app.calibration.lens_frame_signature = Some(((800, 800), Orientation::Normal));
@@ -997,19 +999,146 @@ field_frame=\n";
     assert_eq!(app.camera.orientation, Orientation::Rotate180);
     assert!(app.camera.use_device);
     assert_eq!(app.camera.device, 2);
-    assert_eq!(app.calibration.n, 9);
-    assert_eq!(app.calibration.dot_kind, crate::calib::DotKind::Bright);
+    assert_eq!(app.calibration.burn.n, 9);
+    assert_eq!(app.calibration.burn.dot_kind, crate::calib::DotKind::Bright);
+    // A pre-split blob has one shared parameter set: the paper set is seeded
+    // from it, since that's what ① was last fit with.
+    assert_eq!(app.calibration.paper, app.calibration.burn);
     assert!(app.placement.field_correct);
 
     let before = crate::settings::parse(legacy);
     let after = crate::settings::parse(&app.settings_blob());
+    // The save keeps every legacy key (with its value) and adds exactly the
+    // four new paper-set keys, seeded from the legacy shared values.
+    let new_keys: Vec<_> = after
+        .keys()
+        .filter(|k| !before.contains_key(*k))
+        .map(|k| k.as_str())
+        .collect();
     assert_eq!(
-        before.keys().collect::<Vec<_>>(),
-        after.keys().collect::<Vec<_>>()
+        new_keys,
+        vec![
+            "calib_paper_dot_kind",
+            "calib_paper_dot_mm",
+            "calib_paper_n",
+            "calib_paper_pitch_mm",
+            "lens_px_bounds",
+        ]
+    );
+    assert_eq!(after.get("calib_paper_n"), Some(&"9".to_string()));
+    assert_eq!(after.get("calib_paper_pitch_mm"), Some(&"8".to_string()));
+    assert_eq!(
+        after.get("calib_paper_dot_kind"),
+        Some(&"bright".to_string())
     );
     for (key, value) in before {
         assert_eq!(after.get(&key), Some(&value), "setting {key}");
     }
+}
+
+/// The two parameter sets persist independently once both exist.
+#[test]
+fn paper_and_burn_params_persist_independently() {
+    let db = tmp_db();
+    {
+        let mut a = ConsoleApp::new(db.clone(), vec!["true".into()]);
+        a.calibration.paper = GridParams {
+            n: 9,
+            pitch_mm: 9.6,
+            dot_mm: 0.3,
+            dot_kind: crate::calib::DotKind::Dark,
+        };
+        a.calibration.burn = GridParams {
+            n: 7,
+            pitch_mm: 10.0,
+            dot_mm: 0.4,
+            dot_kind: crate::calib::DotKind::Bright,
+        };
+        a.save_settings_if_changed();
+    }
+    let b = ConsoleApp::new(db, vec!["true".into()]);
+    assert_eq!(b.calibration.paper.n, 9);
+    assert!((b.calibration.paper.pitch_mm - 9.6).abs() < 1e-9);
+    assert_eq!(b.calibration.paper.dot_kind, crate::calib::DotKind::Dark);
+    assert_eq!(b.calibration.burn.n, 7);
+    assert!((b.calibration.burn.pitch_mm - 10.0).abs() < 1e-9);
+    assert_eq!(b.calibration.burn.dot_kind, crate::calib::DotKind::Bright);
+}
+
+/// The ① lens fit's pixel bounds survive a save/reload, and a legacy blob
+/// written before the `lens_px_bounds` key existed restores them as `None`.
+#[test]
+fn lens_calibration_pixel_bounds_round_trip() {
+    use nalgebra::Point2;
+    let coords = [0.0, 20.0, 40.0, 60.0];
+    let pairs: Vec<_> = coords
+        .iter()
+        .flat_map(|&y| {
+            coords.iter().map(move |&x| {
+                (
+                    Point2::new(10.0 * x + 20.0, 800.0 - 10.0 * y),
+                    Point2::new(x, y),
+                )
+            })
+        })
+        .collect();
+    let lens = vision::fit_lens(&pairs).unwrap();
+    let expected = lens.calib_px_bounds.expect("fit records bounds");
+    let make_cal = |lens: vision::LensMap| crate::calib::CameraCal {
+        lens,
+        dots: Vec::new(),
+        found: 16,
+        total: 16,
+    };
+
+    // Round-trip through save + reload: bounds survive.
+    let db = tmp_db();
+    {
+        let mut a = ConsoleApp::new(db.clone(), vec!["true".into()]);
+        a.calibration.lens = Some(make_cal(lens.clone()));
+        a.save_settings_if_changed();
+    }
+    let b = ConsoleApp::new(db, vec!["true".into()]);
+    let restored = b
+        .calibration
+        .lens
+        .as_ref()
+        .expect("lens restored")
+        .lens
+        .calib_px_bounds
+        .expect("bounds restored");
+    for (e, r) in expected.iter().zip(&restored) {
+        assert!((e - r).abs() < 1e-9, "bound {e} vs {r}");
+    }
+
+    // A legacy blob with the lens maps but no lens_px_bounds key restores None.
+    let legacy_db = tmp_db();
+    let blob = {
+        let mut a = ConsoleApp::new(legacy_db.clone(), vec!["true".into()]);
+        a.calibration.lens = Some(make_cal(lens));
+        a.settings_blob()
+    };
+    let stripped: String = blob
+        .lines()
+        .filter(|l| !l.starts_with("lens_px_bounds="))
+        .map(|l| format!("{l}\n"))
+        .collect();
+    assert!(
+        !stripped.contains("lens_px_bounds"),
+        "legacy blob carries no bounds key"
+    );
+    std::fs::write(crate::settings::path_for_db(&legacy_db), stripped).unwrap();
+    let c = ConsoleApp::new(legacy_db, vec!["true".into()]);
+    assert!(
+        c.calibration
+            .lens
+            .as_ref()
+            .expect("lens restored")
+            .lens
+            .calib_px_bounds
+            .is_none(),
+        "a missing bounds key restores as None"
+    );
 }
 
 /// "Etch here" resolves a bare output filename next to the copper Gerber
@@ -1121,8 +1250,8 @@ fn calibration_persists_as_a_reanchor_seed() {
     use nalgebra::Matrix3;
     let db = tmp_db();
     let mut a = ConsoleApp::new(db.clone(), vec!["true".into()]);
-    a.calibration.n = 7;
-    a.calibration.pitch_mm = 10.0;
+    a.calibration.burn.n = 7;
+    a.calibration.burn.pitch_mm = 10.0;
     a.calibration.anchor = Some(crate::calib::Calibration {
         px_to_mm: vision::Homography {
             matrix: Matrix3::new(0.1, 0.0, 1.0, 0.0, 0.1, 2.0, 0.0, 0.0, 1.0),
@@ -1144,7 +1273,7 @@ fn calibration_persists_as_a_reanchor_seed() {
         (cal.px_to_mm.matrix[(0, 2)] - 1.0).abs() < 1e-12,
         "translation survived"
     );
-    assert_eq!(b.calibration.n, 7);
+    assert_eq!(b.calibration.burn.n, 7);
 }
 
 /// Camera-lens calibration through the console: a printed-grid frame + 4
@@ -1171,9 +1300,9 @@ fn camera_lens_calibration_flow() {
     let mut app = ConsoleApp::new(tmp_db(), vec!["true".into()]);
     app.runtime.tab = CentralTab::Calibrate;
     app.calibration.mode = CalibMode::CameraLens;
-    app.calibration.n = 7;
-    app.calibration.pitch_mm = 10.0;
-    app.calibration.dot_mm = dot;
+    app.calibration.paper.n = 7;
+    app.calibration.paper.pitch_mm = 10.0;
+    app.calibration.paper.dot_mm = dot;
     app.calibration.frame_img = Some(img);
     // Corner clicks at the four grid corners (px = mm*ppm + 40).
     app.calibration.corners = vec![(40.0, 40.0), (640.0, 40.0), (640.0, 640.0), (40.0, 640.0)];
@@ -1212,9 +1341,9 @@ fn anchor_overlay_renders_the_machine_grid() {
     let mut app = ConsoleApp::new(tmp_db(), vec!["true".into()]);
     app.runtime.tab = CentralTab::Calibrate;
     app.calibration.mode = CalibMode::LaserAnchor;
-    app.calibration.n = 7;
-    app.calibration.pitch_mm = 10.0;
-    app.calibration.dot_mm = 2.0;
+    app.calibration.burn.n = 7;
+    app.calibration.burn.pitch_mm = 10.0;
+    app.calibration.burn.dot_mm = 2.0;
     app.calibration.frame = concat!(
         env!("CARGO_MANIFEST_DIR"),
         "/../../samples/calibration/grid-7x7-10mm-distorted.png"
@@ -1449,8 +1578,8 @@ fn camera_view_downscales_but_data_stays_full_res() {
 #[test]
 fn generate_grid_centers_on_the_field() {
     let mut app = ConsoleApp::new(tmp_db(), vec!["true".into()]);
-    app.calibration.n = 7;
-    app.calibration.pitch_mm = 10.0;
+    app.calibration.burn.n = 7;
+    app.calibration.burn.pitch_mm = 10.0;
     app.camera.field_cx_mm = 0.0;
     app.camera.field_cy_mm = 0.0;
     app.calibration.grid_out = "calib-grid.lbrn2".into();
