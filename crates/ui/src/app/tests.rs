@@ -143,6 +143,40 @@ fn load_place_without_any_calibration_still_shows_the_frame() {
     std::fs::remove_dir_all(dir).unwrap();
 }
 
+/// "Load frame + job" with an empty bed-frame path grabs a fresh frame from
+/// the camera source (a File source here) instead of loading a file — same
+/// one-click camera path as the fiducial check.
+#[test]
+fn load_place_with_empty_frame_grabs_from_the_camera() {
+    let mut app = ConsoleApp::new(tmp_db(), vec!["true".into()]);
+    let dir = std::env::temp_dir().join(format!("pcbforge-place-cam-{}", std::process::id()));
+    std::fs::create_dir_all(&dir).unwrap();
+    let cam = dir.join("cam.png");
+    image::GrayImage::from_pixel(64, 48, image::Luma([90]))
+        .save(&cam)
+        .unwrap();
+    app.camera.use_device = false;
+    app.camera.file = cam.to_string_lossy().into_owned();
+    // No saved frame path → the grab comes from the camera source.
+    app.placement.frame = String::new();
+    let fixtures = concat!(env!("CARGO_MANIFEST_DIR"), "/../cli/tests/fixtures");
+    app.job.emit_copper = format!("{fixtures}/uv_test-F_Cu.gbr");
+    app.job.emit_outline = format!("{fixtures}/uv_test-Edge_Cuts.gbr");
+    let ctx = Context::default();
+    let _ = ctx.run(egui::RawInput::default(), |ctx| app.load_place(ctx));
+    assert!(
+        app.placement.frame_img.is_some(),
+        "camera frame cached: {}",
+        app.placement.note
+    );
+    assert!(
+        app.placement.note.contains("needs calibration"),
+        "note explains the gap: {}",
+        app.placement.note
+    );
+    std::fs::remove_dir_all(dir).unwrap();
+}
+
 /// A saved ② laser anchor gives Place an approximate homography preview;
 /// "Etch here" without ① + ③ exports UNWARPED geometry with a logged warning
 /// (the operator's call — there is no hard gate).
@@ -1053,6 +1087,10 @@ field_frame=\n";
             "fid_profile",
             "fid_search_mm",
             "fid_shape",
+            "job_interval_mm",
+            "job_passes",
+            "job_pulse_ns",
+            "job_speed_mm_s",
             "lens_px_bounds",
         ]
     );
@@ -1080,6 +1118,34 @@ fn field_acceptance_limits_persist() {
     let b = ConsoleApp::new(db, vec!["true".into()]);
     assert!((b.calibration.accept_rms_um - 120.0).abs() < 1e-9);
     assert!((b.calibration.accept_worst_um - 300.0).abs() < 1e-9);
+}
+
+/// The operator-configurable LightBurn export recipe (speed / Q-pulse /
+/// interval / passes) round-trips through a save + reload; absent keys keep
+/// the defaults (backward compatible).
+#[test]
+fn job_export_recipe_persists() {
+    let db = tmp_db();
+    {
+        let mut a = ConsoleApp::new(db.clone(), vec!["true".into()]);
+        a.job.speed_mm_s = 2500.0;
+        a.job.pulse_ns = 42;
+        a.job.interval_mm = 0.05;
+        a.job.passes = 3;
+        a.save_settings_if_changed();
+    }
+    let b = ConsoleApp::new(db, vec!["true".into()]);
+    assert!((b.job.speed_mm_s - 2500.0).abs() < 1e-9);
+    assert_eq!(b.job.pulse_ns, 42);
+    assert!((b.job.interval_mm - 0.05).abs() < 1e-9);
+    assert_eq!(b.job.passes, 3);
+
+    // A blob with none of the recipe keys keeps today's defaults.
+    let fresh = ConsoleApp::new(tmp_db(), vec!["true".into()]);
+    assert!((fresh.job.speed_mm_s - 1000.0).abs() < 1e-9);
+    assert_eq!(fresh.job.pulse_ns, 1);
+    assert!((fresh.job.interval_mm - 0.03).abs() < 1e-9);
+    assert_eq!(fresh.job.passes, 1);
 }
 
 /// The burned-grid frame anchor's mirror flag round-trips as a 5th
@@ -1249,6 +1315,10 @@ fn fresh_app_summary_reports_circle_shape() {
     assert!(
         summary.contains("profile=dark_dot"),
         "summary carries the profile token: {summary}"
+    );
+    assert!(
+        summary.contains("speed=1000 pulse_ns=1 interval=0.03 passes=1"),
+        "summary carries the export recipe defaults: {summary}"
     );
 }
 

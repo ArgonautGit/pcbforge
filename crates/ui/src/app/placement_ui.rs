@@ -133,11 +133,23 @@ impl ConsoleApp {
     /// Load the bed frame + job geometry into the place cache and center the
     /// job on the frame. Uses the Job-tab Gerber paths for the geometry.
     pub fn load_place(&mut self, ctx: &Context) {
-        let img = match image::open(crate::clean_path(&self.placement.frame)) {
-            Ok(i) => i.to_luma8(),
-            Err(e) => {
-                self.placement.note = format!("frame: {e}");
-                return;
+        // Empty path → grab a fresh frame from the camera source (same one-click
+        // path as the fiducial check); a set path loads that saved image.
+        let img = if crate::clean_path(&self.placement.frame).trim().is_empty() {
+            match crate::camera::grab(&self.cam_source()) {
+                Ok(img) => self.camera.orientation.apply(img),
+                Err(e) => {
+                    self.placement.note = format!("camera: {e}");
+                    return;
+                }
+            }
+        } else {
+            match image::open(crate::clean_path(&self.placement.frame)) {
+                Ok(i) => i.to_luma8(),
+                Err(e) => {
+                    self.placement.note = format!("frame: {e}");
+                    return;
+                }
             }
         };
         let (_, _, ablate) = match self.active_job() {
@@ -148,6 +160,11 @@ impl ConsoleApp {
             }
         };
         self.placement.pivot = crate::place::bbox_center_mm(&ablate);
+        // Convert the frame to RGBA once; recompose clones this per drag step.
+        let base = ColorImage {
+            size: [img.width() as usize, img.height() as usize],
+            pixels: img.pixels().map(|p| Color32::from_gray(p[0])).collect(),
+        };
         // Start centered on the frame — in the SAME frame the overlay draws in.
         // Under an active homography, uniform px/mm would land the job far
         // off-centre until dragged (LR-42).
@@ -157,13 +174,10 @@ impl ConsoleApp {
                 // No projection at all — still show the bare frame so the
                 // operator sees what loaded; the note says what's missing.
                 self.placement.note = format!("frame loaded, but placement needs calibration: {e}");
-                let bare = ColorImage {
-                    size: [img.width() as usize, img.height() as usize],
-                    pixels: img.pixels().map(|p| Color32::from_gray(p[0])).collect(),
-                };
                 self.placement.job.clear();
                 self.placement.frame_img = Some(img);
-                self.placement.tex = Some(ctx.load_texture("place", bare, TextureOptions::NEAREST));
+                self.set_place_tex(ctx, base.clone());
+                self.placement.base_rgba = Some(base);
                 return;
             }
         };
@@ -172,6 +186,7 @@ impl ConsoleApp {
         self.placement.rot_deg = 0.0;
         self.placement.job = ablate;
         self.placement.frame_img = Some(img);
+        self.placement.base_rgba = Some(base);
         self.recompose(ctx);
     }
 
@@ -191,27 +206,50 @@ impl ConsoleApp {
                 return;
             }
         };
-        let img = match crate::place::composite_projected(
-            frame,
+        // Blend over a clone of the cached RGBA base (built once at load);
+        // rebuild the cache here only for state set up outside load_place.
+        let mut img = match &self.placement.base_rgba {
+            Some(base) if base.size == [frame.width() as usize, frame.height() as usize] => {
+                base.clone()
+            }
+            _ => {
+                let base = ColorImage {
+                    size: [frame.width() as usize, frame.height() as usize],
+                    pixels: frame.pixels().map(|p| Color32::from_gray(p[0])).collect(),
+                };
+                self.placement.base_rgba = Some(base.clone());
+                base
+            }
+        };
+        if let Err(e) = crate::place::composite_over_projected(
+            &mut img,
             &self.placement.job,
             &self.placement(),
             &|x, y| projection.to_px((x, y)),
             [0xf0, 0x50, 0x30],
             0.55,
         ) {
-            Ok(img) => img,
-            Err(e) => {
-                self.placement.note = format!("placement projection unavailable: {e}");
-                self.placement.tex = None;
-                return;
-            }
-        };
+            self.placement.note = format!("placement projection unavailable: {e}");
+            self.placement.tex = None;
+            return;
+        }
         let frame_note = projection.label();
         self.placement.note = format!(
             "placed at ({:.1}, {:.1}) mm, {:.0}° · {frame_note}",
             self.placement.tx_mm, self.placement.ty_mm, self.placement.rot_deg
         );
-        self.placement.tex = Some(ctx.load_texture("place", img, TextureOptions::NEAREST));
+        self.set_place_tex(ctx, img);
+    }
+
+    /// Upload the composed image, reusing the existing GPU texture when one is
+    /// live (a fresh `load_texture` per drag step allocates a new texture).
+    fn set_place_tex(&mut self, ctx: &Context, img: ColorImage) {
+        match &mut self.placement.tex {
+            Some(tex) => tex.set(img, TextureOptions::NEAREST),
+            None => {
+                self.placement.tex = Some(ctx.load_texture("place", img, TextureOptions::NEAREST));
+            }
+        }
     }
 
     /// Emit the job registered to the current manual placement by encoding it
@@ -291,6 +329,14 @@ impl ConsoleApp {
             out.clone(),
             "--fiducials".into(),
             self.placement().correspondences(),
+            "--speed-mm-s".into(),
+            format!("{}", self.job.speed_mm_s),
+            "--pulse-ns".into(),
+            format!("{}", self.job.pulse_ns),
+            "--interval-mm".into(),
+            format!("{}", self.job.interval_mm),
+            "--passes".into(),
+            format!("{}", self.job.passes),
         ];
         if !crate::clean_path(&self.job.emit_outline).is_empty() {
             args.push("--outline".into());
@@ -345,7 +391,11 @@ impl ConsoleApp {
             .show(ui, |ui| {
                 let lbl = ui.label("bed frame");
                 ui.add(egui::TextEdit::singleline(&mut self.placement.frame).desired_width(240.0))
-                    .labelled_by(lbl.id);
+                    .labelled_by(lbl.id)
+                    .on_hover_text(
+                        "Leave empty to grab a fresh frame from the camera source \
+                         picked in the Camera tab; set a path to use a saved image.",
+                    );
                 ui.end_row();
                 ui.label("out .lbrn2");
                 ui.add(egui::TextEdit::singleline(&mut self.placement.lbrn2).desired_width(240.0))
@@ -358,7 +408,14 @@ impl ConsoleApp {
                 ui.end_row();
             });
         ui.horizontal(|ui| {
-            if ui.button("⤵ Load frame + job").clicked() {
+            if ui
+                .button("⤵ Load frame + job")
+                .on_hover_text(
+                    "Leave the bed-frame path empty to grab a fresh frame from the \
+                     camera source picked in the Camera tab; set a path to use a saved image.",
+                )
+                .clicked()
+            {
                 let ctx = ui.ctx().clone();
                 self.load_place(&ctx);
             }

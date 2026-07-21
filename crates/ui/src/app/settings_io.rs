@@ -34,6 +34,10 @@ impl ConsoleApp {
             ("outline", self.job.emit_outline.clone()),
             ("lbrn2", self.job.emit_lbrn2.clone()),
             ("offset_mm", self.job.offset_mm.to_string()),
+            ("job_speed_mm_s", self.job.speed_mm_s.to_string()),
+            ("job_pulse_ns", self.job.pulse_ns.to_string()),
+            ("job_interval_mm", self.job.interval_mm.to_string()),
+            ("job_passes", self.job.passes.to_string()),
             ("back_copper", self.job.back_copper.clone()),
             ("back_outline", self.job.back_outline.clone()),
             ("thickness_mm", self.job.board_thickness_mm.to_string()),
@@ -275,6 +279,35 @@ impl ConsoleApp {
             }
         };
         f64_field(&m, "offset_mm", &mut self.job.offset_mm);
+        // LightBurn export recipe, clamped to the DragValue ranges so a
+        // hand-edited/corrupt blob can't push them out of bounds. Absent keys
+        // keep the defaults (backward compatible).
+        let u32_field =
+            |m: &std::collections::BTreeMap<String, String>,
+             k: &str,
+             lo: u32,
+             hi: u32,
+             dst: &mut u32| {
+                if let Some(v) = m.get(k).and_then(|s| s.trim().parse::<u32>().ok()) {
+                    *dst = v.clamp(lo, hi);
+                }
+            };
+        if let Some(v) = m
+            .get("job_speed_mm_s")
+            .and_then(|s| s.trim().parse().ok())
+            .filter(|v: &f64| v.is_finite())
+        {
+            self.job.speed_mm_s = v.clamp(1.0, 6000.0);
+        }
+        u32_field(&m, "job_pulse_ns", 0, 500, &mut self.job.pulse_ns);
+        if let Some(v) = m
+            .get("job_interval_mm")
+            .and_then(|s| s.trim().parse().ok())
+            .filter(|v: &f64| v.is_finite())
+        {
+            self.job.interval_mm = v.clamp(0.001, 1.0);
+        }
+        u32_field(&m, "job_passes", 1, 1000, &mut self.job.passes);
         f64_field(&m, "thickness_mm", &mut self.job.board_thickness_mm);
         f64_field(&m, "focal_mm", &mut self.job.focal_mm);
         f64_field(&m, "place_px_per_mm", &mut self.placement.px_per_mm);

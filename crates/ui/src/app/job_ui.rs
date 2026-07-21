@@ -145,7 +145,44 @@ impl ConsoleApp {
                         .range(0.0..=10.0),
                 );
                 ui.end_row();
+                let l = ui.label("speed mm/s");
+                ui.add(
+                    egui::DragValue::new(&mut self.job.speed_mm_s)
+                        .speed(10.0)
+                        .range(1.0..=6000.0),
+                )
+                .labelled_by(l.id);
+                ui.end_row();
+                let l = ui.label("Q-pulse ns");
+                ui.add(
+                    egui::DragValue::new(&mut self.job.pulse_ns)
+                        .speed(1.0)
+                        .range(0..=500),
+                )
+                .labelled_by(l.id)
+                .on_hover_text(
+                    "MOPA Q-pulse width; 0 = source default (omits QPulseWidth)",
+                );
+                ui.end_row();
+                let l = ui.label("interval mm");
+                ui.add(
+                    egui::DragValue::new(&mut self.job.interval_mm)
+                        .speed(0.001)
+                        .range(0.001..=1.0),
+                )
+                .labelled_by(l.id)
+                .on_hover_text("fill line spacing (hatch interval)");
+                ui.end_row();
+                let l = ui.label("passes");
+                ui.add(
+                    egui::DragValue::new(&mut self.job.passes)
+                        .speed(1.0)
+                        .range(1..=1000),
+                )
+                .labelled_by(l.id);
+                ui.end_row();
             });
+            ui.weak("Recipe (speed / Q-pulse / interval / passes) applies to both this Emit and Place's “Etch here”.");
 
         // Double-sided (ORC-6): side selector + back-side inputs.
         ui.separator();
@@ -258,6 +295,14 @@ impl ConsoleApp {
             crate::clean_path(&self.job.emit_lbrn2),
             "--offset-mm".into(),
             format!("{}", self.job.offset_mm),
+            "--speed-mm-s".into(),
+            format!("{}", self.job.speed_mm_s),
+            "--pulse-ns".into(),
+            format!("{}", self.job.pulse_ns),
+            "--interval-mm".into(),
+            format!("{}", self.job.interval_mm),
+            "--passes".into(),
+            format!("{}", self.job.passes),
         ];
         // Field-warp when a usable calibration + map file exist; otherwise
         // emit unwarped with a warning (operator's call — the machine's own

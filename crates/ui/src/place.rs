@@ -144,7 +144,10 @@ pub fn composite_projected(
     Ok(img)
 }
 
-fn composite_over_projected(
+/// In-place variant of [`composite_projected`] for callers that keep a cached
+/// RGBA base frame (the Place tab re-blends on every drag step — rebuilding
+/// the base from the gray frame each time costs a full-frame conversion).
+pub(crate) fn composite_over_projected(
     img: &mut ColorImage,
     shapes: &[Poly],
     placement: &Placement,
@@ -170,20 +173,65 @@ fn composite_over_projected(
     let fill_a = (alpha * 0.4).clamp(0.0, 1.0);
     let edge_a = (alpha * 1.8).clamp(0.0, 1.0);
 
+    let (wf, hf) = (w as f64, h as f64);
+    // Cohen–Sutherland outcode against the frame, padded by the 2 px stroke
+    // block. A polygon (or edge) that is entirely off one side contributes no
+    // visible pixel, so it can be skipped wholesale — this is what keeps the
+    // per-drag cost proportional to *visible* geometry rather than
+    // (poly count × frame height).
+    let outcode = |x: f64, y: f64| -> u8 {
+        let mut c = 0u8;
+        if x < -2.0 {
+            c |= 1; // left
+        }
+        if x > wf + 1.0 {
+            c |= 2; // right
+        }
+        if y < -2.0 {
+            c |= 4; // top
+        }
+        if y > hf + 1.0 {
+            c |= 8; // bottom
+        }
+        c
+    };
+
+    let mut xs: Vec<f64> = Vec::new();
     for poly in shapes {
         let rings: Option<Vec<Vec<(f64, f64)>>> = std::iter::once(&poly.outer)
             .chain(poly.holes.iter())
             .filter(|r| r.len() >= 3)
             .map(|r| r.iter().map(|p| to_px(p.x, p.y)).collect())
             .collect();
+        // Projection (and its fail-closed non-finite check) has already run;
+        // culling below only changes which off-frame pixels we skip, never the
+        // error contract nor any pixel that lands on the frame.
         let rings = rings.ok_or("camera projection returned a non-finite polygon vertex")?;
         if rings.is_empty() {
             continue;
         }
-        // Even-odd fill (light).
-        for j in 0..h {
+        // Pixel bbox over every ring vertex. If it (padded for the stroke) does
+        // not intersect the frame, the whole poly is invisible — skip it.
+        let (mut min_x, mut min_y) = (f64::INFINITY, f64::INFINITY);
+        let (mut max_x, mut max_y) = (f64::NEG_INFINITY, f64::NEG_INFINITY);
+        for ring in &rings {
+            for &(x, y) in ring {
+                min_x = min_x.min(x);
+                min_y = min_y.min(y);
+                max_x = max_x.max(x);
+                max_y = max_y.max(y);
+            }
+        }
+        if max_x + 2.0 < 0.0 || min_x - 2.0 >= wf || max_y + 2.0 < 0.0 || min_y - 2.0 >= hf {
+            continue;
+        }
+        // Even-odd fill (light). Only rows the bbox spans can yield crossings, so
+        // clamp the scanline loop to the poly's row range within [0, h).
+        let y0 = min_y.floor().clamp(0.0, hf) as usize;
+        let y1 = max_y.ceil().clamp(0.0, hf) as usize;
+        for j in y0..y1 {
             let yc = j as f64 + 0.5;
-            let mut xs: Vec<f64> = Vec::new();
+            xs.clear();
             for ring in &rings {
                 let n = ring.len();
                 for k in 0..n {
@@ -204,18 +252,27 @@ fn composite_over_projected(
             let mut s = 0;
             while s + 1 < xs.len() {
                 let x0 = xs[s].max(0.0).ceil() as usize;
-                let x1 = (xs[s + 1].min(w as f64)).floor() as usize;
+                let x1 = (xs[s + 1].min(wf)).floor() as usize;
                 for x in x0..x1.min(w) {
                     blend_px(px, w, h, x as i32, j as i32, rgb, fill_a);
                 }
                 s += 2;
             }
         }
-        // Outline (crisp) — draw each ring edge as a thickened line.
+        // Outline (crisp) — draw each ring edge as a thickened line. Trivially
+        // reject an edge whose endpoints are both ≥2 px off the *same* side of
+        // the frame: its whole 2 px span is off-screen (every pixel would be
+        // bounds-rejected in the blend anyway), and same-side outcodes can never
+        // straddle the visible area, so no visible edge is dropped.
         for ring in &rings {
             let n = ring.len();
             for k in 0..n {
-                stroke_edge(px, w, h, ring[k], ring[(k + 1) % n], rgb, edge_a);
+                let p0 = ring[k];
+                let p1 = ring[(k + 1) % n];
+                if outcode(p0.0, p0.1) & outcode(p1.0, p1.1) != 0 {
+                    continue;
+                }
+                stroke_edge(px, w, h, p0, p1, rgb, edge_a);
             }
         }
     }
@@ -497,5 +554,70 @@ mod tests {
             edge > interior + 30,
             "edge {edge} should be clearly stronger than interior {interior}"
         );
+    }
+
+    #[test]
+    fn off_frame_finite_poly_is_skipped_without_error_or_pixel_change() {
+        // A poly whose projection lands far off-frame must leave every pixel
+        // untouched (the bbox cull is pixel-equivalent to the old bounds-checked
+        // blends) and must NOT error as long as its vertices are finite.
+        let frame = GrayImage::from_pixel(64, 48, image::Luma([120]));
+        let job = [sq(0, 0, MM)];
+        let p = Placement {
+            tx_mm: 0.0,
+            ty_mm: 0.0,
+            rot_deg: 0.0,
+            pivot_mm: (0.0, 0.0),
+        };
+        // Finite projection pushing the whole poly far negative (off-frame).
+        let far = |x: f64, y: f64| Some((x - 1.0e6, y - 1.0e6));
+        let img = composite_projected(&frame, &job, &p, &far, [200, 60, 60], 0.9)
+            .expect("finite vertices must not error even when fully off-frame");
+        assert!(
+            img.pixels.iter().all(|c| *c == Color32::from_gray(120)),
+            "an off-frame poly must not touch any frame pixel"
+        );
+        // The fail-closed contract is unchanged: the non-finite check runs at
+        // projection time, before the bbox cull, so a non-finite vertex still
+        // errors even for an off-frame poly.
+        let nonfinite = |_x: f64, _y: f64| Some((f64::NAN, 0.0));
+        assert!(
+            composite_projected(&frame, &job, &p, &nonfinite, [200, 60, 60], 0.9).is_err(),
+            "non-finite vertices must still fail closed regardless of the bbox"
+        );
+    }
+
+    #[test]
+    fn partially_clipped_poly_still_draws_its_visible_part() {
+        // The boundary-crossing case the bbox clamp/outcode reject must get
+        // right: a square that overhangs the frame's bottom-left corner. Its
+        // left edge (col -10) and bottom edge (row 110) are off-frame; its top
+        // and right edges are partly visible. Forces min_y clamped up to 0-ish
+        // and edges with exactly one endpoint off-frame (reject NOT triggered).
+        let frame = GrayImage::from_pixel(100, 100, image::Luma([120]));
+        let job = [sq(0, 0, 2 * MM)]; // 4 mm square, ±2 mm about gerber origin
+        let p = Placement {
+            tx_mm: 1.0,
+            ty_mm: 1.0,
+            rot_deg: 0.0,
+            pivot_mm: (0.0, 0.0),
+        };
+        // Uniform 10 px/mm, y-up: bed x∈[-1,3] → cols [-10,30]; bed y∈[-1,3] →
+        // rows [110,70]. So the square covers cols −10..30, rows 70..110.
+        let img = composite(&frame, &job, &p, 10.0, None, [200, 60, 60], 0.9);
+        let r = |x: usize, y: usize| img.pixels[y * 100 + x].r();
+        // Right edge (col 30) is visible for rows 70..100 — crisp outline.
+        assert!(r(30, 85) > 170, "visible right edge drawn: {}", r(30, 85));
+        // Top edge (row 70) has one endpoint off-frame (col −10) and one on
+        // (col 30); the reject must NOT fire, so its visible span is drawn.
+        assert!(r(15, 70) > 170, "clipped top edge drawn: {}", r(15, 70));
+        // Interior, on-frame and clear of any edge — softly filled, not a blob.
+        assert!(
+            (120..170).contains(&r(15, 90)),
+            "interior softly filled: {}",
+            r(15, 90)
+        );
+        // A far corner outside the footprint stays untouched frame gray.
+        assert_eq!(img.pixels[5 * 100 + 60], Color32::from_gray(120));
     }
 }

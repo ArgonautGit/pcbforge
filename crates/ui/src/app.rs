@@ -135,6 +135,10 @@ impl ConsoleApp {
                 focal_mm: 70.0,
                 scan_center_auto: true,
                 scan_center_mm: (35.0, 35.0),
+                speed_mm_s: 1000.0,
+                pulse_ns: 1,
+                interval_mm: 0.03,
+                passes: 1,
                 preview_tex: None,
                 preview_note: "Set a copper Gerber and click “Render preview”.".into(),
             },
@@ -229,6 +233,7 @@ impl ConsoleApp {
                 rot_deg: 0.0,
                 job: Vec::new(),
                 frame_img: None,
+                base_rgba: None,
                 pivot: (0.0, 0.0),
                 tex: None,
                 note: "Load a frame + job, then drag / rotate to place it on the board.".into(),
@@ -377,7 +382,7 @@ impl ConsoleApp {
                 .unwrap_or_else(|| "unset".into())
         };
         let gerbers = format!(
-            "copper={} outline={}",
+            "copper={} outline={} speed={} pulse_ns={} interval={} passes={}",
             if self.job.emit_copper.trim().is_empty() {
                 "unset".into()
             } else {
@@ -387,7 +392,11 @@ impl ConsoleApp {
                 "unset".into()
             } else {
                 base(&self.job.emit_outline)
-            }
+            },
+            self.job.speed_mm_s,
+            self.job.pulse_ns,
+            self.job.interval_mm,
+            self.job.passes,
         );
         format!(
             "tab={:?} side={:?} calib_mode={:?}\n\

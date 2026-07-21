@@ -310,6 +310,26 @@ enum Command {
         #[arg(long, default_value_t = 0.05)]
         max_rms_mm: f64,
 
+        // --- process recipe (see docs/lbrn2-schema.md) ---
+        /// Max power %.
+        #[arg(long, default_value_t = 20.0)]
+        power_pct: f64,
+        /// Scan speed, mm/s.
+        #[arg(long, default_value_t = 1000.0)]
+        speed_mm_s: f64,
+        /// Frequency, kHz (written to the file in Hz).
+        #[arg(long, default_value_t = 30.0)]
+        frequency_khz: f64,
+        /// MOPA Q-pulse width, ns (a fluence knob; 0 = source default).
+        #[arg(long, default_value_t = 1)]
+        pulse_ns: u32,
+        /// Fill passes.
+        #[arg(long, default_value_t = 1)]
+        passes: u32,
+        /// Fill line interval, mm.
+        #[arg(long, default_value_t = 0.03)]
+        interval_mm: f64,
+
         /// Laser field-distortion correction file (from the console's
         /// step-3 Laser-field calibration). When given, every emitted vertex is
         /// pre-distorted physical→commanded so the beam cancels the galvo/
@@ -614,6 +634,12 @@ fn run(cli: &Cli) -> Result<(), Box<dyn std::error::Error>> {
             margin_mm,
             device,
             max_rms_mm,
+            power_pct,
+            speed_mm_s,
+            frequency_khz,
+            pulse_ns,
+            passes,
+            interval_mm,
             field_map,
             field_seg_mm,
         } => register_cmd(RegisterArgs {
@@ -630,6 +656,14 @@ fn run(cli: &Cli) -> Result<(), Box<dyn std::error::Error>> {
             margin_mm: *margin_mm,
             device,
             max_rms_mm: *max_rms_mm,
+            params: AblationParams {
+                power_pct: *power_pct,
+                speed_mm_s: *speed_mm_s,
+                frequency_khz: *frequency_khz,
+                pulse_ns: *pulse_ns,
+                passes: *passes,
+            },
+            interval_mm: *interval_mm,
             field_map: field_map.as_deref(),
             field_seg_mm: *field_seg_mm,
         }),
@@ -1304,6 +1338,8 @@ struct RegisterArgs<'a> {
     margin_mm: f64,
     device: &'a str,
     max_rms_mm: f64,
+    params: AblationParams,
+    interval_mm: f64,
     field_map: Option<&'a std::path::Path>,
     field_seg_mm: f64,
 }
@@ -1401,16 +1437,8 @@ fn register_cmd(a: RegisterArgs) -> Result<(), Box<dyn std::error::Error>> {
         }
     };
 
-    // Same default recipe as `emit`; the operator tunes it in LightBurn or
-    // re-runs with a richer flag set later.
-    let params = AblationParams {
-        power_pct: 20.0,
-        speed_mm_s: 1000.0,
-        frequency_khz: 30.0,
-        pulse_ns: 1,
-        passes: 1,
-    };
-    let layer = EmitLayer::fill("C00", params, cam::lbrn2::polys_to_elems(&placed));
+    let mut layer = EmitLayer::fill("C00", a.params, cam::lbrn2::polys_to_elems(&placed));
+    layer.interval_mm = a.interval_mm;
     cam::lbrn2::write_lbrn2(a.device, &[layer], a.lbrn2)?;
     let rings: usize = placed.iter().map(|p| 1 + p.holes.len()).sum();
     // Report where the job actually landed (bbox extent + center, machine mm)

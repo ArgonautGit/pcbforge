@@ -2121,3 +2121,26 @@ bench-validated calibration grid fitter rides on them.
 Persistence: the Fiducials tab's diameter/search/profile were never saved;
 they are now, along with the new `fid_shape`/`fid_height_mm`/`fid_out` keys
 (absent keys keep defaults, so old settings blobs load unchanged).
+
+## 2026-07-21 — Operator export recipe, camera-fresh Place loads, drag-speed fix
+
+LightBurn export settings the operator actually tunes at the bench — speed,
+Q-pulse width, fill interval, passes — are now Job-tab fields (persisted).
+One recipe intentionally drives BOTH export paths (Job-tab emit and Place
+"Etch here"): the register verb grew the same six process flags emit already
+had, defaulting to the old hardcoded 20%/1000mm/s/30kHz/1ns/1-pass so
+existing invocations are byte-identical. Power % and frequency stay
+CLI-only until asked for.
+
+"Load frame + job" with an EMPTY bed-frame path now grabs a fresh frame from
+the Camera-tab source (same one-click contract as the fiducial check); a set
+path still loads that file. Empty is the default, so the Place view reflects
+the board as it sits now instead of a stale file.
+
+Place-tab dragging was O(polys × frame_height): the compositor scanline-filled
+every poly over EVERY frame row, per drag step. Scanlines are now clamped to
+each poly's projected bbox, off-frame polys and same-side off-frame edges are
+culled (Cohen–Sutherland trivial reject), the gray→RGBA base frame is
+converted once at load and cloned per recompose, and the GPU texture is
+updated in place instead of reallocated. Output pixels are unchanged —
+clip-boundary regression tests lock the fill/stroke semantics.
