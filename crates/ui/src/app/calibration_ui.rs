@@ -192,7 +192,13 @@ impl ConsoleApp {
                     return;
                 }
                 match crate::calib::fit_laser_field(
-                    frame, corners, &grid, b.dot_mm, b.dot_kind, &lens,
+                    frame,
+                    corners,
+                    &grid,
+                    b.dot_mm,
+                    b.dot_kind,
+                    &lens,
+                    self.calibration.allow_machine_scale,
                 ) {
                     Ok(cal) => {
                         let worst = cal.dots.iter().map(|d| d.field_um).fold(0.0_f64, f64::max);
@@ -239,8 +245,24 @@ impl ConsoleApp {
                                 match std::fs::write(&path, cal.field.serialize()) {
                                     Ok(()) => {
                                         self.placement.field_correct = true;
+                                        // When the operator opted to absorb a
+                                        // large machine scale, say so loudly: the
+                                        // polynomial makes shapes true, but the
+                                        // machine's physical speeds and hatch
+                                        // spacing stay in its oversized units, so
+                                        // energy density differs by this factor.
+                                        let scale_absorbed = (self.calibration.allow_machine_scale
+                                            && (cal.scale - 1.0).abs()
+                                                > crate::calib::FIELD_SCALE_FAIL_FRAC)
+                                            .then(|| {
+                                                format!(
+                                                    "machine scale {:+.1}% ABSORBED in software — physical speeds/hatch density differ from commanded by this factor; ",
+                                                    (cal.scale - 1.0) * 100.0
+                                                )
+                                            })
+                                            .unwrap_or_default();
                                         format!(
-                                            "field accepted: {}/{} dots, raw worst {:.0} µm, fit RMS/worst {:.0}/{:.0} µm — {}{off_center_note}{extrapolated_note}",
+                                            "field accepted: {}/{} dots, raw worst {:.0} µm, fit RMS/worst {:.0}/{:.0} µm — {scale_absorbed}{}{off_center_note}{extrapolated_note}",
                                             cal.found,
                                             cal.total,
                                             worst,
@@ -974,6 +996,22 @@ impl ConsoleApp {
                 self.calibration.corners.clear();
             }
         });
+
+        // ③ only: let the operator opt into absorbing a large machine-scale
+        // error into the field correction, near the Fit control that uses it.
+        if self.calibration.mode == CalibMode::LaserField {
+            ui.checkbox(
+                &mut self.calibration.allow_machine_scale,
+                "compensate machine scale",
+            )
+            .on_hover_text(
+                "Absorb any machine scale error into the field correction instead of refusing. \
+                 Shapes burn dimensionally true, but the machine's speeds and hatch spacing stay \
+                 in its own oversized units — physical speed and line spacing scale by the same \
+                 factor, so energy density changes; re-tune power/speed after enabling. Fixing the \
+                 field size in LightBurn is the cleaner solution.",
+            );
+        }
 
         // Mode-specific status + controls.
         match self.calibration.mode {

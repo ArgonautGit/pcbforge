@@ -183,6 +183,7 @@ impl ConsoleApp {
                 lens_frame_signature: None,
                 field: None,
                 field_accepted: false,
+                allow_machine_scale: false,
                 lens_arrow_scale: 20.0,
                 anchor_resid_scale: 30.0,
                 edit_anchor_dots: false,
@@ -381,7 +382,7 @@ impl ConsoleApp {
              gerbers: {gerbers}\n\
              calib_anchor: {calib}\n\
              camera_lens: {lens}\n\
-             laser_field: {field} field_correct={}\n\
+             laser_field: {field} field_correct={} scale_comp={}\n\
              camera_projection: {projection}\n\
              camera_frame: {cam}\n\
              calib_frame: {calib_frame}\n\
@@ -395,6 +396,11 @@ impl ConsoleApp {
             self.job.side,
             self.calibration.mode,
             self.placement.field_correct,
+            if self.calibration.allow_machine_scale {
+                "on"
+            } else {
+                "off"
+            },
             self.camera.show_bed,
             self.camera.field_mm,
             self.camera.field_cx_mm,

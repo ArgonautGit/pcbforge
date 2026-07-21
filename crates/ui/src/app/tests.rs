@@ -1018,6 +1018,7 @@ field_frame=\n";
     assert_eq!(
         new_keys,
         vec![
+            "calib_allow_machine_scale",
             "calib_paper_dot_kind",
             "calib_paper_dot_mm",
             "calib_paper_n",

@@ -190,6 +190,35 @@ fn the_laser_field_calibration_step_is_selectable() {
 }
 
 #[test]
+fn laser_field_scale_compensation_opt_in_is_drivable() {
+    let mut h = console();
+    h.get_by_label("🎯 Calibrate").click();
+    h.run();
+    // Exact label: "③ Laser field" also appears in the Job-tab export help.
+    h.get_by_label("3) Laser field (burned grid)").click();
+    h.run();
+    // The setting persists across runs (shared temp DB), so drive to a known
+    // OFF state before toggling rather than trusting the starting value.
+    if summary_line(&h.state().debug_summary(), "laser_field:").contains("scale_comp=on") {
+        h.get_by_label("compensate machine scale").click();
+        h.run();
+    }
+    assert!(
+        summary_line(&h.state().debug_summary(), "laser_field:").contains("scale_comp=off"),
+        "opt-in driven to off:\n{}",
+        h.state().debug_summary()
+    );
+    // The checkbox is labelled, so an agent/operator can drive it.
+    h.get_by_label("compensate machine scale").click();
+    h.run();
+    assert!(
+        summary_line(&h.state().debug_summary(), "laser_field:").contains("scale_comp=on"),
+        "checkbox turns scale compensation on:\n{}",
+        h.state().debug_summary()
+    );
+}
+
+#[test]
 fn laser_anchor_is_explicitly_labelled_as_approximate() {
     let mut h = console();
     h.get_by_label_contains("Calibrate").click();

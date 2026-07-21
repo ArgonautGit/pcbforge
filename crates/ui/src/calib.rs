@@ -765,6 +765,15 @@ pub const FIELD_SCALE_NOTE_FRAC: f64 = 0.01;
 /// without matching prose.
 pub const FIELD_SCALE_ERR_MARKER: &str = "burn-vs-paper scale";
 
+/// `allow_machine_scale` lets the operator opt into absorbing a large uniform
+/// burn-vs-paper scale (e.g. a machine whose configured field size is wrong) in
+/// software: with it set, the `> FIELD_SCALE_FAIL_FRAC` hard gate is skipped and
+/// the scale is absorbed by the field polynomial's linear terms downstream.
+/// Shapes then burn dimensionally true, but the machine's speeds and hatch
+/// spacing stay in its own oversized units, so energy density shifts — the UI
+/// warns and records the choice. The mirror guard below is independent of this
+/// flag: a mirrored view or scrambled corner order cannot be fixed by scale +
+/// rotation + translation, so it is caught in either mode.
 pub fn fit_laser_field(
     frame: &GrayImage,
     corners_px: [(f64, f64); 4],
@@ -772,6 +781,7 @@ pub fn fit_laser_field(
     dot_mm: f64,
     kind: DotKind,
     lens: &LensMap,
+    allow_machine_scale: bool,
 ) -> Result<FieldCal, String> {
     if grid.n < 4 {
         return Err("laser-field fit needs at least a 4×4 grid".into());
@@ -815,23 +825,46 @@ pub fn fit_laser_field(
             (Point2::new(phx, phy), Point2::new(cmd.x, cmd.y))
         })
         .collect();
-    // Scale sanity gate, BEFORE the rigid fit and its mirror guard: a large
-    // uniform scale mismatch (wrong paper pitch at ①, camera moved since ①,
-    // paper out of the burn plane, machine field size) would otherwise land
-    // near the align-RMS guard below and read as a misleading "mirrored view"
-    // error — or worse, squeak under it as a fake 10 mm field error.
+    // Scale sanity gate, BEFORE the mirror guard: a large uniform scale mismatch
+    // (wrong paper pitch at ①, camera moved since ①, paper out of the burn
+    // plane, machine field size) is a setup error unless the operator has opted
+    // to absorb it in software (`allow_machine_scale`). When absorbed, the field
+    // polynomial's linear terms take it up downstream; `scale` still records it.
     let sim =
         fit_similarity(&paper_pairs).map_err(|e| format!("burned-grid frame alignment: {e}"))?;
     // sim is measured → commanded, so measured/commanded is its inverse.
     let scale = 1.0 / sim.scale;
-    if (scale - 1.0).abs() > FIELD_SCALE_FAIL_FRAC {
+    if !allow_machine_scale && (scale - 1.0).abs() > FIELD_SCALE_FAIL_FRAC {
         return Err(format!(
             "{FIELD_SCALE_ERR_MARKER} is off by {:+.1}% — a setup error, not field distortion. \
              Likeliest causes, in order: the pitch entered at step 1 wasn't the paper's MEASURED \
              pitch (or step 3's isn't the commanded one); the camera moved or zoomed since step 1; the \
              printed paper wasn't lying in the burn plane; the machine's field-size setting \
-             (LightBurn/EZCAD). Fix the setup, re-run step 1, then step 3",
+             (LightBurn/EZCAD). Fix the setup, re-run step 1, then step 3 (or enable \
+             \"compensate machine scale\" to absorb it in software)",
             (scale - 1.0) * 100.0
+        ));
+    }
+    // Mirror guard on the SIMILARITY residual, in BOTH modes: a mirrored view or
+    // scrambled corner clicks is a reflection, which scale + rotation +
+    // translation cannot undo, so it leaves a large residual even when a genuine
+    // scale is present and legitimately absorbed. (The rigid-residual guard this
+    // replaces tripped spuriously once a real scale passed through, since the
+    // rigid fit carries no scale.)
+    let sim_rms_mm = (paper_pairs
+        .iter()
+        .map(|(p, c)| {
+            let (sx, sy) = sim.apply((p.x, p.y));
+            (sx - c.x).powi(2) + (sy - c.y).powi(2)
+        })
+        .sum::<f64>()
+        / paper_pairs.len() as f64)
+        .sqrt();
+    if sim_rms_mm > grid.pitch_mm {
+        return Err(format!(
+            "burned-grid frame alignment left {sim_rms_mm:.1} mm RMS after scale+rotation \
+             (≥ one grid pitch) — the dots don't match the commanded lattice; check the corner \
+             click order and the camera orientation (a mirrored view cannot be aligned)"
         ));
     }
     let paper_to_machine =
@@ -843,21 +876,6 @@ pub fn fit_laser_field(
             (Point2::new(mx, my), *cmd)
         })
         .collect();
-    // A mirrored view (or scrambled corner clicks) cannot be aligned by a
-    // rotation — surface it instead of reporting a nonsense "field error".
-    let align_rms_mm = (field_pairs
-        .iter()
-        .map(|(p, c)| (p.x - c.x).powi(2) + (p.y - c.y).powi(2))
-        .sum::<f64>()
-        / field_pairs.len() as f64)
-        .sqrt();
-    if align_rms_mm > grid.pitch_mm {
-        return Err(format!(
-            "burned-grid frame alignment left {align_rms_mm:.1} mm RMS (≥ one grid pitch) — \
-             the dots don't match the commanded lattice; check the corner click order and the \
-             camera orientation (a mirrored view cannot be rigidly aligned)"
-        ));
-    }
     let field = fit_field(&field_pairs).map_err(|e| format!("field fit: {e}"))?;
     // A linear physical-mm → px map for the Place overlay: fit a homography
     // from each dot's physical position to its detected pixel.
@@ -1517,7 +1535,7 @@ mod tests {
             cam(px, py)
         });
 
-        let cal = fit_laser_field(&img, corners_px, &grid, dot_mm, DotKind::Dark, &lens)
+        let cal = fit_laser_field(&img, corners_px, &grid, dot_mm, DotKind::Dark, &lens, false)
             .expect("field fit");
         assert_eq!(cal.found, 49, "all dots detected");
         assert!(cal.field.rms_um < 60.0, "field RMS {} µm", cal.field.rms_um);
@@ -1614,7 +1632,7 @@ mod tests {
     #[test]
     fn laser_field_fit_rejects_setup_scale_error() {
         let (img, corners_px, grid, dot_mm, lens) = mis_scaled_ruler_setup(1.35);
-        let err = fit_laser_field(&img, corners_px, &grid, dot_mm, DotKind::Dark, &lens)
+        let err = fit_laser_field(&img, corners_px, &grid, dot_mm, DotKind::Dark, &lens, false)
             .expect_err("a 35% scale mismatch is a setup error");
         assert!(
             err.contains(FIELD_SCALE_ERR_MARKER),
@@ -1635,12 +1653,63 @@ mod tests {
     #[test]
     fn laser_field_fit_mild_scale_passes_with_diagnostic() {
         let (img, corners_px, grid, dot_mm, lens) = mis_scaled_ruler_setup(1.015);
-        let cal = fit_laser_field(&img, corners_px, &grid, dot_mm, DotKind::Dark, &lens)
+        let cal = fit_laser_field(&img, corners_px, &grid, dot_mm, DotKind::Dark, &lens, false)
             .expect("a 1.5% scale deviation is fittable");
         assert!(
             (cal.scale - 1.015).abs() < 0.003,
             "measured scale {} ≈ 1.015",
             cal.scale
+        );
+    }
+
+    /// With `allow_machine_scale`, a gross uniform scale (an oversized machine
+    /// field the operator chose to compensate in software) is no longer a hard
+    /// setup error: the fit succeeds, records the scale, and the field
+    /// polynomial genuinely absorbs it — a physical target maps to a command
+    /// scaled by `1/scale` relative to the grid, so shapes burn dimensionally
+    /// true.
+    #[test]
+    fn laser_field_fit_absorbs_machine_scale_when_allowed() {
+        let (img, corners_px, grid, dot_mm, lens) = mis_scaled_ruler_setup(1.35);
+        let cal = fit_laser_field(&img, corners_px, &grid, dot_mm, DotKind::Dark, &lens, true)
+            .expect("a 35% scale is fittable once the operator opts to compensate it");
+        assert!(
+            (cal.scale - 1.35).abs() < 0.01,
+            "measured scale {} ≈ 1.35",
+            cal.scale
+        );
+        // Precompensation carries the scale: the command-space separation of two
+        // physical targets is the physical separation shrunk by 1/1.35 (the
+        // additive centroid offset cancels in the ratio). Targets sit inside the
+        // grid's machine-frame span (~ −10.5..70.5 mm).
+        let (a, b) = ((10.0, 10.0), (40.0, 40.0));
+        let pa = cal.field.precompensate(a.0, a.1);
+        let pb = cal.field.precompensate(b.0, b.1);
+        let cmd_sep = ((pa.0 - pb.0).powi(2) + (pa.1 - pb.1).powi(2)).sqrt();
+        let phys_sep = ((a.0 - b.0).powi(2) + (a.1 - b.1).powi(2)).sqrt();
+        let ratio = cmd_sep / phys_sep;
+        assert!(
+            (ratio * 1.35 - 1.0).abs() < 0.01,
+            "command/physical separation ratio {ratio} ≈ 1/1.35"
+        );
+    }
+
+    /// A mirrored view (or scrambled corner clicks) is still caught even with
+    /// `allow_machine_scale` on: a reflection cannot be undone by scale +
+    /// rotation + translation, so the similarity-residual guard trips. Feed the
+    /// corner clicks in horizontally-reflected order (swap LL↔LR and UR↔UL): the
+    /// symmetric 7×7 grid still locks every dot through the reflected seed, but
+    /// each pairs with the mirrored commanded label, so the correspondence is a
+    /// reflection — not a scale to absorb.
+    #[test]
+    fn laser_field_fit_catches_mirror_even_when_scale_allowed() {
+        let (img, corners_px, grid, dot_mm, lens) = mis_scaled_ruler_setup(1.0);
+        let mirrored = [corners_px[1], corners_px[0], corners_px[3], corners_px[2]];
+        let err = fit_laser_field(&img, mirrored, &grid, dot_mm, DotKind::Dark, &lens, true)
+            .expect_err("a mirrored correspondence is not a scale to absorb");
+        assert!(
+            err.contains("mirrored") || err.contains("corner"),
+            "mirror/corner-order message expected, got: {err}"
         );
     }
 
@@ -1695,7 +1764,7 @@ mod tests {
         });
         let corners_px = grid.corners_mm().map(|(cx, cy)| cam(cx, cy));
 
-        let cal = fit_laser_field(&img, corners_px, &grid, dot_mm, DotKind::Dark, &lens)
+        let cal = fit_laser_field(&img, corners_px, &grid, dot_mm, DotKind::Dark, &lens, false)
             .expect("field fit");
         assert!(
             !matches!(
@@ -1744,8 +1813,16 @@ mod tests {
             })
             .collect();
         let inner_lens = fit_lens(&inner).expect("inner lens");
-        let cal = fit_laser_field(&img, corners_px, &grid, dot_mm, DotKind::Dark, &inner_lens)
-            .expect("field fit over inner lens");
+        let cal = fit_laser_field(
+            &img,
+            corners_px,
+            &grid,
+            dot_mm,
+            DotKind::Dark,
+            &inner_lens,
+            false,
+        )
+        .expect("field fit over inner lens");
         assert!(
             cal.extrapolated > 0,
             "outer dots must be flagged, got {}",
@@ -1769,8 +1846,16 @@ mod tests {
             })
             .collect();
         let full_lens = fit_lens(&full).expect("full lens");
-        let cal = fit_laser_field(&img, corners_px, &grid, dot_mm, DotKind::Dark, &full_lens)
-            .expect("field fit over full lens");
+        let cal = fit_laser_field(
+            &img,
+            corners_px,
+            &grid,
+            dot_mm,
+            DotKind::Dark,
+            &full_lens,
+            false,
+        )
+        .expect("field fit over full lens");
         assert_eq!(cal.extrapolated, 0, "all dots within the calibrated region");
     }
 

@@ -1985,6 +1985,42 @@ files look plausible in LightBurn.
 - Calibration grids remain deliberately unwarped: their commanded-vs-physical
   error is the measurement used to construct the field map.
 
+## 2026-07-20 — Operator opt-in to absorb machine scale in software
+
+A follow-on to the similarity-scale setup guard below. One operator's machine
+burns ~33% oversize (LightBurn field size set to 70 mm against a ~93 mm actual
+lens field) and they cannot always reach the machine config to fix it, so they
+asked PCBForge to compensate in software instead of refusing the ③ fit.
+
+- Added `allow_machine_scale: bool` (last parameter) to `fit_laser_field`, wired
+  to a `pub(super) allow_machine_scale` flag on `CalibrationState` (default
+  false) and a labelled ③-only "compensate machine scale" checkbox near the Fit
+  control. Off: behaviour is exactly as before (the `> FIELD_SCALE_FAIL_FRAC`
+  hard gate stands). On: the gate is skipped and any measured scale proceeds —
+  the field polynomial's linear terms already absorb uniform scale downstream,
+  so shapes burn dimensionally true. `FieldCal::scale` still records it, and the
+  accepted-fit note prefixes the verdict with a loud "machine scale {:+.1}%
+  ABSORBED in software …" line.
+- Energy-density caveat (recorded so it isn't lost): absorbing the scale only
+  corrects geometry. The machine's speeds and hatch spacing stay in its own
+  oversized units, so physical speed and line spacing scale by the same factor
+  and energy density shifts — the operator must re-tune power/speed after
+  enabling. The checkbox hover text says this, and states that fixing the field
+  size in LightBurn is the cleaner solution.
+- Moved the mirror guard from the RIGID-fit residual to the SIMILARITY-fit
+  residual. With a genuine 33% scale now legitimately passing through, the old
+  rigid residual (~scale_err × grid RMS radius) tripped spuriously — the rigid
+  fit carries no scale, so it cannot align a correctly-oriented but scaled grid.
+  A mirrored view or scrambled corner order is a reflection, which scale +
+  rotation + translation cannot undo, so the similarity residual is the correct
+  mirror detector and works in both modes. The paper→machine anchor stays the
+  rigid fit (it threads through every camera↔machine conversion; the polynomial
+  handles scale). The scale gate still runs before the mirror guard, so a pure
+  scale error in the non-allow path is still diagnosed as a setup error, never a
+  mirror.
+- Persisted as `calib_allow_machine_scale` (true/false), and surfaced in
+  `debug_summary`'s `laser_field:` line as `scale_comp={on,off}`.
+
 ## 2026-07-20 — Per-step grid parameters + similarity-scale setup guard
 
 A live ③ Laser-field fit was rejected with an apparent ~35% "uniform scale"

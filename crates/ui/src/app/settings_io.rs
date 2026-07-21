@@ -83,6 +83,10 @@ impl ConsoleApp {
                 self.calibration.grid_origin_mm.1.to_string(),
             ),
             ("calib_grid_out", self.calibration.grid_out.clone()),
+            (
+                "calib_allow_machine_scale",
+                self.calibration.allow_machine_scale.to_string(),
+            ),
             ("cam_show_bed", self.camera.show_bed.to_string()),
             (
                 "place_field_correct",
@@ -305,6 +309,12 @@ impl ConsoleApp {
         self.sync_auto_field_center();
         if let Some(v) = m.get("cam_show_bed").and_then(|s| s.trim().parse().ok()) {
             self.camera.show_bed = v;
+        }
+        if let Some(v) = m
+            .get("calib_allow_machine_scale")
+            .and_then(|s| s.trim().parse().ok())
+        {
+            self.calibration.allow_machine_scale = v;
         }
         // A persisted field-correction preference is only honored once a field
         // cal exists this session (the placement frame needs it), so this just

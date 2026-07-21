@@ -155,6 +155,10 @@ pub(super) struct CalibrationState {
     pub(super) lens_frame_signature: Option<((u32, u32), Orientation)>,
     pub(super) field: Option<crate::calib::FieldCal>,
     pub(super) field_accepted: bool,
+    /// Operator opt-in: absorb a large uniform burn-vs-paper scale (an oversized
+    /// machine field) into the ③ field correction instead of refusing the fit.
+    /// Off by default — fixing the field size in LightBurn is the cleaner fix.
+    pub(super) allow_machine_scale: bool,
     pub(super) lens_arrow_scale: f32,
     pub(super) anchor_resid_scale: f32,
     pub(super) edit_anchor_dots: bool,
