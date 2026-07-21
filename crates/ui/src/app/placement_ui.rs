@@ -302,9 +302,10 @@ impl ConsoleApp {
             " · field-warped geometry"
         } else {
             self.runtime.log.push(LogLine {
-                text: "place: no accepted ① Camera lens + ③ Laser field calibration — \
+                text:
+                    "place: no accepted step 1 (Camera lens) + step 3 (Laser field) calibration — \
                        exporting UNWARPED geometry"
-                    .into(),
+                        .into(),
                 err: true,
             });
             " · UNWARPED geometry (no field calibration)"
@@ -371,7 +372,7 @@ impl ConsoleApp {
                 if has_field {
                     "● field-warped export active"
                 } else {
-                    "⚠ UNWARPED export (no ① Camera lens + ③ Laser field)"
+                    "⚠ UNWARPED export (no step 1 Camera lens + step 3 Laser field)"
                 },
             )
             .on_hover_text(
@@ -383,7 +384,7 @@ impl ConsoleApp {
         if self.calibration.field.is_some() && !self.calibration.field_accepted {
             ui.colored_label(
                 status_color(false),
-                "⚠ latest ③ field fit was rejected; nonlinear placement and correction are disabled",
+                "⚠ latest step-3 field fit was rejected; nonlinear placement and correction are disabled",
             );
         }
         ui.horizontal(|ui| {

@@ -125,15 +125,29 @@ pub(super) struct CameraState {
     pub(super) capture_src: Option<crate::camera::Source>,
 }
 
-pub(super) struct CalibrationState {
-    pub(super) anchor: Option<crate::calib::Calibration>,
-    pub(super) saved_at: Option<u64>,
+/// One grid-parameter set (dots per side, pitch, dot size, contrast). The ①
+/// printed paper and the ②③ burned grid each get their own — sharing one set
+/// across the steps let a burned-grid pitch silently mis-scale the ① metric
+/// ruler (and vice versa).
+#[derive(Debug, Clone, Copy, PartialEq)]
+pub(super) struct GridParams {
     pub(super) n: usize,
     pub(super) pitch_mm: f64,
     pub(super) dot_mm: f64,
     pub(super) dot_kind: crate::calib::DotKind,
+}
+
+pub(super) struct CalibrationState {
+    pub(super) anchor: Option<crate::calib::Calibration>,
+    pub(super) saved_at: Option<u64>,
+    /// ① printed paper: the MEASURED pitch (calipers — printers scale).
+    pub(super) paper: GridParams,
+    /// ②③ burned grid: the COMMANDED pitch.
+    pub(super) burn: GridParams,
     pub(super) grid_origin_mm: (f64, f64),
     pub(super) grid_out: String,
+    /// ① printed-paper grid SVG output path (`paper-grid` verb).
+    pub(super) paper_out: String,
     pub(super) frame: String,
     pub(super) frame_img: Option<image::GrayImage>,
     pub(super) frame_tex: Option<TextureHandle>,
@@ -143,13 +157,38 @@ pub(super) struct CalibrationState {
     pub(super) lens_frame_signature: Option<((u32, u32), Orientation)>,
     pub(super) field: Option<crate::calib::FieldCal>,
     pub(super) field_accepted: bool,
+    /// Operator-configurable step 3 laser-field acceptance limits (µm): a fit
+    /// whose residual RMS / worst per-dot error exceeds these is rejected. The
+    /// defaults accept the rig's demonstrated measurement floor.
+    pub(super) accept_rms_um: f64,
+    pub(super) accept_worst_um: f64,
+    /// Operator opt-in: absorb a large uniform burn-vs-paper scale (an oversized
+    /// machine field) into the ③ field correction instead of refusing the fit.
+    /// Off by default — fixing the field size in LightBurn is the cleaner fix.
+    pub(super) allow_machine_scale: bool,
     pub(super) lens_arrow_scale: f32,
     pub(super) anchor_resid_scale: f32,
     pub(super) edit_anchor_dots: bool,
+    /// Per-session view toggle: when off, the post-fit feedback overlays (lens
+    /// arrows, anchor mesh/residuals, field lattice + REJECTED banner) are
+    /// hidden so the operator can see the bare dots to re-click the 4 corners.
+    /// Not persisted — like `corners`, it resets with each session/frame.
+    pub(super) show_fit_feedback: bool,
     pub(super) live: bool,
     pub(super) capture: Option<crate::camera::Capture>,
     pub(super) capture_src: Option<crate::camera::Source>,
     pub(super) note: String,
+}
+
+impl CalibrationState {
+    /// The grid-parameter set the active step edits and fits with: ① Camera
+    /// lens uses the paper set, ②③ use the burned-grid set.
+    pub(super) fn active_params_mut(&mut self) -> &mut GridParams {
+        match self.mode {
+            CalibMode::CameraLens => &mut self.paper,
+            _ => &mut self.burn,
+        }
+    }
 }
 
 pub(super) struct FiducialState {

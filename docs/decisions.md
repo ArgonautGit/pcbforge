@@ -1984,3 +1984,117 @@ files look plausible in LightBurn.
   compatibility but no longer selects an unwarped production path.
 - Calibration grids remain deliberately unwarped: their commanded-vs-physical
   error is the measurement used to construct the field map.
+
+## 2026-07-20 — Operator opt-in to absorb machine scale in software
+
+A follow-on to the similarity-scale setup guard below. One operator's machine
+burns ~33% oversize (LightBurn field size set to 70 mm against a ~93 mm actual
+lens field) and they cannot always reach the machine config to fix it, so they
+asked PCBForge to compensate in software instead of refusing the ③ fit.
+
+- Added `allow_machine_scale: bool` (last parameter) to `fit_laser_field`, wired
+  to a `pub(super) allow_machine_scale` flag on `CalibrationState` (default
+  false) and a labelled ③-only "compensate machine scale" checkbox near the Fit
+  control. Off: behaviour is exactly as before (the `> FIELD_SCALE_FAIL_FRAC`
+  hard gate stands). On: the gate is skipped and any measured scale proceeds —
+  the field polynomial's linear terms already absorb uniform scale downstream,
+  so shapes burn dimensionally true. `FieldCal::scale` still records it, and the
+  accepted-fit note prefixes the verdict with a loud "machine scale {:+.1}%
+  ABSORBED in software …" line.
+- Energy-density caveat (recorded so it isn't lost): absorbing the scale only
+  corrects geometry. The machine's speeds and hatch spacing stay in its own
+  oversized units, so physical speed and line spacing scale by the same factor
+  and energy density shifts — the operator must re-tune power/speed after
+  enabling. The checkbox hover text says this, and states that fixing the field
+  size in LightBurn is the cleaner solution.
+- Moved the mirror guard from the RIGID-fit residual to the SIMILARITY-fit
+  residual. With a genuine 33% scale now legitimately passing through, the old
+  rigid residual (~scale_err × grid RMS radius) tripped spuriously — the rigid
+  fit carries no scale, so it cannot align a correctly-oriented but scaled grid.
+  A mirrored view or scrambled corner order is a reflection, which scale +
+  rotation + translation cannot undo, so the similarity residual is the correct
+  mirror detector and works in both modes. The paper→machine anchor stays the
+  rigid fit (it threads through every camera↔machine conversion; the polynomial
+  handles scale). The scale gate still runs before the mirror guard, so a pure
+  scale error in the non-allow path is still diagnosed as a setup error, never a
+  mirror.
+- Persisted as `calib_allow_machine_scale` (true/false), and surfaced in
+  `debug_summary`'s `laser_field:` line as `scale_comp={on,off}`.
+
+## 2026-07-20 — Per-step grid parameters + similarity-scale setup guard
+
+A live ③ Laser-field fit was rejected with an apparent ~35% "uniform scale"
+error (9.8 mm RMS systematic against a 968 µm scatter floor), and the console
+gave the operator no way to tell which of several plausible causes was at
+fault: a shared pitch/dot-size field reused between calibration steps, the
+camera having moved or zoomed since ①, the printed paper sitting proud of the
+burn plane, or a genuine machine field-size misconfiguration.
+
+- Root cause: `CalibrationState` held one n/pitch/dot⌀/contrast set for both
+  ① (measured, printed pitch) and ②③ (commanded, burned pitch), so fitting ①
+  with the burned-grid pitch silently mis-scaled the metric ruler. Split into
+  distinct `paper` and `burn` parameter sets; the form now shows whichever is
+  active for the step being run. The legacy `calib_*` settings keys keep
+  meaning the burn set; new `calib_paper_*` keys hold the paper set; on first
+  load without paper keys, paper is seeded from burn (that was what ① was
+  last fit against).
+- Added `fit_similarity` (2-D Procrustes with uniform scale) strictly as a
+  diagnostic — the paper→machine anchor itself stays rigid, per the 2026-07-19
+  entry above, so the printed pitch remains the metric authority and galvo
+  scale errors stay measurable. A |scale − 1| beyond `FIELD_SCALE_FAIL_FRAC`
+  (5%) now fails ③ early with a ranked-causes message pointing at the likely
+  culprit; genuine galvo scale error is only ever ~1–2%, so 5% cleanly
+  separates "setup mistake" from "real field distortion." Scale error inside
+  1–5% still proceeds, but `FieldCal::scale` now carries the measurement
+  through the verdict phrase, `debug_summary`, and the persisted
+  `field_stats` (third token; missing on old data implies 1.0).
+- The new scale gate runs before the existing rigid-fit alignment-RMS guard,
+  not after: over this grid's ~28 mm RMS radius, a 35% scale error alone
+  produces ~9.9 mm alignment RMS, which sits right on top of the one-pitch
+  (10 mm) mirrored-view threshold. Left in the old order, the same fault could
+  either trip a misleading "mirrored view" error or narrowly duck under the
+  guard and masquerade as a field-distortion failure.
+- The ③ fit note also gains an off-centre warning when the fitted grid centre
+  sits more than 25% of the work-area size from the configured field centre:
+  `classify_field_error` assumes a centred grid, and an off-axis grid's
+  curvature otherwise reads as uniform scale.
+
+## 2026-07-21 — Mirror-blind calibration fixed with an asymmetric grid + reflective frame (bench-caught)
+
+An exported job burned on the mirrored side of the field while the whole
+calibration chain reported a clean, self-consistent fit. The operator caught
+it by comparing the emitted coordinates, LightBurn's preview, and the physical
+burn: the machine negates X (galvo axis config), and calibration never saw it.
+
+- Root cause is structural: an n×n dot lattice is mirror-symmetric, and the
+  corner-click instruction labeled dots by *visual* position, so a machine
+  X-flip merely relabels dots — the fitted map is internally consistent and
+  the mirrored-view guard has nothing to catch. The flip only reappears when
+  true commanded coordinates reach the real machine at export.
+- Fix, part 1: `calib-grid` now burns two off-lattice orientation markers
+  (diagonally outside the LL corner; below the bottom-edge midpoint), and the
+  laser-mode corner clicks are keyed to them (LL = corner nearest the lone
+  diagonal marker). Dots therefore get their TRUE commanded labels, making a
+  machine mirror visible as a genuinely mirrored correspondence. Markers sit
+  ≥0.5·pitch off-lattice, outside the detector's search windows. The paper
+  grid stays unmarked — its frame is arbitrary by design.
+- Fix, part 2: `fit_rigid`/`fit_similarity` are now full Procrustes with
+  reflection (try det=+1 and det=−1, keep the better); `Rigid2` carries
+  `flip_x` (applied before rotation) through every camera↔machine conversion
+  and the persisted `field_frame` (fifth token; absent = no flip). A mirrored
+  machine calibrates cleanly with a loud note naming the mirror; clearing the
+  axis negate in LightBurn and recalibrating removes it.
+- Corner-order scrambles are still rejected, but the mechanism split: square-
+  symmetry permutations are geometrically identical to machine flips/rotations
+  and are now absorbed by design; non-isometric scrambles bowtie the corner
+  seed and fail at dot detection, and a sheared correspondence still trips the
+  alignment-residual guard (which now mentions the orientation markers).
+- Collateral hardening: a bowtied seed produced a near-singular homography
+  whose blown-up local scale panicked the fiducial search-window arithmetic
+  (i64 overflow); degenerate centers/scales now return a miss.
+- Same session, operator direction: the ③ acceptance limits (residual
+  RMS/worst) became editable + persisted (`calib_accept_rms_um`/`_worst_um`,
+  default 100/250 µm). The rig's demonstrated measurement floor is ~69/182 µm,
+  so the old hardcoded 50/100 rejected every fit the hardware could produce;
+  limits now sit at what the operator's process actually needs, and rejection
+  text quotes the configured values.

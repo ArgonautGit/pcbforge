@@ -386,12 +386,24 @@ pub fn re_anchor(
 /// carries the paper's metric frame onto the machine's commanded frame, fit
 /// from the burned dots. Scale is deliberately excluded so a genuine galvo
 /// scale error stays measurable against the paper's printed pitch.
+///
+/// `flip_x` lets the frame represent a REFLECTION, not just a rotation: some
+/// galvo machines mirror the X axis relative to commanded coordinates (a
+/// LightBurn axis-negate / galvo mapping), so a burned grid labelled with its
+/// TRUE commanded coordinates is the commanded lattice reflected in x. A pure
+/// rotation+translation cannot undo that; a reflection can. The convention is
+/// `map = R · F`: the reflection `F` (which negates x) is applied FIRST, then
+/// the rotation `R`, then the translation. `flip_x == false` is the ordinary
+/// proper (det = +1) rigid transform.
 #[derive(Debug, Clone, Copy, PartialEq)]
 pub struct Rigid2 {
     pub cos: f64,
     pub sin: f64,
     pub tx: f64,
     pub ty: f64,
+    /// When set, negate the source x BEFORE the rotation (`map = R · F`), so the
+    /// transform is an improper isometry (a reflection). See the type docs.
+    pub flip_x: bool,
 }
 
 impl Rigid2 {
@@ -400,23 +412,26 @@ impl Rigid2 {
         sin: 0.0,
         tx: 0.0,
         ty: 0.0,
+        flip_x: false,
     };
 
-    /// Paper mm → machine mm.
+    /// Paper mm → machine mm. With `flip_x`, x is negated before the rotation
+    /// (`map = R · F`).
     pub fn apply(&self, p: (f64, f64)) -> (f64, f64) {
+        let x = if self.flip_x { -p.0 } else { p.0 };
         (
-            self.cos * p.0 - self.sin * p.1 + self.tx,
-            self.sin * p.0 + self.cos * p.1 + self.ty,
+            self.cos * x - self.sin * p.1 + self.tx,
+            self.sin * x + self.cos * p.1 + self.ty,
         )
     }
 
-    /// Machine mm → paper mm (rotations invert by transpose).
+    /// Machine mm → paper mm (rotations invert by transpose). With `flip_x`,
+    /// `F` is its own inverse, so un-negate x LAST: `map⁻¹ = F · Rᵀ`.
     pub fn inverse_apply(&self, p: (f64, f64)) -> (f64, f64) {
         let (dx, dy) = (p.0 - self.tx, p.1 - self.ty);
-        (
-            self.cos * dx + self.sin * dy,
-            -self.sin * dx + self.cos * dy,
-        )
+        let rx = self.cos * dx + self.sin * dy;
+        let ry = -self.sin * dx + self.cos * dy;
+        (if self.flip_x { -rx } else { rx }, ry)
     }
 
     pub fn is_finite(&self) -> bool {
@@ -425,15 +440,18 @@ impl Rigid2 {
             .all(|v| v.is_finite())
     }
 
-    /// Rotation angle, degrees — for operator feedback.
+    /// Rotation angle of the `R` factor, degrees — for operator feedback. Note
+    /// that with `flip_x` set this is the rotation applied AFTER the x
+    /// reflection (`map = R · F`), not the overall det-negative map's "angle".
     pub fn angle_deg(&self) -> f64 {
         self.sin.atan2(self.cos).to_degrees()
     }
 }
 
-/// Least-squares rigid alignment `src → dst` (2-D Kabsch/Procrustes without
-/// scale). Needs ≥2 points with non-zero spread.
-pub fn fit_rigid(pairs: &[(Point2<f64>, Point2<f64>)]) -> Result<Rigid2, String> {
+/// Least-squares PROPER rigid alignment `src → dst` (2-D Kabsch/Procrustes, no
+/// scale, det = +1). The reflection-aware [`fit_rigid`] wraps this. Needs ≥2
+/// points with non-zero spread.
+fn fit_rigid_proper(pairs: &[(Point2<f64>, Point2<f64>)]) -> Result<Rigid2, String> {
     let n = pairs.len();
     if n < 2 {
         return Err(format!("rigid alignment needs ≥2 points, got {n}"));
@@ -466,11 +484,153 @@ pub fn fit_rigid(pairs: &[(Point2<f64>, Point2<f64>)]) -> Result<Rigid2, String>
         sin,
         tx: bx - (cos * ax - sin * ay),
         ty: by - (sin * ax + cos * ay),
+        flip_x: false,
     };
     rigid
         .is_finite()
         .then_some(rigid)
         .ok_or_else(|| "rigid alignment produced non-finite values".into())
+}
+
+/// Sum of squared residuals `Σ |transform(src) − dst|²` for a fitted frame.
+fn frame_residual_sq(frame: &Rigid2, pairs: &[(Point2<f64>, Point2<f64>)]) -> f64 {
+    pairs
+        .iter()
+        .map(|(a, b)| {
+            let (x, y) = frame.apply((a.x, a.y));
+            (x - b.x).powi(2) + (y - b.y).powi(2)
+        })
+        .sum()
+}
+
+/// Least-squares rigid alignment `src → dst` with REFLECTION (2-D Procrustes
+/// with reflection). Fits both the proper (det = +1) transform and the
+/// x-reflected variant (`map = R · F`, F negating src x) and returns whichever
+/// has the lower residual, recording the choice in `flip_x`. This lets the
+/// paper→machine frame absorb a machine that mirrors X relative to commanded
+/// coordinates. Needs ≥2 points with non-zero spread.
+pub fn fit_rigid(pairs: &[(Point2<f64>, Point2<f64>)]) -> Result<Rigid2, String> {
+    let proper = fit_rigid_proper(pairs)?;
+    // Reflected variant: fit the proper transform on x-negated src, then mark
+    // flip_x so `apply` negates x itself (`map = R · F` on the ORIGINAL src).
+    let reflected_src: Vec<(Point2<f64>, Point2<f64>)> = pairs
+        .iter()
+        .map(|(a, b)| (Point2::new(-a.x, a.y), *b))
+        .collect();
+    match fit_rigid_proper(&reflected_src) {
+        Ok(mut reflected) => {
+            reflected.flip_x = true;
+            if frame_residual_sq(&reflected, pairs) < frame_residual_sq(&proper, pairs) {
+                Ok(reflected)
+            } else {
+                Ok(proper)
+            }
+        }
+        Err(_) => Ok(proper),
+    }
+}
+
+/// A similarity (uniform scale · rotation + translation) alignment `src → dst`.
+/// DIAGNOSTIC ONLY — the metric paper→machine anchor stays rigid
+/// ([`fit_rigid`]) so galvo scale errors remain measurable against the printed
+/// pitch; this exists to *detect* a scale mismatch, never to absorb one.
+#[derive(Debug, Clone, Copy, PartialEq)]
+pub struct Similarity2 {
+    /// src units → dst units, > 0.
+    pub scale: f64,
+    /// Rotation + translation applied after scaling.
+    pub rigid: Rigid2,
+}
+
+impl Similarity2 {
+    pub fn apply(&self, p: (f64, f64)) -> (f64, f64) {
+        self.rigid.apply((p.0 * self.scale, p.1 * self.scale))
+    }
+}
+
+/// Least-squares PROPER similarity alignment `src → dst` (2-D Procrustes with
+/// uniform scale, det = +1). The reflection-aware [`fit_similarity`] wraps this.
+/// Needs ≥2 points with non-zero spread.
+fn fit_similarity_proper(pairs: &[(Point2<f64>, Point2<f64>)]) -> Result<Similarity2, String> {
+    let n = pairs.len();
+    if n < 2 {
+        return Err(format!("similarity alignment needs ≥2 points, got {n}"));
+    }
+    let nf = n as f64;
+    let (mut ax, mut ay, mut bx, mut by) = (0.0, 0.0, 0.0, 0.0);
+    for (a, b) in pairs {
+        ax += a.x;
+        ay += a.y;
+        bx += b.x;
+        by += b.y;
+    }
+    let (ax, ay, bx, by) = (ax / nf, ay / nf, bx / nf, by / nf);
+    let (mut dot, mut cross, mut src_sq, mut spread) = (0.0, 0.0, 0.0, 0.0_f64);
+    for (a, b) in pairs {
+        let (ux, uy) = (a.x - ax, a.y - ay);
+        let (vx, vy) = (b.x - bx, b.y - by);
+        dot += ux * vx + uy * vy;
+        cross += ux * vy - uy * vx;
+        src_sq += ux * ux + uy * uy;
+        spread = spread.max(ux.hypot(uy));
+    }
+    if spread < 1e-9 || (dot == 0.0 && cross == 0.0) {
+        return Err("similarity alignment is degenerate: the points have no spread".into());
+    }
+    let scale = dot.hypot(cross) / src_sq;
+    if !(scale.is_finite() && scale > 0.0) {
+        return Err("similarity alignment produced a non-positive scale".into());
+    }
+    let theta = cross.atan2(dot);
+    let (sin, cos) = theta.sin_cos();
+    let rigid = Rigid2 {
+        cos,
+        sin,
+        tx: bx - scale * (cos * ax - sin * ay),
+        ty: by - scale * (sin * ax + cos * ay),
+        flip_x: false,
+    };
+    rigid
+        .is_finite()
+        .then_some(Similarity2 { scale, rigid })
+        .ok_or_else(|| "similarity alignment produced non-finite values".into())
+}
+
+/// Sum of squared residuals `Σ |sim(src) − dst|²` for a fitted similarity.
+fn similarity_residual_sq(sim: &Similarity2, pairs: &[(Point2<f64>, Point2<f64>)]) -> f64 {
+    pairs
+        .iter()
+        .map(|(a, b)| {
+            let (x, y) = sim.apply((a.x, a.y));
+            (x - b.x).powi(2) + (y - b.y).powi(2)
+        })
+        .sum()
+}
+
+/// Least-squares similarity alignment `src → dst` with REFLECTION (2-D
+/// Procrustes with uniform scale AND reflection). Fits both the proper
+/// (det = +1) transform and the x-reflected variant (`map = R · F` on the
+/// scaled src) and returns whichever has the lower residual, recording the
+/// choice in `rigid.flip_x`. Needs ≥2 points with non-zero spread.
+pub fn fit_similarity(pairs: &[(Point2<f64>, Point2<f64>)]) -> Result<Similarity2, String> {
+    let proper = fit_similarity_proper(pairs)?;
+    // Reflected variant: fit the proper similarity on x-negated src, then mark
+    // flip_x so `apply` negates the scaled x itself (`map = R · F`).
+    let reflected_src: Vec<(Point2<f64>, Point2<f64>)> = pairs
+        .iter()
+        .map(|(a, b)| (Point2::new(-a.x, a.y), *b))
+        .collect();
+    match fit_similarity_proper(&reflected_src) {
+        Ok(mut reflected) => {
+            reflected.rigid.flip_x = true;
+            if similarity_residual_sq(&reflected, pairs) < similarity_residual_sq(&proper, pairs) {
+                Ok(reflected)
+            } else {
+                Ok(proper)
+            }
+        }
+        Err(_) => Ok(proper),
+    }
 }
 
 /// One burned-grid dot's laser-field feedback for the overlay: where it was
@@ -512,6 +672,18 @@ pub struct FieldCal {
     /// correction will fix, or scatter it won't help with — see
     /// `vision::classify_field_error`.
     pub field_verdict: FieldVerdict,
+    /// Measured burn size / commanded size: the uniform similarity scale
+    /// between the burned grid (through the ① paper ruler) and the commanded
+    /// lattice. `> 1.0` ⇒ the burn reads larger than commanded. Diagnostic
+    /// only — the alignment the map is built on is rigid (no scale).
+    pub scale: f64,
+    /// How many detected burned-grid dots landed OUTSIDE the pixel region the
+    /// step-1 camera-lens calibration was fit over (`LensMap::calib_px_bounds`,
+    /// expanded 5% each side). The metric ruler extrapolates there, so their
+    /// contribution to the field error reads as scatter rather than real
+    /// distortion. `0` when the lens map carries no bounds. Per-fit feedback —
+    /// not persisted.
+    pub extrapolated: usize,
 }
 
 /// Map a camera pixel into the laser's **commanded** coordinate frame by
@@ -623,7 +795,12 @@ fn invert_poly(forward: &Poly2, reverse_seed: &Poly2, target: (f64, f64)) -> Opt
 /// Gate a real laser-field fit before it is allowed to drive corrected
 /// projection or emission. The four boundary corners keep a deceptively good
 /// center-only polynomial from being accepted.
-pub fn field_live_acceptance(cal: &FieldCal, grid: &GridSpec) -> Result<(), String> {
+pub fn field_live_acceptance(
+    cal: &FieldCal,
+    grid: &GridSpec,
+    accept_rms_um: f64,
+    accept_worst_um: f64,
+) -> Result<(), String> {
     if cal.total == 0 || cal.found * 5 < cal.total * 4 {
         let pct = if cal.total == 0 {
             0
@@ -652,11 +829,11 @@ pub fn field_live_acceptance(cal: &FieldCal, grid: &GridSpec) -> Result<(), Stri
     }
     if !cal.field.rms_um.is_finite()
         || !cal.field.max_um.is_finite()
-        || cal.field.rms_um > 50.0
-        || cal.field.max_um > 100.0
+        || cal.field.rms_um > accept_rms_um
+        || cal.field.max_um > accept_worst_um
     {
         return Err(format!(
-            "fit residual RMS {:.0} µm, worst {:.0} µm; limits are 50/100 µm",
+            "fit residual RMS {:.0} µm, worst {:.0} µm; limits are {accept_rms_um:.0}/{accept_worst_um:.0} µm",
             cal.field.rms_um, cal.field.max_um
         ));
     }
@@ -675,6 +852,27 @@ pub fn field_live_acceptance(cal: &FieldCal, grid: &GridSpec) -> Result<(), Stri
 /// The printed paper's position/rotation in the view is arbitrary — only its
 /// pitch (metric scale) and the lens curvature it characterizes matter. The
 /// camera must not have moved between the lens fit and this frame.
+/// `|scale − 1|` above this is a setup error (wrong pitch entered at ①/③, the
+/// camera moved or zoomed since ①, the paper not lying in the burn plane, or a
+/// machine field-size misconfiguration) — the fit fails early rather than
+/// producing a garbage rejection. Genuine galvo scale errors are ≲1–2%.
+pub const FIELD_SCALE_FAIL_FRAC: f64 = 0.05;
+/// `|scale − 1|` above this is surfaced to the operator but still fittable
+/// (the field polynomial's linear terms absorb it).
+pub const FIELD_SCALE_NOTE_FRAC: f64 = 0.01;
+/// Stable marker substring in the scale-gate error, so the UI can recognize it
+/// without matching prose.
+pub const FIELD_SCALE_ERR_MARKER: &str = "burn-vs-paper scale";
+
+/// `allow_machine_scale` lets the operator opt into absorbing a large uniform
+/// burn-vs-paper scale (e.g. a machine whose configured field size is wrong) in
+/// software: with it set, the `> FIELD_SCALE_FAIL_FRAC` hard gate is skipped and
+/// the scale is absorbed by the field polynomial's linear terms downstream.
+/// Shapes then burn dimensionally true, but the machine's speeds and hatch
+/// spacing stay in its own oversized units, so energy density shifts — the UI
+/// warns and records the choice. The mirror guard below is independent of this
+/// flag: a mirrored view or scrambled corner order cannot be fixed by scale +
+/// rotation + translation, so it is caught in either mode.
 pub fn fit_laser_field(
     frame: &GrayImage,
     corners_px: [(f64, f64); 4],
@@ -682,6 +880,7 @@ pub fn fit_laser_field(
     dot_mm: f64,
     kind: DotKind,
     lens: &LensMap,
+    allow_machine_scale: bool,
 ) -> Result<FieldCal, String> {
     if grid.n < 4 {
         return Err("laser-field fit needs at least a 4×4 grid".into());
@@ -695,6 +894,23 @@ pub fn fit_laser_field(
              (check the burned grid, the corner clicks, the dot size, and polarity)"
         ));
     }
+    // Count detected dots whose pixels fall outside the region the step-1 lens
+    // calibration was fit over. Reading a burn through the ruler out there
+    // extrapolates the bi-cubic unreliably, and that error lands silently in the
+    // field fit's residuals/scatter — so surface it. The box is grown 5% of its
+    // own span on each side: extrapolation right at the edge is harmless.
+    let extrapolated = lens
+        .calib_px_bounds
+        .map_or(0, |[min_x, min_y, max_x, max_y]| {
+            let mx = (max_x - min_x) * 0.05;
+            let my = (max_y - min_y) * 0.05;
+            let (lo_x, hi_x) = (min_x - mx, max_x + mx);
+            let (lo_y, hi_y) = (min_y - my, max_y + my);
+            pairs
+                .iter()
+                .filter(|(fpx, _)| fpx.x < lo_x || fpx.x > hi_x || fpx.y < lo_y || fpx.y > hi_y)
+                .count()
+        });
     // Detected px → paper-frame mm through the lens ruler. The printed paper
     // only characterizes distortion + metric scale; its pose in the view is
     // arbitrary (it's taped on top). The BURNED GRID anchors the coordinate
@@ -708,6 +924,53 @@ pub fn fit_laser_field(
             (Point2::new(phx, phy), Point2::new(cmd.x, cmd.y))
         })
         .collect();
+    // Scale sanity gate, BEFORE the mirror guard: a large uniform scale mismatch
+    // (wrong paper pitch at ①, camera moved since ①, paper out of the burn
+    // plane, machine field size) is a setup error unless the operator has opted
+    // to absorb it in software (`allow_machine_scale`). When absorbed, the field
+    // polynomial's linear terms take it up downstream; `scale` still records it.
+    let sim =
+        fit_similarity(&paper_pairs).map_err(|e| format!("burned-grid frame alignment: {e}"))?;
+    // sim is measured → commanded, so measured/commanded is its inverse.
+    let scale = 1.0 / sim.scale;
+    if !allow_machine_scale && (scale - 1.0).abs() > FIELD_SCALE_FAIL_FRAC {
+        return Err(format!(
+            "{FIELD_SCALE_ERR_MARKER} is off by {:+.1}% — a setup error, not field distortion. \
+             Likeliest causes, in order: the pitch entered at step 1 wasn't the paper's MEASURED \
+             pitch (or step 3's isn't the commanded one); the camera moved or zoomed since step 1; the \
+             printed paper wasn't lying in the burn plane; the machine's field-size setting \
+             (LightBurn/EZCAD). Fix the setup, re-run step 1, then step 3 (or enable \
+             \"compensate machine scale\" to absorb it in software)",
+            (scale - 1.0) * 100.0
+        ));
+    }
+    // Correspondence guard on the SIMILARITY residual, in BOTH modes. The
+    // similarity fit now absorbs a REFLECTION (`fit_similarity` tries the
+    // x-mirrored variant too), so a genuinely mirrored machine — burned grid
+    // labelled with its TRUE commanded coordinates — no longer trips this: it's
+    // a reflection the fit represents, and `paper_to_machine.flip_x` records it.
+    // What still leaves a large residual is a correspondence that is NOT a
+    // similarity-with-reflection at all: a corner-click order that scrambles the
+    // labels into a non-isometry (or any other mislabelling / shear). Scale +
+    // rotation + translation + reflection cannot undo that, so the guard stays
+    // as the backstop, even when a genuine scale is legitimately absorbed.
+    let sim_rms_mm = (paper_pairs
+        .iter()
+        .map(|(p, c)| {
+            let (sx, sy) = sim.apply((p.x, p.y));
+            (sx - c.x).powi(2) + (sy - c.y).powi(2)
+        })
+        .sum::<f64>()
+        / paper_pairs.len() as f64)
+        .sqrt();
+    if sim_rms_mm > grid.pitch_mm {
+        return Err(format!(
+            "burned-grid frame alignment left {sim_rms_mm:.1} mm RMS after scale+rotation+reflection \
+             (≥ one grid pitch) — the dots don't match the commanded lattice; check the corner \
+             click order against the grid's orientation markers (LL is the corner nearest the lone \
+             diagonal marker; the edge with the midpoint marker is the bottom)"
+        ));
+    }
     let paper_to_machine =
         fit_rigid(&paper_pairs).map_err(|e| format!("burned-grid frame alignment: {e}"))?;
     let field_pairs: Vec<(Point2<f64>, Point2<f64>)> = paper_pairs
@@ -717,21 +980,6 @@ pub fn fit_laser_field(
             (Point2::new(mx, my), *cmd)
         })
         .collect();
-    // A mirrored view (or scrambled corner clicks) cannot be aligned by a
-    // rotation — surface it instead of reporting a nonsense "field error".
-    let align_rms_mm = (field_pairs
-        .iter()
-        .map(|(p, c)| (p.x - c.x).powi(2) + (p.y - c.y).powi(2))
-        .sum::<f64>()
-        / field_pairs.len() as f64)
-        .sqrt();
-    if align_rms_mm > grid.pitch_mm {
-        return Err(format!(
-            "burned-grid frame alignment left {align_rms_mm:.1} mm RMS (≥ one grid pitch) — \
-             the dots don't match the commanded lattice; check the corner click order and the \
-             camera orientation (a mirrored view cannot be rigidly aligned)"
-        ));
-    }
     let field = fit_field(&field_pairs).map_err(|e| format!("field fit: {e}"))?;
     // A linear physical-mm → px map for the Place overlay: fit a homography
     // from each dot's physical position to its detected pixel.
@@ -773,6 +1021,8 @@ pub fn fit_laser_field(
         found,
         total,
         field_verdict,
+        scale,
+        extrapolated,
     })
 }
 
@@ -845,6 +1095,7 @@ mod tests {
             rms_um: 0.0,
             max_um: 0.0,
             residuals: vec![],
+            calib_px_bounds: None,
         };
         // Field: command (x,y) lands physically at (1.02x+1, 0.98y-2).
         let field = FieldMap {
@@ -870,6 +1121,7 @@ mod tests {
             sin: 1.0,
             tx: 5.0,
             ty: -3.0,
+            flip_x: false,
         };
         let px =
             commanded_to_camera_px(&lens, &frame, &field, commanded).expect("finite projection");
@@ -882,8 +1134,8 @@ mod tests {
         assert!((px2.0 - px.0).abs() < 1e-9 && (px2.1 - px.1).abs() < 1e-9);
     }
 
-    /// The rigid fit recovers a known rotation+translation and refuses
-    /// degenerate input; apply/inverse_apply round-trip.
+    /// The rigid fit recovers a known rotation+translation (proper, det = +1)
+    /// and refuses degenerate input; apply/inverse_apply round-trip.
     #[test]
     fn rigid_alignment_recovers_pose_and_round_trips() {
         let truth = Rigid2 {
@@ -891,6 +1143,7 @@ mod tests {
             sin: (0.3_f64).sin(),
             tx: 12.5,
             ty: -7.25,
+            flip_x: false,
         };
         let pairs: Vec<(Point2<f64>, Point2<f64>)> = (0..5)
             .flat_map(|r| (0..5).map(move |c| (c as f64 * 10.0, r as f64 * 10.0)))
@@ -900,6 +1153,10 @@ mod tests {
             })
             .collect();
         let fit = fit_rigid(&pairs).expect("rigid fit");
+        assert!(
+            !fit.flip_x,
+            "a proper transform is not flagged as reflected"
+        );
         assert!((fit.cos - truth.cos).abs() < 1e-12);
         assert!((fit.sin - truth.sin).abs() < 1e-12);
         assert!((fit.tx - truth.tx).abs() < 1e-9);
@@ -913,6 +1170,113 @@ mod tests {
             .map(|_| (Point2::new(1.0, 1.0), Point2::new(2.0, 2.0)))
             .collect();
         assert!(fit_rigid(&coincident).is_err(), "no spread is refused");
+    }
+
+    /// The rigid fit recovers a known REFLECTED transform (`map = R · F`, F
+    /// negating x): `flip_x` is set and the parameters are recovered, and
+    /// apply/inverse_apply still round-trip through the flip.
+    #[test]
+    fn rigid_alignment_recovers_a_reflection() {
+        let truth = Rigid2 {
+            cos: (-0.4_f64).cos(),
+            sin: (-0.4_f64).sin(),
+            tx: -3.5,
+            ty: 8.0,
+            flip_x: true,
+        };
+        let pairs: Vec<(Point2<f64>, Point2<f64>)> = (0..5)
+            .flat_map(|r| (0..5).map(move |c| (c as f64 * 10.0, r as f64 * 10.0)))
+            .map(|p| {
+                let q = truth.apply(p);
+                (Point2::new(p.0, p.1), Point2::new(q.0, q.1))
+            })
+            .collect();
+        let fit = fit_rigid(&pairs).expect("rigid fit");
+        assert!(fit.flip_x, "the reflected variant is chosen");
+        assert!((fit.cos - truth.cos).abs() < 1e-12);
+        assert!((fit.sin - truth.sin).abs() < 1e-12);
+        assert!((fit.tx - truth.tx).abs() < 1e-9);
+        assert!((fit.ty - truth.ty).abs() < 1e-9);
+        // The fitted reflected frame reproduces the truth on every point.
+        for (a, b) in &pairs {
+            let (x, y) = fit.apply((a.x, a.y));
+            assert!((x - b.x).abs() < 1e-9 && (y - b.y).abs() < 1e-9);
+        }
+        // inverse_apply is the exact inverse through the flip.
+        let p = (3.7, -1.2);
+        let round = fit.inverse_apply(fit.apply(p));
+        assert!((round.0 - p.0).abs() < 1e-9 && (round.1 - p.1).abs() < 1e-9);
+    }
+
+    /// The similarity fit recovers a known scale·rotation+translation and
+    /// refuses degenerate input.
+    #[test]
+    fn similarity_alignment_recovers_scale_rotation_translation() {
+        let truth = Similarity2 {
+            scale: 1.35,
+            rigid: Rigid2 {
+                cos: (0.3_f64).cos(),
+                sin: (0.3_f64).sin(),
+                tx: 12.5,
+                ty: -7.25,
+                flip_x: false,
+            },
+        };
+        let pairs: Vec<(Point2<f64>, Point2<f64>)> = (0..5)
+            .flat_map(|r| (0..5).map(move |c| (c as f64 * 10.0, r as f64 * 10.0)))
+            .map(|p| {
+                let q = truth.apply(p);
+                (Point2::new(p.0, p.1), Point2::new(q.0, q.1))
+            })
+            .collect();
+        let fit = fit_similarity(&pairs).expect("similarity fit");
+        assert!(!fit.rigid.flip_x, "a proper similarity is not reflected");
+        assert!((fit.scale - truth.scale).abs() < 1e-12);
+        assert!((fit.rigid.cos - truth.rigid.cos).abs() < 1e-12);
+        assert!((fit.rigid.sin - truth.rigid.sin).abs() < 1e-12);
+        assert!((fit.rigid.tx - truth.rigid.tx).abs() < 1e-9);
+        assert!((fit.rigid.ty - truth.rigid.ty).abs() < 1e-9);
+
+        assert!(fit_similarity(&pairs[..1]).is_err(), "<2 points refused");
+        let coincident: Vec<_> = (0..4)
+            .map(|_| (Point2::new(1.0, 1.0), Point2::new(2.0, 2.0)))
+            .collect();
+        assert!(fit_similarity(&coincident).is_err(), "no spread is refused");
+    }
+
+    /// The similarity fit recovers a known REFLECTED scale·rotation+translation
+    /// (`map = R · F` on the scaled src): `flip_x` is set and every parameter is
+    /// recovered.
+    #[test]
+    fn similarity_alignment_recovers_a_reflection() {
+        let truth = Similarity2 {
+            scale: 0.8,
+            rigid: Rigid2 {
+                cos: (1.1_f64).cos(),
+                sin: (1.1_f64).sin(),
+                tx: 4.0,
+                ty: -2.0,
+                flip_x: true,
+            },
+        };
+        let pairs: Vec<(Point2<f64>, Point2<f64>)> = (0..5)
+            .flat_map(|r| (0..5).map(move |c| (c as f64 * 10.0, r as f64 * 10.0)))
+            .map(|p| {
+                let q = truth.apply(p);
+                (Point2::new(p.0, p.1), Point2::new(q.0, q.1))
+            })
+            .collect();
+        let fit = fit_similarity(&pairs).expect("similarity fit");
+        assert!(fit.rigid.flip_x, "the reflected variant is chosen");
+        assert!((fit.scale - truth.scale).abs() < 1e-12);
+        assert!((fit.rigid.cos - truth.rigid.cos).abs() < 1e-12);
+        assert!((fit.rigid.sin - truth.rigid.sin).abs() < 1e-12);
+        assert!((fit.rigid.tx - truth.rigid.tx).abs() < 1e-9);
+        assert!((fit.rigid.ty - truth.rigid.ty).abs() < 1e-9);
+        for (a, b) in &pairs {
+            let (x, y) = fit.apply((a.x, a.y));
+            assert!((x - b.x).abs() < 1e-9 && (y - b.y).abs() < 1e-9);
+        }
     }
 
     #[test]
@@ -1354,11 +1718,12 @@ mod tests {
             cam(px, py)
         });
 
-        let cal = fit_laser_field(&img, corners_px, &grid, dot_mm, DotKind::Dark, &lens)
+        let cal = fit_laser_field(&img, corners_px, &grid, dot_mm, DotKind::Dark, &lens, false)
             .expect("field fit");
         assert_eq!(cal.found, 49, "all dots detected");
         assert!(cal.field.rms_um < 60.0, "field RMS {} µm", cal.field.rms_um);
-        field_live_acceptance(&cal, &grid).expect("well-covered field fit is accepted");
+        field_live_acceptance(&cal, &grid, 100.0, 250.0)
+            .expect("well-covered field fit is accepted");
 
         let mut missing_corner = cal.clone();
         missing_corner
@@ -1366,7 +1731,7 @@ mod tests {
             .retain(|d| d.commanded_mm != grid.corners_mm()[0]);
         missing_corner.found = missing_corner.dots.len();
         assert!(
-            field_live_acceptance(&missing_corner, &grid)
+            field_live_acceptance(&missing_corner, &grid, 100.0, 250.0)
                 .unwrap_err()
                 .contains("boundary corners"),
             "a center-heavy fit cannot activate correction"
@@ -1375,7 +1740,7 @@ mod tests {
         let mut inaccurate = cal.clone();
         inaccurate.field.max_um = 101.0;
         assert!(
-            field_live_acceptance(&inaccurate, &grid)
+            field_live_acceptance(&inaccurate, &grid, 50.0, 100.0)
                 .unwrap_err()
                 .contains("limits are 50/100"),
             "a high-residual polynomial cannot activate correction"
@@ -1405,6 +1770,305 @@ mod tests {
             cal.field_verdict.pattern
         );
         assert!(cal.field_verdict.ratio >= 2.0);
+    }
+
+    /// The residual acceptance limits are operator-configurable: a fit sitting
+    /// at the rig's measurement floor (RMS 70 µm / worst 180 µm) passes the new
+    /// 100/250 defaults but is rejected by the old hardcoded 50/100.
+    #[test]
+    fn field_acceptance_limits_are_configurable() {
+        let grid = GridSpec {
+            origin_mm: (0.0, 0.0),
+            pitch_mm: 10.0,
+            n: 4,
+        };
+        let (_lens, mut field) = affine_maps();
+        field.rms_um = 70.0;
+        field.max_um = 180.0;
+        // One dot per commanded point, so all four corners lock and coverage is
+        // 100% — isolating the residual gate.
+        let dots: Vec<FieldDot> = grid
+            .points()
+            .iter()
+            .map(|&(x, y)| FieldDot {
+                px: (0.0, 0.0),
+                physical_mm: (x, y),
+                commanded_mm: (x, y),
+                field_um: 0.0,
+                resid_um: 0.0,
+            })
+            .collect();
+        let total = dots.len();
+        let to_px = homog(&[
+            ((0.0, 0.0), (0.0, 0.0)),
+            ((30.0, 0.0), (300.0, 0.0)),
+            ((30.0, 30.0), (300.0, 300.0)),
+            ((0.0, 30.0), (0.0, 300.0)),
+        ]);
+        let cal = FieldCal {
+            field,
+            paper_to_machine: Rigid2::IDENTITY,
+            to_px,
+            found: total,
+            total,
+            dots,
+            field_verdict: vision::classify_field_error(&[]),
+            scale: 1.0,
+            extrapolated: 0,
+        };
+        // The new defaults accept the rig's floor.
+        assert!(field_live_acceptance(&cal, &grid, 100.0, 250.0).is_ok());
+        // The old hardcoded limits reject it, quoting the configured limits.
+        let err = field_live_acceptance(&cal, &grid, 50.0, 100.0).unwrap_err();
+        assert!(err.contains("limits are 50/100"), "got: {err}");
+    }
+
+    /// Build a burned-grid frame with NO field distortion, imaged by a plain
+    /// 10 px/mm camera, but a lens ruler whose mm output is scaled by
+    /// `ruler_scale` — exactly what fitting ① against the wrong printed pitch
+    /// produces. Returns (frame, corners_px, grid, dot_mm, lens).
+    fn mis_scaled_ruler_setup(
+        ruler_scale: f64,
+    ) -> (GrayImage, [(f64, f64); 4], GridSpec, f64, LensMap) {
+        let grid = GridSpec {
+            origin_mm: (0.0, 0.0),
+            pitch_mm: 10.0,
+            n: 7,
+        };
+        let dot_mm = 1.5;
+        let cam = |x: f64, y: f64| (10.0 * x + 50.0, 10.0 * y + 50.0);
+        let lens_pairs: Vec<(Point2<f64>, Point2<f64>)> = grid
+            .points()
+            .iter()
+            .map(|&(x, y)| {
+                let (u, v) = cam(x, y);
+                (
+                    Point2::new(u, v),
+                    Point2::new(x * ruler_scale, y * ruler_scale),
+                )
+            })
+            .collect();
+        let lens = fit_lens(&lens_pairs).expect("lens");
+        let mm_to_px = homog(&[
+            ((0.0, 0.0), cam(0.0, 0.0)),
+            ((60.0, 0.0), cam(60.0, 0.0)),
+            ((60.0, 60.0), cam(60.0, 60.0)),
+            ((0.0, 60.0), cam(0.0, 60.0)),
+        ]);
+        let img = render_grid(&grid, &mm_to_px, dot_mm, 720, 720);
+        let corners_px = grid.corners_mm().map(|(x, y)| cam(x, y));
+        (img, corners_px, grid, dot_mm, lens)
+    }
+
+    /// A grossly mis-scaled metric ruler (wrong pitch at ①, a moved camera, a
+    /// paper out of the burn plane…) must fail the field fit EARLY as a setup
+    /// error with the measured percentage — not fall into the mirrored-view
+    /// guard or come back as a garbage "field error".
+    #[test]
+    fn laser_field_fit_rejects_setup_scale_error() {
+        let (img, corners_px, grid, dot_mm, lens) = mis_scaled_ruler_setup(1.35);
+        let err = fit_laser_field(&img, corners_px, &grid, dot_mm, DotKind::Dark, &lens, false)
+            .expect_err("a 35% scale mismatch is a setup error");
+        assert!(
+            err.contains(FIELD_SCALE_ERR_MARKER),
+            "setup-scale message expected, got: {err}"
+        );
+        assert!(
+            err.contains("+35.0%") || err.contains("+34.9%") || err.contains("+35.1%"),
+            "measured percentage reported: {err}"
+        );
+        assert!(
+            !err.contains("mirrored"),
+            "must not be misdiagnosed as a mirrored view: {err}"
+        );
+    }
+
+    /// A mild scale deviation (galvo-plausible) still fits; the measured
+    /// scale is carried on the calibration for the operator-facing note.
+    #[test]
+    fn laser_field_fit_mild_scale_passes_with_diagnostic() {
+        let (img, corners_px, grid, dot_mm, lens) = mis_scaled_ruler_setup(1.015);
+        let cal = fit_laser_field(&img, corners_px, &grid, dot_mm, DotKind::Dark, &lens, false)
+            .expect("a 1.5% scale deviation is fittable");
+        assert!(
+            (cal.scale - 1.015).abs() < 0.003,
+            "measured scale {} ≈ 1.015",
+            cal.scale
+        );
+    }
+
+    /// With `allow_machine_scale`, a gross uniform scale (an oversized machine
+    /// field the operator chose to compensate in software) is no longer a hard
+    /// setup error: the fit succeeds, records the scale, and the field
+    /// polynomial genuinely absorbs it — a physical target maps to a command
+    /// scaled by `1/scale` relative to the grid, so shapes burn dimensionally
+    /// true.
+    #[test]
+    fn laser_field_fit_absorbs_machine_scale_when_allowed() {
+        let (img, corners_px, grid, dot_mm, lens) = mis_scaled_ruler_setup(1.35);
+        let cal = fit_laser_field(&img, corners_px, &grid, dot_mm, DotKind::Dark, &lens, true)
+            .expect("a 35% scale is fittable once the operator opts to compensate it");
+        assert!(
+            (cal.scale - 1.35).abs() < 0.01,
+            "measured scale {} ≈ 1.35",
+            cal.scale
+        );
+        // Precompensation carries the scale: the command-space separation of two
+        // physical targets is the physical separation shrunk by 1/1.35 (the
+        // additive centroid offset cancels in the ratio). Targets sit inside the
+        // grid's machine-frame span (~ −10.5..70.5 mm).
+        let (a, b) = ((10.0, 10.0), (40.0, 40.0));
+        let pa = cal.field.precompensate(a.0, a.1);
+        let pb = cal.field.precompensate(b.0, b.1);
+        let cmd_sep = ((pa.0 - pb.0).powi(2) + (pa.1 - pb.1).powi(2)).sqrt();
+        let phys_sep = ((a.0 - b.0).powi(2) + (a.1 - b.1).powi(2)).sqrt();
+        let ratio = cmd_sep / phys_sep;
+        assert!(
+            (ratio * 1.35 - 1.0).abs() < 0.01,
+            "command/physical separation ratio {ratio} ≈ 1/1.35"
+        );
+    }
+
+    /// A machine that MIRRORS X relative to commanded coordinates is now
+    /// absorbed, not rejected. With the burned grid labelled by its TRUE
+    /// commanded corners (the operator reads them off the grid's orientation
+    /// markers), the paper↔commanded correspondence is a pure reflection: the
+    /// dot commanded to LL landed on the mirrored (right) side, so LL's true
+    /// pixel is the far-right corner. The reflected similarity/rigid variants
+    /// fit it cleanly, `paper_to_machine.flip_x` is set, and the composed
+    /// projection round-trips exactly — exercising `Rigid2::inverse_apply` as
+    /// the true inverse of `apply` THROUGH the flip.
+    ///
+    /// Geometrically this is the horizontally-reflected corner order on a
+    /// symmetric grid: the dot at physical (cx,cy) carries commanded (60−cx,cy).
+    #[test]
+    fn laser_field_fit_absorbs_a_mirrored_machine() {
+        let (img, corners_px, grid, dot_mm, lens) = mis_scaled_ruler_setup(1.0);
+        // TRUE labels for a mirror: LL's dot is the far-right burn, etc.
+        let true_corners = [corners_px[1], corners_px[0], corners_px[3], corners_px[2]];
+        let cal = fit_laser_field(
+            &img,
+            true_corners,
+            &grid,
+            dot_mm,
+            DotKind::Dark,
+            &lens,
+            false,
+        )
+        .expect("a mirrored machine with true corner labels is a reflection the fit absorbs");
+        assert!(
+            cal.paper_to_machine.flip_x,
+            "the mirror is recorded as flip_x, not rejected"
+        );
+        // The fit is clean: no residual scatter beyond detection noise.
+        assert!(
+            cal.field.rms_um < 200.0,
+            "clean fit RMS {} µm",
+            cal.field.rms_um
+        );
+        // The composed projection round-trips commanded → camera px → commanded
+        // to identity, through the flipped frame and the field inverse.
+        for &cmd in &[(15.0, 15.0), (5.0, 55.0), (55.0, 5.0), (30.0, 30.0)] {
+            let px = commanded_to_camera_px(&lens, &cal.paper_to_machine, &cal.field, cmd)
+                .expect("finite projection");
+            let back = camera_px_to_commanded(&lens, &cal.paper_to_machine, &cal.field, px)
+                .expect("finite inverse");
+            assert!(
+                (back.0 - cmd.0).abs() < 1e-6 && (back.1 - cmd.1).abs() < 1e-6,
+                "round-trip identity through the flip: {cmd:?} → {back:?}"
+            );
+        }
+    }
+
+    /// A genuinely SCRAMBLED corner order (a non-isometry permutation, not a
+    /// symmetry of the square) still fails — reflection support only absorbs
+    /// reflections, not arbitrary relabellings. An adjacent swap (LL↔LR only)
+    /// bowties the seed quad, so the search windows land off the dots and the
+    /// fit cannot proceed. The guard against silently accepting a scramble is
+    /// intact: the fit returns an error rather than a bogus calibration.
+    #[test]
+    fn laser_field_fit_rejects_a_scrambled_corner_order() {
+        let (img, corners_px, grid, dot_mm, lens) = mis_scaled_ruler_setup(1.0);
+        // Swap only LL↔LR (keep UR, UL): NOT a square symmetry, so neither a
+        // rotation nor a reflection can align it — a real mislabelling.
+        let scrambled = [corners_px[1], corners_px[0], corners_px[2], corners_px[3]];
+        let err = fit_laser_field(&img, scrambled, &grid, dot_mm, DotKind::Dark, &lens, true)
+            .expect_err("a scrambled (non-isometry) corner order is not a calibration");
+        // It fails through detection (the bowtie seed places windows off the
+        // dots) rather than silently producing a flipped fit.
+        assert!(
+            err.contains("dots") || err.contains("orientation markers"),
+            "scramble is rejected (detection or correspondence guard), got: {err}"
+        );
+    }
+
+    /// The correspondence guard still trips on a burned grid whose true-labelled
+    /// dots form a SHEAR relative to the commanded lattice — a correspondence
+    /// that is neither a similarity nor a reflection, so scale+rotation+
+    /// reflection cannot align it. All dots lock (a shear is affine, so the
+    /// corner seed predicts them), but the similarity residual exceeds one grid
+    /// pitch and the guard rejects the fit with the orientation-marker message.
+    /// Run with `allow_machine_scale` so the scale gate is skipped and the
+    /// correspondence guard is the path exercised.
+    #[test]
+    fn laser_field_fit_guard_trips_on_a_sheared_correspondence() {
+        let grid = GridSpec {
+            origin_mm: (0.0, 0.0),
+            pitch_mm: 10.0,
+            n: 7,
+        };
+        let dot_mm = 1.5;
+        let cam = |phx: f64, phy: f64| (10.0 * phx + 50.0, 10.0 * phy + 50.0);
+        // Camera-lens ruler over a printed grid (physical == commanded).
+        let lens_pairs: Vec<(Point2<f64>, Point2<f64>)> = grid
+            .points()
+            .iter()
+            .map(|&(x, y)| {
+                let (u, v) = cam(x, y);
+                (Point2::new(u, v), Point2::new(x, y))
+            })
+            .collect();
+        let lens = fit_lens(&lens_pairs).expect("lens");
+        // Burned grid sheared in x by y: commanded (cx,cy) lands physically at
+        // (cx + cy, cy). A shear is not a similarity; its best similarity fit
+        // leaves several mm of anisotropic residual, above the 10 mm pitch.
+        let shear = |cx: f64, cy: f64| (cx + cy, cy);
+        let centers: Vec<(f64, f64, f64)> = grid
+            .points()
+            .iter()
+            .map(|&(cx, cy)| {
+                let (px, py) = shear(cx, cy);
+                let (u, v) = cam(px, py);
+                (u, v, dot_mm * 10.0)
+            })
+            .collect();
+        let (w, h) = (1320u32, 720u32);
+        let img = GrayImage::from_fn(w, h, |x, y| {
+            let mut cover = 0.0;
+            for sy in 0..4 {
+                for sx in 0..4 {
+                    let px = x as f64 + (sx as f64 + 0.5) / 4.0 - 0.5;
+                    let py = y as f64 + (sy as f64 + 0.5) / 4.0 - 0.5;
+                    if centers.iter().any(|&(cx, cy, r)| {
+                        ((px - cx).powi(2) + (py - cy).powi(2)).sqrt() < r / 2.0
+                    }) {
+                        cover += 1.0 / 16.0;
+                    }
+                }
+            }
+            image::Luma([(210.0 - 150.0 * cover) as u8])
+        });
+        // TRUE corner labels: the sheared pixel of each commanded corner.
+        let corners_px = grid.corners_mm().map(|(cx, cy)| {
+            let (px, py) = shear(cx, cy);
+            cam(px, py)
+        });
+        let err = fit_laser_field(&img, corners_px, &grid, dot_mm, DotKind::Dark, &lens, true)
+            .expect_err("a shear is not a similarity+reflection — the guard must trip");
+        assert!(
+            err.contains("orientation markers"),
+            "the correspondence guard message is expected, got: {err}"
+        );
     }
 
     /// A burned grid with NO field distortion (commanded == physical, up to
@@ -1458,7 +2122,7 @@ mod tests {
         });
         let corners_px = grid.corners_mm().map(|(cx, cy)| cam(cx, cy));
 
-        let cal = fit_laser_field(&img, corners_px, &grid, dot_mm, DotKind::Dark, &lens)
+        let cal = fit_laser_field(&img, corners_px, &grid, dot_mm, DotKind::Dark, &lens, false)
             .expect("field fit");
         assert!(
             !matches!(
@@ -1468,6 +2132,89 @@ mod tests {
             "a flat field must not be flagged as systematic distortion: {:?}",
             cal.field_verdict.pattern
         );
+    }
+
+    /// The step-3 field fit flags burned dots that fall outside the pixel
+    /// region the step-1 lens calibration was fit over: reading them through
+    /// the metric ruler extrapolates the bi-cubic, so their error would
+    /// otherwise hide in the scatter floor. A lens fit over a SMALLER pixel
+    /// area than the burned grid spans reports `extrapolated > 0`; a lens fit
+    /// over the full area reports 0.
+    #[test]
+    fn field_fit_flags_dots_outside_the_lens_calibration_region() {
+        let grid = GridSpec {
+            origin_mm: (0.0, 0.0),
+            pitch_mm: 10.0,
+            n: 7,
+        };
+        let dot_mm = 1.5;
+        let cam = |x: f64, y: f64| (10.0 * x + 50.0, 10.0 * y + 50.0);
+
+        // A flat burned grid (commanded == physical), imaged by `cam`, spanning
+        // pixels ~50..650.
+        let mm_to_px = homog(&[
+            ((0.0, 0.0), cam(0.0, 0.0)),
+            ((60.0, 0.0), cam(60.0, 0.0)),
+            ((60.0, 60.0), cam(60.0, 60.0)),
+            ((0.0, 60.0), cam(0.0, 60.0)),
+        ]);
+        let img = render_grid(&grid, &mm_to_px, dot_mm, 720, 720);
+        let corners_px = grid.corners_mm().map(|(x, y)| cam(x, y));
+
+        // Lens fit over ONLY the inner 4×4 block (commanded 10..40 mm → pixels
+        // ~150..450): the burned grid's outer ring lands outside this box.
+        let inner: Vec<(Point2<f64>, Point2<f64>)> = (1..5)
+            .flat_map(|r| (1..5).map(move |c| (c as f64 * 10.0, r as f64 * 10.0)))
+            .map(|(x, y)| {
+                let (u, v) = cam(x, y);
+                (Point2::new(u, v), Point2::new(x, y))
+            })
+            .collect();
+        let inner_lens = fit_lens(&inner).expect("inner lens");
+        let cal = fit_laser_field(
+            &img,
+            corners_px,
+            &grid,
+            dot_mm,
+            DotKind::Dark,
+            &inner_lens,
+            false,
+        )
+        .expect("field fit over inner lens");
+        assert!(
+            cal.extrapolated > 0,
+            "outer dots must be flagged, got {}",
+            cal.extrapolated
+        );
+        assert!(
+            cal.extrapolated < cal.found,
+            "not every dot is outside: {}/{}",
+            cal.extrapolated,
+            cal.found
+        );
+
+        // Lens fit over the FULL grid (pixels ~50..650): every burned dot is
+        // inside, so nothing is flagged.
+        let full: Vec<(Point2<f64>, Point2<f64>)> = grid
+            .points()
+            .iter()
+            .map(|&(x, y)| {
+                let (u, v) = cam(x, y);
+                (Point2::new(u, v), Point2::new(x, y))
+            })
+            .collect();
+        let full_lens = fit_lens(&full).expect("full lens");
+        let cal = fit_laser_field(
+            &img,
+            corners_px,
+            &grid,
+            dot_mm,
+            DotKind::Dark,
+            &full_lens,
+            false,
+        )
+        .expect("field fit over full lens");
+        assert_eq!(cal.extrapolated, 0, "all dots within the calibrated region");
     }
 
     #[test]

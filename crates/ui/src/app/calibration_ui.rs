@@ -7,8 +7,8 @@ impl ConsoleApp {
             // burned-grid fit and bed overlay must match where the dots
             // actually landed (LR-02).
             origin_mm: self.calibration.grid_origin_mm,
-            pitch_mm: self.calibration.pitch_mm,
-            n: self.calibration.n,
+            pitch_mm: self.calibration.burn.pitch_mm,
+            n: self.calibration.burn.n,
         }
     }
 
@@ -23,7 +23,8 @@ impl ConsoleApp {
         // Centre the grid on the machine field (Camera-tab work area), so it
         // lands inside the addressable area — a centre-origin galvo has (0,0)
         // at the field centre, not a corner. origin = field centre − span/2.
-        let span = (self.calibration.n.saturating_sub(1)) as f64 * self.calibration.pitch_mm;
+        let span =
+            (self.calibration.burn.n.saturating_sub(1)) as f64 * self.calibration.burn.pitch_mm;
         let ox = self.camera.field_cx_mm as f64 - span / 2.0;
         let oy = self.camera.field_cy_mm as f64 - span / 2.0;
         // Remember the exact origin the grid is burned at, so the later fit
@@ -35,11 +36,11 @@ impl ConsoleApp {
             "--out".into(),
             out,
             "--n".into(),
-            self.calibration.n.to_string(),
+            self.calibration.burn.n.to_string(),
             "--pitch-mm".into(),
-            format!("{}", self.calibration.pitch_mm),
+            format!("{}", self.calibration.burn.pitch_mm),
             "--dot-mm".into(),
-            format!("{}", self.calibration.dot_mm),
+            format!("{}", self.calibration.burn.dot_mm),
             "--origin".into(),
             format!("{ox},{oy}"),
         ]);
@@ -52,12 +53,49 @@ impl ConsoleApp {
         self.calibration.note = format!(
             "generating {n}×{n} grid centred on work area ({cx:.0},{cy:.0}) size {sz:.0} → \
              spans ({ox:.0},{oy:.0})…({x1:.0},{y1:.0}) mm — see Log for the file path{warn}",
-            n = self.calibration.n,
+            n = self.calibration.burn.n,
             cx = self.camera.field_cx_mm,
             cy = self.camera.field_cy_mm,
             sz = self.camera.field_mm,
             x1 = ox + span,
             y1 = oy + span,
+        );
+    }
+
+    /// Emit the ① printed-paper calibration grid by shelling `pcbforge
+    /// paper-grid` — the operator prints it at 100%, calipers the printed pitch,
+    /// enters that as the step-1 measured pitch, then images it.
+    pub(super) fn calibrate_generate_paper_grid(&mut self) {
+        let out = crate::clean_path(&self.calibration.paper_out);
+        if out.is_empty() {
+            self.calibration.note = "set an output path for the paper grid".into();
+            return;
+        }
+        let params = self.calibration.paper;
+        self.run_verb(&[
+            "paper-grid".into(),
+            "--out".into(),
+            out,
+            "--n".into(),
+            params.n.to_string(),
+            "--pitch-mm".into(),
+            format!("{}", params.pitch_mm),
+            "--dot-mm".into(),
+            format!("{}", params.dot_mm),
+        ]);
+        // Mirror generate-grid: warn but still shell, so the CLI's own
+        // span-too-large error surfaces in the Log.
+        let span = (params.n.saturating_sub(1)) as f64 * params.pitch_mm;
+        let warn = if span > 190.0 {
+            " ⚠ span exceeds the 190 mm printable width — lower pitch or dots per side"
+        } else {
+            ""
+        };
+        self.calibration.note = format!(
+            "generating {n}×{n} paper grid, nominal pitch {p} mm — print at 100%, then CALIPER \
+             the printed pitch and enter it above before fitting — see Log for the file path{warn}",
+            n = params.n,
+            p = params.pitch_mm,
         );
     }
 
@@ -91,8 +129,25 @@ impl ConsoleApp {
             Some(ctx.load_texture("calib-frame", color, TextureOptions::NEAREST));
         self.calibration.frame_img = Some(img);
         self.calibration.corners.clear();
-        self.calibration.note =
-            "click the 4 corner dots: lower-left, lower-right, upper-right, upper-left".into();
+        // Fresh frame → hide any stale fit overlay so the bare dots are visible
+        // to re-click the corners.
+        self.calibration.show_fit_feedback = false;
+        self.calibration.note = format!("click the 4 corner dots: {}", self.corner_click_order());
+    }
+
+    /// The corner-click order instruction, mode-aware. The step-1 printed paper
+    /// has an arbitrary pose by design, so its corners are named by visual
+    /// position. The burned laser grid (steps 2/3) carries orientation markers
+    /// that break its mirror symmetry, so its corners are named by those markers
+    /// — this is what stops a mirrored-X machine from being silently absorbed
+    /// into the labelling (the flip must reach the fit as a real reflection).
+    pub(super) fn corner_click_order(&self) -> &'static str {
+        if self.calibration.mode == CalibMode::CameraLens {
+            "lower-left, lower-right, upper-right, upper-left"
+        } else {
+            "LL = the corner nearest the lone diagonal marker; LR = the far corner of the edge \
+             with the midpoint marker; then UR, UL"
+        }
     }
 
     /// Fit the camera→laser calibration from the 4 clicked corners.
@@ -103,8 +158,9 @@ impl ConsoleApp {
         };
         if self.calibration.corners.len() != 4 {
             self.calibration.note = format!(
-                "click all 4 corner dots (have {}) — LL, LR, UR, UL",
-                self.calibration.corners.len()
+                "click all 4 corner dots (have {}) — {}",
+                self.calibration.corners.len(),
+                self.corner_click_order()
             );
             return;
         }
@@ -114,26 +170,27 @@ impl ConsoleApp {
             self.calibration.corners[2],
             self.calibration.corners[3],
         ];
-        let grid = self.calib_grid();
-        let dot = self.calibration.dot_mm;
-        let kind = self.calibration.dot_kind;
         match self.calibration.mode {
             CalibMode::CameraLens => {
-                // The camera-lens fit is a metric ruler over a printed grid: its
-                // origin is arbitrary, so pin it to (0,0) rather than inheriting
-                // a burn origin left over from a generated laser grid (LR-02).
+                // The camera-lens fit is a metric ruler over the PRINTED grid:
+                // its own parameter set (measured pitch), and an arbitrary
+                // origin pinned to (0,0) rather than inheriting a burn origin
+                // left over from a generated laser grid (LR-02).
+                let p = self.calibration.paper;
                 let paper = crate::calib::GridSpec {
                     origin_mm: (0.0, 0.0),
-                    ..grid
+                    pitch_mm: p.pitch_mm,
+                    n: p.n,
                 };
-                match crate::calib::fit_camera_lens(frame, corners, &paper, dot, kind) {
+                match crate::calib::fit_camera_lens(frame, corners, &paper, p.dot_mm, p.dot_kind) {
                     Ok(cal) => {
                         self.calibration.note = format!(
-                            "lens fit: {}/{} dots, RMS {:.0} µm, worst {:.0} µm — camera is now a metric ruler; run ③ again before using field correction",
+                            "lens fit: {}/{} dots, RMS {:.0} µm, worst {:.0} µm — camera is now a metric ruler; run step 3 again before using field correction",
                             cal.found, cal.total, cal.lens.rms_um, cal.lens.max_um
                         );
                         self.calibration.lens_frame_signature =
                             Some((frame.dimensions(), self.camera.orientation));
+                        self.calibration.show_fit_feedback = true;
                         self.calibration.lens = Some(cal);
                         // A field fit is expressed in the old lens ruler's
                         // physical frame. Re-fitting the lens invalidates it.
@@ -150,12 +207,17 @@ impl ConsoleApp {
                 }
             }
             CalibMode::LaserAnchor => {
-                match crate::calib::fit_camera_to_machine(frame, corners, &grid, dot, kind) {
+                let grid = self.calib_grid();
+                let b = self.calibration.burn;
+                match crate::calib::fit_camera_to_machine(
+                    frame, corners, &grid, b.dot_mm, b.dot_kind,
+                ) {
                     Ok(cal) => {
                         self.calibration.note = format!(
                             "anchor: {}/{} dots, RMS {:.0} µm — Place now burns in machine coordinates",
                             cal.found, cal.total, cal.rms_um
                         );
+                        self.calibration.show_fit_feedback = true;
                         self.calibration.anchor = Some(cal);
                         self.calibration.saved_at = Some(now_unix());
                     }
@@ -167,9 +229,11 @@ impl ConsoleApp {
                 }
             }
             CalibMode::LaserField => {
+                let grid = self.calib_grid();
+                let b = self.calibration.burn;
                 let Some(lens) = self.calibration.lens.as_ref().map(|c| c.lens.clone()) else {
                     self.calibration.note =
-                        "laser-field needs a camera-lens calibration first (① Camera lens) — \
+                        "laser-field needs a camera-lens calibration first (step 1, Camera lens) — \
                          it's the metric ruler that measures where burns land"
                             .into();
                     return;
@@ -184,26 +248,105 @@ impl ConsoleApp {
                     self.placement.field_correct = false;
                     return;
                 }
-                match crate::calib::fit_laser_field(frame, corners, &grid, dot, kind, &lens) {
+                match crate::calib::fit_laser_field(
+                    frame,
+                    corners,
+                    &grid,
+                    b.dot_mm,
+                    b.dot_kind,
+                    &lens,
+                    self.calibration.allow_machine_scale,
+                ) {
                     Ok(cal) => {
+                        // A successful fit produced fresh feedback worth showing,
+                        // regardless of whether it met the acceptance limits.
+                        self.calibration.show_fit_feedback = true;
                         let worst = cal.dots.iter().map(|d| d.field_um).fold(0.0_f64, f64::max);
-                        let acceptance = crate::calib::field_live_acceptance(&cal, &grid);
+                        let acceptance = crate::calib::field_live_acceptance(
+                            &cal,
+                            &grid,
+                            self.calibration.accept_rms_um,
+                            self.calibration.accept_worst_um,
+                        );
                         self.calibration.field_accepted = acceptance.is_ok();
                         self.placement.field_correct = false;
+                        // classify_field_error assumes the grid is centred on
+                        // the scan field: off-axis, genuine curvature reads as
+                        // a uniform scale. Warn when the burn is well off the
+                        // configured field centre.
+                        const OFF_CENTER_FRAC: f64 = 0.25;
+                        let span = (grid.n.saturating_sub(1)) as f64 * grid.pitch_mm;
+                        let (cx, cy) =
+                            (grid.origin_mm.0 + span / 2.0, grid.origin_mm.1 + span / 2.0);
+                        let off = (cx - self.camera.field_cx_mm as f64)
+                            .hypot(cy - self.camera.field_cy_mm as f64);
+                        let off_center_note = (off > OFF_CENTER_FRAC * self.camera.field_mm as f64)
+                            .then(|| {
+                                format!(
+                                    " note: grid centre ({cx:.0},{cy:.0}) is {off:.0} mm off the \
+                                     configured field centre — an off-axis grid makes curvature \
+                                     read as uniform scale; centre the grid (or fix the work-area \
+                                     centre)"
+                                )
+                            })
+                            .unwrap_or_default();
+                        // Burned dots outside the region the step-1 lens fit
+                        // covered read through an extrapolating ruler, so their
+                        // error hides in the scatter floor instead of surfacing.
+                        let extrapolated_note = (cal.extrapolated > 0)
+                            .then(|| {
+                                format!(
+                                    " note: {}/{} dots lie outside the region the step-1 lens \
+                                     calibration covered — the ruler extrapolates there and the \
+                                     error reads as scatter; print/calibrate a larger paper grid \
+                                     or shrink the burn grid",
+                                    cal.extrapolated, cal.found
+                                )
+                            })
+                            .unwrap_or_default();
                         self.calibration.note = match acceptance {
                             Ok(()) => {
                                 let path = self.field_map_path();
                                 match std::fs::write(&path, cal.field.serialize()) {
                                     Ok(()) => {
                                         self.placement.field_correct = true;
+                                        // When the operator opted to absorb a
+                                        // large machine scale, say so loudly: the
+                                        // polynomial makes shapes true, but the
+                                        // machine's physical speeds and hatch
+                                        // spacing stay in its oversized units, so
+                                        // energy density differs by this factor.
+                                        let scale_absorbed = (self.calibration.allow_machine_scale
+                                            && (cal.scale - 1.0).abs()
+                                                > crate::calib::FIELD_SCALE_FAIL_FRAC)
+                                            .then(|| {
+                                                format!(
+                                                    "machine scale {:+.1}% ABSORBED in software — physical speeds/hatch density differ from commanded by this factor; ",
+                                                    (cal.scale - 1.0) * 100.0
+                                                )
+                                            })
+                                            .unwrap_or_default();
+                                        // A fitted mirror means the machine's X
+                                        // axis runs backwards vs commanded
+                                        // coordinates (a LightBurn axis-negate /
+                                        // galvo mapping). The correction accounts
+                                        // for it, but say so loudly so the
+                                        // operator can undo it at the source.
+                                        let mirror_note = cal
+                                            .paper_to_machine
+                                            .flip_x
+                                            .then_some(
+                                                "machine X axis is MIRRORED relative to commanded coordinates — the correction accounts for it; clearing the axis negate in LightBurn and recalibrating removes this; ",
+                                            )
+                                            .unwrap_or_default();
                                         format!(
-                                            "field accepted: {}/{} dots, raw worst {:.0} µm, fit RMS/worst {:.0}/{:.0} µm — {}",
+                                            "field accepted: {}/{} dots, raw worst {:.0} µm, fit RMS/worst {:.0}/{:.0} µm — {mirror_note}{scale_absorbed}{}{off_center_note}{extrapolated_note}",
                                             cal.found,
                                             cal.total,
                                             worst,
                                             cal.field.rms_um,
                                             cal.field.max_um,
-                                            field_verdict_phrase(&cal.field_verdict)
+                                            field_verdict_phrase(&cal.field_verdict, cal.scale)
                                         )
                                     }
                                     Err(e) => {
@@ -221,7 +364,7 @@ impl ConsoleApp {
                                 }
                             }
                             Err(reason) => format!(
-                                "field rejected: {}/{} dots, raw worst {:.0} µm, fit RMS/worst {:.0}/{:.0} µm — {reason}; correction remains disabled",
+                                "field rejected: {}/{} dots, raw worst {:.0} µm, fit RMS/worst {:.0}/{:.0} µm — {reason}; correction remains disabled{off_center_note}{extrapolated_note}",
                                 cal.found, cal.total, worst, cal.field.rms_um, cal.field.max_um
                             ),
                         };
@@ -229,9 +372,23 @@ impl ConsoleApp {
                     }
                     Err(e) => {
                         // Keep any previous field calibration on a failed fit
-                        // (LR-16).
+                        // (LR-16). For the scale setup-error gate, append the
+                        // two entered pitches so a ①/③ pitch mix-up is
+                        // checkable at a glance.
+                        let pitch_context = e
+                            .contains(crate::calib::FIELD_SCALE_ERR_MARKER)
+                            .then(|| {
+                                let paper = self.calibration.paper.pitch_mm;
+                                let burn = self.calibration.burn.pitch_mm;
+                                format!(
+                                    " (step-1 paper pitch entered: {paper} mm; step-3 commanded pitch: \
+                                     {burn} mm — ratio {:.3})",
+                                    burn / paper
+                                )
+                            })
+                            .unwrap_or_default();
                         self.calibration.note =
-                            format!("laser-field fit failed (kept previous): {e}");
+                            format!("laser-field fit failed (kept previous): {e}{pitch_context}");
                     }
                 }
             }
@@ -270,8 +427,8 @@ impl ConsoleApp {
             return;
         };
         let grid = self.calib_grid();
-        let dot = self.calibration.dot_mm;
-        let kind = self.calibration.dot_kind;
+        let dot = self.calibration.burn.dot_mm;
+        let kind = self.calibration.burn.dot_kind;
         match crate::camera::grab(&self.cam_source()) {
             Ok(g) => {
                 let frame = self.camera.orientation.apply(g);
@@ -331,8 +488,8 @@ impl ConsoleApp {
                 &frame,
                 &prev,
                 &self.calib_grid(),
-                self.calibration.dot_mm,
-                self.calibration.dot_kind,
+                self.calibration.burn.dot_mm,
+                self.calibration.burn.dot_kind,
             ) {
                 Ok(cal) => {
                     self.calibration.note = format!(
@@ -470,7 +627,8 @@ impl ConsoleApp {
         // Lens feedback (camera mode, after a fit): a magenta arrow per dot
         // showing the distortion it exhibited (exaggerated ×scale), and a dot
         // colored by how well the polynomial corrected it.
-        if self.calibration.mode == CalibMode::CameraLens
+        if self.calibration.show_fit_feedback
+            && self.calibration.mode == CalibMode::CameraLens
             && let Some(cal) = &self.calibration.lens
         {
             let s = xf.scale;
@@ -501,7 +659,8 @@ impl ConsoleApp {
         // the origin + axes, per-dot residual vectors (× exaggerated), and any
         // dots that failed to lock. This makes the abstract homography visible:
         // the operator sees exactly where the laser thinks its grid is.
-        if self.calibration.mode == CalibMode::LaserAnchor
+        if self.calibration.show_fit_feedback
+            && self.calibration.mode == CalibMode::LaserAnchor
             && let Some(cal) = &self.calibration.anchor
             && cal.found > 0
             && let Some(mm_to_px) = cal.px_to_mm.try_inverse()
@@ -631,7 +790,8 @@ impl ConsoleApp {
         // lattice should pass through the detected burns. Orange vectors show
         // the raw field error from the desired physical coordinate to where the
         // command actually landed; ring color is the post-fit residual.
-        if self.calibration.mode == CalibMode::LaserField
+        if self.calibration.show_fit_feedback
+            && self.calibration.mode == CalibMode::LaserField
             && let (Some(cal), Some(lens)) = (&self.calibration.field, &self.calibration.lens)
         {
             let grid = self.calib_grid();
@@ -747,22 +907,45 @@ impl ConsoleApp {
 impl ConsoleApp {
     pub(super) fn calibrate_view(&mut self, ui: &mut egui::Ui) {
         // Live capture is pumped from ui() regardless of tab (LR-45).
+        //
+        // The controls (step selector, description, form grid, buttons and the
+        // multi-line fit notes) had grown tall enough to squeeze the camera
+        // image into a sliver. Put them in a resizable, scrollable top panel so
+        // the operator can drag the split and the image below gets real room.
+        egui::TopBottomPanel::top("calib-controls")
+            .resizable(true)
+            .default_height(300.0)
+            .min_height(100.0)
+            .show_inside(ui, |ui| {
+                egui::ScrollArea::vertical()
+                    .id_salt("calib-controls-scroll")
+                    .auto_shrink([false, false])
+                    .show(ui, |ui| self.calibrate_controls(ui));
+            });
+        self.calib_frame_overlay(ui);
+    }
+
+    /// The Calibrate tab's control block (everything above the camera image):
+    /// step selector, description, form grid, button rows, and the fit notes.
+    /// Lives in its own resizable/scrollable panel so it can't crowd out the
+    /// image (see `calibrate_view`).
+    fn calibrate_controls(&mut self, ui: &mut egui::Ui) {
         ui.horizontal(|ui| {
             ui.label("step");
             ui.selectable_value(
                 &mut self.calibration.mode,
                 CalibMode::CameraLens,
-                "① Camera lens (printed grid)",
+                "1) Camera lens (printed grid)",
             );
             ui.selectable_value(
                 &mut self.calibration.mode,
                 CalibMode::LaserAnchor,
-                "② Laser anchor (approximate)",
+                "2) Laser anchor (approximate)",
             );
             ui.selectable_value(
                 &mut self.calibration.mode,
                 CalibMode::LaserField,
-                "③ Laser field (burned grid)",
+                "3) Laser field (burned grid)",
             );
         });
         match self.calibration.mode {
@@ -774,30 +957,42 @@ impl ConsoleApp {
             CalibMode::LaserAnchor => ui.label(egui::RichText::new(
                 "Approximate homography anchor: burn a dot grid at known coordinates, leave it taped down, image it, \
                  mark the 4 corners, and Fit. Re-anchor / ● Live re-lock to that fixed grid as the camera \
-                 moves. It cannot model lens/field curvature; ①+③ provide the corrected nonlinear projection.",
+                 moves. It cannot model lens/field curvature; steps 1+3 provide the corrected nonlinear projection.",
             ).weak()),
             CalibMode::LaserField => ui.label(egui::RichText::new(
-                "Correct the laser field: needs ① Camera lens first (the metric ruler), at the same camera \
+                "Correct the laser field: needs step 1 (Camera lens) first (the metric ruler), at the same camera \
                  pose, resolution, crop, and orientation. Burn a dot grid at \
                  known coordinates, image it, mark the 4 corners, and Fit — this measures where each command \
                  physically lands and fits a pre-distortion. Accepted fits are mandatory for every production \
                  export; geometry is always field-warped so shapes burn dimensionally true.",
             ).weak()),
         };
+        let is_paper = self.calibration.mode == CalibMode::CameraLens;
+        ui.label(
+            egui::RichText::new(if is_paper {
+                "Step 1 has its own printed-paper parameters — edits here don't touch the steps 2/3 \
+                 burned-grid set."
+            } else {
+                "Steps 2/3 share the burned-grid parameters — the step-1 printed-paper set is separate."
+            })
+            .weak(),
+        );
         egui::Grid::new("calib-form")
             .num_columns(2)
             .spacing([8.0, 6.0])
             .show(ui, |ui| {
                 ui.label("dots per side");
-                ui.add(egui::DragValue::new(&mut self.calibration.n).range(2..=15));
+                ui.add(
+                    egui::DragValue::new(&mut self.calibration.active_params_mut().n).range(2..=15),
+                );
                 ui.end_row();
-                ui.label(if self.calibration.mode == CalibMode::CameraLens {
-                    "measured pitch mm"
+                ui.label(if is_paper {
+                    "measured pitch mm (paper)"
                 } else {
-                    "pitch mm"
+                    "commanded pitch mm"
                 });
                 ui.add(
-                    egui::DragValue::new(&mut self.calibration.pitch_mm)
+                    egui::DragValue::new(&mut self.calibration.active_params_mut().pitch_mm)
                         .speed(0.1)
                         .range(1.0..=50.0),
                 )
@@ -808,7 +1003,7 @@ impl ConsoleApp {
                 ui.end_row();
                 ui.label("dot ⌀ mm");
                 ui.add(
-                    egui::DragValue::new(&mut self.calibration.dot_mm)
+                    egui::DragValue::new(&mut self.calibration.active_params_mut().dot_mm)
                         .speed(0.05)
                         .range(0.05..=5.0),
                 );
@@ -821,19 +1016,31 @@ impl ConsoleApp {
                 );
                 ui.horizontal(|ui| {
                     ui.selectable_value(
-                        &mut self.calibration.dot_kind,
+                        &mut self.calibration.active_params_mut().dot_kind,
                         crate::calib::DotKind::Dark,
                         "◉ dark-on-light",
                     )
                     .on_hover_text("Printed grid or dark-anodized burn.");
                     ui.selectable_value(
-                        &mut self.calibration.dot_kind,
+                        &mut self.calibration.active_params_mut().dot_kind,
                         crate::calib::DotKind::Bright,
                         "◎ bright-on-dark",
                     )
                     .on_hover_text("Ablated mark on a dark plate, or a backlit hole.");
                 });
                 ui.end_row();
+                if self.calibration.mode == CalibMode::CameraLens {
+                    let lbl = ui.label("paper out .svg");
+                    ui.add(
+                        egui::TextEdit::singleline(&mut self.calibration.paper_out)
+                            .desired_width(240.0),
+                    )
+                    .labelled_by(lbl.id)
+                    .on_hover_text(
+                        "Where the printable A4 dot-grid SVG is written. Print it at 100%.",
+                    );
+                    ui.end_row();
+                }
                 if self.calibration.mode != CalibMode::CameraLens {
                     ui.label("grid out .lbrn2");
                     ui.add(
@@ -877,6 +1084,31 @@ impl ConsoleApp {
                     });
                     ui.end_row();
                 }
+                if self.calibration.mode == CalibMode::LaserField {
+                    let rms_label = ui.label("accept RMS µm");
+                    ui.add(
+                        egui::DragValue::new(&mut self.calibration.accept_rms_um)
+                            .speed(1.0)
+                            .range(10.0..=1000.0),
+                    )
+                    .labelled_by(rms_label.id)
+                    .on_hover_text(
+                        "Reject the step 3 field fit when its residual RMS exceeds this. \
+                         Raise it to accept a fit as good as the camera/optics can measure.",
+                    );
+                    ui.end_row();
+                    let worst_label = ui.label("accept worst µm");
+                    ui.add(
+                        egui::DragValue::new(&mut self.calibration.accept_worst_um)
+                            .speed(1.0)
+                            .range(10.0..=1000.0),
+                    )
+                    .labelled_by(worst_label.id)
+                    .on_hover_text(
+                        "Reject the step 3 field fit when its worst per-dot residual exceeds this.",
+                    );
+                    ui.end_row();
+                }
                 let lbl = ui.label("grid frame (optional)");
                 ui.add(
                     egui::TextEdit::singleline(&mut self.calibration.frame).desired_width(240.0),
@@ -886,9 +1118,17 @@ impl ConsoleApp {
                 ui.end_row();
             });
         ui.horizontal(|ui| {
+            if self.calibration.mode == CalibMode::CameraLens
+                && ui
+                    .button("Generate paper grid")
+                    .on_hover_text("Emit a print-ready A4 SVG dot grid — print it at 100%.")
+                    .clicked()
+            {
+                self.calibrate_generate_paper_grid();
+            }
             if self.calibration.mode != CalibMode::CameraLens
                 && ui
-                    .button("① Generate grid")
+                    .button("Generate grid")
                     .on_hover_text("Emit the dot grid to burn.")
                     .clicked()
             {
@@ -904,7 +1144,30 @@ impl ConsoleApp {
             if ui.button("↺ clear corners").clicked() {
                 self.calibration.corners.clear();
             }
+            ui.checkbox(&mut self.calibration.show_fit_feedback, "show fit feedback")
+                .on_hover_text(
+                    "Draw the post-fit overlay (step 1 lens arrows, step 2 anchor mesh, \
+                 step 3 field lattice and rejection banner). Turn it off to see the bare \
+                 dots when re-clicking the 4 corners. Loading a fresh frame hides it; a \
+                 successful Fit shows it.",
+                );
         });
+
+        // ③ only: let the operator opt into absorbing a large machine-scale
+        // error into the field correction, near the Fit control that uses it.
+        if self.calibration.mode == CalibMode::LaserField {
+            ui.checkbox(
+                &mut self.calibration.allow_machine_scale,
+                "compensate machine scale",
+            )
+            .on_hover_text(
+                "Absorb any machine scale error into the field correction instead of refusing. \
+                 Shapes burn dimensionally true, but the machine's speeds and hatch spacing stay \
+                 in its own oversized units — physical speed and line spacing scale by the same \
+                 factor, so energy density changes; re-tune power/speed after enabling. Fixing the \
+                 field size in LightBurn is the cleaner solution.",
+            );
+        }
 
         // Mode-specific status + controls.
         match self.calibration.mode {
@@ -1035,7 +1298,7 @@ impl ConsoleApp {
                 if self.calibration.lens.is_none() {
                     ui.colored_label(
                         status_color(false),
-                        "○ needs ① Camera lens first — that metric ruler measures where burns land",
+                        "○ needs step 1 (Camera lens) first — that metric ruler measures where burns land",
                     );
                 }
                 let (status, ok) = match &self.calibration.field {
@@ -1080,12 +1343,19 @@ impl ConsoleApp {
                     };
                     ui.colored_label(
                         status_color(verdict_ok),
-                        format!("{glyph} {}", field_verdict_phrase(&c.field_verdict)),
+                        format!(
+                            "{glyph} {}",
+                            field_verdict_phrase(&c.field_verdict, c.scale)
+                        ),
                     );
                     let hint = if !self.calibration.field_accepted {
-                        "This fit did not meet 80% + four-corner + 50/100 µm acceptance; recapture before use."
+                        format!(
+                            "This fit did not meet 80% + four-corner + {:.0}/{:.0} µm acceptance; recapture before use.",
+                            self.calibration.accept_rms_um, self.calibration.accept_worst_um
+                        )
                     } else {
                         "Field warping is mandatory and active for every production console export."
+                            .to_string()
                     };
                     if self.calibration.field_accepted {
                         ui.weak(format!(
@@ -1099,11 +1369,10 @@ impl ConsoleApp {
             }
         }
         ui.label(egui::RichText::new(&self.calibration.note).weak());
-        ui.weak(
-            "Click the 4 corner dots in order: lower-left, lower-right, upper-right, upper-left.",
-        );
+        ui.weak(format!(
+            "Click the 4 corner dots in order: {}.",
+            self.corner_click_order()
+        ));
         ui.weak(NAV_HINT);
-        ui.separator();
-        self.calib_frame_overlay(ui);
     }
 }

@@ -174,7 +174,7 @@ impl ConsoleApp {
         // lens + ③ Laser field are accepted, so no unwarped geometry can ship.
         let Some(px_to_mm) = self.calibration.anchor.as_ref().map(|c| c.px_to_mm.clone()) else {
             return Err(
-                "Place needs a projection: accept ① Camera lens + ③ Laser field (or at least a ② Laser anchor for an approximate preview)"
+                "Place needs a projection: accept step 1 (Camera lens) + step 3 (Laser field) (or at least step 2, Laser anchor, for an approximate preview)"
                     .into(),
             );
         };

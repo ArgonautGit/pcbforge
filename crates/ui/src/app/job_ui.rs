@@ -227,7 +227,7 @@ impl ConsoleApp {
 
         ui.separator();
         ui.weak(
-            "With an accepted ① Camera lens + ③ Laser field map the export field-warps every edge; without one it emits unwarped (warned in the log).",
+            "With an accepted step 1 (Camera lens) + step 3 (Laser field) map the export field-warps every edge; without one it emits unwarped (warned in the log).",
         );
         if ui.button("⏭ Next stage (bring-up)").clicked() {
             self.run_verb(&["next".into(), "--bringup-stubs".into()]);
@@ -268,9 +268,10 @@ impl ConsoleApp {
             args.push(field_path.to_string_lossy().into_owned());
         } else {
             self.runtime.log.push(LogLine {
-                text: "emit: no accepted ① Camera lens + ③ Laser field calibration — \
+                text:
+                    "emit: no accepted step 1 (Camera lens) + step 3 (Laser field) calibration — \
                        emitting UNWARPED geometry"
-                    .into(),
+                        .into(),
                 err: true,
             });
         }

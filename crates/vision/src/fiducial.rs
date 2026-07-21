@@ -253,8 +253,22 @@ fn find_one(
         return Err(Miss::DotTooSmall { dot_px });
     }
 
-    let half = (search_px + dot_px).ceil() as i64;
     let (fw, fh) = (frame.width() as i64, frame.height() as i64);
+    // A degenerate/near-singular seed homography (e.g. a self-intersecting
+    // corner-click order) can map this site to a non-finite pixel or blow up the
+    // local scale, making the search window absurdly large. Guard before the
+    // window arithmetic so such a site reports a clean Miss instead of
+    // overflowing the i64 window bounds — a mislabelled corner set then fails
+    // detection rather than panicking.
+    if !center_px.x.is_finite()
+        || !center_px.y.is_finite()
+        || !search_px.is_finite()
+        || !dot_px.is_finite()
+        || search_px > (fw + fh) as f64
+    {
+        return Err(Miss::OutsideFrame);
+    }
+    let half = (search_px + dot_px).ceil() as i64;
     let x0 = (center_px.x.round() as i64 - half).max(0);
     let y0 = (center_px.y.round() as i64 - half).max(0);
     let x1 = (center_px.x.round() as i64 + half).min(fw - 1);

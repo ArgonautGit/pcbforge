@@ -107,18 +107,30 @@ fn gerbers_from_kicad_fills_the_copper_and_outline_fields() {
     );
 }
 
+/// Pull the single summary line beginning with `prefix` (e.g. `calib_paper:`).
+/// Panics with the full summary if the line is missing, so failures are legible.
+fn summary_line<'a>(summary: &'a str, prefix: &str) -> &'a str {
+    summary
+        .lines()
+        .find(|l| l.trim_start().starts_with(prefix))
+        .unwrap_or_else(|| panic!("no `{prefix}` line in summary:\n{summary}"))
+}
+
 #[test]
 fn the_dot_contrast_toggle_switches_detection_polarity() {
     let mut h = console();
     h.get_by_label("🎯 Calibrate").click();
     h.run();
-    // Drive to a known state rather than trusting the persisted default (the
-    // setting survives across runs, so the starting polarity is whatever was
-    // saved last). Dark-on-light is for printed grids / dark-anodized burns.
+    // The Calibrate tab opens in ① CameraLens mode, so the contrast toggle binds
+    // the paper set. Drive to a known state rather than trusting the persisted
+    // default (the setting survives across runs, so the starting polarity is
+    // whatever was saved last). Dark-on-light is for printed grids / dark
+    // burns. The summary now carries two `contrast=` lines, so assert on the
+    // `calib_paper:` line specifically.
     h.get_by_label("◉ dark-on-light").click();
     h.run();
     assert!(
-        h.state().debug_summary().contains("contrast=dark-on-light"),
+        summary_line(&h.state().debug_summary(), "calib_paper:").contains("contrast=dark-on-light"),
         "selected dark:\n{}",
         h.state().debug_summary()
     );
@@ -127,11 +139,37 @@ fn the_dot_contrast_toggle_switches_detection_polarity() {
     h.get_by_label("◎ bright-on-dark").click();
     h.run();
     assert!(
-        h.state()
-            .debug_summary()
+        summary_line(&h.state().debug_summary(), "calib_paper:")
             .contains("contrast=bright-on-dark"),
         "toggled to bright:\n{}",
         h.state().debug_summary()
+    );
+}
+
+#[test]
+fn grid_params_are_per_step() {
+    let mut h = console();
+    h.get_by_label("🎯 Calibrate").click();
+    h.run();
+    // The tab opens in ① CameraLens mode: this toggle binds the paper set.
+    h.get_by_label("◎ bright-on-dark").click();
+    h.run();
+    // Switch to ③ Laser field, which binds the burn set (exact label — the
+    // substring also appears in the Job-tab export help).
+    h.get_by_label("3) Laser field (burned grid)").click();
+    h.run();
+    h.get_by_label("◉ dark-on-light").click();
+    h.run();
+    // Each step kept its own polarity, proving the form binds per-step through
+    // `active_params_mut()` rather than sharing one grid.
+    let s = h.state().debug_summary();
+    assert!(
+        summary_line(&s, "calib_paper:").contains("contrast=bright-on-dark"),
+        "paper kept its polarity:\n{s}"
+    );
+    assert!(
+        summary_line(&s, "calib_burn:").contains("contrast=dark-on-light"),
+        "burn kept its own polarity:\n{s}"
     );
 }
 
@@ -142,7 +180,7 @@ fn the_laser_field_calibration_step_is_selectable() {
     h.run();
     // Exact label: the substring "③ Laser field" also appears in the Job-tab
     // export help text, and substring queries panic on multiple matches.
-    h.get_by_label("③ Laser field (burned grid)").click();
+    h.get_by_label("3) Laser field (burned grid)").click();
     h.run();
     let s = h.state().debug_summary();
     assert!(
@@ -152,12 +190,70 @@ fn the_laser_field_calibration_step_is_selectable() {
 }
 
 #[test]
+fn fit_feedback_visibility_toggle_is_drivable() {
+    let mut h = console();
+    h.get_by_label("🎯 Calibrate").click();
+    h.run();
+    // The toggle is per-session (not persisted), so it starts on regardless of
+    // the shared temp DB. debug_summary reports it on the calib_burn: line.
+    assert!(
+        summary_line(&h.state().debug_summary(), "calib_burn:").contains("feedback=on"),
+        "feedback starts visible:\n{}",
+        h.state().debug_summary()
+    );
+    // The checkbox is labelled, so an agent/operator can drive it.
+    h.get_by_label("show fit feedback").click();
+    h.run();
+    assert!(
+        summary_line(&h.state().debug_summary(), "calib_burn:").contains("feedback=off"),
+        "checkbox hides the fit feedback:\n{}",
+        h.state().debug_summary()
+    );
+    h.get_by_label("show fit feedback").click();
+    h.run();
+    assert!(
+        summary_line(&h.state().debug_summary(), "calib_burn:").contains("feedback=on"),
+        "checkbox re-shows the fit feedback:\n{}",
+        h.state().debug_summary()
+    );
+}
+
+#[test]
+fn laser_field_scale_compensation_opt_in_is_drivable() {
+    let mut h = console();
+    h.get_by_label("🎯 Calibrate").click();
+    h.run();
+    // Exact label: "③ Laser field" also appears in the Job-tab export help.
+    h.get_by_label("3) Laser field (burned grid)").click();
+    h.run();
+    // The setting persists across runs (shared temp DB), so drive to a known
+    // OFF state before toggling rather than trusting the starting value.
+    if summary_line(&h.state().debug_summary(), "laser_field:").contains("scale_comp=on") {
+        h.get_by_label("compensate machine scale").click();
+        h.run();
+    }
+    assert!(
+        summary_line(&h.state().debug_summary(), "laser_field:").contains("scale_comp=off"),
+        "opt-in driven to off:\n{}",
+        h.state().debug_summary()
+    );
+    // The checkbox is labelled, so an agent/operator can drive it.
+    h.get_by_label("compensate machine scale").click();
+    h.run();
+    assert!(
+        summary_line(&h.state().debug_summary(), "laser_field:").contains("scale_comp=on"),
+        "checkbox turns scale compensation on:\n{}",
+        h.state().debug_summary()
+    );
+}
+
+#[test]
 fn laser_anchor_is_explicitly_labelled_as_approximate() {
     let mut h = console();
     h.get_by_label_contains("Calibrate").click();
     h.run();
     assert!(
-        h.query_by_label_contains("② Laser anchor (approximate)")
+        h.query_by_label_contains("2) Laser anchor (approximate)")
             .is_some(),
         "the homography-only fallback must not imply lens/field correction"
     );
@@ -168,7 +264,7 @@ fn laser_anchor_exposes_manual_dot_correction() {
     let mut h = console();
     h.get_by_label_contains("Calibrate").click();
     h.run();
-    h.get_by_label_contains("② Laser anchor").click();
+    h.get_by_label_contains("2) Laser anchor").click();
     h.run();
     assert!(
         h.query_by_label("Correct detected dots").is_some(),

@@ -82,6 +82,8 @@ fn nonlinear_app() -> ConsoleApp {
                 .map(|(p, c)| (*c, Vector2::new(p.x - c.x, p.y - c.y)))
                 .collect::<Vec<_>>(),
         ),
+        scale: 1.0,
+        extrapolated: 0,
     });
     app.calibration.field_accepted = true;
     app.calibration.lens_frame_signature = Some(((800, 800), Orientation::Normal));
@@ -997,19 +999,295 @@ field_frame=\n";
     assert_eq!(app.camera.orientation, Orientation::Rotate180);
     assert!(app.camera.use_device);
     assert_eq!(app.camera.device, 2);
-    assert_eq!(app.calibration.n, 9);
-    assert_eq!(app.calibration.dot_kind, crate::calib::DotKind::Bright);
+    assert_eq!(app.calibration.burn.n, 9);
+    assert_eq!(app.calibration.burn.dot_kind, crate::calib::DotKind::Bright);
+    // A pre-split blob has one shared parameter set: the paper set is seeded
+    // from it, since that's what ① was last fit with.
+    assert_eq!(app.calibration.paper, app.calibration.burn);
     assert!(app.placement.field_correct);
 
     let before = crate::settings::parse(legacy);
     let after = crate::settings::parse(&app.settings_blob());
+    // The save keeps every legacy key (with its value) and adds exactly the
+    // four new paper-set keys, seeded from the legacy shared values.
+    let new_keys: Vec<_> = after
+        .keys()
+        .filter(|k| !before.contains_key(*k))
+        .map(|k| k.as_str())
+        .collect();
     assert_eq!(
-        before.keys().collect::<Vec<_>>(),
-        after.keys().collect::<Vec<_>>()
+        new_keys,
+        vec![
+            "calib_accept_rms_um",
+            "calib_accept_worst_um",
+            "calib_allow_machine_scale",
+            "calib_paper_dot_kind",
+            "calib_paper_dot_mm",
+            "calib_paper_n",
+            "calib_paper_out",
+            "calib_paper_pitch_mm",
+            "lens_px_bounds",
+        ]
+    );
+    assert_eq!(after.get("calib_paper_n"), Some(&"9".to_string()));
+    assert_eq!(after.get("calib_paper_pitch_mm"), Some(&"8".to_string()));
+    assert_eq!(
+        after.get("calib_paper_dot_kind"),
+        Some(&"bright".to_string())
     );
     for (key, value) in before {
         assert_eq!(after.get(&key), Some(&value), "setting {key}");
     }
+}
+
+/// The operator-configurable step 3 field acceptance limits round-trip.
+#[test]
+fn field_acceptance_limits_persist() {
+    let db = tmp_db();
+    {
+        let mut a = ConsoleApp::new(db.clone(), vec!["true".into()]);
+        a.calibration.accept_rms_um = 120.0;
+        a.calibration.accept_worst_um = 300.0;
+        a.save_settings_if_changed();
+    }
+    let b = ConsoleApp::new(db, vec!["true".into()]);
+    assert!((b.calibration.accept_rms_um - 120.0).abs() < 1e-9);
+    assert!((b.calibration.accept_worst_um - 300.0).abs() < 1e-9);
+}
+
+/// The burned-grid frame anchor's mirror flag round-trips as a 5th
+/// `field_frame` token (`… 1`), and a legacy 4-token blob (written before X
+/// mirroring was representable) restores as un-mirrored.
+#[test]
+fn field_frame_mirror_flag_round_trips() {
+    use nalgebra::{Matrix3, Point2};
+    let coords = [0.0, 20.0, 40.0, 60.0];
+    let lens = {
+        let pairs: Vec<_> = coords
+            .iter()
+            .flat_map(|&y| {
+                coords.iter().map(move |&x| {
+                    (
+                        Point2::new(10.0 * x + 20.0, 800.0 - 10.0 * y),
+                        Point2::new(x, y),
+                    )
+                })
+            })
+            .collect();
+        vision::fit_lens(&pairs).unwrap()
+    };
+    let field = {
+        let pairs: Vec<_> = coords
+            .iter()
+            .flat_map(|&y| {
+                coords
+                    .iter()
+                    .map(move |&x| (Point2::new(x, y), Point2::new(x, y)))
+            })
+            .collect();
+        vision::fit_field(&pairs).unwrap()
+    };
+    let to_px = vision::Homography {
+        matrix: Matrix3::new(10.0, 0.0, 20.0, 0.0, -10.0, 800.0, 0.0, 0.0, 1.0),
+        residuals: vec![],
+        rms: 0.0,
+    };
+    let flipped = crate::calib::Rigid2 {
+        cos: (0.2_f64).cos(),
+        sin: (0.2_f64).sin(),
+        tx: 3.5,
+        ty: -1.25,
+        flip_x: true,
+    };
+    let make_app = |db: &PathBuf, frame: crate::calib::Rigid2| {
+        let mut a = ConsoleApp::new(db.clone(), vec!["true".into()]);
+        a.calibration.lens = Some(crate::calib::CameraCal {
+            lens: lens.clone(),
+            dots: vec![],
+            found: 16,
+            total: 16,
+        });
+        a.calibration.field = Some(crate::calib::FieldCal {
+            field: field.clone(),
+            paper_to_machine: frame,
+            to_px: to_px.clone(),
+            dots: vec![],
+            found: 16,
+            total: 16,
+            field_verdict: vision::classify_field_error(&[]),
+            scale: 1.0,
+            extrapolated: 0,
+        });
+        a.calibration.field_accepted = true;
+        a.calibration.lens_frame_signature = Some(((800, 800), Orientation::Normal));
+        // The reload path reads the FieldMap from the field-map file.
+        std::fs::write(a.field_map_path(), field.serialize()).unwrap();
+        a
+    };
+
+    // Save a mirrored frame, reload: flip_x survives as the 5th token = 1.
+    let db = tmp_db();
+    let blob = {
+        let mut a = make_app(&db, flipped);
+        a.save_settings_if_changed();
+        a.settings_blob()
+    };
+    assert!(
+        blob.lines()
+            .any(|l| l.starts_with("field_frame=") && l.trim_end().ends_with(" 1")),
+        "flip serializes as the 5th field_frame token = 1:\n{blob}"
+    );
+    let b = ConsoleApp::new(db, vec!["true".into()]);
+    let r = b
+        .calibration
+        .field
+        .as_ref()
+        .expect("field restored")
+        .paper_to_machine;
+    assert!(r.flip_x, "the mirror flag is restored");
+    assert!(
+        (r.cos - flipped.cos).abs() < 1e-9
+            && (r.sin - flipped.sin).abs() < 1e-9
+            && (r.tx - flipped.tx).abs() < 1e-9
+            && (r.ty - flipped.ty).abs() < 1e-9,
+        "the frame parameters survive alongside the flag"
+    );
+
+    // A legacy 4-token field_frame (no flip token) restores as un-mirrored.
+    let legacy_db = tmp_db();
+    let blob4: String = {
+        let a = make_app(
+            &legacy_db,
+            crate::calib::Rigid2 {
+                flip_x: false,
+                ..flipped
+            },
+        );
+        a.settings_blob()
+            .lines()
+            .map(|l| match l.strip_prefix("field_frame=") {
+                Some(v) => {
+                    let toks: Vec<&str> = v.split_whitespace().take(4).collect();
+                    format!("field_frame={}\n", toks.join(" "))
+                }
+                None => format!("{l}\n"),
+            })
+            .collect()
+    };
+    std::fs::write(crate::settings::path_for_db(&legacy_db), blob4).unwrap();
+    let c = ConsoleApp::new(legacy_db, vec!["true".into()]);
+    let rc = c
+        .calibration
+        .field
+        .as_ref()
+        .expect("legacy field restored")
+        .paper_to_machine;
+    assert!(!rc.flip_x, "a 4-token field_frame restores un-mirrored");
+}
+
+/// The two parameter sets persist independently once both exist.
+#[test]
+fn paper_and_burn_params_persist_independently() {
+    let db = tmp_db();
+    {
+        let mut a = ConsoleApp::new(db.clone(), vec!["true".into()]);
+        a.calibration.paper = GridParams {
+            n: 9,
+            pitch_mm: 9.6,
+            dot_mm: 0.3,
+            dot_kind: crate::calib::DotKind::Dark,
+        };
+        a.calibration.burn = GridParams {
+            n: 7,
+            pitch_mm: 10.0,
+            dot_mm: 0.4,
+            dot_kind: crate::calib::DotKind::Bright,
+        };
+        a.save_settings_if_changed();
+    }
+    let b = ConsoleApp::new(db, vec!["true".into()]);
+    assert_eq!(b.calibration.paper.n, 9);
+    assert!((b.calibration.paper.pitch_mm - 9.6).abs() < 1e-9);
+    assert_eq!(b.calibration.paper.dot_kind, crate::calib::DotKind::Dark);
+    assert_eq!(b.calibration.burn.n, 7);
+    assert!((b.calibration.burn.pitch_mm - 10.0).abs() < 1e-9);
+    assert_eq!(b.calibration.burn.dot_kind, crate::calib::DotKind::Bright);
+}
+
+/// The ① lens fit's pixel bounds survive a save/reload, and a legacy blob
+/// written before the `lens_px_bounds` key existed restores them as `None`.
+#[test]
+fn lens_calibration_pixel_bounds_round_trip() {
+    use nalgebra::Point2;
+    let coords = [0.0, 20.0, 40.0, 60.0];
+    let pairs: Vec<_> = coords
+        .iter()
+        .flat_map(|&y| {
+            coords.iter().map(move |&x| {
+                (
+                    Point2::new(10.0 * x + 20.0, 800.0 - 10.0 * y),
+                    Point2::new(x, y),
+                )
+            })
+        })
+        .collect();
+    let lens = vision::fit_lens(&pairs).unwrap();
+    let expected = lens.calib_px_bounds.expect("fit records bounds");
+    let make_cal = |lens: vision::LensMap| crate::calib::CameraCal {
+        lens,
+        dots: Vec::new(),
+        found: 16,
+        total: 16,
+    };
+
+    // Round-trip through save + reload: bounds survive.
+    let db = tmp_db();
+    {
+        let mut a = ConsoleApp::new(db.clone(), vec!["true".into()]);
+        a.calibration.lens = Some(make_cal(lens.clone()));
+        a.save_settings_if_changed();
+    }
+    let b = ConsoleApp::new(db, vec!["true".into()]);
+    let restored = b
+        .calibration
+        .lens
+        .as_ref()
+        .expect("lens restored")
+        .lens
+        .calib_px_bounds
+        .expect("bounds restored");
+    for (e, r) in expected.iter().zip(&restored) {
+        assert!((e - r).abs() < 1e-9, "bound {e} vs {r}");
+    }
+
+    // A legacy blob with the lens maps but no lens_px_bounds key restores None.
+    let legacy_db = tmp_db();
+    let blob = {
+        let mut a = ConsoleApp::new(legacy_db.clone(), vec!["true".into()]);
+        a.calibration.lens = Some(make_cal(lens));
+        a.settings_blob()
+    };
+    let stripped: String = blob
+        .lines()
+        .filter(|l| !l.starts_with("lens_px_bounds="))
+        .map(|l| format!("{l}\n"))
+        .collect();
+    assert!(
+        !stripped.contains("lens_px_bounds"),
+        "legacy blob carries no bounds key"
+    );
+    std::fs::write(crate::settings::path_for_db(&legacy_db), stripped).unwrap();
+    let c = ConsoleApp::new(legacy_db, vec!["true".into()]);
+    assert!(
+        c.calibration
+            .lens
+            .as_ref()
+            .expect("lens restored")
+            .lens
+            .calib_px_bounds
+            .is_none(),
+        "a missing bounds key restores as None"
+    );
 }
 
 /// "Etch here" resolves a bare output filename next to the copper Gerber
@@ -1121,8 +1399,8 @@ fn calibration_persists_as_a_reanchor_seed() {
     use nalgebra::Matrix3;
     let db = tmp_db();
     let mut a = ConsoleApp::new(db.clone(), vec!["true".into()]);
-    a.calibration.n = 7;
-    a.calibration.pitch_mm = 10.0;
+    a.calibration.burn.n = 7;
+    a.calibration.burn.pitch_mm = 10.0;
     a.calibration.anchor = Some(crate::calib::Calibration {
         px_to_mm: vision::Homography {
             matrix: Matrix3::new(0.1, 0.0, 1.0, 0.0, 0.1, 2.0, 0.0, 0.0, 1.0),
@@ -1144,7 +1422,7 @@ fn calibration_persists_as_a_reanchor_seed() {
         (cal.px_to_mm.matrix[(0, 2)] - 1.0).abs() < 1e-12,
         "translation survived"
     );
-    assert_eq!(b.calibration.n, 7);
+    assert_eq!(b.calibration.burn.n, 7);
 }
 
 /// Camera-lens calibration through the console: a printed-grid frame + 4
@@ -1171,13 +1449,20 @@ fn camera_lens_calibration_flow() {
     let mut app = ConsoleApp::new(tmp_db(), vec!["true".into()]);
     app.runtime.tab = CentralTab::Calibrate;
     app.calibration.mode = CalibMode::CameraLens;
-    app.calibration.n = 7;
-    app.calibration.pitch_mm = 10.0;
-    app.calibration.dot_mm = dot;
+    app.calibration.paper.n = 7;
+    app.calibration.paper.pitch_mm = 10.0;
+    app.calibration.paper.dot_mm = dot;
     app.calibration.frame_img = Some(img);
     // Corner clicks at the four grid corners (px = mm*ppm + 40).
     app.calibration.corners = vec![(40.0, 40.0), (640.0, 40.0), (640.0, 640.0), (40.0, 640.0)];
+    // Start with feedback hidden (as a fresh-loaded frame would) so the assertion
+    // below actually verifies the successful fit flips it back on.
+    app.calibration.show_fit_feedback = false;
     app.calibrate_fit();
+    assert!(
+        app.calibration.show_fit_feedback,
+        "a successful lens fit re-shows the feedback overlay"
+    );
     let lens = app.calibration.lens.as_ref().expect("lens fit produced");
     assert!(lens.found >= 45, "locked most dots: {}", lens.found);
     assert!(
@@ -1191,6 +1476,38 @@ fn camera_lens_calibration_flow() {
     let ctx = Context::default();
     let out = ctx.run(egui::RawInput::default(), |ctx| app.ui(ctx));
     assert!(!out.shapes.is_empty());
+}
+
+/// The fit-feedback overlay defaults to visible, and loading a fresh grid frame
+/// hides it so the operator sees the bare dots to re-click the 4 corners.
+#[test]
+fn loading_a_frame_hides_stale_fit_feedback() {
+    let mut app = ConsoleApp::new(tmp_db(), vec!["true".into()]);
+    assert!(
+        app.calibration.show_fit_feedback,
+        "feedback visible by default"
+    );
+    assert!(
+        app.debug_summary().contains("feedback=on"),
+        "default summary reports feedback=on:\n{}",
+        app.debug_summary()
+    );
+    app.calibration.frame = concat!(
+        env!("CARGO_MANIFEST_DIR"),
+        "/../../samples/calibration/grid-7x7-10mm-distorted.png"
+    )
+    .into();
+    let ctx = Context::default();
+    app.calibrate_load_frame(&ctx);
+    assert!(
+        !app.calibration.show_fit_feedback,
+        "loading a fresh frame hides the stale overlay"
+    );
+    assert!(
+        app.debug_summary().contains("feedback=off"),
+        "summary reports feedback=off after load:\n{}",
+        app.debug_summary()
+    );
 }
 
 /// The Calibrate tab lays out headless, including corner clicks.
@@ -1212,9 +1529,9 @@ fn anchor_overlay_renders_the_machine_grid() {
     let mut app = ConsoleApp::new(tmp_db(), vec!["true".into()]);
     app.runtime.tab = CentralTab::Calibrate;
     app.calibration.mode = CalibMode::LaserAnchor;
-    app.calibration.n = 7;
-    app.calibration.pitch_mm = 10.0;
-    app.calibration.dot_mm = 2.0;
+    app.calibration.burn.n = 7;
+    app.calibration.burn.pitch_mm = 10.0;
+    app.calibration.burn.dot_mm = 2.0;
     app.calibration.frame = concat!(
         env!("CARGO_MANIFEST_DIR"),
         "/../../samples/calibration/grid-7x7-10mm-distorted.png"
@@ -1449,8 +1766,8 @@ fn camera_view_downscales_but_data_stays_full_res() {
 #[test]
 fn generate_grid_centers_on_the_field() {
     let mut app = ConsoleApp::new(tmp_db(), vec!["true".into()]);
-    app.calibration.n = 7;
-    app.calibration.pitch_mm = 10.0;
+    app.calibration.burn.n = 7;
+    app.calibration.burn.pitch_mm = 10.0;
     app.camera.field_cx_mm = 0.0;
     app.camera.field_cy_mm = 0.0;
     app.calibration.grid_out = "calib-grid.lbrn2".into();
@@ -1476,6 +1793,52 @@ fn generate_grid_centers_on_the_field() {
         "grid recentres on the work area: {}",
         app.calibration.note
     );
+}
+
+/// The step-1 paper-grid button shells `paper-grid` and leaves a note that
+/// tells the operator to caliper the printed pitch before fitting.
+#[test]
+fn generate_paper_grid_notes_the_caliper_step() {
+    let mut app = ConsoleApp::new(tmp_db(), vec!["true".into()]);
+    app.calibration.mode = CalibMode::CameraLens;
+    app.calibration.paper.n = 9;
+    app.calibration.paper.pitch_mm = 10.0;
+    app.calibration.paper_out = "paper-grid.svg".into();
+    app.calibrate_generate_paper_grid();
+    assert!(
+        app.calibration.note.contains("9×9 paper grid") && app.calibration.note.contains("CALIPER"),
+        "note reminds the operator to caliper: {}",
+        app.calibration.note
+    );
+    // A comfortable 80 mm span is not flagged.
+    assert!(
+        !app.calibration.note.contains("span exceeds"),
+        "an in-bounds span is not warned: {}",
+        app.calibration.note
+    );
+
+    // A too-large span (29×10 = 280 mm) warns but still shells (the CLI reports
+    // the hard error in the Log).
+    app.calibration.paper.n = 29;
+    app.calibrate_generate_paper_grid();
+    assert!(
+        app.calibration.note.contains("span exceeds the 190 mm"),
+        "an oversize span is warned: {}",
+        app.calibration.note
+    );
+}
+
+/// The ① paper-grid output path round-trips through save + reload.
+#[test]
+fn paper_out_path_persists() {
+    let db = tmp_db();
+    {
+        let mut a = ConsoleApp::new(db.clone(), vec!["true".into()]);
+        a.calibration.paper_out = "sheets/lens-grid.svg".into();
+        a.save_settings_if_changed();
+    }
+    let b = ConsoleApp::new(db, vec!["true".into()]);
+    assert_eq!(b.calibration.paper_out, "sheets/lens-grid.svg");
 }
 
 /// A failed re-fit (wrong corners/polarity — the operator's 0/49 case)

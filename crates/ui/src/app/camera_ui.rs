@@ -329,8 +329,8 @@ impl ConsoleApp {
                 ui.checkbox(&mut self.camera.show_bed, "⧉ Work area + 50 mm scale")
                     .on_hover_text(
                         "Project the laser's work area and a 50 mm ruler onto the bed. \
-                         Uses nonlinear camera + laser-field compensation after ①+③; \
-                         otherwise uses the approximate ② homography anchor.",
+                         Uses nonlinear camera + laser-field compensation after steps 1+3; \
+                         otherwise uses the approximate step-2 homography anchor.",
                     );
                 if self.camera.show_bed {
                     let size_label = ui.label("field mm");
@@ -372,7 +372,7 @@ impl ConsoleApp {
                             ("● physical camera projection".to_string(), true)
                         }
                         Ok(Some(CameraProjection::Homography { .. })) => (
-                            "◐ approximate homography anchor — run ① Camera lens + ③ Laser field for distortion compensation".to_string(),
+                            "◐ approximate homography anchor — run step 1 (Camera lens) + step 3 (Laser field) for distortion compensation".to_string(),
                             false,
                         ),
                         Ok(_) => ("○ no camera-to-machine projection".to_string(), false),
