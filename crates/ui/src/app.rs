@@ -136,6 +136,7 @@ impl ConsoleApp {
                 scan_center_auto: true,
                 scan_center_mm: (35.0, 35.0),
                 speed_mm_s: 1000.0,
+                frequency_khz: 30.0,
                 pulse_ns: 1,
                 interval_mm: 0.03,
                 passes: 1,
@@ -382,7 +383,7 @@ impl ConsoleApp {
                 .unwrap_or_else(|| "unset".into())
         };
         let gerbers = format!(
-            "copper={} outline={} speed={} pulse_ns={} interval={} passes={}",
+            "copper={} outline={} speed={} freq_khz={} pulse_ns={} interval={} passes={}",
             if self.job.emit_copper.trim().is_empty() {
                 "unset".into()
             } else {
@@ -394,6 +395,7 @@ impl ConsoleApp {
                 base(&self.job.emit_outline)
             },
             self.job.speed_mm_s,
+            self.job.frequency_khz,
             self.job.pulse_ns,
             self.job.interval_mm,
             self.job.passes,

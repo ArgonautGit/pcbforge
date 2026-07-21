@@ -1098,6 +1098,7 @@ field_frame=\n";
             "fid_profile",
             "fid_search_mm",
             "fid_shape",
+            "job_frequency_khz",
             "job_interval_mm",
             "job_passes",
             "job_pulse_ns",
@@ -1140,6 +1141,7 @@ fn job_export_recipe_persists() {
     {
         let mut a = ConsoleApp::new(db.clone(), vec!["true".into()]);
         a.job.speed_mm_s = 2500.0;
+        a.job.frequency_khz = 80.0;
         a.job.pulse_ns = 42;
         a.job.interval_mm = 0.05;
         a.job.passes = 3;
@@ -1147,6 +1149,7 @@ fn job_export_recipe_persists() {
     }
     let b = ConsoleApp::new(db, vec!["true".into()]);
     assert!((b.job.speed_mm_s - 2500.0).abs() < 1e-9);
+    assert!((b.job.frequency_khz - 80.0).abs() < 1e-9);
     assert_eq!(b.job.pulse_ns, 42);
     assert!((b.job.interval_mm - 0.05).abs() < 1e-9);
     assert_eq!(b.job.passes, 3);
@@ -1154,6 +1157,7 @@ fn job_export_recipe_persists() {
     // A blob with none of the recipe keys keeps today's defaults.
     let fresh = ConsoleApp::new(tmp_db(), vec!["true".into()]);
     assert!((fresh.job.speed_mm_s - 1000.0).abs() < 1e-9);
+    assert!((fresh.job.frequency_khz - 30.0).abs() < 1e-9);
     assert_eq!(fresh.job.pulse_ns, 1);
     assert!((fresh.job.interval_mm - 0.03).abs() < 1e-9);
     assert_eq!(fresh.job.passes, 1);
@@ -1328,7 +1332,7 @@ fn fresh_app_summary_reports_circle_shape() {
         "summary carries the profile token: {summary}"
     );
     assert!(
-        summary.contains("speed=1000 pulse_ns=1 interval=0.03 passes=1"),
+        summary.contains("speed=1000 freq_khz=30 pulse_ns=1 interval=0.03 passes=1"),
         "summary carries the export recipe defaults: {summary}"
     );
 }

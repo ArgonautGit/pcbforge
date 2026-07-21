@@ -102,6 +102,7 @@ pub(super) struct JobState {
     pub(super) scan_center_auto: bool,
     pub(super) scan_center_mm: (f64, f64),
     pub(super) speed_mm_s: f64,
+    pub(super) frequency_khz: f64,
     pub(super) pulse_ns: u32,
     pub(super) interval_mm: f64,
     pub(super) passes: u32,

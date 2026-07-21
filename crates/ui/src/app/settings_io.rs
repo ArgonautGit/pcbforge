@@ -35,6 +35,7 @@ impl ConsoleApp {
             ("lbrn2", self.job.emit_lbrn2.clone()),
             ("offset_mm", self.job.offset_mm.to_string()),
             ("job_speed_mm_s", self.job.speed_mm_s.to_string()),
+            ("job_frequency_khz", self.job.frequency_khz.to_string()),
             ("job_pulse_ns", self.job.pulse_ns.to_string()),
             ("job_interval_mm", self.job.interval_mm.to_string()),
             ("job_passes", self.job.passes.to_string()),
@@ -298,6 +299,13 @@ impl ConsoleApp {
             .filter(|v: &f64| v.is_finite())
         {
             self.job.speed_mm_s = v.clamp(1.0, 15000.0);
+        }
+        if let Some(v) = m
+            .get("job_frequency_khz")
+            .and_then(|s| s.trim().parse().ok())
+            .filter(|v: &f64| v.is_finite())
+        {
+            self.job.frequency_khz = v.clamp(1.0, 4000.0);
         }
         u32_field(&m, "job_pulse_ns", 0, 500, &mut self.job.pulse_ns);
         if let Some(v) = m

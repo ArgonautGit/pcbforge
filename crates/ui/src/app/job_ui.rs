@@ -153,6 +153,15 @@ impl ConsoleApp {
                 )
                 .labelled_by(l.id);
                 ui.end_row();
+                let l = ui.label("frequency kHz");
+                ui.add(
+                    egui::DragValue::new(&mut self.job.frequency_khz)
+                        .speed(1.0)
+                        .range(1.0..=4000.0),
+                )
+                .labelled_by(l.id)
+                .on_hover_text("pulse repetition rate");
+                ui.end_row();
                 let l = ui.label("Q-pulse ns");
                 ui.add(
                     egui::DragValue::new(&mut self.job.pulse_ns)
@@ -297,6 +306,8 @@ impl ConsoleApp {
             format!("{}", self.job.offset_mm),
             "--speed-mm-s".into(),
             format!("{}", self.job.speed_mm_s),
+            "--frequency-khz".into(),
+            format!("{}", self.job.frequency_khz),
             "--pulse-ns".into(),
             format!("{}", self.job.pulse_ns),
             "--interval-mm".into(),

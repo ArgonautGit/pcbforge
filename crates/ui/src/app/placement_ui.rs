@@ -337,6 +337,8 @@ impl ConsoleApp {
             self.placement().correspondences(),
             "--speed-mm-s".into(),
             format!("{}", self.job.speed_mm_s),
+            "--frequency-khz".into(),
+            format!("{}", self.job.frequency_khz),
             "--pulse-ns".into(),
             format!("{}", self.job.pulse_ns),
             "--interval-mm".into(),
