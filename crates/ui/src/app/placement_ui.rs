@@ -133,22 +133,28 @@ impl ConsoleApp {
     /// Load the bed frame + job geometry into the place cache and center the
     /// job on the frame. Uses the Job-tab Gerber paths for the geometry.
     pub fn load_place(&mut self, ctx: &Context) {
-        // Empty path → grab a fresh frame from the camera source (same one-click
-        // path as the fiducial check); a set path loads that saved image.
-        let img = if crate::clean_path(&self.placement.frame).trim().is_empty() {
-            match crate::camera::grab(&self.cam_source()) {
-                Ok(img) => self.camera.orientation.apply(img),
-                Err(e) => {
-                    self.placement.note = format!("camera: {e}");
+        // ALWAYS grab a fresh frame from the camera source first, so Load
+        // reflects the board as it sits now (the bed-frame path is persisted —
+        // preferring it would silently keep re-loading a stale file). The file
+        // is the fallback when no camera source is reachable.
+        let img = match crate::camera::grab(&self.cam_source()) {
+            Ok(img) => self.camera.orientation.apply(img),
+            Err(cam_err) => {
+                let path = crate::clean_path(&self.placement.frame);
+                if path.trim().is_empty() {
+                    self.placement.note = format!("camera: {cam_err}");
                     return;
                 }
-            }
-        } else {
-            match image::open(crate::clean_path(&self.placement.frame)) {
-                Ok(i) => i.to_luma8(),
-                Err(e) => {
-                    self.placement.note = format!("frame: {e}");
-                    return;
+                match image::open(path) {
+                    Ok(i) => {
+                        self.placement.note =
+                            format!("camera unavailable ({cam_err}) — loaded the bed-frame file");
+                        i.to_luma8()
+                    }
+                    Err(e) => {
+                        self.placement.note = format!("camera: {cam_err}; frame file: {e}");
+                        return;
+                    }
                 }
             }
         };
@@ -393,8 +399,9 @@ impl ConsoleApp {
                 ui.add(egui::TextEdit::singleline(&mut self.placement.frame).desired_width(240.0))
                     .labelled_by(lbl.id)
                     .on_hover_text(
-                        "Leave empty to grab a fresh frame from the camera source \
-                         picked in the Camera tab; set a path to use a saved image.",
+                        "Optional fallback image: \"Load frame + job\" always grabs a \
+                         fresh frame from the camera source picked in the Camera tab, \
+                         and loads this file only when that grab fails (offline work).",
                     );
                 ui.end_row();
                 ui.label("out .lbrn2");
@@ -411,8 +418,9 @@ impl ConsoleApp {
             if ui
                 .button("⤵ Load frame + job")
                 .on_hover_text(
-                    "Leave the bed-frame path empty to grab a fresh frame from the \
-                     camera source picked in the Camera tab; set a path to use a saved image.",
+                    "Grabs a fresh frame from the camera source picked in the Camera \
+                     tab and loads the Job-tab Gerbers onto it; the bed-frame file is \
+                     used only when the camera grab fails.",
                 )
                 .clicked()
             {

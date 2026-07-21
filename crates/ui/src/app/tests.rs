@@ -127,6 +127,10 @@ fn load_place_without_any_calibration_still_shows_the_frame() {
     image::GrayImage::from_pixel(64, 48, image::Luma([90]))
         .save(&frame)
         .unwrap();
+    // A dead camera source (File("")) so the grab-first path falls back to
+    // the bed-frame file without touching real hardware in tests.
+    app.camera.use_device = false;
+    app.camera.file = String::new();
     app.placement.frame = frame.to_string_lossy().into_owned();
     let fixtures = concat!(env!("CARGO_MANIFEST_DIR"), "/../cli/tests/fixtures");
     app.job.emit_copper = format!("{fixtures}/uv_test-F_Cu.gbr");
@@ -143,11 +147,12 @@ fn load_place_without_any_calibration_still_shows_the_frame() {
     std::fs::remove_dir_all(dir).unwrap();
 }
 
-/// "Load frame + job" with an empty bed-frame path grabs a fresh frame from
-/// the camera source (a File source here) instead of loading a file — same
-/// one-click camera path as the fiducial check.
+/// "Load frame + job" ALWAYS grabs a fresh frame from the camera source (a
+/// File source here) — even when a bed-frame path is set. The persisted path
+/// must not silently win over the camera, or Place keeps showing a stale
+/// image of the bed (the file is only the fallback when the grab fails).
 #[test]
-fn load_place_with_empty_frame_grabs_from_the_camera() {
+fn load_place_prefers_a_fresh_camera_grab_over_the_saved_frame_path() {
     let mut app = ConsoleApp::new(tmp_db(), vec!["true".into()]);
     let dir = std::env::temp_dir().join(format!("pcbforge-place-cam-{}", std::process::id()));
     std::fs::create_dir_all(&dir).unwrap();
@@ -157,17 +162,23 @@ fn load_place_with_empty_frame_grabs_from_the_camera() {
         .unwrap();
     app.camera.use_device = false;
     app.camera.file = cam.to_string_lossy().into_owned();
-    // No saved frame path → the grab comes from the camera source.
-    app.placement.frame = String::new();
+    // A stale saved bed-frame path of a DIFFERENT size: the camera grab must
+    // win, which the cached frame's dimensions prove below.
+    let stale = dir.join("stale.png");
+    image::GrayImage::from_pixel(32, 32, image::Luma([40]))
+        .save(&stale)
+        .unwrap();
+    app.placement.frame = stale.to_string_lossy().into_owned();
     let fixtures = concat!(env!("CARGO_MANIFEST_DIR"), "/../cli/tests/fixtures");
     app.job.emit_copper = format!("{fixtures}/uv_test-F_Cu.gbr");
     app.job.emit_outline = format!("{fixtures}/uv_test-Edge_Cuts.gbr");
     let ctx = Context::default();
     let _ = ctx.run(egui::RawInput::default(), |ctx| app.load_place(ctx));
-    assert!(
-        app.placement.frame_img.is_some(),
-        "camera frame cached: {}",
-        app.placement.note
+    let frame = app.placement.frame_img.as_ref().expect("camera frame cached");
+    assert_eq!(
+        (frame.width(), frame.height()),
+        (64, 48),
+        "the fresh camera grab won over the stale bed-frame file"
     );
     assert!(
         app.placement.note.contains("needs calibration"),
