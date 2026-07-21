@@ -1455,7 +1455,14 @@ fn camera_lens_calibration_flow() {
     app.calibration.frame_img = Some(img);
     // Corner clicks at the four grid corners (px = mm*ppm + 40).
     app.calibration.corners = vec![(40.0, 40.0), (640.0, 40.0), (640.0, 640.0), (40.0, 640.0)];
+    // Start with feedback hidden (as a fresh-loaded frame would) so the assertion
+    // below actually verifies the successful fit flips it back on.
+    app.calibration.show_fit_feedback = false;
     app.calibrate_fit();
+    assert!(
+        app.calibration.show_fit_feedback,
+        "a successful lens fit re-shows the feedback overlay"
+    );
     let lens = app.calibration.lens.as_ref().expect("lens fit produced");
     assert!(lens.found >= 45, "locked most dots: {}", lens.found);
     assert!(
@@ -1469,6 +1476,38 @@ fn camera_lens_calibration_flow() {
     let ctx = Context::default();
     let out = ctx.run(egui::RawInput::default(), |ctx| app.ui(ctx));
     assert!(!out.shapes.is_empty());
+}
+
+/// The fit-feedback overlay defaults to visible, and loading a fresh grid frame
+/// hides it so the operator sees the bare dots to re-click the 4 corners.
+#[test]
+fn loading_a_frame_hides_stale_fit_feedback() {
+    let mut app = ConsoleApp::new(tmp_db(), vec!["true".into()]);
+    assert!(
+        app.calibration.show_fit_feedback,
+        "feedback visible by default"
+    );
+    assert!(
+        app.debug_summary().contains("feedback=on"),
+        "default summary reports feedback=on:\n{}",
+        app.debug_summary()
+    );
+    app.calibration.frame = concat!(
+        env!("CARGO_MANIFEST_DIR"),
+        "/../../samples/calibration/grid-7x7-10mm-distorted.png"
+    )
+    .into();
+    let ctx = Context::default();
+    app.calibrate_load_frame(&ctx);
+    assert!(
+        !app.calibration.show_fit_feedback,
+        "loading a fresh frame hides the stale overlay"
+    );
+    assert!(
+        app.debug_summary().contains("feedback=off"),
+        "summary reports feedback=off after load:\n{}",
+        app.debug_summary()
+    );
 }
 
 /// The Calibrate tab lays out headless, including corner clicks.

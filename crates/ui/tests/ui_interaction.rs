@@ -190,6 +190,35 @@ fn the_laser_field_calibration_step_is_selectable() {
 }
 
 #[test]
+fn fit_feedback_visibility_toggle_is_drivable() {
+    let mut h = console();
+    h.get_by_label("🎯 Calibrate").click();
+    h.run();
+    // The toggle is per-session (not persisted), so it starts on regardless of
+    // the shared temp DB. debug_summary reports it on the calib_burn: line.
+    assert!(
+        summary_line(&h.state().debug_summary(), "calib_burn:").contains("feedback=on"),
+        "feedback starts visible:\n{}",
+        h.state().debug_summary()
+    );
+    // The checkbox is labelled, so an agent/operator can drive it.
+    h.get_by_label("show fit feedback").click();
+    h.run();
+    assert!(
+        summary_line(&h.state().debug_summary(), "calib_burn:").contains("feedback=off"),
+        "checkbox hides the fit feedback:\n{}",
+        h.state().debug_summary()
+    );
+    h.get_by_label("show fit feedback").click();
+    h.run();
+    assert!(
+        summary_line(&h.state().debug_summary(), "calib_burn:").contains("feedback=on"),
+        "checkbox re-shows the fit feedback:\n{}",
+        h.state().debug_summary()
+    );
+}
+
+#[test]
 fn laser_field_scale_compensation_opt_in_is_drivable() {
     let mut h = console();
     h.get_by_label("🎯 Calibrate").click();

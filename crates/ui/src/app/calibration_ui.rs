@@ -129,6 +129,9 @@ impl ConsoleApp {
             Some(ctx.load_texture("calib-frame", color, TextureOptions::NEAREST));
         self.calibration.frame_img = Some(img);
         self.calibration.corners.clear();
+        // Fresh frame → hide any stale fit overlay so the bare dots are visible
+        // to re-click the corners.
+        self.calibration.show_fit_feedback = false;
         self.calibration.note = format!("click the 4 corner dots: {}", self.corner_click_order());
     }
 
@@ -187,6 +190,7 @@ impl ConsoleApp {
                         );
                         self.calibration.lens_frame_signature =
                             Some((frame.dimensions(), self.camera.orientation));
+                        self.calibration.show_fit_feedback = true;
                         self.calibration.lens = Some(cal);
                         // A field fit is expressed in the old lens ruler's
                         // physical frame. Re-fitting the lens invalidates it.
@@ -213,6 +217,7 @@ impl ConsoleApp {
                             "anchor: {}/{} dots, RMS {:.0} µm — Place now burns in machine coordinates",
                             cal.found, cal.total, cal.rms_um
                         );
+                        self.calibration.show_fit_feedback = true;
                         self.calibration.anchor = Some(cal);
                         self.calibration.saved_at = Some(now_unix());
                     }
@@ -253,6 +258,9 @@ impl ConsoleApp {
                     self.calibration.allow_machine_scale,
                 ) {
                     Ok(cal) => {
+                        // A successful fit produced fresh feedback worth showing,
+                        // regardless of whether it met the acceptance limits.
+                        self.calibration.show_fit_feedback = true;
                         let worst = cal.dots.iter().map(|d| d.field_um).fold(0.0_f64, f64::max);
                         let acceptance = crate::calib::field_live_acceptance(
                             &cal,
@@ -619,7 +627,8 @@ impl ConsoleApp {
         // Lens feedback (camera mode, after a fit): a magenta arrow per dot
         // showing the distortion it exhibited (exaggerated ×scale), and a dot
         // colored by how well the polynomial corrected it.
-        if self.calibration.mode == CalibMode::CameraLens
+        if self.calibration.show_fit_feedback
+            && self.calibration.mode == CalibMode::CameraLens
             && let Some(cal) = &self.calibration.lens
         {
             let s = xf.scale;
@@ -650,7 +659,8 @@ impl ConsoleApp {
         // the origin + axes, per-dot residual vectors (× exaggerated), and any
         // dots that failed to lock. This makes the abstract homography visible:
         // the operator sees exactly where the laser thinks its grid is.
-        if self.calibration.mode == CalibMode::LaserAnchor
+        if self.calibration.show_fit_feedback
+            && self.calibration.mode == CalibMode::LaserAnchor
             && let Some(cal) = &self.calibration.anchor
             && cal.found > 0
             && let Some(mm_to_px) = cal.px_to_mm.try_inverse()
@@ -780,7 +790,8 @@ impl ConsoleApp {
         // lattice should pass through the detected burns. Orange vectors show
         // the raw field error from the desired physical coordinate to where the
         // command actually landed; ring color is the post-fit residual.
-        if self.calibration.mode == CalibMode::LaserField
+        if self.calibration.show_fit_feedback
+            && self.calibration.mode == CalibMode::LaserField
             && let (Some(cal), Some(lens)) = (&self.calibration.field, &self.calibration.lens)
         {
             let grid = self.calib_grid();
@@ -896,6 +907,29 @@ impl ConsoleApp {
 impl ConsoleApp {
     pub(super) fn calibrate_view(&mut self, ui: &mut egui::Ui) {
         // Live capture is pumped from ui() regardless of tab (LR-45).
+        //
+        // The controls (step selector, description, form grid, buttons and the
+        // multi-line fit notes) had grown tall enough to squeeze the camera
+        // image into a sliver. Put them in a resizable, scrollable top panel so
+        // the operator can drag the split and the image below gets real room.
+        egui::TopBottomPanel::top("calib-controls")
+            .resizable(true)
+            .default_height(300.0)
+            .min_height(100.0)
+            .show_inside(ui, |ui| {
+                egui::ScrollArea::vertical()
+                    .id_salt("calib-controls-scroll")
+                    .auto_shrink([false, false])
+                    .show(ui, |ui| self.calibrate_controls(ui));
+            });
+        self.calib_frame_overlay(ui);
+    }
+
+    /// The Calibrate tab's control block (everything above the camera image):
+    /// step selector, description, form grid, button rows, and the fit notes.
+    /// Lives in its own resizable/scrollable panel so it can't crowd out the
+    /// image (see `calibrate_view`).
+    fn calibrate_controls(&mut self, ui: &mut egui::Ui) {
         ui.horizontal(|ui| {
             ui.label("step");
             ui.selectable_value(
@@ -1110,6 +1144,13 @@ impl ConsoleApp {
             if ui.button("↺ clear corners").clicked() {
                 self.calibration.corners.clear();
             }
+            ui.checkbox(&mut self.calibration.show_fit_feedback, "show fit feedback")
+                .on_hover_text(
+                    "Draw the post-fit overlay (step 1 lens arrows, step 2 anchor mesh, \
+                 step 3 field lattice and rejection banner). Turn it off to see the bare \
+                 dots when re-clicking the 4 corners. Loading a fresh frame hides it; a \
+                 successful Fit shows it.",
+                );
         });
 
         // ③ only: let the operator opt into absorbing a large machine-scale
@@ -1333,7 +1374,5 @@ impl ConsoleApp {
             self.corner_click_order()
         ));
         ui.weak(NAV_HINT);
-        ui.separator();
-        self.calib_frame_overlay(ui);
     }
 }

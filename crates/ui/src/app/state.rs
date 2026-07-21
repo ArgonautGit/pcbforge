@@ -169,6 +169,11 @@ pub(super) struct CalibrationState {
     pub(super) lens_arrow_scale: f32,
     pub(super) anchor_resid_scale: f32,
     pub(super) edit_anchor_dots: bool,
+    /// Per-session view toggle: when off, the post-fit feedback overlays (lens
+    /// arrows, anchor mesh/residuals, field lattice + REJECTED banner) are
+    /// hidden so the operator can see the bare dots to re-click the 4 corners.
+    /// Not persisted — like `corners`, it resets with each session/frame.
+    pub(super) show_fit_feedback: bool,
     pub(super) live: bool,
     pub(super) capture: Option<crate::camera::Capture>,
     pub(super) capture_src: Option<crate::camera::Source>,

@@ -190,6 +190,7 @@ impl ConsoleApp {
                 lens_arrow_scale: 20.0,
                 anchor_resid_scale: 30.0,
                 edit_anchor_dots: false,
+                show_fit_feedback: true,
                 live: false,
                 capture: None,
                 capture_src: None,
@@ -397,7 +398,7 @@ impl ConsoleApp {
              bed_overlay: show={} field={:.0}mm center=({:.1},{:.1}) auto={}\n\
              place: x={:.2} y={:.2} rot={:.1}° frame={} note={:?}\n\
              calib_paper: n={} pitch={:.2}mm dot={:.2}mm contrast={} out={}\n\
-             calib_burn: n={} pitch={:.2}mm dot={:.2}mm contrast={} corners_marked={} edit_anchor_dots={} origin=({:.1},{:.1})\n\
+             calib_burn: n={} pitch={:.2}mm dot={:.2}mm contrast={} corners_marked={} edit_anchor_dots={} feedback={} origin=({:.1},{:.1})\n\
              fiducials: {} markers\n\
              settings: {}",
             self.runtime.tab,
@@ -436,6 +437,11 @@ impl ConsoleApp {
             self.calibration.burn.dot_kind.label(),
             self.calibration.corners.len(),
             self.calibration.edit_anchor_dots,
+            if self.calibration.show_fit_feedback {
+                "on"
+            } else {
+                "off"
+            },
             self.calibration.grid_origin_mm.0,
             self.calibration.grid_origin_mm.1,
             self.fiducials.search.len(),
