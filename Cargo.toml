@@ -20,3 +20,9 @@ license = "MIT"
 
 [workspace.dependencies]
 pcb-core = { path = "crates/core" }
+
+# The calibration/vision tests synthesize and scan whole camera frames;
+# unoptimized they dominate the suite's runtime, so test builds get optimized
+# code at the cost of slightly slower compilation.
+[profile.test]
+opt-level = 2
