@@ -135,6 +135,11 @@ impl ConsoleApp {
                 focal_mm: 70.0,
                 scan_center_auto: true,
                 scan_center_mm: (35.0, 35.0),
+                speed_mm_s: 1000.0,
+                frequency_khz: 30.0,
+                pulse_ns: 1,
+                interval_mm: 0.03,
+                passes: 1,
                 preview_tex: None,
                 preview_note: "Set a copper Gerber and click “Render preview”.".into(),
             },
@@ -200,9 +205,12 @@ impl ConsoleApp {
                 frame: String::new(),
                 layout: "10,10; 60,10; 10,60; 60,60".into(),
                 px_per_mm: 10.0,
+                shape: crate::fiducial::ShapeKind::Circle,
                 diameter_mm: 1.0,
+                height_mm: 1.0,
                 search_mm: 2.0,
                 profile: crate::fiducial::ProfileKind::DarkDot,
+                out: "fid-holes.lbrn2".into(),
                 click_place: false,
                 note: "Load a frame, drag each marker near its hole, then Check.".into(),
                 rows: Vec::new(),
@@ -226,6 +234,7 @@ impl ConsoleApp {
                 rot_deg: 0.0,
                 job: Vec::new(),
                 frame_img: None,
+                base_rgba: None,
                 pivot: (0.0, 0.0),
                 tex: None,
                 note: "Load a frame + job, then drag / rotate to place it on the board.".into(),
@@ -374,7 +383,7 @@ impl ConsoleApp {
                 .unwrap_or_else(|| "unset".into())
         };
         let gerbers = format!(
-            "copper={} outline={}",
+            "copper={} outline={} speed={} freq_khz={} pulse_ns={} interval={} passes={}",
             if self.job.emit_copper.trim().is_empty() {
                 "unset".into()
             } else {
@@ -384,7 +393,12 @@ impl ConsoleApp {
                 "unset".into()
             } else {
                 base(&self.job.emit_outline)
-            }
+            },
+            self.job.speed_mm_s,
+            self.job.frequency_khz,
+            self.job.pulse_ns,
+            self.job.interval_mm,
+            self.job.passes,
         );
         format!(
             "tab={:?} side={:?} calib_mode={:?}\n\
@@ -399,7 +413,7 @@ impl ConsoleApp {
              place: x={:.2} y={:.2} rot={:.1}° frame={} note={:?}\n\
              calib_paper: n={} pitch={:.2}mm dot={:.2}mm contrast={} out={}\n\
              calib_burn: n={} pitch={:.2}mm dot={:.2}mm contrast={} corners_marked={} edit_anchor_dots={} feedback={} origin=({:.1},{:.1})\n\
-             fiducials: {} markers\n\
+             fiducials: {} markers shape={} w={} h={} profile={} search={} out={}\n\
              settings: {}",
             self.runtime.tab,
             self.job.side,
@@ -445,6 +459,12 @@ impl ConsoleApp {
             self.calibration.grid_origin_mm.0,
             self.calibration.grid_origin_mm.1,
             self.fiducials.search.len(),
+            self.fiducials.shape.token(),
+            self.fiducials.diameter_mm,
+            self.fiducials.height_mm,
+            self.fiducials.profile.token(),
+            self.fiducials.search_mm,
+            base(&self.fiducials.out),
             self.runtime.settings_error.as_deref().unwrap_or("saved"),
         )
     }

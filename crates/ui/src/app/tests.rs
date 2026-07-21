@@ -127,6 +127,10 @@ fn load_place_without_any_calibration_still_shows_the_frame() {
     image::GrayImage::from_pixel(64, 48, image::Luma([90]))
         .save(&frame)
         .unwrap();
+    // A dead camera source (File("")) so the grab-first path falls back to
+    // the bed-frame file without touching real hardware in tests.
+    app.camera.use_device = false;
+    app.camera.file = String::new();
     app.placement.frame = frame.to_string_lossy().into_owned();
     let fixtures = concat!(env!("CARGO_MANIFEST_DIR"), "/../cli/tests/fixtures");
     app.job.emit_copper = format!("{fixtures}/uv_test-F_Cu.gbr");
@@ -135,6 +139,47 @@ fn load_place_without_any_calibration_still_shows_the_frame() {
     let _ = ctx.run(egui::RawInput::default(), |ctx| app.load_place(ctx));
     assert!(app.placement.frame_img.is_some(), "frame image cached");
     assert!(app.placement.tex.is_some(), "bare frame texture shown");
+    assert!(
+        app.placement.note.contains("needs calibration"),
+        "note explains the gap: {}",
+        app.placement.note
+    );
+    std::fs::remove_dir_all(dir).unwrap();
+}
+
+/// "Load frame + job" ALWAYS grabs a fresh frame from the camera source (a
+/// File source here) — even when a bed-frame path is set. The persisted path
+/// must not silently win over the camera, or Place keeps showing a stale
+/// image of the bed (the file is only the fallback when the grab fails).
+#[test]
+fn load_place_prefers_a_fresh_camera_grab_over_the_saved_frame_path() {
+    let mut app = ConsoleApp::new(tmp_db(), vec!["true".into()]);
+    let dir = std::env::temp_dir().join(format!("pcbforge-place-cam-{}", std::process::id()));
+    std::fs::create_dir_all(&dir).unwrap();
+    let cam = dir.join("cam.png");
+    image::GrayImage::from_pixel(64, 48, image::Luma([90]))
+        .save(&cam)
+        .unwrap();
+    app.camera.use_device = false;
+    app.camera.file = cam.to_string_lossy().into_owned();
+    // A stale saved bed-frame path of a DIFFERENT size: the camera grab must
+    // win, which the cached frame's dimensions prove below.
+    let stale = dir.join("stale.png");
+    image::GrayImage::from_pixel(32, 32, image::Luma([40]))
+        .save(&stale)
+        .unwrap();
+    app.placement.frame = stale.to_string_lossy().into_owned();
+    let fixtures = concat!(env!("CARGO_MANIFEST_DIR"), "/../cli/tests/fixtures");
+    app.job.emit_copper = format!("{fixtures}/uv_test-F_Cu.gbr");
+    app.job.emit_outline = format!("{fixtures}/uv_test-Edge_Cuts.gbr");
+    let ctx = Context::default();
+    let _ = ctx.run(egui::RawInput::default(), |ctx| app.load_place(ctx));
+    let frame = app.placement.frame_img.as_ref().expect("camera frame cached");
+    assert_eq!(
+        (frame.width(), frame.height()),
+        (64, 48),
+        "the fresh camera grab won over the stale bed-frame file"
+    );
     assert!(
         app.placement.note.contains("needs calibration"),
         "note explains the gap: {}",
@@ -328,6 +373,25 @@ fn fiducial_tab_lays_out_headless() {
     let ctx = Context::default();
     let out = ctx.run(egui::RawInput::default(), |ctx| app.ui(ctx));
     assert!(!out.shapes.is_empty(), "fiducial tab must render");
+}
+
+/// The Fiducial tab lays out with the Rect shape selected — the width/height
+/// form branch renders (and the summary reports the rect footprint).
+#[test]
+fn fiducial_tab_lays_out_with_rect_shape() {
+    let mut app = ConsoleApp::new(tmp_db(), vec!["true".into()]);
+    app.runtime.tab = CentralTab::Fiducials;
+    app.fiducials.shape = crate::fiducial::ShapeKind::Rect;
+    app.fiducials.diameter_mm = 2.0;
+    app.fiducials.height_mm = 1.5;
+    let ctx = Context::default();
+    let out = ctx.run(egui::RawInput::default(), |ctx| app.ui(ctx));
+    assert!(!out.shapes.is_empty(), "rect-shape fiducial tab must render");
+    assert!(
+        app.debug_summary().contains("shape=rect w=2 h=1.5"),
+        "summary reports the rect footprint: {}",
+        app.debug_summary()
+    );
 }
 
 /// The Place-on-board tab lays out headless (form + placement controls).
@@ -698,7 +762,8 @@ fn profile_selector_changes_detection_polarity() {
         &img,
         &holes,
         ppm,
-        &crate::fiducial::ProfileKind::Backlit.to_profile(1.0),
+        &crate::fiducial::ProfileKind::Backlit
+            .to_profile(vision::FidShape::Circle { diameter_mm: 1.0 }),
         2.0,
     );
     assert_eq!(backlit.tally.0, 3, "backlit finds the bright blobs");
@@ -707,7 +772,8 @@ fn profile_selector_changes_detection_polarity() {
         &img,
         &holes,
         ppm,
-        &crate::fiducial::ProfileKind::DarkDot.to_profile(1.0),
+        &crate::fiducial::ProfileKind::DarkDot
+            .to_profile(vision::FidShape::Circle { diameter_mm: 1.0 }),
         2.0,
     );
     assert!(
@@ -1026,6 +1092,17 @@ field_frame=\n";
             "calib_paper_n",
             "calib_paper_out",
             "calib_paper_pitch_mm",
+            "fid_diameter_mm",
+            "fid_height_mm",
+            "fid_out",
+            "fid_profile",
+            "fid_search_mm",
+            "fid_shape",
+            "job_frequency_khz",
+            "job_interval_mm",
+            "job_passes",
+            "job_pulse_ns",
+            "job_speed_mm_s",
             "lens_px_bounds",
         ]
     );
@@ -1053,6 +1130,37 @@ fn field_acceptance_limits_persist() {
     let b = ConsoleApp::new(db, vec!["true".into()]);
     assert!((b.calibration.accept_rms_um - 120.0).abs() < 1e-9);
     assert!((b.calibration.accept_worst_um - 300.0).abs() < 1e-9);
+}
+
+/// The operator-configurable LightBurn export recipe (speed / Q-pulse /
+/// interval / passes) round-trips through a save + reload; absent keys keep
+/// the defaults (backward compatible).
+#[test]
+fn job_export_recipe_persists() {
+    let db = tmp_db();
+    {
+        let mut a = ConsoleApp::new(db.clone(), vec!["true".into()]);
+        a.job.speed_mm_s = 2500.0;
+        a.job.frequency_khz = 80.0;
+        a.job.pulse_ns = 42;
+        a.job.interval_mm = 0.05;
+        a.job.passes = 3;
+        a.save_settings_if_changed();
+    }
+    let b = ConsoleApp::new(db, vec!["true".into()]);
+    assert!((b.job.speed_mm_s - 2500.0).abs() < 1e-9);
+    assert!((b.job.frequency_khz - 80.0).abs() < 1e-9);
+    assert_eq!(b.job.pulse_ns, 42);
+    assert!((b.job.interval_mm - 0.05).abs() < 1e-9);
+    assert_eq!(b.job.passes, 3);
+
+    // A blob with none of the recipe keys keeps today's defaults.
+    let fresh = ConsoleApp::new(tmp_db(), vec!["true".into()]);
+    assert!((fresh.job.speed_mm_s - 1000.0).abs() < 1e-9);
+    assert!((fresh.job.frequency_khz - 30.0).abs() < 1e-9);
+    assert_eq!(fresh.job.pulse_ns, 1);
+    assert!((fresh.job.interval_mm - 0.03).abs() < 1e-9);
+    assert_eq!(fresh.job.passes, 1);
 }
 
 /// The burned-grid frame anchor's mirror flag round-trips as a 5th
@@ -1183,6 +1291,50 @@ fn field_frame_mirror_flag_round_trips() {
         .expect("legacy field restored")
         .paper_to_machine;
     assert!(!rc.flip_x, "a 4-token field_frame restores un-mirrored");
+}
+
+/// The fiducial shape/footprint/search/profile/out fields round-trip through
+/// a save + reload, and a fresh app reports the circle default in its summary.
+#[test]
+fn fiducial_shape_and_footprint_persist() {
+    let db = tmp_db();
+    {
+        let mut a = ConsoleApp::new(db.clone(), vec!["true".into()]);
+        a.fiducials.shape = crate::fiducial::ShapeKind::Rect;
+        a.fiducials.diameter_mm = 2.5;
+        a.fiducials.height_mm = 1.75;
+        a.fiducials.search_mm = 4.0;
+        a.fiducials.profile = crate::fiducial::ProfileKind::Backlit;
+        a.fiducials.out = "holes.lbrn2".into();
+        a.save_settings_if_changed();
+    }
+    let b = ConsoleApp::new(db, vec!["true".into()]);
+    assert_eq!(b.fiducials.shape, crate::fiducial::ShapeKind::Rect);
+    assert!((b.fiducials.diameter_mm - 2.5).abs() < 1e-9);
+    assert!((b.fiducials.height_mm - 1.75).abs() < 1e-9);
+    assert!((b.fiducials.search_mm - 4.0).abs() < 1e-9);
+    assert_eq!(b.fiducials.profile, crate::fiducial::ProfileKind::Backlit);
+    assert_eq!(b.fiducials.out, "holes.lbrn2");
+}
+
+/// A fresh console's summary reports the fiducial shape (circle by default),
+/// so the headless `state` command surfaces the new fields.
+#[test]
+fn fresh_app_summary_reports_circle_shape() {
+    let app = ConsoleApp::new(tmp_db(), vec!["true".into()]);
+    let summary = app.debug_summary();
+    assert!(
+        summary.contains("shape=circle"),
+        "summary carries the shape token: {summary}"
+    );
+    assert!(
+        summary.contains("profile=dark_dot"),
+        "summary carries the profile token: {summary}"
+    );
+    assert!(
+        summary.contains("speed=1000 freq_khz=30 pulse_ns=1 interval=0.03 passes=1"),
+        "summary carries the export recipe defaults: {summary}"
+    );
 }
 
 /// The two parameter sets persist independently once both exist.

@@ -17,7 +17,7 @@
 use image::GrayImage;
 use nalgebra::{Matrix3, Point2, Vector2};
 use vision::{
-    BedMap, FiducialProfile, FieldMap, FieldVerdict, Homography, LensMap, Poly2,
+    BedMap, FidShape, FiducialProfile, FieldMap, FieldVerdict, Homography, LensMap, Poly2,
     classify_field_error, find_fiducials, fit_field, fit_homography, fit_lens,
 };
 
@@ -40,13 +40,12 @@ pub enum DotKind {
 impl DotKind {
     /// The detector profile for this polarity at `dot_mm` diameter.
     fn profile(self, dot_mm: f64) -> FiducialProfile {
+        let shape = FidShape::Circle {
+            diameter_mm: dot_mm,
+        };
         match self {
-            DotKind::Dark => FiducialProfile::DarkDot {
-                diameter_mm: dot_mm,
-            },
-            DotKind::Bright => FiducialProfile::Backlit {
-                diameter_mm: dot_mm,
-            },
+            DotKind::Dark => FiducialProfile::DarkDot { shape },
+            DotKind::Bright => FiducialProfile::Backlit { shape },
         }
     }
 

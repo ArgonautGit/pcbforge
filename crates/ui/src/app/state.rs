@@ -101,6 +101,11 @@ pub(super) struct JobState {
     pub(super) focal_mm: f64,
     pub(super) scan_center_auto: bool,
     pub(super) scan_center_mm: (f64, f64),
+    pub(super) speed_mm_s: f64,
+    pub(super) frequency_khz: f64,
+    pub(super) pulse_ns: u32,
+    pub(super) interval_mm: f64,
+    pub(super) passes: u32,
     pub(super) preview_tex: Option<TextureHandle>,
     pub(super) preview_note: String,
 }
@@ -195,9 +200,15 @@ pub(super) struct FiducialState {
     pub(super) frame: String,
     pub(super) layout: String,
     pub(super) px_per_mm: f64,
+    pub(super) shape: crate::fiducial::ShapeKind,
+    /// Circle diameter, or rectangle width (`shape == Rect`).
     pub(super) diameter_mm: f64,
+    /// Rectangle height (ignored when `shape == Circle`).
+    pub(super) height_mm: f64,
     pub(super) search_mm: f64,
     pub(super) profile: crate::fiducial::ProfileKind,
+    /// Output path for the generated fiducial-holes .lbrn2 (`fid-holes` verb).
+    pub(super) out: String,
     pub(super) click_place: bool,
     pub(super) note: String,
     pub(super) rows: Vec<FidRow>,
@@ -222,6 +233,9 @@ pub(super) struct PlacementState {
     pub(super) rot_deg: f64,
     pub(super) job: Vec<pcb_core::Poly>,
     pub(super) frame_img: Option<image::GrayImage>,
+    /// The frame pre-converted to RGBA, cached so each drag-step recompose
+    /// clones it instead of redoing the full-frame gray→color conversion.
+    pub(super) base_rgba: Option<ColorImage>,
     pub(super) pivot: (f64, f64),
     pub(super) tex: Option<TextureHandle>,
     pub(super) note: String,

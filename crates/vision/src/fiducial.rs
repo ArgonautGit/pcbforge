@@ -81,36 +81,52 @@ impl BedMap {
     }
 }
 
+/// The physical footprint of a fiducial mark.
+#[derive(Debug, Clone, Copy, PartialEq)]
+pub enum FidShape {
+    Circle { diameter_mm: f64 },
+    /// Axis-aligned (in machine/board frame) rectangle.
+    Rect { w_mm: f64, h_mm: f64 },
+}
+
+impl FidShape {
+    /// Footprint extent on the bed as `(w_mm, h_mm)` (a circle is square).
+    fn dims_mm(&self) -> (f64, f64) {
+        match *self {
+            Self::Circle { diameter_mm } => (diameter_mm, diameter_mm),
+            Self::Rect { w_mm, h_mm } => (w_mm, h_mm),
+        }
+    }
+}
+
 /// What the fiducial looks like in the frame.
 #[derive(Debug, Clone, PartialEq)]
 pub enum FiducialProfile {
     /// Bright blob on a dark field (hole in the pallet lit from below).
     Backlit {
-        /// Blob diameter on the bed, mm.
-        diameter_mm: f64,
+        /// Blob footprint on the bed.
+        shape: FidShape,
     },
     /// Bright ablated disc scored by the contrast of the surrounding
     /// untouched ring (burned annulus fiducial).
     Annulus {
-        /// Disc diameter on the bed, mm.
-        diameter_mm: f64,
+        /// Disc footprint on the bed.
+        shape: FidShape,
     },
     /// Dark dot on a bright field: burned grid dots on anodized plate, and
     /// the operator's drilled 1 mm holes on bare copper (field photo
     /// 2026-07-14 — holes at (10,10)/(60,10)/(10,60) read as dark dots).
     DarkDot {
-        /// Dot diameter on the bed, mm.
-        diameter_mm: f64,
+        /// Dot footprint on the bed.
+        shape: FidShape,
     },
 }
 
 impl FiducialProfile {
-    /// The target diameter on the bed, mm (common to every profile).
-    pub fn diameter_mm(&self) -> f64 {
+    /// The target footprint on the bed (common to every profile).
+    pub fn shape(&self) -> FidShape {
         match *self {
-            Self::Backlit { diameter_mm }
-            | Self::Annulus { diameter_mm }
-            | Self::DarkDot { diameter_mm } => diameter_mm,
+            Self::Backlit { shape } | Self::Annulus { shape } | Self::DarkDot { shape } => shape,
         }
     }
 
@@ -129,7 +145,10 @@ impl FiducialProfile {
 pub struct Confidence {
     /// Peak contrast over robust background noise (MAD-based σ).
     pub snr: f64,
-    /// Component fill ratio against its circumscribed circle (1 = disc).
+    /// Shape-fill consistency score: how completely the component fills its
+    /// expected footprint (circularity for circles — fill of the
+    /// circumscribed circle, 1 = disc; rectangularity for rects — fill of the
+    /// bounding box, ~1 = axis-aligned rectangle).
     pub circularity: f64,
     /// Mean target-disc minus surrounding-ring intensity, polarity
     /// normalized (positive = the profile's expected contrast exists).
@@ -244,7 +263,16 @@ fn find_one(
     // affine, first-order for a homography — fine over a few mm).
     let sx = (bed.mm_to_px(Point2::new(expected.x + 1.0, expected.y)) - center_px).norm();
     let sy = (bed.mm_to_px(Point2::new(expected.x, expected.y + 1.0)) - center_px).norm();
-    let dot_px = profile.diameter_mm() * 0.5 * (sx + sy);
+    let shape = profile.shape();
+    let (w_mm, h_mm) = shape.dims_mm();
+    // Expected footprint in pixels. `dot_px` is the characteristic (smaller)
+    // extent: it gates the sub-2px case, scales the matched filter, and
+    // normalizes the centroid-peak gap. For a circle under a uniform scale
+    // `wx == wy == dot_px`, so every derived quantity below reduces to the
+    // pre-shape formulas bit-for-bit (calibration depends on this).
+    let wx_px = w_mm * sx;
+    let wy_px = h_mm * sy;
+    let dot_px = wx_px.min(wy_px);
     let search_px = search_mm * sx.max(sy);
     if dot_px < 2.0 {
         // The dot is sub-2-pixel: no centroid can be meaningful. This is a
@@ -308,8 +336,16 @@ fn find_one(
     let thr = bg + 0.4 * (peak - bg);
     let mask: Vec<bool> = win.v.iter().map(|&x| x > thr).collect();
 
-    // Connected components + gates: size, circularity, distance.
-    let nominal_area = std::f64::consts::FRAC_PI_4 * dot_px * dot_px;
+    // Connected components + gates: size, shape-fill, aspect, distance. All
+    // three are shape-aware: for a circle they reduce to the disc formulas.
+    let nominal_area = match shape {
+        FidShape::Circle { .. } => std::f64::consts::FRAC_PI_4 * wx_px * wy_px,
+        FidShape::Rect { .. } => wx_px * wy_px,
+    };
+    // Aspect gate is on the *relative* aspect (measured / expected), so a long
+    // rectangle passes while an extreme 90°-off orientation is rejected. For a
+    // circle `expected_aspect == 1`, so this is the old raw `bw/bh` gate.
+    let expected_aspect = wx_px / wy_px;
     let exp_in_win = (center_px.x - x0 as f64, center_px.y - y0 as f64);
     let best = components(&mask, w, h)
         .into_iter()
@@ -321,8 +357,15 @@ fn find_one(
             let bw = (c.max_x - c.min_x + 1) as f64;
             let bh = (c.max_y - c.min_y + 1) as f64;
             let maxdim = bw.max(bh);
-            let circularity = area / (std::f64::consts::FRAC_PI_4 * maxdim * maxdim);
-            if circularity < MIN_CIRCULARITY || !(ASPECT_MIN..=ASPECT_MAX).contains(&(bw / bh)) {
+            // Shape-fill consistency: circularity (fill of circumscribed
+            // circle) for circles, rectangularity (fill of bounding box) for
+            // rects — ~1.0 for an axis-aligned rect, degrading with rotation.
+            let shape_fill = match shape {
+                FidShape::Circle { .. } => area / (std::f64::consts::FRAC_PI_4 * maxdim * maxdim),
+                FidShape::Rect { .. } => area / (bw * bh),
+            };
+            let rel_aspect = (bw / bh) / expected_aspect;
+            if shape_fill < MIN_CIRCULARITY || !(ASPECT_MIN..=ASPECT_MAX).contains(&rel_aspect) {
                 return None;
             }
             let (cx, cy) = c.mean();
@@ -330,10 +373,10 @@ fn find_one(
             if dist > search_px {
                 return None;
             }
-            Some((c, circularity, dist))
+            Some((c, shape_fill, dist))
         })
         .min_by(|a, b| a.2.total_cmp(&b.2));
-    let Some((comp, circularity, _)) = best else {
+    let Some((comp, shape_fill, _)) = best else {
         return Err(Miss::NoCandidate { snr });
     };
 
@@ -374,13 +417,23 @@ fn find_one(
     let peak_sub = paraboloid_peak(&resp, w, h, centroid);
     let gap = ((peak_sub.0 - centroid.0).powi(2) + (peak_sub.1 - centroid.1).powi(2)).sqrt();
 
-    // Ring contrast: target disc vs the surrounding annulus, polarity
+    // Ring contrast: target interior vs the surrounding annulus, polarity
     // normalized (positive = profile-consistent). Scores the tan ring for
-    // Annulus and the copper field for DarkDot alike.
-    let ring_contrast = disc_ring_contrast(&win, centroid, dot_px);
+    // Annulus and the copper field for DarkDot alike. Radii are derived from
+    // the shape; the Circle band is special-cased to the exact historical
+    // 0.4/0.8/1.4·dot_px so calibration detection is bit-for-bit unchanged
+    // (the diag-based band gives 0.78/1.20·dot_px for a circle — too tight).
+    let (inner_r, ring_lo, ring_hi) = match shape {
+        FidShape::Circle { .. } => (0.4 * dot_px, 0.8 * dot_px, 1.4 * dot_px),
+        FidShape::Rect { .. } => {
+            let diag = (wx_px * wx_px + wy_px * wy_px).sqrt();
+            (0.4 * wx_px.min(wy_px), 0.55 * diag, 0.85 * diag)
+        }
+    };
+    let ring_contrast = disc_ring_contrast(&win, centroid, inner_r, ring_lo, ring_hi);
 
     let score = (snr / 10.0).min(1.0)
-        * circularity.min(1.0)
+        * shape_fill.min(1.0)
         * (ring_contrast / (0.5 * (peak - bg))).clamp(0.0, 1.0)
         * (1.0 - (gap / dot_px).min(1.0));
 
@@ -391,7 +444,7 @@ fn find_one(
         found_px,
         confidence: Confidence {
             snr,
-            circularity,
+            circularity: shape_fill,
             ring_contrast,
             centroid_peak_gap_px: gap,
             score,
@@ -517,11 +570,19 @@ fn paraboloid_peak(resp: &[f64], w: usize, h: usize, near: (f64, f64)) -> (f64, 
     )
 }
 
-/// Mean intensity of the target disc minus the surrounding annulus
-/// (`[0.8d, 1.4d]` of the center), in polarity-normalized values.
-fn disc_ring_contrast(win: &Window, center: (f64, f64), dot_px: f64) -> f64 {
+/// Mean intensity of the target interior (radius `≤ inner_r`) minus the
+/// surrounding annulus (`[ring_lo, ring_hi]` of the center), in
+/// polarity-normalized values. The radii are supplied by the caller so the
+/// band can follow the fiducial's shape.
+fn disc_ring_contrast(
+    win: &Window,
+    center: (f64, f64),
+    inner_r: f64,
+    ring_lo: f64,
+    ring_hi: f64,
+) -> f64 {
     let (mut disc_sum, mut disc_n, mut ring_sum, mut ring_n) = (0.0, 0usize, 0.0, 0usize);
-    let r_out = (1.4 * dot_px).ceil() as i64;
+    let r_out = ring_hi.ceil() as i64;
     for dy in -r_out..=r_out {
         for dx in -r_out..=r_out {
             let (x, y) = (center.0.round() as i64 + dx, center.1.round() as i64 + dy);
@@ -530,10 +591,10 @@ fn disc_ring_contrast(win: &Window, center: (f64, f64), dot_px: f64) -> f64 {
             }
             let d = ((x as f64 - center.0).powi(2) + (y as f64 - center.1).powi(2)).sqrt();
             let val = win.at(x as usize, y as usize);
-            if d <= 0.4 * dot_px {
+            if d <= inner_r {
                 disc_sum += val;
                 disc_n += 1;
-            } else if d >= 0.8 * dot_px && d <= 1.4 * dot_px {
+            } else if d >= ring_lo && d <= ring_hi {
                 ring_sum += val;
                 ring_n += 1;
             }
@@ -618,7 +679,9 @@ mod tests {
     const PX_PER_MM: f64 = 10.0;
 
     fn dark_1mm() -> FiducialProfile {
-        FiducialProfile::DarkDot { diameter_mm: 1.0 }
+        FiducialProfile::DarkDot {
+            shape: FidShape::Circle { diameter_mm: 1.0 },
+        }
     }
 
     /// VIS-4 done-when: rendered blobs + noise recover centers < 0.15 px.
@@ -734,7 +797,9 @@ mod tests {
             &frame,
             &expected,
             2.0,
-            &FiducialProfile::Backlit { diameter_mm: 1.2 },
+            &FiducialProfile::Backlit {
+                shape: FidShape::Circle { diameter_mm: 1.2 },
+            },
             &bed,
         )
         .remove(0)
@@ -819,5 +884,80 @@ mod tests {
             "expected DotTooSmall, got {:?}",
             r[0]
         );
+    }
+
+    /// Render a frame with anti-aliased **axis-aligned rectangles** on the
+    /// same glary field as [`render`]. Rects are `(cx_px, cy_px, w_px, h_px)`;
+    /// `depth > 0` renders dark marks. Mirrors `render`'s supersampling so a
+    /// rect's centroid is recoverable to sub-pixel.
+    fn render_rects(
+        w: u32,
+        h: u32,
+        rects: &[(f64, f64, f64, f64)],
+        depth: f64,
+        noise_amp: f64,
+        seed: u64,
+    ) -> GrayImage {
+        let mut rng = Rng(seed | 1);
+        GrayImage::from_fn(w, h, |x, y| {
+            let bg = 140.0 + 70.0 * (x as f64 + y as f64) / (w + h) as f64;
+            let mut cover = 0.0;
+            for sy in 0..4 {
+                for sx in 0..4 {
+                    let px = x as f64 + (sx as f64 + 0.5) / 4.0 - 0.5;
+                    let py = y as f64 + (sy as f64 + 0.5) / 4.0 - 0.5;
+                    if rects.iter().any(|&(cx, cy, rw, rh)| {
+                        (px - cx).abs() < rw / 2.0 && (py - cy).abs() < rh / 2.0
+                    }) {
+                        cover += 1.0 / 16.0;
+                    }
+                }
+            }
+            let v = bg - depth * cover + rng.noise(noise_amp);
+            image::Luma([v.clamp(0.0, 255.0) as u8])
+        })
+    }
+
+    /// A dark 2 mm × 1 mm rectangle (20 × 10 px at 10 px/mm) is located at its
+    /// true centroid when the profile says `Rect { 2.0, 1.0 }`.
+    #[test]
+    fn dark_rect_is_found_at_its_centroid() {
+        let (tx, ty) = (100.3, 90.6);
+        let frame = render_rects(200, 200, &[(tx, ty, 20.0, 10.0)], 90.0, 5.0, 17);
+        let bed = BedMap::uniform_scale(PX_PER_MM);
+        let expected = [bed.px_to_mm(Point2::new(tx + 4.0, ty - 3.0))];
+        let profile = FiducialProfile::DarkDot {
+            shape: FidShape::Rect {
+                w_mm: 2.0,
+                h_mm: 1.0,
+            },
+        };
+        let f = find_fiducials(&frame, &expected, 2.0, &profile, &bed)
+            .remove(0)
+            .expect("2x1 mm rect found");
+        let err = ((f.found_px.x - tx).powi(2) + (f.found_px.y - ty).powi(2)).sqrt();
+        assert!(err < 0.5, "rect centroid error {err:.3} px");
+    }
+
+    /// The relative-aspect gate rejects a rectangle whose measured orientation
+    /// is 90° off the expected one: a 4 mm × 0.5 mm mark (40 × 5 px) sought as
+    /// `Rect { 0.5, 4.0 }` has relative aspect (40/5)/(5/40) = 64, far outside
+    /// the [0.3, 3.3] band — no candidate passes.
+    #[test]
+    fn rect_with_swapped_extreme_aspect_is_rejected() {
+        let (tx, ty) = (100.0, 100.0);
+        let frame = render_rects(200, 200, &[(tx, ty, 40.0, 5.0)], 90.0, 5.0, 23);
+        let bed = BedMap::uniform_scale(PX_PER_MM);
+        let expected = [bed.px_to_mm(Point2::new(tx, ty))];
+        let profile = FiducialProfile::DarkDot {
+            shape: FidShape::Rect {
+                w_mm: 0.5,
+                h_mm: 4.0,
+            },
+        };
+        match find_fiducials(&frame, &expected, 2.0, &profile, &bed).remove(0) {
+            Err(Miss::NoCandidate { .. }) => {}
+            other => panic!("expected NoCandidate for 90°-off rect, got {other:?}"),
+        }
     }
 }

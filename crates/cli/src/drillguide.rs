@@ -24,7 +24,7 @@ use image::{GrayImage, Rgb, RgbImage};
 use ingest::excellon::DrillOp;
 use nalgebra::Point2;
 use pcb_core::NM_PER_MM;
-use vision::{BedMap, FiducialProfile, find_fiducials};
+use vision::{BedMap, FidShape, FiducialProfile, find_fiducials};
 
 /// One hole the operator must drill, in drill-file mm.
 #[derive(Debug, Clone, Copy, PartialEq)]
@@ -149,7 +149,9 @@ pub fn check_hole(
     // downward, so bed (0,0) is the frame's bottom-left.
     let bed = BedMap::uniform_scale_y_flip(px_per_mm, frame.height() as f64);
     let profile = FiducialProfile::DarkDot {
-        diameter_mm: target.d_mm,
+        shape: FidShape::Circle {
+            diameter_mm: target.d_mm,
+        },
     };
     let expected = [Point2::new(target.x_mm, target.y_mm)];
     let res = find_fiducials(frame, &expected, search_mm, &profile, &bed);
