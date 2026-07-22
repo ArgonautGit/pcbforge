@@ -227,7 +227,10 @@ impl ConsoleApp {
                 search: Vec::new(),
                 found: Vec::new(),
                 drag: None,
+                marking: None,
+                last_placed: false,
                 homography: None,
+                pose: None,
                 live: false,
                 capture: None,
                 capture_src: None,
@@ -239,6 +242,7 @@ impl ConsoleApp {
                 tx_mm: 0.0,
                 ty_mm: 0.0,
                 rot_deg: 0.0,
+                auto_pose: false,
                 job: Vec::new(),
                 frame_img: None,
                 base_rgba: None,
@@ -418,6 +422,13 @@ impl ConsoleApp {
             self.fiducials.board_h_mm,
             self.fiducials.margin_mm,
         ));
+        let fid_pose = match &self.fiducials.pose {
+            Some(p) => format!(
+                "rot={:+.2} tx={:.2} ty={:.2} rms={:.3} flipped={} used={}",
+                p.rot_deg, p.tx_mm, p.ty_mm, p.rms_mm, p.flipped, p.used
+            ),
+            None => "none".into(),
+        };
         format!(
             "tab={:?} side={:?} calib_mode={:?}\n\
              gerbers: {gerbers}\n\
@@ -428,11 +439,12 @@ impl ConsoleApp {
              camera_frame: {cam}\n\
              calib_frame: {calib_frame}\n\
              bed_overlay: show={} field={:.0}mm center=({:.1},{:.1}) auto={}\n\
-             place: x={:.2} y={:.2} rot={:.1}° frame={} lightburn={} device={} note={:?}\n\
+             place: x={:.2} y={:.2} rot={:.1}° auto_pose={} frame={} lightburn={} device={} note={:?}\n\
              calib_paper: n={} pitch={:.2}mm dot={:.2}mm contrast={} out={}\n\
              calib_burn: n={} pitch={:.2}mm dot={:.2}mm contrast={} corners_marked={} edit_anchor_dots={} feedback={} origin=({:.1},{:.1})\n\
-             fiducials: {} markers shape={} w={} h={} profile={} search={} out={}\n\
+             fiducials: {} markers shape={} w={} h={} profile={} search={} out={} marking={}\n\
              fid_board: w={} h={} margin={} layout={}\n\
+             fid_pose: {}\n\
              settings: {}",
             self.runtime.tab,
             self.job.side,
@@ -453,6 +465,7 @@ impl ConsoleApp {
             self.placement.tx_mm,
             self.placement.ty_mm,
             self.placement.rot_deg,
+            self.placement.auto_pose,
             match (&self.placement.frame_img, &self.placement.tex) {
                 (Some(f), Some(_)) => format!("{}x{}", f.width(), f.height()),
                 (Some(_), None) => "loaded-no-tex".into(),
@@ -486,10 +499,15 @@ impl ConsoleApp {
             self.fiducials.profile.token(),
             self.fiducials.search_mm,
             base(&self.fiducials.out),
+            match self.fiducials.marking {
+                Some(k) => k.to_string(),
+                None => "-".to_string(),
+            },
             self.fiducials.board_w_mm,
             self.fiducials.board_h_mm,
             self.fiducials.margin_mm,
             fid_layout,
+            fid_pose,
             self.runtime.settings_error.as_deref().unwrap_or("saved"),
         )
     }

@@ -362,3 +362,31 @@ fn the_accessibility_tree_exposes_labeled_widgets() {
     assert!(h.query_by_label("📷 Camera").is_some());
     assert!(h.query_by_label("🎯 Calibrate").is_some());
 }
+
+#[test]
+fn fiducial_tab_exposes_its_controls_after_the_panel_split() {
+    let mut h = console();
+    h.get_by_label("◎ Fiducial check").click();
+    h.run();
+    assert!(
+        h.state().debug_summary().contains("tab=Fiducials"),
+        "fiducial tab active:\n{}",
+        h.state().debug_summary()
+    );
+    // The controls moved into a resizable top panel + scroll area (matching the
+    // Calibrate tab); the labelled buttons must stay queryable/drivable.
+    assert!(
+        h.query_by_label("🎯 Check fiducials").is_some(),
+        "Check button present after the split"
+    );
+    assert!(
+        h.query_by_label("↺ reset markers").is_some(),
+        "reset-markers button present after the split"
+    );
+    // A fresh tab has no active marking round.
+    assert!(
+        summary_line(&h.state().debug_summary(), "fiducials:").contains("marking=-"),
+        "no marking round on a fresh tab:\n{}",
+        h.state().debug_summary()
+    );
+}

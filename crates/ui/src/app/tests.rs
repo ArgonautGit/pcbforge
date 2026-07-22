@@ -478,6 +478,254 @@ fn fiducial_check_grabs_from_the_camera() {
     );
 }
 
+/// After a fiducial Check, the Place tab's placement is set from the detected
+/// holes (rotation + translation) and flagged `auto_pose`; a subsequent Load
+/// must NOT recenter over it, and switching side clears the flag.
+#[test]
+fn fiducial_check_sets_placement_and_load_preserves_it() {
+    use nalgebra::Matrix3;
+    let dir = std::env::temp_dir().join(format!("ui-fidpose-{}", std::process::id()));
+    std::fs::create_dir_all(&dir).unwrap();
+    let path = dir.join("cam.png");
+    let ppm = 10.0;
+    let holes = [(10.0, 10.0), (60.0, 10.0), (10.0, 60.0)];
+    let img = image::GrayImage::from_fn(700, 700, |x, y| {
+        let mut v = 170.0;
+        for (mx, my) in holes {
+            let (cx, cy) = (mx * ppm, 700.0 - my * ppm); // bed y-up
+            if (((x as f64) - cx).powi(2) + ((y as f64) - cy).powi(2)).sqrt() < 0.5 * ppm {
+                v -= 110.0;
+            }
+        }
+        image::Luma([v as u8])
+    });
+    img.save(&path).unwrap();
+
+    let mut app = ConsoleApp::new(tmp_db(), vec!["true".into()]);
+    app.camera.use_device = false;
+    app.camera.file = path.to_string_lossy().into();
+    app.fiducials.layout = "10,10; 60,10; 10,60".into();
+    app.fiducials.px_per_mm = ppm;
+    // Homography-fallback place_projection matching the frame's px↔mm map
+    // (mm_x = px_x/ppm, mm_y = (H − px_y)/ppm), so from_px recovers machine mm.
+    app.calibration.anchor = Some(crate::calib::Calibration {
+        px_to_mm: vision::Homography {
+            matrix: Matrix3::new(
+                1.0 / ppm,
+                0.0,
+                0.0,
+                0.0,
+                -1.0 / ppm,
+                700.0 / ppm,
+                0.0,
+                0.0,
+                1.0,
+            ),
+            residuals: vec![],
+            rms: 0.0,
+        },
+        rms_um: 10.0,
+        found: 3,
+        total: 3,
+        dots: Vec::new(),
+    });
+    // Real Gerbers so Load installs a job (and would recenter without the guard).
+    let fixtures = concat!(env!("CARGO_MANIFEST_DIR"), "/../cli/tests/fixtures");
+    app.job.emit_copper = format!("{fixtures}/uv_test-F_Cu.gbr");
+    app.job.emit_outline = format!("{fixtures}/uv_test-Edge_Cuts.gbr");
+    let ctx = Context::default();
+
+    // The pose portion of the `place:` line (x/y/rot/auto_pose) — stable across
+    // rounding, so equality before/after Load proves preservation.
+    let place_pose = |app: &ConsoleApp| {
+        let s = app.debug_summary();
+        let line = s
+            .lines()
+            .find(|l| l.trim_start().starts_with("place:"))
+            .unwrap()
+            .to_string();
+        line[..line.find(" frame=").unwrap()].trim().to_string()
+    };
+
+    // Detection maps px→machine mm, fits the (identity) pose, and writes it.
+    app.grab_fid_frame(&ctx);
+    assert_eq!(
+        app.fiducials.found.iter().filter(|f| f.is_some()).count(),
+        3,
+        "three holes detected: {:?}",
+        app.fiducials.rows
+    );
+    assert!(app.placement.auto_pose, "placement flagged auto-posed");
+    // Identity front pose → tx=ty=layout centroid (26.67), NOT the frame center
+    // (35) a recenter would give; rotation ~0.
+    assert!(
+        (app.placement.tx_mm - 80.0 / 3.0).abs() < 0.15
+            && (app.placement.ty_mm - 80.0 / 3.0).abs() < 0.15,
+        "placed at the fiducial centroid: ({}, {})",
+        app.placement.tx_mm,
+        app.placement.ty_mm
+    );
+    assert!(app.placement.rot_deg.abs() < 0.5, "rot ~0: {}", app.placement.rot_deg);
+    let pose1 = place_pose(&app);
+    assert!(pose1.ends_with("auto_pose=true"), "line: {pose1}");
+    assert!(
+        app.debug_summary().contains("fid_pose: rot="),
+        "fid_pose line is populated from the cached pose: {}",
+        app.debug_summary()
+    );
+    assert!(
+        app.fiducials.note.contains("placement set from fiducials"),
+        "note reports the auto-place: {}",
+        app.fiducials.note
+    );
+    let (tx1, ty1, rot1) = (app.placement.tx_mm, app.placement.ty_mm, app.placement.rot_deg);
+
+    // Load installs the job but must NOT recenter over the auto pose.
+    let _ = ctx.run(egui::RawInput::default(), |ctx| app.load_place(ctx));
+    assert!(app.placement.auto_pose, "Load kept the auto-pose flag");
+    assert!(
+        (app.placement.tx_mm - tx1).abs() < 1e-9
+            && (app.placement.ty_mm - ty1).abs() < 1e-9
+            && (app.placement.rot_deg - rot1).abs() < 1e-9,
+        "Load preserved the pose values"
+    );
+    assert_eq!(place_pose(&app), pose1, "place line's pose portion unchanged");
+
+    // Switching side clears the auto-pose flag.
+    app.set_side(Side::Back);
+    assert!(!app.placement.auto_pose, "set_side cleared auto_pose");
+    assert!(
+        place_pose(&app).ends_with("auto_pose=false"),
+        "place line reflects the cleared flag: {}",
+        place_pose(&app)
+    );
+
+    std::fs::remove_dir_all(dir).ok();
+}
+
+/// A synthetic bed frame with dark holes at `holes` (bed mm, y-up), saved to
+/// `path` at `ppm` px/mm on a 700×700 field — the fixture the fiducial tests
+/// grab/load through the real camera + file paths.
+fn write_hole_frame(path: &std::path::Path, ppm: f64, holes: &[(f64, f64)]) {
+    let img = image::GrayImage::from_fn(700, 700, |x, y| {
+        let mut v = 170.0;
+        for &(mx, my) in holes {
+            let (cx, cy) = (mx * ppm, 700.0 - my * ppm); // bed y-up
+            if (((x as f64) - cx).powi(2) + ((y as f64) - cy).powi(2)).sqrt() < 0.5 * ppm {
+                v -= 110.0;
+            }
+        }
+        image::Luma([v as u8])
+    });
+    img.save(path).unwrap();
+}
+
+/// The marking round (Calibrate-style click-in-order): a file Load opens the
+/// round at marker 0, `fid_mark_click` advances marker-by-marker WITHOUT
+/// detecting, and only the FINAL click closes the round and runs detection.
+/// "reset markers" reopens the round.
+#[test]
+fn marking_round_walks_the_fiducials_and_the_final_click_detects() {
+    let dir = std::env::temp_dir().join(format!("ui-fidmark-{}", std::process::id()));
+    std::fs::create_dir_all(&dir).unwrap();
+    let path = dir.join("bed3.png");
+    let ppm = 10.0;
+    let holes = [(10.0, 10.0), (60.0, 10.0), (10.0, 60.0)];
+    write_hole_frame(&path, ppm, &holes);
+
+    let mut app = ConsoleApp::new(tmp_db(), vec!["true".into()]);
+    app.runtime.tab = CentralTab::Fiducials;
+    app.fiducials.frame = path.to_string_lossy().into();
+    app.fiducials.layout = "10,10; 60,10; 10,60".into();
+    app.fiducials.px_per_mm = ppm;
+    let ctx = Context::default();
+
+    // A file Load opens the round at marker 0 and prompts for the first click;
+    // nothing is detected yet.
+    app.load_fid_frame(&ctx);
+    assert_eq!(app.fiducials.marking, Some(0), "load opens the marking round");
+    assert!(
+        app.fiducials.note.starts_with("click fiducial 1 of 3"),
+        "note prompts the first marker: {}",
+        app.fiducials.note
+    );
+    assert!(
+        app.fiducials.found.iter().all(Option::is_none) && app.fiducials.rows.is_empty(),
+        "no detection before the round completes"
+    );
+
+    // Marking the first two holes advances the round but must NOT detect yet.
+    app.fid_mark_click(holes[0], &ctx);
+    assert_eq!(app.fiducials.marking, Some(1), "advanced to marker 1");
+    assert!(
+        app.fiducials.note.starts_with("click fiducial 2 of 3"),
+        "note advanced: {}",
+        app.fiducials.note
+    );
+    app.fid_mark_click(holes[1], &ctx);
+    assert_eq!(app.fiducials.marking, Some(2), "advanced to marker 2");
+    assert!(
+        app.fiducials.rows.is_empty(),
+        "detection has not run before the final click: {:?}",
+        app.fiducials.rows
+    );
+
+    // The final click closes the round and runs detection on the marked holes.
+    app.fid_mark_click(holes[2], &ctx);
+    assert_eq!(app.fiducials.marking, None, "round closed on the final click");
+    assert_eq!(
+        app.fiducials.found.iter().filter(|f| f.is_some()).count(),
+        3,
+        "the final click detected the three holes: {:?}",
+        app.fiducials.rows
+    );
+
+    // "reset markers" reopens the round from marker 0.
+    app.reset_fid_markers();
+    assert_eq!(app.fiducials.marking, Some(0), "reset reopens the round");
+    assert_eq!(app.fiducials.search.len(), 3, "markers reseeded from the layout");
+
+    std::fs::remove_dir_all(dir).ok();
+}
+
+/// A camera Grab auto-detects at the seeded positions, so it must NOT open a
+/// marking round — the round is the Load/reset (no-auto-detect) path only.
+#[test]
+fn grab_does_not_open_a_marking_round() {
+    let dir = std::env::temp_dir().join(format!("ui-fidmarkgrab-{}", std::process::id()));
+    std::fs::create_dir_all(&dir).unwrap();
+    let path = dir.join("cam.png");
+    let ppm = 10.0;
+    let holes = [(10.0, 10.0), (60.0, 10.0), (10.0, 60.0)];
+    write_hole_frame(&path, ppm, &holes);
+
+    let mut app = ConsoleApp::new(tmp_db(), vec!["true".into()]);
+    app.camera.use_device = false;
+    app.camera.file = path.to_string_lossy().into();
+    app.fiducials.layout = "10,10; 60,10; 10,60".into();
+    app.fiducials.px_per_mm = ppm;
+    let ctx = Context::default();
+
+    app.grab_fid_frame(&ctx);
+    assert_eq!(
+        app.fiducials.marking, None,
+        "grab must not open a marking round (it auto-detects instead)"
+    );
+    assert_eq!(
+        app.fiducials.found.iter().filter(|f| f.is_some()).count(),
+        3,
+        "grab still auto-detected the holes: {:?}",
+        app.fiducials.rows
+    );
+    assert!(
+        app.debug_summary().contains("marking=-"),
+        "summary reports no active round: {}",
+        app.debug_summary()
+    );
+
+    std::fs::remove_dir_all(dir).ok();
+}
+
 /// FLD-11: live tracking pulls frames from the camera source and re-detects
 /// each one — the found rings and the perspective fit update without a
 /// manual Check. Verified with a File source of 4 holes.

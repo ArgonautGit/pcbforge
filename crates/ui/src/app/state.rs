@@ -233,7 +233,21 @@ pub(super) struct FiducialState {
     pub(super) search: Vec<(f64, f64)>,
     pub(super) found: Vec<Option<(f64, f64)>>,
     pub(super) drag: Option<usize>,
+    /// An active click-the-fiducials-in-order marking round: `Some(k)` means the
+    /// next primary canvas click drops search marker `k` (layout order). `None`
+    /// when no round is running (drag + Check are always available regardless).
+    pub(super) marking: Option<usize>,
+    /// Whether the MOST RECENT detection actually wrote the Place placement.
+    /// Distinct from `pose`/`placement.auto_pose`, which a rejected fit leaves
+    /// at their last-good value — this resets to false on every detection and
+    /// only goes true on a successful apply, so the verdict never shows a stale
+    /// "placement updated" after a Check that was gated out.
+    pub(super) last_placed: bool,
     pub(super) homography: Option<vision::Homography>,
+    /// The most recently APPLIED board pose (only cached on a successful,
+    /// side-matching, in-tolerance fit that wrote the Place tab); a rejected
+    /// fit leaves this unchanged and the note carries the reason.
+    pub(super) pose: Option<crate::fiducial::BoardPose>,
     pub(super) live: bool,
     pub(super) capture: Option<crate::camera::Capture>,
     pub(super) capture_src: Option<crate::camera::Source>,
@@ -246,6 +260,9 @@ pub(super) struct PlacementState {
     pub(super) tx_mm: f64,
     pub(super) ty_mm: f64,
     pub(super) rot_deg: f64,
+    /// The placement was set from detected fiducials (see `fit_board_pose`).
+    /// `load_place` must not recenter/zero over an auto-fitted pose.
+    pub(super) auto_pose: bool,
     pub(super) job: Vec<pcb_core::Poly>,
     pub(super) frame_img: Option<image::GrayImage>,
     /// The frame pre-converted to RGBA, cached so each drag-step recompose

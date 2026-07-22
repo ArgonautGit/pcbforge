@@ -329,6 +329,84 @@ pub fn format_layout(pts: &[(f64, f64)]) -> String {
         .join("; ")
 }
 
+/// The board's fitted pose, distilled to what the Place tab needs: the rigid
+/// (optionally mirrored) transform carrying the design/layout frame onto the
+/// machine bed, plus the fit quality.
+#[derive(Debug, Clone, Copy, PartialEq)]
+pub struct BoardPose {
+    pub tx_mm: f64,
+    pub ty_mm: f64,
+    pub rot_deg: f64,
+    pub rms_mm: f64,
+    /// The fit chose the x-mirrored variant (`Rigid2::flip_x`). Whether that
+    /// matches the working face (front vs. back) is the caller's decision.
+    pub flipped: bool,
+    pub used: usize,
+}
+
+/// Fit the board's pose from detected fiducials paired with the nominal layout.
+///
+/// `detected_mm[i]` is the machine-mm position measured for layout point `i`
+/// (`None` = not found). `exit = Some(params)` is the BACK face: the camera
+/// sees each drilled through-hole's EXIT opening, so the fit sources are the
+/// exit-magnified nominal positions ([`cam::flip::entry_to_exit_mm`]); `None`
+/// is the front. The translation lands the FULL layout's centroid `b0` (so the
+/// pose is independent of which subset detected) under the fit, which centers
+/// the design on the fiducial-layout centroid. Back exactness holds because the
+/// design mirror about x=0 (applied to the job elsewhere) and the fitted
+/// physical flip compose to a proper placement.
+pub fn fit_board_pose(
+    layout_mm: &[(f64, f64)],
+    detected_mm: &[Option<(f64, f64)>],
+    exit: Option<&cam::flip::FieldParams>,
+) -> Result<BoardPose, String> {
+    if layout_mm.is_empty() {
+        return Err("no layout points".into());
+    }
+    let src = |p: (f64, f64)| match exit {
+        Some(field) => cam::flip::entry_to_exit_mm(p.0, p.1, field),
+        None => p,
+    };
+    let pairs: Vec<(Point2<f64>, Point2<f64>)> = layout_mm
+        .iter()
+        .zip(detected_mm)
+        .filter_map(|(&l, d)| {
+            d.map(|(dx, dy)| {
+                let (sx, sy) = src(l);
+                (Point2::new(sx, sy), Point2::new(dx, dy))
+            })
+        })
+        .collect();
+    if pairs.len() < 3 {
+        return Err(format!("need ≥3 detected fiducials, have {}", pairs.len()));
+    }
+    let fit = crate::calib::fit_rigid(&pairs)?;
+    // b0 = centroid of the FULL layout (not just the detected subset), in the
+    // RAW design frame — the pose is written as fit.apply(b0).
+    let n = layout_mm.len() as f64;
+    let b0 = (
+        layout_mm.iter().map(|p| p.0).sum::<f64>() / n,
+        layout_mm.iter().map(|p| p.1).sum::<f64>() / n,
+    );
+    let sse: f64 = pairs
+        .iter()
+        .map(|(s, d)| {
+            let (x, y) = fit.apply((s.x, s.y));
+            (x - d.x).powi(2) + (y - d.y).powi(2)
+        })
+        .sum();
+    let rms_mm = (sse / pairs.len() as f64).sqrt();
+    let (tx_mm, ty_mm) = fit.apply(b0);
+    Ok(BoardPose {
+        tx_mm,
+        ty_mm,
+        rot_deg: fit.angle_deg(),
+        rms_mm,
+        flipped: fit.flip_x,
+        used: pairs.len(),
+    })
+}
+
 fn summarize(
     expected_mm: &[(f64, f64)],
     results: &[Result<vision::Fiducial, Miss>],
@@ -534,6 +612,149 @@ impl Overlay {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    /// Front: a known PROPER rigid maps the layout to the detected holes, and
+    /// the fit recovers it exactly — rotation, the layout-centroid translation,
+    /// and flipped=false.
+    #[test]
+    fn fit_board_pose_recovers_a_proper_front_pose() {
+        let layout = [(10.0, 10.0), (80.0, 10.0), (10.0, 80.0), (80.0, 80.0)];
+        let (s, c) = 5.0_f64.to_radians().sin_cos();
+        let t = crate::calib::Rigid2 {
+            cos: c,
+            sin: s,
+            tx: 3.0,
+            ty: -2.0,
+            flip_x: false,
+        };
+        let detected: Vec<Option<(f64, f64)>> =
+            layout.iter().map(|&p| Some(t.apply(p))).collect();
+
+        let pose = fit_board_pose(&layout, &detected, None).unwrap();
+        assert!(!pose.flipped, "a proper pattern is not flagged flipped");
+        assert!((pose.rot_deg - 5.0).abs() < 1e-6, "rot {}", pose.rot_deg);
+        assert!(pose.rms_mm < 1e-9, "exact fit, rms {}", pose.rms_mm);
+        assert_eq!(pose.used, 4);
+        let b0 = (
+            layout.iter().map(|p| p.0).sum::<f64>() / 4.0,
+            layout.iter().map(|p| p.1).sum::<f64>() / 4.0,
+        );
+        let (ex, ey) = t.apply(b0);
+        assert!(
+            (pose.tx_mm - ex).abs() < 1e-9 && (pose.ty_mm - ey).abs() < 1e-9,
+            "translation lands the layout centroid under the fit: ({}, {}) vs ({ex}, {ey})",
+            pose.tx_mm,
+            pose.ty_mm
+        );
+    }
+
+    /// Back (load-bearing): the camera sees each hole's EXIT opening after a
+    /// physical flip. Fit against the exit-magnified layout, then verify the
+    /// resulting back Placement carries the x=0-mirrored COPPER design through
+    /// the SAME physical flip — with NO exit magnification (copper is a surface
+    /// mark, only the drilled fiducials carry the parallax). The load-bearing
+    /// identity, derived from the recipe: Placement.apply(mirror_x0(g)) ==
+    /// flip.apply(g − pivot_front + b0).
+    #[test]
+    fn fit_board_pose_back_places_mirrored_copper_through_the_physical_flip() {
+        let layout = [(10.0, 10.0), (80.0, 10.0), (10.0, 80.0), (80.0, 80.0)];
+        let b0 = (
+            layout.iter().map(|p| p.0).sum::<f64>() / 4.0,
+            layout.iter().map(|p| p.1).sum::<f64>() / 4.0,
+        ); // (45, 45)
+        let params = cam::flip::FieldParams {
+            scan_center_mm: b0,
+            thickness_mm: 1.6,
+            focal_mm: 70.0,
+        };
+        // The physical flip: a reflection (map = R·F_neg) — R = +3°, chosen tx/ty.
+        let (s, c) = 3.0_f64.to_radians().sin_cos();
+        let flip = crate::calib::Rigid2 {
+            cos: c,
+            sin: s,
+            tx: 90.0,
+            ty: 5.0,
+            flip_x: true,
+        };
+        // detected = flip(exit_magnify(L_i)).
+        let detected: Vec<Option<(f64, f64)>> = layout
+            .iter()
+            .map(|&p| Some(flip.apply(cam::flip::entry_to_exit_mm(p.0, p.1, &params))))
+            .collect();
+
+        let pose = fit_board_pose(&layout, &detected, Some(&params)).unwrap();
+        assert!(pose.flipped, "a mirrored pattern is flagged flipped");
+        assert!(pose.rms_mm < 1e-9, "exact fit, rms {}", pose.rms_mm);
+
+        // Sample copper points distinct from the fiducials, so pivot_front ≠ b0
+        // and the identity is non-trivial. active_job mirrors the back job about
+        // design x=0, so the placed design point is mirror_x0(g).
+        let copper = [(20.0, 30.0), (55.0, 15.0)];
+        let (fx0, fx1, fy0, fy1) = (20.0_f64, 55.0_f64, 15.0_f64, 30.0_f64);
+        let pivot_front = ((fx0 + fx1) / 2.0, (fy0 + fy1) / 2.0);
+        // bbox center of the x=0-mirrored copper == mirror_x0(pivot_front).
+        let pivot_back = (-pivot_front.0, pivot_front.1);
+        let placement = crate::place::Placement {
+            tx_mm: pose.tx_mm,
+            ty_mm: pose.ty_mm,
+            rot_deg: pose.rot_deg,
+            pivot_mm: pivot_back,
+        };
+        let a = placement.affine();
+        let apply_place =
+            |g: (f64, f64)| (a[0] * g.0 + a[1] * g.1 + a[2], a[3] * g.0 + a[4] * g.1 + a[5]);
+        for &g in &copper {
+            let g_back = (-g.0, g.1);
+            let bed_front = (g.0 - pivot_front.0 + b0.0, g.1 - pivot_front.1 + b0.1);
+            let want = flip.apply(bed_front);
+            let got = apply_place(g_back);
+            assert!(
+                (got.0 - want.0).abs() < 1e-6 && (got.1 - want.1).abs() < 1e-6,
+                "g {g:?}: placement {got:?} vs flip(bed_front) {want:?}"
+            );
+        }
+    }
+
+    /// A front-side layout whose detections are actually MIRRORED (the board
+    /// was flipped without switching to Back) is flagged `flipped` — the signal
+    /// the caller keys on to refuse the update.
+    #[test]
+    fn fit_board_pose_flags_a_mirrored_pattern() {
+        let layout = [(10.0, 10.0), (80.0, 10.0), (10.0, 80.0), (80.0, 80.0)];
+        let (s, c) = 4.0_f64.to_radians().sin_cos();
+        let mirrored = crate::calib::Rigid2 {
+            cos: c,
+            sin: s,
+            tx: 7.0,
+            ty: -3.0,
+            flip_x: true,
+        };
+        let detected: Vec<Option<(f64, f64)>> =
+            layout.iter().map(|&p| Some(mirrored.apply(p))).collect();
+        let pose = fit_board_pose(&layout, &detected, None).unwrap();
+        assert!(pose.flipped, "the mirror is detected");
+        assert!(pose.rms_mm < 1e-9, "still an exact fit");
+    }
+
+    /// Gates: too few detections, an empty layout, and a degenerate target
+    /// (all detections collapsed to one point) each return Err.
+    #[test]
+    fn fit_board_pose_rejects_too_few_or_degenerate() {
+        let layout = [(10.0, 10.0), (80.0, 10.0), (10.0, 80.0), (80.0, 80.0)];
+        let two = [Some((10.0, 10.0)), Some((80.0, 10.0)), None, None];
+        assert!(fit_board_pose(&layout, &two, None).is_err(), "need ≥3");
+        assert!(fit_board_pose(&[], &[], None).is_err(), "empty layout");
+        let collapsed = [
+            Some((5.0, 5.0)),
+            Some((5.0, 5.0)),
+            Some((5.0, 5.0)),
+            None,
+        ];
+        assert!(
+            fit_board_pose(&layout, &collapsed, None).is_err(),
+            "no target spread is degenerate"
+        );
+    }
 
     /// xorshift for deterministic noise (no rand dep), matching VIS-4's test.
     struct Rng(u64);

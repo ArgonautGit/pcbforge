@@ -62,6 +62,19 @@ impl ConsoleApp {
     /// center when they've measured where the lens axis really is. `None` on
     /// the front.
     fn back_field(&self) -> Option<(cam::flip::MirrorAxis, cam::flip::FieldParams)> {
+        let params = self.back_field_params()?;
+        let pts = fiducial::parse_layout(&self.fiducials.layout).ok()?;
+        let n = pts.len() as f64;
+        let cx = pts.iter().map(|p| p.0).sum::<f64>() / n;
+        Some((cam::flip::MirrorAxis::VerticalX { x_mm: cx }, params))
+    }
+
+    /// The f-theta field optics for the back side's exit-parallax model — the
+    /// scan center is the fiducial layout centroid by default
+    /// (`scan_center_auto`) or the operator-entered field center. `None` on the
+    /// front (no parallax to model) or when the layout doesn't parse. Shared by
+    /// the display mirror ([`back_field`]) and the fiducial pose fit.
+    pub(super) fn back_field_params(&self) -> Option<cam::flip::FieldParams> {
         if self.job.side != Side::Back {
             return None;
         }
@@ -74,14 +87,11 @@ impl ConsoleApp {
         } else {
             self.job.scan_center_mm
         };
-        Some((
-            cam::flip::MirrorAxis::VerticalX { x_mm: cx },
-            cam::flip::FieldParams {
-                scan_center_mm: scan_center,
-                thickness_mm: self.job.board_thickness_mm,
-                focal_mm: self.job.focal_mm,
-            },
-        ))
+        Some(cam::flip::FieldParams {
+            scan_center_mm: scan_center,
+            thickness_mm: self.job.board_thickness_mm,
+            focal_mm: self.job.focal_mm,
+        })
     }
 
     /// The expected fiducial positions to display/detect, in bed mm: the raw
@@ -108,11 +118,17 @@ impl ConsoleApp {
         self.fiducials.search.clear();
         self.fiducials.found.clear();
         self.fiducials.rows.clear();
+        self.fiducials.marking = None;
+        self.fiducials.last_placed = false;
         self.fiducials.homography = None;
+        self.fiducials.pose = None;
         self.ar.board.clear();
         self.ar.copper.clear();
         self.ar.ablate.clear();
         self.placement.job.clear();
+        // The fitted pose was for the old face's detection — drop it so the
+        // next Load recenters normally until a fresh Check re-fits.
+        self.placement.auto_pose = false;
         // Also drop the cached frame/textures, or both tabs keep painting the
         // other side's image until a new frame is loaded (LR-41).
         self.placement.frame_img = None;
@@ -173,23 +189,27 @@ impl ConsoleApp {
         };
         // Start centered on the frame — in the SAME frame the overlay draws in.
         // Under an active homography, uniform px/mm would land the job far
-        // off-centre until dragged (LR-42).
-        let (cx, cy) = match self.initial_center_mm(img.width() as f64, img.height() as f64) {
-            Ok(center) => center,
-            Err(e) => {
-                // No projection at all — still show the bare frame so the
-                // operator sees what loaded; the note says what's missing.
-                self.placement.note = format!("frame loaded, but placement needs calibration: {e}");
-                self.placement.job.clear();
-                self.placement.frame_img = Some(img);
-                self.set_place_tex(ctx, base.clone());
-                self.placement.base_rgba = Some(base);
-                return;
-            }
-        };
-        self.placement.tx_mm = cx;
-        self.placement.ty_mm = cy;
-        self.placement.rot_deg = 0.0;
+        // off-centre until dragged (LR-42). Skip when the pose was fitted from
+        // fiducials: Load must not recenter/zero over an auto-placement.
+        if !self.placement.auto_pose {
+            let (cx, cy) = match self.initial_center_mm(img.width() as f64, img.height() as f64) {
+                Ok(center) => center,
+                Err(e) => {
+                    // No projection at all — still show the bare frame so the
+                    // operator sees what loaded; the note says what's missing.
+                    self.placement.note =
+                        format!("frame loaded, but placement needs calibration: {e}");
+                    self.placement.job.clear();
+                    self.placement.frame_img = Some(img);
+                    self.set_place_tex(ctx, base.clone());
+                    self.placement.base_rgba = Some(base);
+                    return;
+                }
+            };
+            self.placement.tx_mm = cx;
+            self.placement.ty_mm = cy;
+            self.placement.rot_deg = 0.0;
+        }
         self.placement.job = ablate;
         self.placement.frame_img = Some(img);
         self.placement.base_rgba = Some(base);
@@ -197,7 +217,7 @@ impl ConsoleApp {
     }
 
     /// Re-blend the placed job over the cached frame into the display texture.
-    fn recompose(&mut self, ctx: &Context) {
+    pub(super) fn recompose(&mut self, ctx: &Context) {
         let Some(frame) = &self.placement.frame_img else {
             return;
         };

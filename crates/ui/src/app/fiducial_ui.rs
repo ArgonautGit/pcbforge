@@ -1,5 +1,10 @@
 use super::*;
 
+/// Reject an auto-placement whose fiducial fit residual (RMS over the detected
+/// holes) exceeds this — a loose fit means the pairing or the layout is wrong,
+/// and silently moving the job would be worse than leaving it.
+const POSE_MAX_RMS_MM: f64 = 0.5;
+
 impl ConsoleApp {
     /// Load the fiducial frame into memory + a texture and seed the search
     /// markers from the design layout (so they start near nominal, ready to
@@ -12,7 +17,12 @@ impl ConsoleApp {
                 return;
             }
         };
-        self.set_fid_frame(ctx, img);
+        // A file load has no auto-detect, so open the click-in-order marking
+        // round: the operator marks each fiducial, and the final click runs the
+        // check. (Grab/live auto-detect at the seeded positions instead.)
+        if self.set_fid_frame(ctx, img) {
+            self.start_fid_marking();
+        }
     }
 
     /// Grab one frame from the camera (the source picked in the Camera tab —
@@ -24,7 +34,7 @@ impl ConsoleApp {
             Ok(img) => {
                 let img = self.camera.orientation.apply(img);
                 self.set_fid_frame(ctx, img);
-                self.detect_fiducials();
+                self.detect_fiducials(ctx);
             }
             Err(e) => self.fiducials.note = format!("camera: {e}"),
         }
@@ -32,10 +42,11 @@ impl ConsoleApp {
 
     /// Install `img` as the fiducial-check frame (texture + cache) and sync
     /// the markers, reporting a bad layout instead of silently proceeding.
-    fn set_fid_frame(&mut self, ctx: &Context, img: image::GrayImage) {
+    /// Returns whether the frame was installed (false = bad layout).
+    fn set_fid_frame(&mut self, ctx: &Context, img: image::GrayImage) -> bool {
         if let Err(e) = fiducial::parse_layout(&self.fiducials.layout) {
             self.fiducials.note = format!("layout: {e}");
-            return;
+            return false;
         }
         self.sync_fid_markers();
         let (w, h) = (img.width() as usize, img.height() as usize);
@@ -47,6 +58,59 @@ impl ConsoleApp {
             Some(ctx.load_texture("fid-frame", color, TextureOptions::NEAREST));
         self.fiducials.frame_img = Some(img);
         self.fiducials.note = "drag each ✛ near its hole, then Check".into();
+        true
+    }
+
+    /// Open a click-the-fiducials-in-order round: the next primary canvas click
+    /// drops marker 0, then 1, … and the final click runs the check. A no-op
+    /// (round stays closed) when there are no markers to place.
+    fn start_fid_marking(&mut self) {
+        let n = self.fiducials.search.len();
+        if n == 0 {
+            self.fiducials.marking = None;
+            return;
+        }
+        self.fiducials.marking = Some(0);
+        self.fiducials.note =
+            format!("click fiducial 1 of {n} (layout order) — or drag each ✛ and Check");
+    }
+
+    /// Reseed the ✛ set from the layout (the current frame stays) and reopen the
+    /// click-in-order marking round — the ↺ reset-markers action.
+    pub(super) fn reset_fid_markers(&mut self) {
+        self.fiducials.search.clear();
+        self.fiducials.found.clear();
+        self.sync_fid_markers();
+        self.start_fid_marking();
+    }
+
+    /// Apply one marking-round click: drop search marker `marking` at bed `mm`,
+    /// clear its now-stale detection, and advance. The final marker's click
+    /// closes the round and runs detection (which auto-updates the placement).
+    /// Factored out of the canvas handler so tests can drive it directly.
+    pub(super) fn fid_mark_click(&mut self, mm: (f64, f64), ctx: &Context) {
+        let Some(k) = self.fiducials.marking else {
+            return;
+        };
+        // The layout shrank under an active round (a typed edit): cancel rather
+        // than index out of bounds.
+        if k >= self.fiducials.search.len() {
+            self.fiducials.marking = None;
+            return;
+        }
+        self.fiducials.search[k] = mm;
+        if let Some(f) = self.fiducials.found.get_mut(k) {
+            *f = None; // this marker's old detection is stale now
+        }
+        let n = self.fiducials.search.len();
+        let next = k + 1;
+        if next >= n {
+            self.fiducials.marking = None;
+            self.detect_fiducials(ctx); // final click → detect + auto-place
+        } else {
+            self.fiducials.marking = Some(next);
+            self.fiducials.note = format!("click fiducial {} of {n}", next + 1);
+        }
     }
 
     /// Append an expected fiducial at bed `(mx, my)` mm to the layout and sync
@@ -56,6 +120,9 @@ impl ConsoleApp {
         let base = self.fiducials.layout.trim().trim_end_matches(';').trim();
         let sep = if base.is_empty() { "" } else { "; " };
         self.fiducials.layout = format!("{base}{sep}{mx:.1},{my:.1}");
+        // Editing the marker set invalidates the "click N of M" ordering, so
+        // cancel any active marking round (documented in the checkbox hover).
+        self.fiducials.marking = None;
         self.sync_fid_markers();
         let n = self.fiducials.search.len();
         self.fiducials.note = format!(
@@ -96,6 +163,9 @@ impl ConsoleApp {
         if i < self.fiducials.rows.len() {
             self.fiducials.rows.remove(i);
         }
+        // Editing the marker set invalidates the "click N of M" ordering, so
+        // cancel any active marking round (documented in the checkbox hover).
+        self.fiducials.marking = None;
         // Lengths already match; sync is a no-op reconcile (and re-seeds only if
         // the layout still parses).
         self.sync_fid_markers();
@@ -142,7 +212,7 @@ impl ConsoleApp {
             self.fiducials.note = "load a frame first".into();
             return;
         }
-        self.detect_fiducials();
+        self.detect_fiducials(ctx);
     }
 
     /// Live fiducial tracking: pull frames from the (camera-tab) source and
@@ -177,7 +247,7 @@ impl ConsoleApp {
                     self.fiducials.frame_img = Some(gray);
                     self.sync_fid_markers();
                     if !self.fiducials.search.is_empty() {
-                        self.detect_fiducials();
+                        self.detect_fiducials(ctx);
                     }
                 }
                 Err(e) => {
@@ -247,7 +317,7 @@ impl ConsoleApp {
     /// Run detection on the current in-memory frame around the search markers,
     /// updating rows/found/measured/homography. Shared by the static Check and
     /// the live-tracking loop (FLD-11).
-    fn detect_fiducials(&mut self) {
+    fn detect_fiducials(&mut self, ctx: &Context) {
         let Some(frame) = &self.fiducials.frame_img else {
             return;
         };
@@ -311,10 +381,119 @@ impl ConsoleApp {
             }
             None
         };
+
+        self.update_placement_from_fiducials(ctx);
+    }
+
+    /// Fit the board's actual pose from the just-detected holes and write it
+    /// into the Place tab (rotation + translation, mirror-aware), so a Check
+    /// re-registers the job without a manual drag. The outcome — success or the
+    /// specific reason it was skipped — is appended to the fiducial note; only
+    /// an applied pose sets `placement.auto_pose` and caches `fiducials.pose`.
+    fn update_placement_from_fiducials(&mut self, ctx: &Context) {
+        // This detection's placement outcome: reset up front so every early
+        // return below leaves it false, and only the successful apply sets it
+        // true. The verdict line reads this so it never shows a stale
+        // "placement updated" after a gated-out Check (e.g. a dropped fiducial
+        // under Live), while `pose`/`auto_pose` keep their last-good value.
+        self.fiducials.last_placed = false;
+        // Capture the frame size up front so no frame borrow straddles the
+        // later placement writes.
+        let Some((w, h)) = self.fiducials.frame_img.as_ref().map(|f| f.dimensions()) else {
+            return;
+        };
+        let Ok(layout) = fiducial::parse_layout(&self.fiducials.layout) else {
+            return; // a bad layout was already surfaced above
+        };
+        // place_projection is the ONLY correct camera-px → machine-mm source
+        // here (the design→px homography above would just recover the layout).
+        let projection = match self.place_projection(w, h) {
+            Ok(p) => p,
+            Err(_) => {
+                self.fiducials
+                    .note
+                    .push_str("  ·  no camera→machine calibration — placement not updated");
+                return;
+            }
+        };
+        // Detected machine mm, index-aligned with the layout; a px→mm failure
+        // for one point drops just that point.
+        let detected: Vec<Option<(f64, f64)>> = self
+            .fiducials
+            .found
+            .iter()
+            .map(|&f| f.and_then(|px| projection.from_px(px)))
+            .collect();
+        // Back side: the camera sees the drilled holes' EXIT openings, so fit
+        // against the exit-magnified nominal positions.
+        let exit = self.back_field_params();
+        let pose = match fiducial::fit_board_pose(&layout, &detected, exit.as_ref()) {
+            Ok(pose) => pose,
+            Err(e) => {
+                self.fiducials
+                    .note
+                    .push_str(&format!("  ·  placement not updated: {e}"));
+                return;
+            }
+        };
+        // The fit's mirror must match the working face, or the board is on the
+        // wrong side (or not flipped): refuse rather than place a mirrored job.
+        let flipped_expected = self.job.side == Side::Back;
+        if pose.flipped != flipped_expected {
+            self.fiducials.note.push_str(if flipped_expected {
+                "  ·  fiducial pattern does not look flipped — still on the front face?"
+            } else {
+                "  ·  detected a mirrored fiducial pattern — is the board flipped? switch side to Back"
+            });
+            return;
+        }
+        if pose.rms_mm > POSE_MAX_RMS_MM {
+            self.fiducials.note.push_str(&format!(
+                "  ·  fiducial fit RMS {:.2} mm too loose — placement not updated",
+                pose.rms_mm
+            ));
+            return;
+        }
+        self.placement.tx_mm = pose.tx_mm;
+        self.placement.ty_mm = pose.ty_mm;
+        self.placement.rot_deg = pose.rot_deg;
+        self.placement.auto_pose = true;
+        self.fiducials.last_placed = true;
+        self.fiducials.pose = Some(pose);
+        self.fiducials.note.push_str(&format!(
+            "  ·  placement set from fiducials (rot {:+.2}°, RMS {:.2} mm)",
+            pose.rot_deg, pose.rms_mm
+        ));
+        // Rebuild the Place overlay only if a frame is already loaded there.
+        if self.placement.frame_img.is_some() {
+            self.recompose(ctx);
+        }
     }
 
     pub(super) fn fiducial_view(&mut self, ui: &mut egui::Ui) {
         // Live capture is pumped from ui() regardless of tab (LR-45).
+        //
+        // Match the Calibrate tab: the form + buttons + notes + summary had
+        // grown tall enough to squeeze the frame into a sliver, so put them in a
+        // resizable, scrollable top panel and let the image below take the rest.
+        egui::TopBottomPanel::top("fid-controls")
+            .resizable(true)
+            .default_height(300.0)
+            .min_height(100.0)
+            .show_inside(ui, |ui| {
+                egui::ScrollArea::vertical()
+                    .id_salt("fid-controls-scroll")
+                    .auto_shrink([false, false])
+                    .show(ui, |ui| self.fiducial_controls(ui));
+            });
+        self.fid_frame_overlay(ui);
+    }
+
+    /// The Fiducial-check tab's control block (everything above the frame
+    /// image): form grid, button row, notes/hints, the colored verdict line and
+    /// the per-fiducial summary rows. Lives in its own resizable/scrollable
+    /// panel so it can't crowd out the image (see `fiducial_view`).
+    fn fiducial_controls(&mut self, ui: &mut egui::Ui) {
         egui::Grid::new("fid-form")
             .num_columns(2)
             .spacing([8.0, 6.0])
@@ -442,13 +621,11 @@ impl ConsoleApp {
             ui.checkbox(&mut self.fiducials.click_place, "✚ click-to-place")
                 .on_hover_text(
                     "Left-click an empty spot to add an expected fiducial; \
-                     right-click a ✛ to remove it; drag markers to fine-tune.",
+                     right-click a ✛ to remove it; drag markers to fine-tune. \
+                     Adding/removing here cancels an active marking round.",
                 );
             if ui.button("↺ reset markers").clicked() {
-                // Reseed the ✛ set from the layout; the current frame stays.
-                self.fiducials.search.clear();
-                self.fiducials.found.clear();
-                self.sync_fid_markers();
+                self.reset_fid_markers();
             }
             if ui
                 .button("⚙ Generate holes")
@@ -476,6 +653,7 @@ impl ConsoleApp {
         ui.weak(NAV_HINT);
         ui.separator();
 
+        self.fid_verdict(ui);
         for row in &self.fiducials.rows {
             let color = match row.kind {
                 FidKind::FoundStrong => Color32::from_rgb(0x50, 0xb0, 0x60),
@@ -484,8 +662,38 @@ impl ConsoleApp {
             };
             ui.colored_label(color, &row.text);
         }
-        ui.separator();
-        self.fid_frame_overlay(ui);
+    }
+
+    /// One colored status line (Calibrate-style) summarizing the last check and
+    /// whether it moved the Place placement. Derived from the cached
+    /// tally/rows/pose — it never re-runs detection.
+    fn fid_verdict(&mut self, ui: &mut egui::Ui) {
+        let n = self.fiducials.found.len();
+        let s = self.fiducials.found.iter().filter(|f| f.is_some()).count();
+        if self.fiducials.frame_img.is_none() {
+            ui.weak("○ no frame loaded");
+        } else if self.fiducials.rows.is_empty() {
+            ui.weak("○ not checked");
+        } else if self.fiducials.last_placed {
+            // last_placed ⇒ the pose was just written, so it's the fresh fit.
+            let (rms, rot) = self
+                .fiducials
+                .pose
+                .as_ref()
+                .map_or((0.0, 0.0), |p| (p.rms_mm, p.rot_deg));
+            ui.colored_label(
+                status_color(true),
+                format!(
+                    "● {s}/{n} fiducials, RMS {rms:.2} mm — placement updated (rot {rot:+.2}°)"
+                ),
+            );
+        } else {
+            // Detection ran but the fit was gated out — the note carries why.
+            ui.colored_label(
+                status_color(false),
+                format!("◐ {s}/{n} fiducials — placement not updated"),
+            );
+        }
     }
 
     /// The frame with draggable search markers (✛) and detected rings drawn on
@@ -548,6 +756,20 @@ impl ConsoleApp {
             }
         }
 
+        // Marking round: outside click-to-place, a primary click drops the next
+        // marker in layout order (the final click closes the round + detects).
+        // Suppressed while navigating.
+        if self.fiducials.marking.is_some()
+            && !self.fiducials.click_place
+            && !nav
+            && resp.clicked()
+            && let Some(pos) = resp.interact_pointer_pos()
+        {
+            let mm = to_mm(pos);
+            let ctx = ui.ctx().clone();
+            self.fid_mark_click(mm, &ctx);
+        }
+
         // Drag: pick the nearest marker on press, move it while dragging.
         // Suppressed while navigating (Ctrl+drag pans instead).
         if !nav
@@ -579,18 +801,33 @@ impl ConsoleApp {
         // Paint markers + detected rings.
         let painter = ui.painter_at(rect);
         let cyan = Color32::from_rgb(0x22, 0xcc, 0xdd);
+        // While a marking round is active, ghost the markers not yet placed
+        // (index ≥ the one being marked) so the next target reads at a glance.
+        let ghost = Color32::from_rgba_unmultiplied(0x22, 0xcc, 0xdd, 90);
         let ring_r = (self.fiducials.diameter_mm as f32 * ppm * 0.5 * xf.scale).max(5.0);
         for (i, &(mx, my)) in self.fiducials.search.iter().enumerate() {
             let c = to_screen(mx, my);
+            let mcol = match self.fiducials.marking {
+                Some(k) if i >= k => ghost,
+                _ => cyan,
+            };
             painter.line_segment(
                 [egui::pos2(c.x - 9.0, c.y), egui::pos2(c.x + 9.0, c.y)],
-                (1.5, cyan),
+                (1.5, mcol),
             );
             painter.line_segment(
                 [egui::pos2(c.x, c.y - 9.0), egui::pos2(c.x, c.y + 9.0)],
-                (1.5, cyan),
+                (1.5, mcol),
             );
-            painter.circle_stroke(c, 11.0, egui::Stroke::new(1.0_f32, cyan));
+            painter.circle_stroke(c, 11.0, egui::Stroke::new(1.0_f32, mcol));
+            // 1-based index label next to each ✛ (Calibrate's corner-label style).
+            painter.text(
+                egui::pos2(c.x + 12.0, c.y - 12.0),
+                egui::Align2::LEFT_BOTTOM,
+                format!("{}", i + 1),
+                egui::FontId::proportional(13.0),
+                mcol,
+            );
             if let Some(Some((fx, fy))) = self.fiducials.found.get(i) {
                 let col = match self.fiducials.rows.get(i).map(|r| &r.kind) {
                     Some(FidKind::FoundStrong) => Color32::from_rgb(0x40, 0xc0, 0x50),

@@ -2191,3 +2191,33 @@ Fiducials tab and the new step) pass the map whenever an accepted laser-field
 fit exists, so hole spacing AND size burn dimensionally true. It sits under
 Calibration because the output is only as good as step ③ — the step's copy
 says so.
+
+## 2026-07-21 — Fiducial check reworked to the calibration workflow; detection now places the job
+
+The Fiducials tab predated the calibration UX: markers had to be hand-dragged
+onto each hole, results lived in a cramped single column, and a successful
+check changed nothing downstream — the operator still hand-dragged the design
+in Place. Now the tab mirrors Calibrate: a resizable controls-over-image
+split, and a click-in-order marking round (loading a frame or resetting
+markers opens it; each primary click drops the next numbered ✛, ghosted
+markers show what's left, and the final click runs the check). Grab/live
+paths still auto-detect at the seeded positions — clicking is for frames
+where the seeds land nowhere near the board.
+
+A successful check now fits the board's actual pose and writes it into
+Place's x/y/rotation. Pairs are nominal layout → detected machine mm
+(via place_projection, NEVER the tab's own design→px homography — inverting
+that recovers the layout). The fit is the reflection-aware rigid Procrustes
+(fit_rigid): flip_x tells us whether the pattern is mirrored, which must
+match the selected side or the update is refused with a pointed note. Both
+sides reduce to rot = fit angle, (tx,ty) = fit(layout centroid) — on the
+back, the design's x=0 mirror (already applied by active_job) and the fitted
+physical flip compose to a proper rotation, and the sources are
+exit-magnified (the camera sees drilled holes' EXIT openings; copper is a
+surface mark and carries no parallax, so the placement itself is unmagnified
+— fiducial-anchored alignment is exact at the scan center). Gates: ≥3
+detected, RMS ≤ 0.5 mm, flip matches side; the convention baked in is that
+the design centers on the fiducial-layout centroid. load_place preserves an
+auto-set pose instead of recentering; side switches clear it. Back-side
+EXPORT remains refused (emit_at_placement) — this feature places the
+overlay; the back-copper emit path is still future work.
