@@ -8,7 +8,7 @@ const POSE_MAX_RMS_MM: f64 = 0.5;
 impl ConsoleApp {
     /// Load the fiducial frame into memory + a texture and seed the search
     /// markers from the design layout (so they start near nominal, ready to
-    /// drag onto the real holes).
+    /// click onto the real holes).
     pub fn load_fid_frame(&mut self, ctx: &Context) {
         let img = match image::open(crate::clean_path(&self.fiducials.frame)) {
             Ok(i) => i.to_luma8(),
@@ -57,7 +57,9 @@ impl ConsoleApp {
         self.fiducials.frame_tex =
             Some(ctx.load_texture("fid-frame", color, TextureOptions::NEAREST));
         self.fiducials.frame_img = Some(img);
-        self.fiducials.note = "drag each ✛ near its hole, then Check".into();
+        self.fiducials.note =
+            "click each ✛ onto its hole in layout order — the last click checks (or 🎯 Check as-is)"
+                .into();
         true
     }
 
@@ -71,8 +73,7 @@ impl ConsoleApp {
             return;
         }
         self.fiducials.marking = Some(0);
-        self.fiducials.note =
-            format!("click fiducial 1 of {n} (layout order) — or drag each ✛ and Check");
+        self.fiducials.note = format!("click fiducial 1 of {n} (layout order)");
     }
 
     /// Reseed the ✛ set from the layout (the current frame stays) and reopen the
@@ -84,14 +85,15 @@ impl ConsoleApp {
         self.start_fid_marking();
     }
 
-    /// Apply one marking-round click: drop search marker `marking` at bed `mm`,
-    /// clear its now-stale detection, and advance. The final marker's click
-    /// closes the round and runs detection (which auto-updates the placement).
-    /// Factored out of the canvas handler so tests can drive it directly.
+    /// Apply one placement click: drop the next search marker (layout order) at
+    /// bed `mm`, clear its now-stale detection, and advance. With no round
+    /// active (`marking == None`) the click implicitly opens one at marker 0.
+    /// The final marker's click closes the round and runs detection (which
+    /// auto-updates the placement). Factored out of the canvas handler so tests
+    /// can drive it directly.
     pub(super) fn fid_mark_click(&mut self, mm: (f64, f64), ctx: &Context) {
-        let Some(k) = self.fiducials.marking else {
-            return;
-        };
+        // No active round: a plain click implicitly opens one at marker 0.
+        let k = self.fiducials.marking.unwrap_or(0);
         // The layout shrank under an active round (a typed edit): cancel rather
         // than index out of bounds.
         if k >= self.fiducials.search.len() {
@@ -172,9 +174,9 @@ impl ConsoleApp {
         self.fiducials.note = format!("removed fiducial #{i}  ·  {} left", kept.len());
     }
 
-    /// Resize the draggable markers to match the design layout, preserving
-    /// existing (dragged) positions and seeding any new ones from the layout —
-    /// so adding a 4th coordinate makes a 4th ✛ appear without a manual reset.
+    /// Resize the marker set to match the design layout, preserving existing
+    /// (clicked) positions and seeding any new ones from the layout — so adding
+    /// a 4th coordinate makes a 4th ✛ appear without a manual reset.
     pub(super) fn sync_fid_markers(&mut self) {
         if fiducial::parse_layout(&self.fiducials.layout).is_err() {
             return;
@@ -192,8 +194,8 @@ impl ConsoleApp {
             .resize(self.fiducials.search.len(), None);
     }
 
-    /// Detect around the current (draggable) search markers and record the
-    /// found positions, summary rows, and measured scale.
+    /// Detect around the current search markers and record the found positions,
+    /// summary rows, and measured scale.
     pub fn render_fiducials(&mut self, ctx: &Context) {
         self.sync_fid_markers();
         // No frame yet: pull one from the file path if set, else grab from
@@ -338,8 +340,8 @@ impl ConsoleApp {
         self.fiducials.found = r.found_px;
 
         // Measure the camera scale from KNOWN design spacing paired with the
-        // detected pixels — not the dragged search-marker spacing check_frame
-        // uses internally, which a small drag turns into a scale error (LR-17).
+        // detected pixels — not the search-marker spacing check_frame uses
+        // internally, which a small marker offset turns into a scale error (LR-17).
         let design = fiducial::parse_layout(&self.fiducials.layout).unwrap_or_default();
         self.fiducials.measured_ppm = fiducial::scale_from_design(&design, &self.fiducials.found);
         let scale = match self.fiducials.measured_ppm {
@@ -621,7 +623,7 @@ impl ConsoleApp {
             ui.checkbox(&mut self.fiducials.click_place, "✚ click-to-place")
                 .on_hover_text(
                     "Left-click an empty spot to add an expected fiducial; \
-                     right-click a ✛ to remove it; drag markers to fine-tune. \
+                     right-click a ✛ to remove it. \
                      Adding/removing here cancels an active marking round.",
                 );
             if ui.button("↺ reset markers").clicked() {
@@ -649,7 +651,7 @@ impl ConsoleApp {
         });
         ui.label(egui::RichText::new(&self.fiducials.note).weak());
         ui.weak("⚙ Generate holes burns holes at the expected positions above — same layout the check uses.");
-        ui.weak("Drag each ✛ near its hole; the detector searches locally around it. The typed px/mm only seeds the search — registration is anchored to the measured scale.");
+        ui.weak("Click each ✛ onto its hole in layout order; the detector searches locally around it. The typed px/mm only seeds the search — registration is anchored to the measured scale.");
         ui.weak(NAV_HINT);
         ui.separator();
 
@@ -696,7 +698,7 @@ impl ConsoleApp {
         }
     }
 
-    /// The frame with draggable search markers (✛) and detected rings drawn on
+    /// The frame with clickable search markers (✛) and detected rings drawn on
     /// top via the painter — so markers move without re-rasterizing the image.
     fn fid_frame_overlay(&mut self, ui: &mut egui::Ui) {
         // Keep the marker count in step with the layout field (live), so
@@ -746,7 +748,7 @@ impl ConsoleApp {
                 self.remove_expected_fiducial(i);
             }
             // Left-click on empty frame → append an expected fiducial there (not
-            // when a marker is under the pointer, so dragging isn't hijacked).
+            // when a marker is under the pointer, so an existing ✛ isn't stacked on).
             else if resp.clicked()
                 && let Some(pos) = resp.interact_pointer_pos()
                 && fiducial::nearest_marker(&marker_px, (pos.x, pos.y), 20.0).is_none()
@@ -756,11 +758,11 @@ impl ConsoleApp {
             }
         }
 
-        // Marking round: outside click-to-place, a primary click drops the next
-        // marker in layout order (the final click closes the round + detects).
+        // Placement: outside click-to-place, a primary click drops the next
+        // marker in layout order — implicitly opening a round when none is
+        // active, and closing it + detecting on the final marker's click.
         // Suppressed while navigating.
-        if self.fiducials.marking.is_some()
-            && !self.fiducials.click_place
+        if !self.fiducials.click_place
             && !nav
             && resp.clicked()
             && let Some(pos) = resp.interact_pointer_pos()
@@ -768,34 +770,6 @@ impl ConsoleApp {
             let mm = to_mm(pos);
             let ctx = ui.ctx().clone();
             self.fid_mark_click(mm, &ctx);
-        }
-
-        // Drag: pick the nearest marker on press, move it while dragging.
-        // Suppressed while navigating (Ctrl+drag pans instead).
-        if !nav
-            && resp.drag_started()
-            && let Some(pos) = resp.interact_pointer_pos()
-        {
-            let markers: Vec<(f32, f32)> = self
-                .fiducials
-                .search
-                .iter()
-                .map(|&(x, y)| {
-                    let s = to_screen(x, y);
-                    (s.x, s.y)
-                })
-                .collect();
-            self.fiducials.drag = fiducial::nearest_marker(&markers, (pos.x, pos.y), 30.0);
-        }
-        if !nav
-            && resp.dragged()
-            && let (Some(i), Some(pos)) = (self.fiducials.drag, resp.interact_pointer_pos())
-            && i < self.fiducials.search.len()
-        {
-            self.fiducials.search[i] = to_mm(pos);
-        }
-        if resp.drag_stopped() {
-            self.fiducials.drag = None;
         }
 
         // Paint markers + detected rings.

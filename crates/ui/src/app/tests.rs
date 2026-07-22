@@ -726,6 +726,35 @@ fn grab_does_not_open_a_marking_round() {
     std::fs::remove_dir_all(dir).ok();
 }
 
+/// Clicks are the only placement gesture: a plain canvas click with NO active
+/// round implicitly opens one — placing marker 0 where it lands and advancing
+/// to marker 1 — so the operator no longer needs Load/reset to start marking.
+#[test]
+fn a_plain_click_with_no_round_implicitly_starts_marking() {
+    let mut app = ConsoleApp::new(tmp_db(), vec!["true".into()]);
+    app.fiducials.layout = "10,10; 60,10; 10,60".into();
+    app.sync_fid_markers();
+    assert_eq!(app.fiducials.marking, None, "no round active to begin with");
+
+    let ctx = Context::default();
+    app.fid_mark_click((12.0, 9.0), &ctx);
+    assert_eq!(
+        app.fiducials.marking,
+        Some(1),
+        "the click implicitly opened the round and advanced to marker 1"
+    );
+    assert_eq!(
+        app.fiducials.search[0],
+        (12.0, 9.0),
+        "the click placed marker 0 where it landed"
+    );
+    assert!(
+        app.fiducials.note.starts_with("click fiducial 2 of 3"),
+        "note advanced to the second marker: {}",
+        app.fiducials.note
+    );
+}
+
 /// FLD-11: live tracking pulls frames from the camera source and re-detects
 /// each one — the found rings and the perspective fit update without a
 /// manual Check. Verified with a File source of 4 holes.
@@ -836,7 +865,7 @@ fn spawn_verb_reports_stderr_and_exit() {
 
 /// The marker set tracks the layout field: adding a coordinate adds a
 /// marker (seeded from the layout), removing one drops it, and existing
-/// dragged positions are preserved.
+/// placed positions are preserved.
 #[test]
 fn markers_follow_the_layout_field() {
     let mut app = ConsoleApp::new(tmp_db(), vec!["true".into()]);
@@ -844,14 +873,14 @@ fn markers_follow_the_layout_field() {
     app.sync_fid_markers();
     assert_eq!(app.fiducials.search.len(), 3);
 
-    app.fiducials.search[0] = (11.5, 9.0); // drag marker 0
+    app.fiducials.search[0] = (11.5, 9.0); // move marker 0
     app.fiducials.layout = "10,10; 60,10; 10,60; 60,60".into();
     app.sync_fid_markers();
     assert_eq!(app.fiducials.search.len(), 4, "4th marker appears");
     assert_eq!(
         app.fiducials.search[0],
         (11.5, 9.0),
-        "dragged position kept"
+        "placed position kept"
     );
     assert_eq!(
         app.fiducials.search[3],
@@ -868,12 +897,13 @@ fn markers_follow_the_layout_field() {
     );
 }
 
-/// Dragging a search marker onto an off-nominal hole makes detection find
-/// it: at the nominal design position the hole is out of the search window
-/// (miss); after moving the marker onto the hole, it's found.
+/// A single-fiducial layout: one plain click both opens and closes the round —
+/// it places the lone marker where it lands and immediately detects. A click at
+/// the design nominal misses (the hole is 3 mm off); a fresh click (with the
+/// round already closed, so it implicitly reopens) landing on the hole finds it.
 #[test]
-fn dragging_marker_lets_detection_find_offset_hole() {
-    let dir = std::env::temp_dir().join(format!("ui-drag-{}", std::process::id()));
+fn clicking_the_lone_marker_places_and_detects() {
+    let dir = std::env::temp_dir().join(format!("ui-lone-{}", std::process::id()));
     std::fs::create_dir_all(&dir).unwrap();
     let path = dir.join("hole.png");
     // One dark hole at bed (13,10) mm → px (130, 160−100=60) at 10 px/mm
@@ -903,19 +933,28 @@ fn dragging_marker_lets_detection_find_offset_hole() {
         vec![(10.0, 10.0)],
         "markers seed from design"
     );
+    assert_eq!(
+        app.fiducials.marking,
+        Some(0),
+        "the 1-marker layout opens a round at marker 0"
+    );
 
-    app.render_fiducials(&ctx);
+    // Click at the design nominal: the lone click closes the round and detects,
+    // but the hole is 3 mm off so nothing is found there.
+    app.fid_mark_click((10.0, 10.0), &ctx);
+    assert_eq!(app.fiducials.marking, None, "the lone click closed the round");
     assert!(
         app.fiducials.found[0].is_none(),
         "misses at nominal (hole is 3 mm off)"
     );
 
-    // Drag the marker onto the hole.
-    app.fiducials.search[0] = (13.0, 10.0);
-    app.render_fiducials(&ctx);
+    // A fresh click with no active round implicitly reopens it; landing on the
+    // actual hole makes detection lock on.
+    app.fid_mark_click((13.0, 10.0), &ctx);
+    assert_eq!(app.fiducials.marking, None, "the reopened lone click closed again");
     assert!(
         app.fiducials.found[0].is_some(),
-        "found after dragging the marker onto the hole"
+        "found the hole the click landed on"
     );
 }
 
@@ -969,8 +1008,8 @@ fn click_to_place_appends_an_expected_fiducial() {
     // marker and the aligned layout token + search/found entries go with it.
     app.fiducials.layout = "10,10; 60,10; 60,60".into();
     app.sync_fid_markers();
-    // Fine-tune the 3rd marker via drag, so we can prove removal keeps the
-    // *other* markers' dragged positions aligned by index.
+    // Fine-tune the 3rd marker's position, so we can prove removal keeps the
+    // *other* markers' placed positions aligned by index.
     app.fiducials.search[2] = (61.5, 59.0);
     app.remove_expected_fiducial(1); // remove the (60,10) middle one
     assert_eq!(app.fiducials.search.len(), 2, "one fewer marker");
@@ -983,7 +1022,7 @@ fn click_to_place_appends_an_expected_fiducial() {
     assert_eq!(
         app.fiducials.search[1],
         (61.5, 59.0),
-        "the survivor's dragged position stayed aligned to its token"
+        "the survivor's placed position stayed aligned to its token"
     );
 
     // Appending onto an empty layout doesn't produce a leading separator.

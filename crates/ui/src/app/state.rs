@@ -232,10 +232,10 @@ pub(super) struct FiducialState {
     pub(super) frame_tex: Option<TextureHandle>,
     pub(super) search: Vec<(f64, f64)>,
     pub(super) found: Vec<Option<(f64, f64)>>,
-    pub(super) drag: Option<usize>,
     /// An active click-the-fiducials-in-order marking round: `Some(k)` means the
     /// next primary canvas click drops search marker `k` (layout order). `None`
-    /// when no round is running (drag + Check are always available regardless).
+    /// when no round is active — the next plain click implicitly starts one at
+    /// marker 0 (Check is always available regardless).
     pub(super) marking: Option<usize>,
     /// Whether the MOST RECENT detection actually wrote the Place placement.
     /// Distinct from `pose`/`placement.auto_pose`, which a rejected fit leaves
