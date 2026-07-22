@@ -389,4 +389,18 @@ fn fiducial_tab_exposes_its_controls_after_the_panel_split() {
         "no marking round on a fresh tab:\n{}",
         h.state().debug_summary()
     );
+    // The default layout seeds 4 markers; ✕ clear markers must drop them ALL
+    // (it empties the layout, so the per-frame sync can't reseed them).
+    assert!(
+        summary_line(&h.state().debug_summary(), "fiducials:").contains("fiducials: 4 markers"),
+        "default layout seeded markers to clear:\n{}",
+        h.state().debug_summary()
+    );
+    h.get_by_label("✕ clear markers").click();
+    h.run();
+    assert!(
+        summary_line(&h.state().debug_summary(), "fiducials:").contains("fiducials: 0 markers"),
+        "clear markers removed every marker:\n{}",
+        h.state().debug_summary()
+    );
 }

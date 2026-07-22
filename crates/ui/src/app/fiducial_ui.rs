@@ -85,6 +85,23 @@ impl ConsoleApp {
         self.start_fid_marking();
     }
 
+    /// Remove EVERY expected fiducial — the ✕ clear-markers action. The layout
+    /// string is the source of truth (`sync_fid_markers` reseeds the ✛ set from
+    /// it every frame), so it must empty too or the markers come straight back.
+    /// The placement/pose is left alone: clearing markers must not move the job.
+    pub(super) fn clear_fid_markers(&mut self) {
+        self.fiducials.layout.clear();
+        self.fiducials.search.clear();
+        self.fiducials.found.clear();
+        self.fiducials.rows.clear();
+        self.fiducials.marking = None;
+        self.fiducials.measured_ppm = None;
+        self.fiducials.homography = None;
+        self.fiducials.last_placed = false;
+        self.fiducials.note =
+            "markers cleared — type a layout or ✚ click-to-place new ones".into();
+    }
+
     /// Apply one placement click: drop the next search marker (layout order) at
     /// bed `mm`, clear its now-stale detection, and advance. With no round
     /// active (`marking == None`) the click implicitly opens one at marker 0.
@@ -626,8 +643,25 @@ impl ConsoleApp {
                      right-click a ✛ to remove it. \
                      Adding/removing here cancels an active marking round.",
                 );
-            if ui.button("↺ reset markers").clicked() {
+            if ui
+                .button("↺ reset markers")
+                .on_hover_text(
+                    "Reseed the ✛s at the expected layout positions and restart \
+                     the click-in-order round (the layout itself is kept).",
+                )
+                .clicked()
+            {
                 self.reset_fid_markers();
+            }
+            if ui
+                .button("✕ clear markers")
+                .on_hover_text(
+                    "Remove ALL expected fiducials — empties the layout field \
+                     above, so nothing reseeds them.",
+                )
+                .clicked()
+            {
+                self.clear_fid_markers();
             }
             if ui
                 .button("⚙ Generate holes")

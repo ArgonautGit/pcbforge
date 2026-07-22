@@ -688,6 +688,33 @@ fn marking_round_walks_the_fiducials_and_the_final_click_detects() {
     std::fs::remove_dir_all(dir).ok();
 }
 
+/// "clear markers" removes EVERY expected fiducial — layout included — so a
+/// piled-up marker set (e.g. 15 from click-to-place) actually goes to zero and
+/// stays there: reset and sync must find nothing to reseed from afterwards.
+#[test]
+fn clear_markers_empties_the_layout_so_nothing_reseeds() {
+    let mut app = ConsoleApp::new(tmp_db(), vec!["true".into()]);
+    app.fiducials.layout = "10,10; 60,10; 10,60".into();
+    app.sync_fid_markers();
+    app.fiducials.marking = Some(1);
+    assert_eq!(app.fiducials.search.len(), 3);
+
+    app.clear_fid_markers();
+    assert!(app.fiducials.layout.is_empty(), "layout emptied — it is the reseed source");
+    assert!(app.fiducials.search.is_empty(), "all ✛ markers gone");
+    assert!(app.fiducials.found.is_empty() && app.fiducials.rows.is_empty());
+    assert_eq!(app.fiducials.marking, None, "any active round is cancelled");
+
+    // Neither the per-frame sync nor an explicit reset may bring them back.
+    app.sync_fid_markers();
+    assert!(app.fiducials.search.is_empty(), "sync must not reseed cleared markers");
+    app.reset_fid_markers();
+    assert!(
+        app.fiducials.search.is_empty() && app.fiducials.marking.is_none(),
+        "reset after clear has nothing to reseed and opens no round"
+    );
+}
+
 /// A camera Grab auto-detects at the seeded positions, so it must NOT open a
 /// marking round — the round is the Load/reset (no-auto-detect) path only.
 #[test]

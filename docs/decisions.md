@@ -2221,3 +2221,17 @@ the design centers on the fiducial-layout centroid. load_place preserves an
 auto-set pose instead of recentering; side switches clear it. Back-side
 EXPORT remains refused (emit_at_placement) — this feature places the
 overlay; the back-copper emit path is still future work.
+
+## 2026-07-21 — Fiducials: ✕ clear markers empties the layout, ↺ reset keeps it
+
+With click-to-place able to grow the expected set one click at a time, an
+overgrown set (15 markers on a 4-hole board) had no one-step exit: ↺ reset
+markers reseeds the ✛s from the layout string, so all 15 came straight back,
+and the only true clear was hand-editing the layout field. The two intents
+are now two buttons: ↺ reset re-nominalizes positions and reopens the marking
+round (layout kept), ✕ clear removes every expected fiducial. Because the
+layout string is the source of truth that sync_fid_markers reseeds from every
+frame, clear MUST empty the string itself — clearing only search/found would
+be undone one frame later. Clear also drops rows/measured/homography and
+cancels any marking round, but leaves placement and the cached pose alone:
+removing markers must not move an already-registered job.
