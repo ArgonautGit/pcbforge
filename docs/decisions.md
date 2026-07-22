@@ -2167,3 +2167,27 @@ existing verb job: it chains off the export only when the export actually
 started and exited cleanly, so a refused or failed export never etches a stale
 file. FORCELOAD uses `std::path::absolute` (not canonicalize) to avoid the
 `\\?\` prefix, which LightBurn mishandles, on a file that may not exist yet.
+
+## 2026-07-21 — Auto fiducial layout from board dimensions, field-warped holes
+
+Hand-typing the fiducial layout string meant the operator was doing corner
+math (board size, margins, field centring) by hand, and the generated holes
+ignored the f-theta distortion entirely — positions and hole sizes were only
+as true as the lens. Calibration grew a step "4) Fiducial holes (board)":
+enter board W×H and an edge margin (board-edge → hole centre), and the console
+computes the four corners for a board centred on the effective laser-field
+centre, writes them into the SAME layout string the fiducial check reads
+(one source of truth, unchanged), and generates the .lbrn2. A "board size
+from job" button fills W/H from the active side's Gerber board bbox.
+Generation is disabled when 2×margin swallows the shorter side or a hole
+falls outside the addressable field.
+
+The layout stays in PHYSICAL mm — the camera check measures reality — and
+only the commanded geometry is pre-distorted: `fid-holes` gained
+`--field-map`/`--field-seg-mm` mirroring `emit` (densify to ≤0.25 mm, then
+`FieldMap::precompensate` per vertex; hard error on an unreadable map, loud
+warning + unwarped output when omitted). Both hole-generation paths (the
+Fiducials tab and the new step) pass the map whenever an accepted laser-field
+fit exists, so hole spacing AND size burn dimensionally true. It sits under
+Calibration because the output is only as good as step ③ — the step's copy
+says so.

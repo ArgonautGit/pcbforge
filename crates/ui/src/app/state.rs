@@ -26,6 +26,9 @@ pub(super) enum CalibMode {
     LaserAnchor,
     /// Burned grid through the metric camera → the laser field pre-distortion.
     LaserField,
+    /// Auto-lay four fiducial holes for a board centred on the field, generated
+    /// with the laser-field pre-distortion so spacing/size burn true.
+    FidHoles,
 }
 
 /// Correction for how the camera is physically mounted.
@@ -215,6 +218,12 @@ pub(super) struct FiducialState {
     pub(super) profile: crate::fiducial::ProfileKind,
     /// Output path for the generated fiducial-holes .lbrn2 (`fid-holes` verb).
     pub(super) out: String,
+    /// ④ board width for the auto fiducial-hole layout (mm).
+    pub(super) board_w_mm: f64,
+    /// ④ board height for the auto fiducial-hole layout (mm).
+    pub(super) board_h_mm: f64,
+    /// ④ margin from board edge to hole CENTRE for the auto layout (mm).
+    pub(super) margin_mm: f64,
     pub(super) click_place: bool,
     pub(super) note: String,
     pub(super) rows: Vec<FidRow>,

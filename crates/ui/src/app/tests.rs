@@ -1099,8 +1099,11 @@ field_frame=\n";
             "calib_paper_n",
             "calib_paper_out",
             "calib_paper_pitch_mm",
+            "fid_board_h_mm",
+            "fid_board_w_mm",
             "fid_diameter_mm",
             "fid_height_mm",
+            "fid_margin_mm",
             "fid_out",
             "fid_profile",
             "fid_search_mm",
@@ -1169,6 +1172,59 @@ fn job_export_recipe_persists() {
     assert_eq!(fresh.job.pulse_ns, 1);
     assert!((fresh.job.interval_mm - 0.03).abs() < 1e-9);
     assert_eq!(fresh.job.passes, 1);
+}
+
+/// The ④ auto fiducial-layout board size + margin round-trip through a save +
+/// reload; a blob without them keeps the 70/50/5 defaults.
+#[test]
+fn fid_board_dimensions_persist() {
+    let db = tmp_db();
+    {
+        let mut a = ConsoleApp::new(db.clone(), vec!["true".into()]);
+        a.fiducials.board_w_mm = 90.0;
+        a.fiducials.board_h_mm = 60.0;
+        a.fiducials.margin_mm = 3.0;
+        a.save_settings_if_changed();
+    }
+    let b = ConsoleApp::new(db, vec!["true".into()]);
+    assert!((b.fiducials.board_w_mm - 90.0).abs() < 1e-9);
+    assert!((b.fiducials.board_h_mm - 60.0).abs() < 1e-9);
+    assert!((b.fiducials.margin_mm - 3.0).abs() < 1e-9);
+
+    // A fresh console with no persisted keys keeps the operator defaults.
+    let fresh = ConsoleApp::new(tmp_db(), vec!["true".into()]);
+    assert!((fresh.fiducials.board_w_mm - 70.0).abs() < 1e-9);
+    assert!((fresh.fiducials.board_h_mm - 50.0).abs() < 1e-9);
+    assert!((fresh.fiducials.margin_mm - 5.0).abs() < 1e-9);
+}
+
+/// ④ Fiducial holes: the `fid_board:` summary line reports the board/margin
+/// and the layout computed against the auto-centred field. Field 90 auto →
+/// centre 45,45; board 70×50, margin 5 → x 15..75, y 25..65.
+#[test]
+fn fid_board_summary_reports_the_computed_layout() {
+    let mut app = ConsoleApp::new(tmp_db(), vec!["true".into()]);
+    app.runtime.tab = CentralTab::Calibrate;
+    app.calibration.mode = CalibMode::FidHoles;
+    app.camera.field_mm = 90.0;
+    app.camera.field_center_auto = true;
+    app.sync_auto_field_center();
+    app.fiducials.board_w_mm = 70.0;
+    app.fiducials.board_h_mm = 50.0;
+    app.fiducials.margin_mm = 5.0;
+
+    let summary = app.debug_summary();
+    assert!(
+        summary.contains("calib_mode=FidHoles"),
+        "④ mode active:\n{summary}"
+    );
+    assert!(
+        summary.contains(
+            "fid_board: w=70 h=50 margin=5 \
+             layout=15.00,25.00; 75.00,25.00; 15.00,65.00; 75.00,65.00"
+        ),
+        "fid_board line reports the computed layout:\n{summary}"
+    );
 }
 
 /// The burned-grid frame anchor's mirror flag round-trips as a 5th

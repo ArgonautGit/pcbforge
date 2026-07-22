@@ -309,6 +309,26 @@ pub fn parse_layout(s: &str) -> Result<Vec<(f64, f64)>, String> {
     Ok(out)
 }
 
+/// The four fiducial-hole centres for a `w`×`h` board centred at `(cx, cy)`,
+/// each `margin` in from the board edge. Order: (x0,y0), (x1,y0), (x0,y1),
+/// (x1,y1) — the same LL, LR, UL, UR ordering the check drives from.
+pub fn board_fid_layout(cx: f64, cy: f64, w: f64, h: f64, margin: f64) -> [(f64, f64); 4] {
+    let x0 = cx - w / 2.0 + margin;
+    let x1 = cx + w / 2.0 - margin;
+    let y0 = cy - h / 2.0 + margin;
+    let y1 = cy + h / 2.0 - margin;
+    [(x0, y0), (x1, y0), (x0, y1), (x1, y1)]
+}
+
+/// Format points as the `"x,y; x,y; …"` layout string [`parse_layout`] reads,
+/// with 2-decimal coordinates.
+pub fn format_layout(pts: &[(f64, f64)]) -> String {
+    pts.iter()
+        .map(|(x, y)| format!("{x:.2},{y:.2}"))
+        .collect::<Vec<_>>()
+        .join("; ")
+}
+
 fn summarize(
     expected_mm: &[(f64, f64)],
     results: &[Result<vision::Fiducial, Miss>],
@@ -689,6 +709,24 @@ mod tests {
         );
         assert!(parse_layout("garbage").is_err());
         assert!(parse_layout("").is_err());
+    }
+
+    #[test]
+    fn board_fid_layout_places_holes_a_margin_in_from_the_edges() {
+        // 70×50 board centred at (45,45), 5 mm margin → x 15..75, y 25..65.
+        let pts = board_fid_layout(45.0, 45.0, 70.0, 50.0, 5.0);
+        assert_eq!(
+            pts,
+            [(15.0, 25.0), (75.0, 25.0), (15.0, 65.0), (75.0, 65.0)]
+        );
+    }
+
+    #[test]
+    fn format_layout_round_trips_through_parse_layout() {
+        let pts = board_fid_layout(45.0, 45.0, 70.0, 50.0, 5.0);
+        let s = format_layout(&pts);
+        assert_eq!(s, "15.00,25.00; 75.00,25.00; 15.00,65.00; 75.00,65.00");
+        assert_eq!(parse_layout(&s).unwrap(), pts.to_vec());
     }
 
     #[test]

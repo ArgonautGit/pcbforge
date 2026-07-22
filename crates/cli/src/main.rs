@@ -413,6 +413,17 @@ enum Command {
         /// LightBurn device name.
         #[arg(long, default_value = lbrn2::DEFAULT_DEVICE)]
         device: String,
+
+        /// Laser-field calibration map. When given, every production edge is
+        /// densified and pre-warped from desired physical mm to commanded mm
+        /// before writing the LightBurn job. When omitted, the geometry is
+        /// emitted UNWARPED (a warning is printed) — field accuracy is then
+        /// whatever the machine's own correction provides.
+        #[arg(long)]
+        field_map: Option<PathBuf>,
+        /// Maximum physical edge segment before field pre-warping, mm.
+        #[arg(long, default_value_t = 0.25)]
+        field_seg_mm: f64,
     },
     /// Camera capture (VIS-1): list devices or grab a single frame. The webcam
     /// backend needs the `camera` feature; `--file` re-reads an image path and
@@ -688,7 +699,18 @@ fn run(cli: &Cli) -> Result<(), Box<dyn std::error::Error>> {
             w_mm,
             h_mm,
             device,
-        } => fid_holes_cmd(out, layout, shape, *w_mm, *h_mm, device),
+            field_map,
+            field_seg_mm,
+        } => fid_holes_cmd(
+            out,
+            layout,
+            shape,
+            *w_mm,
+            *h_mm,
+            device,
+            field_map.as_deref(),
+            *field_seg_mm,
+        ),
         Command::Cam {
             list,
             grab,
@@ -1050,6 +1072,42 @@ fn fid_holes_polys(
     }
 }
 
+/// Apply the laser-field pre-distortion to fiducial-hole polys, mirroring the
+/// `emit` verb: a supplied `--field-map` densifies and pre-warps every edge
+/// physical→commanded so the beam lands on the intended geometry; its absence
+/// emits the holes unwarped (with a warning).
+fn warp_fid_holes(
+    polys: Vec<pcb_core::Poly>,
+    field_map: Option<&std::path::Path>,
+    field_seg_mm: f64,
+) -> Result<Vec<pcb_core::Poly>, Box<dyn std::error::Error>> {
+    Ok(match field_map {
+        Some(path) => {
+            let field = load_field_map(path)?;
+            validate_field_segment(field_seg_mm)?;
+            eprintln!(
+                "fid holes: field warp on (fit RMS {:.1} µm, worst {:.1} µm), edges ≤{:.2} mm",
+                field.rms_um, field.max_um, field_seg_mm
+            );
+            cam::register::transform_shapes_field(
+                &polys,
+                &cam::register::Affine2::identity(),
+                field_seg_mm,
+                |x, y| field.precompensate(x, y),
+            )
+        }
+        None => {
+            eprintln!(
+                "fid holes: WARNING — no --field-map: hole geometry is NOT \
+                 field-warped; the burned holes will not be corrected for lens \
+                 distortion (positional accuracy depends on the machine's own \
+                 correction)"
+            );
+            polys
+        }
+    })
+}
+
 /// `pcbforge fid-holes` — burn fiducial holes at operator-supplied positions.
 fn fid_holes_cmd(
     out: &std::path::Path,
@@ -1058,6 +1116,8 @@ fn fid_holes_cmd(
     w_mm: f64,
     h_mm: f64,
     device: &str,
+    field_map: Option<&std::path::Path>,
+    field_seg_mm: f64,
 ) -> Result<(), Box<dyn std::error::Error>> {
     if shape != "circle" && shape != "rect" {
         return Err(format!("--shape must be \"circle\" or \"rect\", got {shape:?}").into());
@@ -1080,6 +1140,7 @@ fn fid_holes_cmd(
     let positions = parse_fid_layout(layout)?;
 
     let polys = fid_holes_polys(shape, w_mm, resolved_h, &positions);
+    let polys = warp_fid_holes(polys, field_map, field_seg_mm)?;
     let params = AblationParams {
         power_pct: 20.0,
         speed_mm_s: 1000.0,
@@ -2216,6 +2277,72 @@ mod tests {
                 );
             }
         }
+    }
+
+    /// Bounding-box center of a Poly's outer ring, in mm — robust to the extra
+    /// vertices `transform_shapes_field` adds when it densifies edges.
+    fn bbox_center_mm(p: &pcb_core::Poly) -> (f64, f64) {
+        let (mut minx, mut maxx) = (Nm::MAX, Nm::MIN);
+        let (mut miny, mut maxy) = (Nm::MAX, Nm::MIN);
+        for v in &p.outer {
+            minx = minx.min(v.x);
+            maxx = maxx.max(v.x);
+            miny = miny.min(v.y);
+            maxy = maxy.max(v.y);
+        }
+        (
+            (minx + maxx) as f64 / 2.0 / NM_PER_MM as f64,
+            (miny + maxy) as f64 / 2.0 / NM_PER_MM as f64,
+        )
+    }
+
+    #[test]
+    fn fid_holes_field_warp_shifts_centers_by_the_precompensation() {
+        use nalgebra::Point2;
+        // A pure +1 mm x translation in commanded space lies inside the bicubic
+        // fit's span, so precompensate(x, y) = (x + 1, y): every warped vertex
+        // (and thus each hole's center) moves +1 mm in x, nothing in y.
+        let pairs: Vec<_> = (0..5)
+            .flat_map(|row| {
+                (0..5).map(move |col| {
+                    let phys = Point2::new(col as f64 * 20.0, row as f64 * 20.0);
+                    (phys, Point2::new(phys.x + 1.0, phys.y))
+                })
+            })
+            .collect();
+        let field = vision::fit_field(&pairs).expect("translation field fits");
+
+        let dir = std::env::temp_dir().join(format!("pcbforge-fidwarp-{}", std::process::id()));
+        std::fs::create_dir_all(&dir).unwrap();
+        let path = dir.join("field.txt");
+        std::fs::write(&path, field.serialize()).unwrap();
+
+        // Hole centers stay inside the fitted 0..80 mm grid (no extrapolation).
+        let positions = [(10.0, 20.0), (30.0, 60.0)];
+        let raw = fid_holes_polys("rect", 2.0, 3.0, &positions);
+        let warped = warp_fid_holes(raw.clone(), Some(path.as_path()), 0.25)
+            .expect("warp with a valid field map succeeds");
+
+        assert_eq!(warped.len(), positions.len());
+        for (w, &(x, y)) in warped.iter().zip(positions.iter()) {
+            let (wx, wy) = bbox_center_mm(w);
+            assert!(
+                (wx - (x + 1.0)).abs() < 1e-3,
+                "center x {wx}, want {} (layout x + 1 mm)",
+                x + 1.0
+            );
+            assert!((wy - y).abs() < 1e-3, "center y {wy}, want {y} (unchanged)");
+        }
+    }
+
+    #[test]
+    fn fid_holes_without_field_map_is_unwarped() {
+        // No --field-map: the geometry is passed through untouched, so the holes
+        // sit exactly at their layout coordinates (0.25 mm segment is inert here).
+        let positions = [(10.0, 20.0), (-5.0, 60.5)];
+        let polys = fid_holes_polys("rect", 2.0, 3.0, &positions);
+        let out = warp_fid_holes(polys.clone(), None, 0.25).expect("no field map is fine");
+        assert_eq!(out, polys, "without --field-map the geometry is unchanged");
     }
 
     #[test]

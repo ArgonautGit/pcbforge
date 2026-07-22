@@ -59,6 +59,9 @@ impl ConsoleApp {
             ("fid_search_mm", self.fiducials.search_mm.to_string()),
             ("fid_profile", self.fiducials.profile.token().to_string()),
             ("fid_out", self.fiducials.out.clone()),
+            ("fid_board_w_mm", self.fiducials.board_w_mm.to_string()),
+            ("fid_board_h_mm", self.fiducials.board_h_mm.to_string()),
+            ("fid_margin_mm", self.fiducials.margin_mm.to_string()),
             ("cam_file", self.camera.file.clone()),
             (
                 "cam_orientation",
@@ -350,6 +353,29 @@ impl ConsoleApp {
             .filter(|v: &f64| v.is_finite())
         {
             self.fiducials.search_mm = v.clamp(0.1, 20.0);
+        }
+        // ④ auto fiducial-layout board size + margin, clamped to the DragValue
+        // ranges (a hand-edited or corrupt blob can't push them out of bounds).
+        if let Some(v) = m
+            .get("fid_board_w_mm")
+            .and_then(|s| s.trim().parse().ok())
+            .filter(|v: &f64| v.is_finite())
+        {
+            self.fiducials.board_w_mm = v.clamp(5.0, 500.0);
+        }
+        if let Some(v) = m
+            .get("fid_board_h_mm")
+            .and_then(|s| s.trim().parse().ok())
+            .filter(|v: &f64| v.is_finite())
+        {
+            self.fiducials.board_h_mm = v.clamp(5.0, 500.0);
+        }
+        if let Some(v) = m
+            .get("fid_margin_mm")
+            .and_then(|s| s.trim().parse().ok())
+            .filter(|v: &f64| v.is_finite())
+        {
+            self.fiducials.margin_mm = v.clamp(0.5, 50.0);
         }
         if let Some(k) = m
             .get("fid_shape")

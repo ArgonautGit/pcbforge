@@ -70,6 +70,23 @@ pub fn bbox_center_mm(shapes: &[Poly]) -> (f64, f64) {
     ((mm(x0) + mm(x1)) / 2.0, (mm(y0) + mm(y1)) / 2.0)
 }
 
+/// The bbox extent (width, height) of `shapes` in Gerber mm, or `None` for an
+/// empty input — the auto fiducial-layout board size.
+pub(crate) fn bbox_size_mm(shapes: &[Poly]) -> Option<(f64, f64)> {
+    let mut b: Option<(i64, i64, i64, i64)> = None;
+    for poly in shapes {
+        for p in poly.outer.iter().chain(poly.holes.iter().flatten()) {
+            b = Some(match b {
+                None => (p.x, p.y, p.x, p.y),
+                Some((x0, y0, x1, y1)) => (x0.min(p.x), y0.min(p.y), x1.max(p.x), y1.max(p.y)),
+            });
+        }
+    }
+    let (x0, y0, x1, y1) = b?;
+    let mm = |v: i64| v as f64 / NM_PER_MM as f64;
+    Some((mm(x1) - mm(x0), mm(y1) - mm(y0)))
+}
+
 /// Alpha-blend the placed job over the bed `frame`. The job `shapes` (Gerber
 /// mm) are mapped through the placement to bed mm, then to pixels, and even-odd
 /// filled in a translucent `color`.
@@ -349,6 +366,26 @@ mod tests {
             ],
             holes: vec![],
         }
+    }
+
+    #[test]
+    fn bbox_size_measures_the_extent_and_rejects_empty() {
+        // A 3 mm half-side square about (5,7) spans 6 mm × 6 mm.
+        let (w, h) = bbox_size_mm(&[sq(5 * MM, 7 * MM, 3 * MM)]).unwrap();
+        assert!((w - 6.0).abs() < 1e-9 && (h - 6.0).abs() < 1e-9);
+        // A wider-than-tall box: outer 10 mm wide, 4 mm tall about origin.
+        let rect = Poly {
+            outer: vec![
+                P::new(-5 * MM, -2 * MM),
+                P::new(5 * MM, -2 * MM),
+                P::new(5 * MM, 2 * MM),
+                P::new(-5 * MM, 2 * MM),
+            ],
+            holes: vec![],
+        };
+        let (w, h) = bbox_size_mm(&[rect]).unwrap();
+        assert!((w - 10.0).abs() < 1e-9 && (h - 4.0).abs() < 1e-9);
+        assert!(bbox_size_mm(&[]).is_none());
     }
 
     #[test]

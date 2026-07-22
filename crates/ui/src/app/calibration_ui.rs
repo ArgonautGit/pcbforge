@@ -392,6 +392,8 @@ impl ConsoleApp {
                     }
                 }
             }
+            // ④ Fiducial holes never marks corners or fits — no-op.
+            CalibMode::FidHoles => {}
         }
     }
 
@@ -597,6 +599,10 @@ impl ConsoleApp {
     }
 
     pub(super) fn calib_frame_overlay(&mut self, ui: &mut egui::Ui) {
+        // ④ Fiducial holes has no frame/corner interaction — nothing to draw.
+        if self.calibration.mode == CalibMode::FidHoles {
+            return;
+        }
         let Some(tex) = self.calibration.frame_tex.clone() else {
             ui.weak("(load a grid frame to mark corners)");
             return;
@@ -930,7 +936,8 @@ impl ConsoleApp {
     /// Lives in its own resizable/scrollable panel so it can't crowd out the
     /// image (see `calibrate_view`).
     fn calibrate_controls(&mut self, ui: &mut egui::Ui) {
-        ui.horizontal(|ui| {
+        // Four steps no longer fit one row at narrow panel widths — wrap.
+        ui.horizontal_wrapped(|ui| {
             ui.label("step");
             ui.selectable_value(
                 &mut self.calibration.mode,
@@ -946,6 +953,11 @@ impl ConsoleApp {
                 &mut self.calibration.mode,
                 CalibMode::LaserField,
                 "3) Laser field (burned grid)",
+            );
+            ui.selectable_value(
+                &mut self.calibration.mode,
+                CalibMode::FidHoles,
+                "4) Fiducial holes (board)",
             );
         });
         match self.calibration.mode {
@@ -966,7 +978,19 @@ impl ConsoleApp {
                  physically lands and fits a pre-distortion. Accepted fits are mandatory for every production \
                  export; geometry is always field-warped so shapes burn dimensionally true.",
             ).weak()),
+            CalibMode::FidHoles => ui.label(egui::RichText::new(
+                "Auto-lay four fiducial holes for a board centred on the laser field centre. Enter the \
+                 board size and an edge margin; the holes sit that margin in from each board edge, and \
+                 the layout feeds the fiducial check automatically. Generated with lens pre-distortion \
+                 so hole spacing and size burn true.",
+            ).weak()),
         };
+        // ④ Fiducial holes has its own self-contained form — no grid params,
+        // corner marking, or fit controls apply.
+        if self.calibration.mode == CalibMode::FidHoles {
+            self.fid_holes_controls(ui);
+            return;
+        }
         let is_paper = self.calibration.mode == CalibMode::CameraLens;
         ui.label(
             egui::RichText::new(if is_paper {
@@ -1367,6 +1391,8 @@ impl ConsoleApp {
                     }
                 }
             }
+            // ④ returns early above; this arm only satisfies the match.
+            CalibMode::FidHoles => {}
         }
         ui.label(egui::RichText::new(&self.calibration.note).weak());
         ui.weak(format!(
@@ -1374,5 +1400,202 @@ impl ConsoleApp {
             self.corner_click_order()
         ));
         ui.weak(NAV_HINT);
+    }
+
+    /// ④ Fiducial holes: enter the board size + edge margin, preview the
+    /// computed layout + effective field centre, and generate the holes .lbrn2
+    /// (writing the layout into the fiducial check first).
+    fn fid_holes_controls(&mut self, ui: &mut egui::Ui) {
+        egui::Grid::new("fid-holes-form")
+            .num_columns(2)
+            .spacing([8.0, 6.0])
+            .show(ui, |ui| {
+                ui.label("board W mm");
+                ui.add(
+                    egui::DragValue::new(&mut self.fiducials.board_w_mm)
+                        .speed(0.5)
+                        .range(5.0..=500.0),
+                );
+                ui.end_row();
+                ui.label("board H mm");
+                ui.add(
+                    egui::DragValue::new(&mut self.fiducials.board_h_mm)
+                        .speed(0.5)
+                        .range(5.0..=500.0),
+                );
+                ui.end_row();
+                ui.label("margin mm");
+                ui.add(
+                    egui::DragValue::new(&mut self.fiducials.margin_mm)
+                        .speed(0.1)
+                        .range(0.5..=50.0),
+                )
+                .on_hover_text("Distance from the board edge to the hole centre.");
+                ui.end_row();
+                ui.label("shape");
+                egui::ComboBox::from_id_salt("fid-holes-shape")
+                    .selected_text(self.fiducials.shape.label())
+                    .show_ui(ui, |ui| {
+                        for k in crate::fiducial::ShapeKind::ALL {
+                            ui.selectable_value(&mut self.fiducials.shape, k, k.label());
+                        }
+                    });
+                ui.end_row();
+                match self.fiducials.shape {
+                    crate::fiducial::ShapeKind::Circle => {
+                        ui.label("hole ⌀ mm");
+                        ui.add(
+                            egui::DragValue::new(&mut self.fiducials.diameter_mm)
+                                .speed(0.05)
+                                .range(0.05..=20.0),
+                        );
+                        ui.end_row();
+                    }
+                    crate::fiducial::ShapeKind::Rect => {
+                        ui.label("width mm");
+                        ui.horizontal(|ui| {
+                            ui.add(
+                                egui::DragValue::new(&mut self.fiducials.diameter_mm)
+                                    .speed(0.05)
+                                    .range(0.05..=20.0),
+                            );
+                            let hl = ui.label("height mm");
+                            ui.add(
+                                egui::DragValue::new(&mut self.fiducials.height_mm)
+                                    .speed(0.05)
+                                    .range(0.05..=20.0),
+                            )
+                            .labelled_by(hl.id);
+                        });
+                        ui.end_row();
+                    }
+                }
+                let lbl = ui.label("holes out");
+                ui.add(
+                    egui::TextEdit::singleline(&mut self.fiducials.out).desired_width(240.0),
+                )
+                .labelled_by(lbl.id)
+                .on_hover_text("Where the generated fiducial-holes .lbrn2 is written.");
+                ui.end_row();
+            });
+
+        // Read the (now-edited) board/margin values and the effective field
+        // centre after the form closure so the preview + validation reflect this
+        // frame's edits, not the last one.
+        self.sync_auto_field_center();
+        let (cx, cy) = (self.camera.field_cx_mm as f64, self.camera.field_cy_mm as f64);
+        let field = self.camera.field_mm as f64;
+        let (w, h, margin) = (
+            self.fiducials.board_w_mm,
+            self.fiducials.board_h_mm,
+            self.fiducials.margin_mm,
+        );
+        let pts = crate::fiducial::board_fid_layout(cx, cy, w, h, margin);
+        let layout = crate::fiducial::format_layout(&pts);
+        ui.label(format!(
+            "layout: {layout}   (board centred at {cx:.1},{cy:.1})"
+        ));
+
+        // Validation: a margin that swallows the shorter side, or any hole
+        // outside the addressable field, disables generation.
+        let margin_too_big = 2.0 * margin >= w.min(h);
+        let out_of_field = pts
+            .iter()
+            .any(|&(x, y)| x < 0.0 || y < 0.0 || x > field || y > field);
+        if margin_too_big {
+            ui.colored_label(
+                status_color(false),
+                "margin too large for the board — 2×margin must be under the shorter side",
+            );
+        }
+        if out_of_field {
+            ui.colored_label(
+                status_color(false),
+                format!(
+                    "holes fall outside the {field:.0} mm laser field — shrink the board, lower \
+                     the margin, or recentre the field"
+                ),
+            );
+        }
+
+        ui.horizontal(|ui| {
+            if ui
+                .button("⤵ board size from job")
+                .on_hover_text(
+                    "Measure the board bbox from the active side's Gerbers and fill W/H.",
+                )
+                .clicked()
+            {
+                self.fid_holes_board_size_from_job();
+            }
+            if ui
+                .add_enabled(
+                    !margin_too_big && !out_of_field,
+                    egui::Button::new("⚙ Generate fiducial holes"),
+                )
+                .on_hover_text(
+                    "Write this layout into the fiducial check and emit the holes .lbrn2 with \
+                     laser-field pre-distortion.",
+                )
+                .clicked()
+            {
+                self.fid_holes_generate();
+            }
+        });
+        ui.label(egui::RichText::new(&self.fiducials.note).weak());
+        ui.weak(NAV_HINT);
+    }
+
+    /// Measure the active side's board bbox from its Gerbers and fill the
+    /// board W/H fields (rounded to 0.01 mm, clamped to the field ranges).
+    fn fid_holes_board_size_from_job(&mut self) {
+        let (copper, outline) = self.active_gerbers();
+        let (copper, outline) = (copper.to_string(), outline.to_string());
+        match job_shapes(&copper, &outline, self.job.offset_mm) {
+            Ok((board, _cu, _ablate)) => match crate::place::bbox_size_mm(&board) {
+                Some((w, h)) => {
+                    let round2 = |v: f64| (v * 100.0).round() / 100.0;
+                    let w = round2(w).clamp(5.0, 500.0);
+                    let h = round2(h).clamp(5.0, 500.0);
+                    self.fiducials.board_w_mm = w;
+                    self.fiducials.board_h_mm = h;
+                    self.runtime.log.push(LogLine {
+                        text: format!("board size from job: {w}×{h} mm (Gerber bbox)"),
+                        err: false,
+                    });
+                }
+                None => self.runtime.log.push(LogLine {
+                    text: "board size from job: empty board region".into(),
+                    err: true,
+                }),
+            },
+            Err(e) => self.runtime.log.push(LogLine {
+                text: format!("board size from job: {e}"),
+                err: true,
+            }),
+        }
+    }
+
+    /// Compute the layout from the current board/margin + field centre, write
+    /// it into the fiducial check's layout string, and generate the holes.
+    fn fid_holes_generate(&mut self) {
+        self.sync_auto_field_center();
+        let (cx, cy) = (self.camera.field_cx_mm as f64, self.camera.field_cy_mm as f64);
+        let (w, h, margin) = (
+            self.fiducials.board_w_mm,
+            self.fiducials.board_h_mm,
+            self.fiducials.margin_mm,
+        );
+        let layout = crate::fiducial::format_layout(&crate::fiducial::board_fid_layout(
+            cx, cy, w, h, margin,
+        ));
+        self.fiducials.layout = layout.clone();
+        self.runtime.log.push(LogLine {
+            text: format!(
+                "fiducial layout updated from board {w}×{h} mm, margin {margin} mm → {layout}"
+            ),
+            err: false,
+        });
+        self.fiducial_generate_holes();
     }
 }

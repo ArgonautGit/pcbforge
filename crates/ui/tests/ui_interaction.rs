@@ -190,6 +190,21 @@ fn the_laser_field_calibration_step_is_selectable() {
 }
 
 #[test]
+fn the_fiducial_holes_calibration_step_is_selectable() {
+    let mut h = console();
+    h.get_by_label("🎯 Calibrate").click();
+    h.run();
+    h.get_by_label("4) Fiducial holes (board)").click();
+    h.run();
+    let s = h.state().debug_summary();
+    assert!(
+        s.contains("calib_mode=FidHoles")
+            && summary_line(&s, "fid_board:").contains("layout="),
+        "④ selects the fiducial-holes step and reports the board layout:\n{s}"
+    );
+}
+
+#[test]
 fn fit_feedback_visibility_toggle_is_drivable() {
     let mut h = console();
     h.get_by_label("🎯 Calibrate").click();

@@ -215,6 +215,9 @@ impl ConsoleApp {
                 search_mm: 2.0,
                 profile: crate::fiducial::ProfileKind::DarkDot,
                 out: "fid-holes.lbrn2".into(),
+                board_w_mm: 70.0,
+                board_h_mm: 50.0,
+                margin_mm: 5.0,
                 click_place: false,
                 note: "Load a frame, drag each marker near its hole, then Check.".into(),
                 rows: Vec::new(),
@@ -406,6 +409,15 @@ impl ConsoleApp {
             self.job.interval_mm,
             self.job.passes,
         );
+        // ④ auto fiducial-hole layout, resolved against the effective field
+        // centre (kept in sync with the auto toggle by `sync_auto_field_center`).
+        let fid_layout = fiducial::format_layout(&fiducial::board_fid_layout(
+            self.camera.field_cx_mm as f64,
+            self.camera.field_cy_mm as f64,
+            self.fiducials.board_w_mm,
+            self.fiducials.board_h_mm,
+            self.fiducials.margin_mm,
+        ));
         format!(
             "tab={:?} side={:?} calib_mode={:?}\n\
              gerbers: {gerbers}\n\
@@ -420,6 +432,7 @@ impl ConsoleApp {
              calib_paper: n={} pitch={:.2}mm dot={:.2}mm contrast={} out={}\n\
              calib_burn: n={} pitch={:.2}mm dot={:.2}mm contrast={} corners_marked={} edit_anchor_dots={} feedback={} origin=({:.1},{:.1})\n\
              fiducials: {} markers shape={} w={} h={} profile={} search={} out={}\n\
+             fid_board: w={} h={} margin={} layout={}\n\
              settings: {}",
             self.runtime.tab,
             self.job.side,
@@ -473,6 +486,10 @@ impl ConsoleApp {
             self.fiducials.profile.token(),
             self.fiducials.search_mm,
             base(&self.fiducials.out),
+            self.fiducials.board_w_mm,
+            self.fiducials.board_h_mm,
+            self.fiducials.margin_mm,
+            fid_layout,
             self.runtime.settings_error.as_deref().unwrap_or("saved"),
         )
     }

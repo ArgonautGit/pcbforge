@@ -209,7 +209,7 @@ impl ConsoleApp {
             crate::fiducial::ShapeKind::Circle => 0.0,
             crate::fiducial::ShapeKind::Rect => self.fiducials.height_mm,
         };
-        self.run_verb(&[
+        let mut args: Vec<String> = vec![
             "fid-holes".into(),
             "--out".into(),
             out,
@@ -221,7 +221,25 @@ impl ConsoleApp {
             format!("{}", self.fiducials.diameter_mm),
             "--h-mm".into(),
             format!("{h_mm}"),
-        ]);
+        ];
+        // Pre-distort with the laser-field map when a usable calibration + map
+        // file exist; otherwise burn uncorrected with a warning (mirrors the
+        // job emit path).
+        let field_path = self.field_map_path();
+        if self.has_usable_field_cal() && field_path.exists() {
+            args.push("--field-map".into());
+            args.push(field_path.to_string_lossy().into_owned());
+        } else {
+            self.runtime.log.push(LogLine {
+                text:
+                    "fid-holes: no accepted step 1 (Camera lens) + step 3 (Laser field) \
+                     calibration — holes will burn without lens correction (accept a laser field \
+                     fit first)"
+                        .into(),
+                err: true,
+            });
+        }
+        self.run_verb(&args);
         self.fiducials.note =
             "generating fiducial holes at the expected positions — see Log for the file path".into();
     }
