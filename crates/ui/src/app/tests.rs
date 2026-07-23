@@ -2517,6 +2517,42 @@ fn etch_and_run_arms_an_absolute_pending_path() {
     assert!(app.debug_summary().contains("lightburn=pending"));
 }
 
+/// "Generate + burn holes" queues an ABSOLUTE holes path once the export
+/// launches, so `pump_verb` chains the LightBurn load + START — the holes
+/// burn immediately instead of waiting for a manual load-and-press-play.
+#[test]
+fn generate_holes_arms_an_absolute_pending_burn() {
+    let mut app = ConsoleApp::new(tmp_db(), vec!["true".into()]);
+    app.fiducial_generate_holes();
+    let pending = app
+        .runtime
+        .pending_lightburn
+        .as_ref()
+        .expect("a LightBurn burn was queued");
+    assert!(
+        pending.is_absolute(),
+        "queued path is absolute: {pending:?}"
+    );
+    assert!(
+        pending.ends_with("fid-holes.lbrn2"),
+        "queued path is the holes output: {pending:?}"
+    );
+    assert!(app.debug_summary().contains("lightburn=pending"));
+}
+
+/// A refused holes generation (bad layout) arms no burn.
+#[test]
+fn generate_holes_guard_refusal_arms_no_burn() {
+    let mut app = ConsoleApp::new(tmp_db(), vec!["true".into()]);
+    app.fiducials.layout = "not a layout".into();
+    app.fiducial_generate_holes();
+    assert!(
+        app.runtime.pending_lightburn.is_none(),
+        "nothing queued when the layout is rejected"
+    );
+    assert!(app.debug_summary().contains("lightburn=idle"));
+}
+
 /// The placement guard (no frame/job loaded) refuses before the export starts,
 /// so the run_after click arms nothing.
 #[test]

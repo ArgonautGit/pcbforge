@@ -2251,3 +2251,19 @@ applied to both Emit and Place's "Etch here". `wobbleStep`/`wobbleSize` are
 inferred field names (no sample varies them — flagged in lbrn2-schema.md for
 verification on first live use). The golden test still reproduces the
 operator's base sample by setting wobble explicitly.
+
+## 2026-07-23 — Fiducial holes burn immediately after generation
+
+"⚙ Generate holes" only wrote the .lbrn2; the operator then had to open
+LightBurn, load the file, and press start by hand — a gap where the wrong
+file (or a stale one) could be run. Both hole generators (the Fiducial tab
+and the ④ Fiducial-holes calibration step) now chain the existing LightBurn
+automation after the export: the `fid-holes` verb finishing arms the same
+`pending_lightburn` path as Place's "Etch + run", which selects the Place-tab
+device, FORCELOADs the file, gates on an idle STATUS, STARTs, and polls to
+completion — all reported in the log. The queue only arms when the verb
+actually launched, the queued path is absolutized without canonicalizing
+(\\?\ upsets FORCELOAD), and the buttons (renamed "Generate + burn …")
+disable while a run is in flight, like Etch + run. If LightBurn isn't open
+the run fails with the friendly not-responding note and the file is still on
+disk for a manual run.

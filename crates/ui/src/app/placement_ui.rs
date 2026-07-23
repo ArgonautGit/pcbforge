@@ -492,13 +492,11 @@ impl ConsoleApp {
             }
             // One-click: export, then load + run it in LightBurn. Disabled while
             // a run is in flight so a second click can't stack a second job.
-            let lb_running = self
-                .runtime
-                .lightburn_run
-                .as_ref()
-                .is_some_and(|r| !r.finished());
             if ui
-                .add_enabled(!lb_running, egui::Button::new("▶ Etch + run in LightBurn"))
+                .add_enabled(
+                    !self.lightburn_busy(),
+                    egui::Button::new("▶ Etch + run in LightBurn"),
+                )
                 .on_hover_text(
                     "Runs the register export, then drives LightBurn over its UDP \
                      automation interface to load the file and START the job — \

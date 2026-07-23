@@ -135,6 +135,15 @@ impl ConsoleApp {
         }
     }
 
+    /// A LightBurn run is currently in flight (loading/starting/running) —
+    /// used to disable the buttons that would start another on top of it.
+    pub(super) fn lightburn_busy(&self) -> bool {
+        self.runtime
+            .lightburn_run
+            .as_ref()
+            .is_some_and(|r| !r.finished())
+    }
+
     /// The place-section token for `debug_summary`: `idle` (nothing queued or
     /// running), `pending` (queued behind the export verb), or the active/last
     /// run's [`token`](LightburnRun::token).

@@ -279,9 +279,11 @@ impl ConsoleApp {
     }
 
     /// Emit fiducial holes at the expected positions by shelling `pcbforge
-    /// fid-holes` — the operator burns them, then images them back for the
-    /// check. Uses the same layout string the check drives from, so the burned
-    /// holes land exactly where detection looks for them.
+    /// fid-holes`, then BURN them: once the export finishes, the queued
+    /// LightBurn run loads the file and STARTs it (see
+    /// [`pump_verb`](Self::pump_verb)) — no manual load-and-press-play. Uses
+    /// the same layout string the check drives from, so the burned holes land
+    /// exactly where detection looks for them.
     pub(super) fn fiducial_generate_holes(&mut self) {
         if let Err(e) = crate::fiducial::parse_layout(&self.fiducials.layout) {
             self.fiducials.note = format!("layout: {e}");
@@ -301,7 +303,7 @@ impl ConsoleApp {
         let mut args: Vec<String> = vec![
             "fid-holes".into(),
             "--out".into(),
-            out,
+            out.clone(),
             "--layout".into(),
             self.fiducials.layout.clone(),
             "--shape".into(),
@@ -328,9 +330,33 @@ impl ConsoleApp {
                 err: true,
             });
         }
-        self.run_verb(&args);
+        let started = self.run_verb(&args);
+        // Chain the burn only when the export actually launched — a refused
+        // click (a job already running) must not arm the chain against a file
+        // this click never wrote. Resolve to an ABSOLUTE path without
+        // canonicalizing: the file may not exist yet, and \\?\ prefixes upset
+        // LightBurn's FORCELOAD (same rule as the placement export).
+        if started {
+            match std::path::absolute(std::path::Path::new(&out)) {
+                Ok(abs) => {
+                    self.runtime.pending_lightburn = Some(abs);
+                    self.runtime.log.push(LogLine {
+                        text: "queued: load + BURN the holes in LightBurn once the export finishes"
+                            .into(),
+                        err: false,
+                    });
+                }
+                Err(e) => self.runtime.log.push(LogLine {
+                    text: format!(
+                        "fid-holes: couldn't resolve an absolute path for the LightBurn run ({e}) \
+                         — the holes file will still be written"
+                    ),
+                    err: true,
+                }),
+            }
+        }
         self.fiducials.note =
-            "generating fiducial holes at the expected positions — see Log for the file path".into();
+            "burning fiducial holes at the expected positions — see Log for progress".into();
     }
 
     /// Run detection on the current in-memory frame around the search markers,
@@ -664,10 +690,14 @@ impl ConsoleApp {
                 self.clear_fid_markers();
             }
             if ui
-                .button("⚙ Generate holes")
+                .add_enabled(
+                    !self.lightburn_busy(),
+                    egui::Button::new("⚙ Generate + burn holes"),
+                )
                 .on_hover_text(
-                    "Burn a .lbrn2 with a hole at each expected position above — the same \
-                     layout the check uses.",
+                    "Write a .lbrn2 with a hole at each expected position above (the same \
+                     layout the check uses), then drive LightBurn to load and START it. \
+                     LightBurn must be open with the Place-tab device configured.",
                 )
                 .clicked()
             {
@@ -684,7 +714,7 @@ impl ConsoleApp {
             }
         });
         ui.label(egui::RichText::new(&self.fiducials.note).weak());
-        ui.weak("⚙ Generate holes burns holes at the expected positions above — same layout the check uses.");
+        ui.weak("⚙ Generate + burn holes writes the .lbrn2 AND runs it in LightBurn at the expected positions above — same layout the check uses.");
         ui.weak("Click each ✛ onto its hole in layout order; the detector searches locally around it. The typed px/mm only seeds the search — registration is anchored to the measured scale.");
         ui.weak(NAV_HINT);
         ui.separator();

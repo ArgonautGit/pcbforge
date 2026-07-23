@@ -1530,12 +1530,13 @@ impl ConsoleApp {
             }
             if ui
                 .add_enabled(
-                    !margin_too_big && !out_of_field,
-                    egui::Button::new("⚙ Generate fiducial holes"),
+                    !margin_too_big && !out_of_field && !self.lightburn_busy(),
+                    egui::Button::new("⚙ Generate + burn fiducial holes"),
                 )
                 .on_hover_text(
-                    "Write this layout into the fiducial check and emit the holes .lbrn2 with \
-                     laser-field pre-distortion.",
+                    "Write this layout into the fiducial check, emit the holes .lbrn2 with \
+                     laser-field pre-distortion, then drive LightBurn to load and START it. \
+                     LightBurn must be open with the Place-tab device configured.",
                 )
                 .clicked()
             {
