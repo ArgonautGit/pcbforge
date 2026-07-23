@@ -334,6 +334,45 @@ fn etch_and_run_in_lightburn_button_is_present_and_guards_without_a_job() {
     );
 }
 
+/// The Place tab carries the no-burn drill-emit control: the button and its
+/// path fields are present and labelled (drivable), the summary reports the
+/// drill output default, and clicking without a job guards without ever
+/// queueing a LightBurn run.
+#[test]
+fn place_tab_emits_drill_holes_without_a_burn() {
+    let mut h = console();
+    h.get_by_label_contains("Place on board").click();
+    h.run();
+    let s = h.state().debug_summary();
+    assert!(
+        summary_line(&s, "place:").contains("drill_out=drill.lbrn2"),
+        "place line reports the drill output default:\n{s}"
+    );
+    // Labelled inputs for the drill file(s) and output.
+    assert!(
+        h.query_by_label("drill .drl").is_some(),
+        "the drill-file field label is present"
+    );
+    assert!(
+        h.query_by_label("drill out .lbrn2").is_some(),
+        "the drill-output field label is present"
+    );
+    // The button exists and is honest about not burning.
+    assert!(
+        h.query_by_label("⤓ Emit drill holes (no burn)").is_some(),
+        "the no-burn drill emit button must be present and labelled"
+    );
+    // Clicking with no frame + job loaded hits the guard: no file written, and
+    // — the point of the button — LightBurn stays idle with nothing queued.
+    h.get_by_label("⤓ Emit drill holes (no burn)").click();
+    h.run();
+    assert!(
+        summary_line(&h.state().debug_summary(), "place:").contains("lightburn=idle"),
+        "drill emit never arms a LightBurn run:\n{}",
+        h.state().debug_summary()
+    );
+}
+
 #[test]
 fn lightburn_device_field_is_labelled_and_editable() {
     let mut h = console();

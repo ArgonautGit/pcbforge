@@ -2265,3 +2265,31 @@ removing markers must not move an already-registered job.
   verb only extracts and emits the geometry. Whether the UV laser actually
   cuts hole outlines through FR4, and at what recipe, is the operator's
   call — defaults mirror the other emit verbs.
+
+## 2026-07-23 — Place tab: "Emit drill holes (no burn)"
+
+- New Place-tab control emitting ONLY the drill-hole geometry at the current
+  placement: `drill .drl` input (`;`-separated — KiCad exports PTH and NPTH
+  as two files), `drill out .lbrn2` output (bare names land next to the
+  drill file), and a `⤓ Emit drill holes (no burn)` button. The button
+  writes the file and stops: it never touches `pending_lightburn`, so the
+  etch/run chain can't fire — the operator opens and starts the job in
+  LightBurn themselves.
+- Runs in-process (`ingest::excellon` → `cam::drill::drill_polys` →
+  `Placement::affine()` as a `cam::register::Affine2` →
+  `transform_shapes[_field]` → `cam::lbrn2::write_lbrn2`) instead of
+  shelling a verb: `drill-emit` only takes a translation origin, so a
+  rotated placement is not expressible through the CLI. The affine layouts
+  match ([a,b,c,d,e,f] row-major), and drill files share the Gerber frame,
+  so the copper job's placement affine positions the holes directly — no
+  normalization, the placement IS the position, exactly like "Etch here".
+- Field-warp fires under the same conditions as "Etch here" (valid
+  calibration for the loaded frame + the map file), reading the same
+  `pcbforge-field-map.txt` with the CLI's 0.25 mm segment default, so the
+  two exports land on the same physical geometry. An unreadable map file
+  REFUSES the emit rather than silently exporting unwarped — the operator
+  believes exports are warped while that file exists.
+- Same guards as the etch buttons: back side refused (no mirror pass —
+  wrong chirality at the wrong spot, silently), job + frame required (the
+  pose is meaningless before a Load). Recipe = Job-tab params over the
+  register verb's default 20 % power, layer name `DRILL`.

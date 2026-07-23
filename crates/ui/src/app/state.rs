@@ -274,6 +274,12 @@ pub(super) struct PlacementState {
     pub(super) field_correct: bool,
     /// LightBurn device name for the one-click "Etch + run in LightBurn".
     pub(super) lightburn_device: String,
+    /// Excellon drill file path(s) for "Emit drill holes" — `;`-separated
+    /// (KiCad exports PTH and NPTH holes as two files).
+    pub(super) drills: String,
+    /// Output `.lbrn2` path for "Emit drill holes" — separate from the etch
+    /// output so the two exports never overwrite each other.
+    pub(super) drill_lbrn2: String,
 }
 
 pub(super) struct ArState {

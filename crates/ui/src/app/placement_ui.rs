@@ -1,5 +1,9 @@
 use super::*;
 
+/// Max physical edge segment before field pre-warping drill geometry, mm —
+/// matches the CLI's `--field-seg-mm` default the etch path inherits.
+const DRILL_FIELD_SEG_MM: f64 = 0.25;
+
 impl ConsoleApp {
     /// Move the placement so its pivot's **pixel** position shifts by
     /// `(dpx, dpy)` frame pixels. Dragging felt wrong under perspective because
@@ -436,6 +440,231 @@ impl ConsoleApp {
         }
     }
 
+    /// Absolute output path for "Emit drill holes": an absolute `drill_lbrn2`
+    /// as-is, a bare filename next to the (first) drill file — beside the
+    /// operator's inputs, like [`Self::resolve_place_output`].
+    fn resolve_drill_output(&self, first_drill: &str) -> PathBuf {
+        let raw = PathBuf::from(crate::clean_path(&self.placement.drill_lbrn2));
+        if raw.is_absolute() {
+            return raw;
+        }
+        match PathBuf::from(first_drill).parent() {
+            Some(dir) if !dir.as_os_str().is_empty() => dir.join(&raw),
+            _ => raw,
+        }
+    }
+
+    /// Emit ONLY the drill-hole geometry (round holes + G85 slots) at the
+    /// current manual placement as a `.lbrn2` — and never queue a LightBurn
+    /// run: the file is written for the operator to open and start themselves
+    /// ([`Self::emit_at_placement`] owns the etch/run chain; this path never
+    /// touches `pending_lightburn`).
+    ///
+    /// Runs in-process (Excellon → `cam::drill::drill_polys` → the placement
+    /// affine → `cam::lbrn2`) rather than shelling `drill-emit`: the CLI verb
+    /// only takes a translation origin, so a rotated placement is not
+    /// expressible through it.
+    pub(super) fn emit_drill_at_placement(&mut self) {
+        // Same back-side refusal as "Etch here": this path applies the FRONT
+        // placement affine with no mirror pass, so it would burn the hole
+        // pattern with the wrong chirality at the wrong spot, silently.
+        if self.job.side == Side::Back {
+            self.runtime.log.push(LogLine {
+                text: "place: back-side drill emit isn't supported yet — the placement \
+                       can't mirror, so it would burn the hole pattern unmirrored at \
+                       the wrong spot. Switch to the front side."
+                    .into(),
+                err: true,
+            });
+            return;
+        }
+        // The pose (pivot, tx/ty/rot) only means something once a job is
+        // loaded and placed — same precondition as the etch buttons.
+        if self.placement.job.is_empty() {
+            self.runtime.log.push(LogLine {
+                text: "place: load a frame + job first".into(),
+                err: true,
+            });
+            return;
+        }
+        let drill_paths: Vec<String> = self
+            .placement
+            .drills
+            .split(';')
+            .map(crate::clean_path)
+            .filter(|p| !p.trim().is_empty())
+            .collect();
+        if drill_paths.is_empty() {
+            self.runtime.log.push(LogLine {
+                text: "place: set a drill file (.drl) first — KiCad exports PTH and \
+                       NPTH holes as two files; list both separated by ;"
+                    .into(),
+                err: true,
+            });
+            return;
+        }
+        let Some(dimensions) = self
+            .placement
+            .frame_img
+            .as_ref()
+            .map(image::GenericImageView::dimensions)
+        else {
+            self.runtime.log.push(LogLine {
+                text: "place: load the current camera frame before export".into(),
+                err: true,
+            });
+            return;
+        };
+        // Every hole from every file, slots kept lossless.
+        let mut entries: Vec<cam::process::DrillEntry> = Vec::new();
+        let (mut holes, mut slots) = (0usize, 0usize);
+        for path in &drill_paths {
+            let ops = match ingest::excellon::load_excellon_full(std::path::Path::new(path)) {
+                Ok(ops) => ops,
+                Err(e) => {
+                    self.placement.note = format!("drill file {path}: {e}");
+                    self.runtime.log.push(LogLine {
+                        text: format!("place: drill file {path}: {e}"),
+                        err: true,
+                    });
+                    return;
+                }
+            };
+            for op in &ops {
+                entries.push(match *op {
+                    ingest::excellon::DrillOp::Hole {
+                        center,
+                        diameter_nm,
+                    } => {
+                        holes += 1;
+                        cam::process::DrillEntry {
+                            x_nm: center.x,
+                            y_nm: center.y,
+                            diameter_nm,
+                            slot_end: None,
+                        }
+                    }
+                    ingest::excellon::DrillOp::Slot { a, b, diameter_nm } => {
+                        slots += 1;
+                        cam::process::DrillEntry {
+                            x_nm: a.x,
+                            y_nm: a.y,
+                            diameter_nm,
+                            slot_end: Some((b.x, b.y)),
+                        }
+                    }
+                });
+            }
+        }
+        let hole_polys = cam::drill::drill_polys(&entries);
+        if hole_polys.is_empty() {
+            self.runtime.log.push(LogLine {
+                text: "place: the drill file(s) contain no holes".into(),
+                err: true,
+            });
+            return;
+        }
+        // Field-warp under exactly the conditions "Etch here" would (a valid
+        // calibration for THIS frame + the map file), so the two exports land
+        // on the same physical geometry.
+        let field_path = self.field_map_path();
+        let use_field = match self.nonlinear_maps_for_frame(dimensions) {
+            Ok(Some(_)) => field_path.exists(),
+            Ok(None) => false,
+            Err(error) => {
+                self.runtime.log.push(LogLine {
+                    text: format!(
+                        "place: field-warp calibration is stale or invalid ({error}) — \
+                         exporting UNWARPED drill geometry"
+                    ),
+                    err: true,
+                });
+                false
+            }
+        };
+        self.placement.field_correct = use_field;
+        // Drill files share the Gerber frame, so the copper job's placement
+        // affine positions the holes on the physical board directly.
+        let affine = cam::register::Affine2 {
+            m: self.placement().affine(),
+        };
+        let placed = if use_field {
+            let field = match std::fs::read_to_string(&field_path)
+                .map_err(|e| e.to_string())
+                .and_then(|s| vision::FieldMap::parse(&s).map_err(|e| e.to_string()))
+            {
+                Ok(f) => f,
+                Err(e) => {
+                    // Refuse rather than silently falling back: the operator
+                    // believes exports are warped while this file is broken.
+                    self.runtime.log.push(LogLine {
+                        text: format!(
+                            "place: field map {} is unreadable ({e}) — drill emit \
+                             refused; fix or remove the file",
+                            field_path.display()
+                        ),
+                        err: true,
+                    });
+                    return;
+                }
+            };
+            cam::register::transform_shapes_field(
+                &hole_polys,
+                &affine,
+                DRILL_FIELD_SEG_MM,
+                |x, y| field.precompensate(x, y),
+            )
+        } else {
+            self.runtime.log.push(LogLine {
+                text: "place: no accepted step 1 (Camera lens) + step 3 (Laser field) \
+                       calibration — exporting UNWARPED drill geometry"
+                    .into(),
+                err: true,
+            });
+            cam::register::transform_shapes(&hole_polys, &affine)
+        };
+        // Same recipe the etch path bakes in: the Job-tab process params over
+        // the register verb's default power.
+        let params = pcb_core::AblationParams {
+            power_pct: 20.0,
+            speed_mm_s: self.job.speed_mm_s,
+            frequency_khz: self.job.frequency_khz,
+            pulse_ns: self.job.pulse_ns,
+            passes: self.job.passes,
+        };
+        let mut layer =
+            cam::lbrn2::EmitLayer::fill("DRILL", params, cam::lbrn2::polys_to_elems(&placed));
+        layer.interval_mm = self.job.interval_mm;
+        let out_path = self.resolve_drill_output(&drill_paths[0]);
+        let out = out_path.to_string_lossy().into_owned();
+        if let Err(e) =
+            cam::lbrn2::write_lbrn2(&self.placement.lightburn_device, &[layer], &out_path)
+        {
+            self.placement.note = format!("drill emit: {e}");
+            self.runtime.log.push(LogLine {
+                text: format!("place: drill emit {out}: {e}"),
+                err: true,
+            });
+            return;
+        }
+        let field_note = if use_field {
+            " · field-warped geometry"
+        } else {
+            " · UNWARPED geometry (no field calibration)"
+        };
+        self.placement.note =
+            format!("drill holes → {out} · {holes} hole(s) + {slots} slot(s) — no burn started");
+        self.runtime.log.push(LogLine {
+            text: format!(
+                "Drill holes → {out}\n  {holes} hole(s) + {slots} slot(s) placed at \
+                 ({:.2}, {:.2}) mm, {:.1}°{field_note} — file written only, NO burn \
+                 started (open it in LightBurn yourself)",
+                self.placement.tx_mm, self.placement.ty_mm, self.placement.rot_deg
+            ),
+            err: false,
+        });
+    }
+
     pub(super) fn place_view(&mut self, ui: &mut egui::Ui) {
         let mut changed = false;
         egui::Grid::new("place-form")
@@ -470,6 +699,28 @@ impl ConsoleApp {
                     "Device name for \"Etch + run in LightBurn\" — must match a \
                      configured LightBurn device (the LASER: automation command \
                      selects it before loading the file).",
+                );
+                ui.end_row();
+                let drl = ui.label("drill .drl");
+                ui.add(egui::TextEdit::singleline(&mut self.placement.drills).desired_width(240.0))
+                    .labelled_by(drl.id)
+                    .on_hover_text(
+                        "Excellon drill file(s) for \"Emit drill holes\" — KiCad \
+                         exports PTH and NPTH holes as two files; list both \
+                         separated by ; to get every hole.",
+                    );
+                ui.end_row();
+                let drl_out = ui.label("drill out .lbrn2");
+                ui.add(
+                    egui::TextEdit::singleline(&mut self.placement.drill_lbrn2)
+                        .desired_width(240.0),
+                )
+                .labelled_by(drl_out.id)
+                .on_hover_text(
+                    "Where \"Emit drill holes\" writes the hole-geometry job — \
+                     separate from the etch output so they never overwrite each \
+                     other. A bare filename lands next to the drill file; the log \
+                     prints the full path it wrote.",
                 );
                 ui.end_row();
             });
@@ -523,6 +774,21 @@ impl ConsoleApp {
                  physical→commanded. Without one, \"Etch here\" exports the placement \
                  unwarped — field accuracy is then the machine's own correction.",
             );
+        });
+        ui.horizontal(|ui| {
+            if ui
+                .button("⤓ Emit drill holes (no burn)")
+                .on_hover_text(
+                    "Writes ONLY the drill-hole geometry (round holes + slots) from \
+                     the drill .drl file(s) at this placement to the drill out \
+                     .lbrn2 — the file is written for you to open in LightBurn; it \
+                     never starts a burn.",
+                )
+                .clicked()
+            {
+                self.emit_drill_at_placement();
+            }
+            ui.weak("hole pattern at the placed pose — file only, never runs the laser");
         });
         if self.calibration.field.is_some() && !self.calibration.field_accepted {
             ui.colored_label(
