@@ -513,6 +513,85 @@ enum Command {
         #[arg(long, default_value = "Edge.Cuts")]
         outline_layer: String,
     },
+    /// Extract pure drill-hole geometry (round holes + G85 slots) from
+    /// Excellon drill files — or straight from a KiCad board via kicad-cli —
+    /// and emit it as a LightBurn `.lbrn2` job of hole outlines.
+    DrillEmit {
+        /// Excellon drill file (.drl); repeat for several (KiCad exports PTH
+        /// and NPTH holes as two separate files — pass both to get every
+        /// hole). Alternative to --board.
+        #[arg(long, conflicts_with = "board")]
+        drills: Vec<PathBuf>,
+
+        /// KiCad board (`.kicad_pcb`) or a project directory: exports the
+        /// drill file(s) via kicad-cli and uses them all (PTH + NPTH).
+        #[arg(long)]
+        board: Option<PathBuf>,
+
+        /// Output `.lbrn2` path.
+        #[arg(long)]
+        out: PathBuf,
+
+        /// Board outline Gerber (Edge.Cuts) pinning the workspace frame: the
+        /// board outline's corner (not the drill pattern's) lands on the
+        /// origin — the same corner `emit` normalizes to — so the drill job
+        /// stays co-registered with the copper job from the same board.
+        /// Export the Gerber and the drill file with the same origin
+        /// convention. Without it the drill pattern's own corner lands on
+        /// the origin.
+        #[arg(long)]
+        outline: Option<PathBuf>,
+
+        /// Hole rendering: "fill" ablates each hole as a filled disc, "line"
+        /// traces each hole outline as a vector cut.
+        #[arg(long, default_value = "fill")]
+        mode: String,
+
+        /// LightBurn device name (must match a configured device).
+        #[arg(long, default_value = lbrn2::DEFAULT_DEVICE)]
+        device: String,
+
+        // --- process recipe (see docs/lbrn2-schema.md) ---
+        /// Max power %.
+        #[arg(long, default_value_t = 20.0)]
+        power_pct: f64,
+        /// Scan speed, mm/s.
+        #[arg(long, default_value_t = 1000.0)]
+        speed_mm_s: f64,
+        /// Frequency, kHz (written to the file in Hz).
+        #[arg(long, default_value_t = 30.0)]
+        frequency_khz: f64,
+        /// MOPA Q-pulse width, ns (a fluence knob; 0 = source default).
+        #[arg(long, default_value_t = 1)]
+        pulse_ns: u32,
+        /// Passes.
+        #[arg(long, default_value_t = 1)]
+        passes: u32,
+        /// Fill line interval, mm (fill mode only).
+        #[arg(long, default_value_t = 0.03)]
+        interval_mm: f64,
+
+        // --- placement ---
+        /// Target x for the job's anchor, mm. The anchor is the board
+        /// outline's corner/center when --outline is given, else the drill
+        /// pattern's own.
+        #[arg(long, default_value_t = 0.0)]
+        origin_x: f64,
+        /// Target y for the job's anchor, mm. See --origin-x.
+        #[arg(long, default_value_t = 0.0)]
+        origin_y: f64,
+        /// Anchor the bounding-box center rather than the lower-left corner.
+        #[arg(long)]
+        center: bool,
+
+        /// Laser-field calibration map (see `emit --field-map`); without it
+        /// the holes are emitted unwarped (a warning is printed).
+        #[arg(long)]
+        field_map: Option<PathBuf>,
+        /// Maximum physical edge segment before field pre-warping, mm.
+        #[arg(long, default_value_t = 0.25)]
+        field_seg_mm: f64,
+    },
 }
 
 fn main() -> ExitCode {
@@ -750,6 +829,45 @@ fn run(cli: &Cli) -> Result<(), Box<dyn std::error::Error>> {
             copper_layer,
             outline_layer,
         } => gerbers_cmd(project, out, copper_layer, outline_layer),
+        Command::DrillEmit {
+            drills,
+            board,
+            out,
+            outline,
+            mode,
+            device,
+            power_pct,
+            speed_mm_s,
+            frequency_khz,
+            pulse_ns,
+            passes,
+            interval_mm,
+            origin_x,
+            origin_y,
+            center,
+            field_map,
+            field_seg_mm,
+        } => drill_emit_cmd(DrillEmitArgs {
+            drills,
+            board: board.as_deref(),
+            out,
+            outline: outline.as_deref(),
+            mode,
+            device,
+            params: AblationParams {
+                power_pct: *power_pct,
+                speed_mm_s: *speed_mm_s,
+                frequency_khz: *frequency_khz,
+                pulse_ns: *pulse_ns,
+                passes: *passes,
+            },
+            interval_mm: *interval_mm,
+            origin_x: *origin_x,
+            origin_y: *origin_y,
+            center: *center,
+            field_map: field_map.as_deref(),
+            field_seg_mm: *field_seg_mm,
+        }),
     }
 }
 
@@ -1072,11 +1190,12 @@ fn fid_holes_polys(
     }
 }
 
-/// Apply the laser-field pre-distortion to fiducial-hole polys, mirroring the
-/// `emit` verb: a supplied `--field-map` densifies and pre-warps every edge
+/// Apply the laser-field pre-distortion to hole polys, mirroring the `emit`
+/// verb: a supplied `--field-map` densifies and pre-warps every edge
 /// physical→commanded so the beam lands on the intended geometry; its absence
-/// emits the holes unwarped (with a warning).
-fn warp_fid_holes(
+/// emits the holes unwarped (with a warning). `tag` prefixes the log lines.
+fn warp_polys(
+    tag: &str,
     polys: Vec<pcb_core::Poly>,
     field_map: Option<&std::path::Path>,
     field_seg_mm: f64,
@@ -1086,7 +1205,7 @@ fn warp_fid_holes(
             let field = load_field_map(path)?;
             validate_field_segment(field_seg_mm)?;
             eprintln!(
-                "fid holes: field warp on (fit RMS {:.1} µm, worst {:.1} µm), edges ≤{:.2} mm",
+                "{tag}: field warp on (fit RMS {:.1} µm, worst {:.1} µm), edges ≤{:.2} mm",
                 field.rms_um, field.max_um, field_seg_mm
             );
             cam::register::transform_shapes_field(
@@ -1098,7 +1217,7 @@ fn warp_fid_holes(
         }
         None => {
             eprintln!(
-                "fid holes: WARNING — no --field-map: hole geometry is NOT \
+                "{tag}: WARNING — no --field-map: hole geometry is NOT \
                  field-warped; the burned holes will not be corrected for lens \
                  distortion (positional accuracy depends on the machine's own \
                  correction)"
@@ -1140,7 +1259,7 @@ fn fid_holes_cmd(
     let positions = parse_fid_layout(layout)?;
 
     let polys = fid_holes_polys(shape, w_mm, resolved_h, &positions);
-    let polys = warp_fid_holes(polys, field_map, field_seg_mm)?;
+    let polys = warp_polys("fid holes", polys, field_map, field_seg_mm)?;
     let params = AblationParams {
         power_pct: 20.0,
         speed_mm_s: 1000.0,
@@ -1159,6 +1278,178 @@ fn fid_holes_cmd(
     );
     // Print the absolute path so it's findable regardless of the working dir.
     let abs = std::path::absolute(out).unwrap_or_else(|_| out.to_path_buf());
+    println!("wrote {}", abs.display());
+    Ok(())
+}
+
+struct DrillEmitArgs<'a> {
+    drills: &'a [PathBuf],
+    board: Option<&'a std::path::Path>,
+    out: &'a std::path::Path,
+    outline: Option<&'a std::path::Path>,
+    mode: &'a str,
+    device: &'a str,
+    params: AblationParams,
+    interval_mm: f64,
+    origin_x: f64,
+    origin_y: f64,
+    center: bool,
+    field_map: Option<&'a std::path::Path>,
+    field_seg_mm: f64,
+}
+
+/// Bounding box over every vertex of `polys` (outer rings and holes), nm.
+fn polys_bbox(polys: &[pcb_core::Poly]) -> Option<((Nm, Nm), (Nm, Nm))> {
+    let mut pts = polys
+        .iter()
+        .flat_map(|p| p.outer.iter().chain(p.holes.iter().flatten()));
+    let first = pts.next()?;
+    let (mut min, mut max) = ((first.x, first.y), (first.x, first.y));
+    for p in pts {
+        min = (min.0.min(p.x), min.1.min(p.y));
+        max = (max.0.max(p.x), max.1.max(p.y));
+    }
+    Some((min, max))
+}
+
+/// Rigidly translate every ring of `polys` by `(dx, dy)` nm.
+fn translate_polys(polys: &[pcb_core::Poly], dx: Nm, dy: Nm) -> Vec<pcb_core::Poly> {
+    let map = |p: &pcb_core::P| pcb_core::P::new(p.x + dx, p.y + dy);
+    polys
+        .iter()
+        .map(|p| pcb_core::Poly {
+            outer: p.outer.iter().map(map).collect(),
+            holes: p
+                .holes
+                .iter()
+                .map(|h| h.iter().map(map).collect())
+                .collect(),
+        })
+        .collect()
+}
+
+/// `pcbforge drill-emit` — pure drill-hole geometry (Excellon, or a KiCad
+/// board via kicad-cli) as a LightBurn `.lbrn2` job: one closed outline per
+/// round hole (circle) or G85 slot (capsule).
+fn drill_emit_cmd(a: DrillEmitArgs) -> Result<(), Box<dyn std::error::Error>> {
+    if a.mode != "fill" && a.mode != "line" {
+        return Err(format!("--mode must be \"fill\" or \"line\", got {:?}", a.mode).into());
+    }
+    let files: Vec<PathBuf> = if !a.drills.is_empty() {
+        a.drills.to_vec()
+    } else if let Some(board) = a.board {
+        let kicad = ingest::kicad_cli::KicadCli::discover()
+            .map_err(|e| format!("--board needs kicad-cli to export the drill files: {e}"))?;
+        let board = ingest::kicad_cli::resolve_board(board)?;
+        let tmp = std::env::temp_dir().join(format!("pcbforge-drill-{}", std::process::id()));
+        std::fs::create_dir_all(&tmp)?;
+        kicad.export_drill(&board, &tmp)?
+    } else {
+        return Err(
+            "supply --drills <file.drl> (repeatable — KiCad splits PTH/NPTH \
+             into two files) or --board <board.kicad_pcb>"
+                .into(),
+        );
+    };
+
+    // Every hole from every file, slots kept lossless (KiCad's PTH/NPTH split
+    // is two files; both end up here).
+    let mut entries: Vec<cam::process::DrillEntry> = Vec::new();
+    let (mut holes, mut slots) = (0usize, 0usize);
+    for path in &files {
+        let ops = ingest::excellon::load_excellon_full(path)
+            .map_err(|e| format!("{}: {e}", path.display()))?;
+        let start = entries.len();
+        for op in &ops {
+            entries.push(match *op {
+                ingest::excellon::DrillOp::Hole {
+                    center,
+                    diameter_nm,
+                } => {
+                    holes += 1;
+                    cam::process::DrillEntry {
+                        x_nm: center.x,
+                        y_nm: center.y,
+                        diameter_nm,
+                        slot_end: None,
+                    }
+                }
+                ingest::excellon::DrillOp::Slot {
+                    a: s,
+                    b,
+                    diameter_nm,
+                } => {
+                    slots += 1;
+                    cam::process::DrillEntry {
+                        x_nm: s.x,
+                        y_nm: s.y,
+                        diameter_nm,
+                        slot_end: Some((b.x, b.y)),
+                    }
+                }
+            });
+        }
+        eprintln!("drill: {}: {} op(s)", path.display(), entries.len() - start);
+    }
+    if entries.is_empty() {
+        return Err("the drill file(s) contain no holes".into());
+    }
+
+    let polys = cam::drill::drill_polys(&entries);
+    if polys.is_empty() {
+        return Err("the drill file(s) contain no drillable holes (zero diameters?)".into());
+    }
+
+    // Frame: with --outline, pin to the board outline's corner (the corner
+    // `emit` normalizes to) so both jobs land identically; else normalize to
+    // the drill pattern itself. Placement then moves the chosen anchor to
+    // --origin-x/-y — a pure translation, like `emit` (no flip: the drill
+    // frame is the Gerber frame, y-up but offset negative).
+    let target = (mm_to_nm(a.origin_x), mm_to_nm(a.origin_y));
+    let polys = match a.outline {
+        Some(p) => {
+            let region =
+                cam::noncopper::board_region_from_outline(&ingest::gerber::load_gerber(p)?.polys);
+            let Some((min, max)) = polys_bbox(&region) else {
+                return Err(format!("outline {} encloses no area", p.display()).into());
+            };
+            // Anchor on the board region, not the drill bbox, so placement
+            // matches an `emit` of the same board with the same flags.
+            let anchor = if a.center {
+                (min.0 + (max.0 - min.0) / 2, min.1 + (max.1 - min.1) / 2)
+            } else {
+                min
+            };
+            translate_polys(&polys, target.0 - anchor.0, target.1 - anchor.1)
+        }
+        None => {
+            let polys = lbrn2::normalize_frame(&polys);
+            if a.origin_x != 0.0 || a.origin_y != 0.0 || a.center {
+                lbrn2::place_frame(&polys, target.0, target.1, a.center)
+            } else {
+                polys
+            }
+        }
+    };
+    let polys = warp_polys("drill", polys, a.field_map, a.field_seg_mm)?;
+
+    let elems = lbrn2::polys_to_elems(&polys);
+    let layer = if a.mode == "fill" {
+        let mut layer = EmitLayer::fill("DRILL", a.params, elems);
+        layer.interval_mm = a.interval_mm;
+        layer
+    } else {
+        EmitLayer::line("DRILL", a.params, elems)
+    };
+    if let Some(dir) = a.out.parent().filter(|d| !d.as_os_str().is_empty()) {
+        std::fs::create_dir_all(dir).ok();
+    }
+    lbrn2::write_lbrn2(a.device, &[layer], a.out)?;
+    eprintln!(
+        "drill: {holes} hole(s) + {slots} slot(s) -> {} layer",
+        if a.mode == "fill" { "Fill" } else { "Line" }
+    );
+    let abs = std::path::absolute(a.out).unwrap_or_else(|_| a.out.to_path_buf());
     println!("wrote {}", abs.display());
     Ok(())
 }
@@ -2320,7 +2611,7 @@ mod tests {
         // Hole centers stay inside the fitted 0..80 mm grid (no extrapolation).
         let positions = [(10.0, 20.0), (30.0, 60.0)];
         let raw = fid_holes_polys("rect", 2.0, 3.0, &positions);
-        let warped = warp_fid_holes(raw.clone(), Some(path.as_path()), 0.25)
+        let warped = warp_polys("fid holes", raw.clone(), Some(path.as_path()), 0.25)
             .expect("warp with a valid field map succeeds");
 
         assert_eq!(warped.len(), positions.len());
@@ -2341,7 +2632,7 @@ mod tests {
         // sit exactly at their layout coordinates (0.25 mm segment is inert here).
         let positions = [(10.0, 20.0), (-5.0, 60.5)];
         let polys = fid_holes_polys("rect", 2.0, 3.0, &positions);
-        let out = warp_fid_holes(polys.clone(), None, 0.25).expect("no field map is fine");
+        let out = warp_polys("fid holes", polys.clone(), None, 0.25).expect("no field map is fine");
         assert_eq!(out, polys, "without --field-map the geometry is unchanged");
     }
 

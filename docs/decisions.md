@@ -2235,3 +2235,33 @@ frame, clear MUST empty the string itself — clearing only search/found would
 be undone one frame later. Clear also drops rows/measured/homography and
 cancels any marking round, but leaves placement and the cached pose alone:
 removing markers must not move an already-registered job.
+
+## 2026-07-23 — drill-emit: pure drill-hole geometry as a LightBurn job
+
+- New extraction path: `cam::drill::drill_polys` turns `DrillEntry` lists
+  (the CAM-6 ingest-free drill carrier) into pure hole outlines — a
+  circle-approximation polygon per round hole and a capsule (two straight
+  sides plus semicircular caps: the bit's swept outline) per G85 slot. Rings
+  wind CCW, vertices sit on the ideal circle under the `circle_segments`
+  2 µm chord bound, and coordinates pass through verbatim — placement stays
+  the emitter's concern.
+- `pcbforge drill-emit` wraps it: Excellon file(s) via `--drills`
+  (repeatable, because KiCad exports PTH and NPTH holes as two separate
+  files) or a board via `--board` + kicad-cli, emitted as a `DRILL` Fill
+  (filled discs) or Line (outline contours) layer through the existing
+  lbrn2 emitter with the emit-style recipe, placement, and field-warp
+  flags. The fid-holes field-warp helper was generalized (`warp_polys`)
+  rather than duplicated.
+- Frame decision: drill files share the Gerber y-up-but-offset-negative
+  frame, so the default normalization sends the drill pattern's own bbox
+  corner to the origin. That corner is NOT the copper job's corner, so
+  `--outline` (Edge.Cuts) pins the frame to the board region's corner
+  instead — the same corner `emit` normalizes to — keeping a drill job
+  co-registered with the copper job emitted from the same board; the
+  placement flags then anchor the board region, not the drill bbox, for
+  the same reason. Both exports must use the same origin convention
+  (KiCad's defaults agree).
+- Scope note: drilling is a hand operation today (ORC-7 drill-guide); this
+  verb only extracts and emits the geometry. Whether the UV laser actually
+  cuts hole outlines through FR4, and at what recipe, is the operator's
+  call — defaults mirror the other emit verbs.
