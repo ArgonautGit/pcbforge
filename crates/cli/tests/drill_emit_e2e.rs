@@ -304,6 +304,65 @@ fn board_exports_drills_via_kicad_cli() {
     assert!(!doc.contains("V-"), "job sits on the workspace");
 }
 
+/// `drills` exports stable `pth.drl` + `npth.drl` from a KiCad project (the
+/// drill counterpart of `gerbers`), and those feed straight into
+/// `drill-emit --drills`. Self-skips when kicad-cli isn't installed.
+#[test]
+fn drills_verb_exports_stable_names_that_feed_drill_emit() {
+    if !ingest::kicad_cli::available() {
+        eprintln!(
+            "SKIP drills_verb_exports_stable_names_that_feed_drill_emit: kicad-cli not available"
+        );
+        return;
+    }
+    let dir = tmp("drills-verb");
+    let board = repo_root().join("samples/kicad/valdemo2.kicad_pcb");
+    let result = run(&[
+        "drills",
+        "--project",
+        board.to_str().unwrap(),
+        "--out",
+        dir.to_str().unwrap(),
+    ]);
+    assert!(
+        result.status.success(),
+        "stderr: {}",
+        String::from_utf8_lossy(&result.stderr)
+    );
+    let stdout = String::from_utf8_lossy(&result.stdout);
+    let path_after = |key: &str| -> PathBuf {
+        stdout
+            .lines()
+            .find_map(|l| l.strip_prefix(key))
+            .map(|p| PathBuf::from(p.trim()))
+            .unwrap_or_else(|| panic!("no `{key}` line in: {stdout}"))
+    };
+    let (pth, npth) = (path_after("pth: "), path_after("npth: "));
+    assert_eq!(pth, dir.join("pth.drl"));
+    assert_eq!(npth, dir.join("npth.drl"));
+    assert!(pth.is_file() && npth.is_file(), "both stable files exist");
+
+    // The pair feeds drill-emit directly: valdemo2's 4 holes + 1 slot are all
+    // plated, and the empty NPTH placeholder contributes zero shapes.
+    let out = dir.join("drills.lbrn2");
+    let result = run(&[
+        "drill-emit",
+        "--drills",
+        pth.to_str().unwrap(),
+        "--drills",
+        npth.to_str().unwrap(),
+        "--out",
+        out.to_str().unwrap(),
+    ]);
+    assert!(
+        result.status.success(),
+        "stderr: {}",
+        String::from_utf8_lossy(&result.stderr)
+    );
+    let doc = std::fs::read_to_string(&out).unwrap();
+    assert_eq!(doc.matches("Type=\"Path\"").count(), 5);
+}
+
 #[test]
 fn rejects_missing_input_and_bad_mode() {
     let dir = tmp("bad");

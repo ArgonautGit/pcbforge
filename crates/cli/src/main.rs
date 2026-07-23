@@ -513,6 +513,19 @@ enum Command {
         #[arg(long, default_value = "Edge.Cuts")]
         outline_layer: String,
     },
+    /// Export the Excellon drill files a job needs from a KiCad project, via
+    /// kicad-cli — the drill counterpart of `gerbers`. Writes stable names
+    /// into `--out`: `pth.drl` (plated) + `npth.drl` (non-plated; a valid
+    /// empty file when the board has none), ready for `drill-emit --drills`.
+    Drills {
+        /// KiCad board (`.kicad_pcb`) or a project directory containing one.
+        #[arg(long)]
+        project: PathBuf,
+
+        /// Output directory for `pth.drl` + `npth.drl`.
+        #[arg(long, default_value = ".")]
+        out: PathBuf,
+    },
     /// Extract pure drill-hole geometry (round holes + G85 slots) from
     /// Excellon drill files — or straight from a KiCad board via kicad-cli —
     /// and emit it as a LightBurn `.lbrn2` job of hole outlines.
@@ -829,6 +842,7 @@ fn run(cli: &Cli) -> Result<(), Box<dyn std::error::Error>> {
             copper_layer,
             outline_layer,
         } => gerbers_cmd(project, out, copper_layer, outline_layer),
+        Command::Drills { project, out } => drills_cmd(project, out),
         Command::DrillEmit {
             drills,
             board,
@@ -890,6 +904,25 @@ fn gerbers_cmd(
     println!("board: {}", board.display());
     println!("copper: {}", copper.display());
     println!("outline: {}", outline.display());
+    Ok(())
+}
+
+/// `pcbforge drills` — point at a KiCad project and export the Excellon drill
+/// files under stable names (`pth.drl`, `npth.drl`), the drill counterpart of
+/// `gerbers`.
+fn drills_cmd(
+    project: &std::path::Path,
+    out: &std::path::Path,
+) -> Result<(), Box<dyn std::error::Error>> {
+    use ingest::kicad_cli::{KicadCli, resolve_board};
+    let cli = KicadCli::discover()?;
+    let board = resolve_board(project)?;
+    let (pth, npth) = cli.export_job_drills(&board, out)?;
+    // Print in a parseable `key: path` form so the console (or a script) can
+    // pick the two drill files up and feed them to `drill-emit --drills`.
+    println!("board: {}", board.display());
+    println!("pth: {}", pth.display());
+    println!("npth: {}", npth.display());
     Ok(())
 }
 

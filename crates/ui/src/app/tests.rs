@@ -2637,6 +2637,56 @@ fn emit_drill_holes_writes_placed_geometry_without_queueing_a_burn() {
     );
 }
 
+/// "⚙ Drills from KiCad" mirrors the Gerbers button: deterministic
+/// `pth.drl;npth.drl` paths (next to the Gerbers) fill the drill field
+/// immediately, and the export shells the `drills` verb in the background.
+#[test]
+fn drills_from_kicad_fills_the_field_with_stable_paths() {
+    let mut app = ConsoleApp::new(tmp_db(), vec!["true".into()]);
+
+    // Guard: no project set.
+    app.drills_from_kicad();
+    assert!(
+        app.runtime
+            .log
+            .iter()
+            .any(|l| l.err && l.text.contains("KiCad project")),
+        "missing-project guard logged"
+    );
+    assert!(
+        app.placement.drills.is_empty(),
+        "field untouched on refusal"
+    );
+
+    // A real (empty) board file: resolve_board only needs it to exist.
+    let dir = std::env::temp_dir().join(format!("ui-drills-kicad-{}", std::process::id()));
+    std::fs::create_dir_all(&dir).unwrap();
+    let board = dir.join("demo.kicad_pcb");
+    std::fs::write(&board, "").unwrap();
+    app.job.kicad_project = board.to_string_lossy().into_owned();
+
+    app.drills_from_kicad();
+    let gerber_dir = dir.join("pcbforge-gerbers");
+    assert_eq!(
+        app.placement.drills,
+        format!(
+            "{};{}",
+            gerber_dir.join("pth.drl").display(),
+            gerber_dir.join("npth.drl").display()
+        ),
+        "both stable drill paths land in the field"
+    );
+    assert!(
+        app.placement.note.contains("exporting drill files"),
+        "note: {}",
+        app.placement.note
+    );
+    assert!(
+        app.runtime.verb_job.is_some(),
+        "the drills verb was shelled"
+    );
+}
+
 /// The drill-emit guards refuse (back side, no job, no drill file) without
 /// writing anything or arming the LightBurn chain.
 #[test]

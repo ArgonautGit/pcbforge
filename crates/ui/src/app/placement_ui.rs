@@ -454,6 +454,52 @@ impl ConsoleApp {
         }
     }
 
+    /// Fill the drill-file field from the Actions-panel KiCad project and
+    /// shell `pcbforge drills` in the **background** — the drill counterpart
+    /// of the Job tab's "⚙ Gerbers from KiCad". The output paths are
+    /// deterministic (`<board dir>/pcbforge-gerbers/{pth,npth}.drl` — the
+    /// same directory the Gerbers land in), so the field is filled
+    /// immediately; the files appear when the background export finishes,
+    /// whose progress/errors stream to the Log.
+    pub(super) fn drills_from_kicad(&mut self) {
+        let proj = crate::clean_path(&self.job.kicad_project);
+        if proj.trim().is_empty() {
+            self.runtime.log.push(LogLine {
+                text: "drills: set a KiCad project path (Actions panel) first".into(),
+                err: true,
+            });
+            return;
+        }
+        // Resolve the board just to place the output dir; the CLI re-resolves it.
+        let board = match ingest::kicad_cli::resolve_board(std::path::Path::new(&proj)) {
+            Ok(b) => b,
+            Err(e) => {
+                self.runtime.log.push(LogLine {
+                    text: format!("drills: {e}"),
+                    err: true,
+                });
+                return;
+            }
+        };
+        let out_dir = board
+            .parent()
+            .map(|p| p.join("pcbforge-gerbers"))
+            .unwrap_or_else(|| PathBuf::from("pcbforge-gerbers"));
+        self.placement.drills = format!(
+            "{};{}",
+            out_dir.join("pth.drl").display(),
+            out_dir.join("npth.drl").display()
+        );
+        self.run_verb(&[
+            "drills".into(),
+            "--project".into(),
+            proj,
+            "--out".into(),
+            out_dir.display().to_string(),
+        ]);
+        self.placement.note = "exporting drill files (PTH + NPTH) from KiCad… (see Log)".into();
+    }
+
     /// Emit ONLY the drill-hole geometry (round holes + G85 slots) at the
     /// current manual placement as a `.lbrn2` — and never queue a LightBurn
     /// run: the file is written for the operator to open and start themselves
@@ -707,7 +753,8 @@ impl ConsoleApp {
                     .on_hover_text(
                         "Excellon drill file(s) for \"Emit drill holes\" — KiCad \
                          exports PTH and NPTH holes as two files; list both \
-                         separated by ; to get every hole.",
+                         separated by ; to get every hole. \"⚙ Drills from \
+                         KiCad\" fills this from the Actions-panel project.",
                     );
                 ui.end_row();
                 let drl_out = ui.label("drill out .lbrn2");
@@ -776,6 +823,17 @@ impl ConsoleApp {
             );
         });
         ui.horizontal(|ui| {
+            if ui
+                .button("⚙ Drills from KiCad")
+                .on_hover_text(
+                    "Run kicad-cli on the Actions-panel KiCad project to export \
+                     pth.drl + npth.drl (next to the Gerbers) and fill the drill \
+                     .drl field with both.",
+                )
+                .clicked()
+            {
+                self.drills_from_kicad();
+            }
             if ui
                 .button("⤓ Emit drill holes (no burn)")
                 .on_hover_text(

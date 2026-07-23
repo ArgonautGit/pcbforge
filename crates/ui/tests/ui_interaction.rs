@@ -334,10 +334,12 @@ fn etch_and_run_in_lightburn_button_is_present_and_guards_without_a_job() {
     );
 }
 
-/// The Place tab carries the no-burn drill-emit control: the button and its
-/// path fields are present and labelled (drivable), the summary reports the
-/// drill output default, and clicking without a job guards without ever
-/// queueing a LightBurn run.
+/// The Place tab carries the no-burn drill-emit controls: the path fields and
+/// buttons are present and labelled (drivable), "⚙ Drills from KiCad" fills
+/// the drill field with the stable pth/npth paths, and clicking the emit
+/// button never queues a LightBurn run. Assertions are positive (type a path,
+/// expect the fill) because the kittest consoles share one settings sidecar —
+/// an "unset" assertion would be order-dependent.
 #[test]
 fn place_tab_emits_drill_holes_without_a_burn() {
     let mut h = console();
@@ -357,13 +359,33 @@ fn place_tab_emits_drill_holes_without_a_burn() {
         h.query_by_label("drill out .lbrn2").is_some(),
         "the drill-output field label is present"
     );
-    // The button exists and is honest about not burning.
-    assert!(
-        h.query_by_label("⤓ Emit drill holes (no burn)").is_some(),
-        "the no-burn drill emit button must be present and labelled"
+    // "⚙ Drills from KiCad" fills the field with the deterministic pth/npth
+    // pair (next to the Gerbers). The verb shells in the background ("true"
+    // here), so this asserts the field wiring without needing kicad-cli.
+    // Select-all before typing: the shared settings sidecar may have persisted
+    // a previous run's project path, and plain typing APPENDS to it.
+    let board = concat!(
+        env!("CARGO_MANIFEST_DIR"),
+        "/../../samples/kicad/valdemo2.kicad_pcb"
     );
-    // Clicking with no frame + job loaded hits the guard: no file written, and
-    // — the point of the button — LightBurn stays idle with nothing queued.
+    let field = h.get_by_label("KiCad project");
+    field.focus();
+    field.key_combination(&[
+        egui_kittest::kittest::Key::Command,
+        egui_kittest::kittest::Key::A,
+    ]);
+    field.type_text(board);
+    h.run();
+    h.get_by_label("⚙ Drills from KiCad").click();
+    h.run();
+    assert!(
+        summary_line(&h.state().debug_summary(), "place:").contains("drills=npth.drl"),
+        "the KiCad button filled the drill field (summary shows the pair's basename):\n{}",
+        h.state().debug_summary()
+    );
+    // Clicking emit with no frame + job loaded hits the guard: no file
+    // written, and — the point of the button — LightBurn stays idle with
+    // nothing queued.
     h.get_by_label("⤓ Emit drill holes (no burn)").click();
     h.run();
     assert!(

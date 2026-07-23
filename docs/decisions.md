@@ -2293,3 +2293,31 @@ removing markers must not move an already-registered job.
   wrong chirality at the wrong spot, silently), job + frame required (the
   pose is meaningless before a Load). Recipe = Job-tab params over the
   register verb's default 20 % power, layer name `DRILL`.
+
+## 2026-07-23 — Drill files extracted from the KiCad project, like the Gerbers
+
+- `ingest::kicad_cli::export_job_drills` is the drill counterpart of
+  `export_job_gerbers`: `--excellon-separate-th` (flag-checked via
+  `require_flags`) always splits plated/non-plated, and the outputs land
+  under stable names `pth.drl` + `npth.drl` regardless of kicad-cli's
+  board-derived naming. A side the export produced no file for (a board
+  with no NPTH holes) gets a valid empty Excellon placeholder — parser-
+  verified — so downstream loaders see "zero holes", never a missing path.
+  A merged file (should a kicad ever ignore the flag) stands in on the PTH
+  side; it still holds every hole. The "Created file" stdout parsing and
+  the rename-or-copy move were factored out (`quoted_created_files`,
+  `move_into`) and shared with the Gerber exporters.
+- New `pcbforge drills --project --out` verb mirrors `gerbers`: resolves
+  the board, exports, prints parseable `board:`/`pth:`/`npth:` lines.
+- Console: "⚙ Drills from KiCad" on the Place tab mirrors the Job tab's
+  Gerbers button — deterministic paths
+  (`<board dir>/pcbforge-gerbers/{pth,npth}.drl`, the same directory the
+  Gerbers land in) fill the `drill .drl` field immediately, and the verb
+  shells in the background with progress in the Log.
+- Test-honesty note: kittest consoles share one settings sidecar, and
+  focused text fields APPEND typed text — the new interaction test
+  select-alls before typing and asserts positively (path in → field
+  filled), because "field is unset" assertions are order-dependent there.
+  Also recorded: kicad-cli is absent on this dev container, so every
+  kicad-gated test self-skips (they print ok) — the export itself needs a
+  machine with KiCad to verify.
