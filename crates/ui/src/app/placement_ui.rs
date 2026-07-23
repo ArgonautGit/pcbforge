@@ -368,6 +368,7 @@ impl ConsoleApp {
             "--passes".into(),
             format!("{}", self.job.passes),
         ];
+        args.extend(self.wobble_args());
         if !crate::clean_path(&self.job.emit_outline).is_empty() {
             args.push("--outline".into());
             args.push(crate::clean_path(&self.job.emit_outline));

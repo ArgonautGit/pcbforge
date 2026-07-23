@@ -64,8 +64,17 @@ pub struct EmitLayer {
     pub fill_angle_step_deg: f64,
     /// Cross-hatch fill.
     pub cross_hatch: bool,
-    /// Wobble (the operator's base config runs with it on).
+    /// Wobble (spiral the beam along the scan to widen the effective line).
+    /// Off by default on every layer — the operator's base config ran with it
+    /// on, which silently wobbled every export; it's opt-in per job now.
     pub wobble: bool,
+    /// Wobble step along the path, mm (with `wobble`; 0 = omitted ⇒ the
+    /// device profile's value). Field name inferred, not sample-observed —
+    /// see docs/lbrn2-schema.md.
+    pub wobble_step_mm: f64,
+    /// Wobble diameter, mm (with `wobble`; 0 = omitted ⇒ the device
+    /// profile's value). Field name inferred, not sample-observed.
+    pub wobble_size_mm: f64,
     /// Sub-layer name (cosmetic; matches the operator's samples).
     pub subname: Option<String>,
     /// Geometry to run at this layer.
@@ -83,7 +92,9 @@ impl EmitLayer {
             angle_deg: 0.0,
             fill_angle_step_deg: 0.0,
             cross_hatch: true,
-            wobble: true,
+            wobble: false,
+            wobble_step_mm: 0.0,
+            wobble_size_mm: 0.0,
             subname: Some("sublayername".into()),
             elems,
         }
@@ -100,6 +111,8 @@ impl EmitLayer {
             fill_angle_step_deg: 0.0,
             cross_hatch: false,
             wobble: false,
+            wobble_step_mm: 0.0,
+            wobble_size_mm: 0.0,
             subname: None,
             elems,
         }
@@ -365,6 +378,16 @@ fn cut_setting_xml(index: u32, layer: &EmitLayer) -> String {
     // Emit an explicit 0/1 rather than omitting the field when off: absent
     // must not inherit a device profile that defaults wobble on (LR-36).
     field("wobbleEnable", if layer.wobble { "1" } else { "0" }.into());
+    if layer.wobble {
+        // Wobble geometry only when set: absent ⇒ the device profile's values
+        // (field names inferred, no sample carries them — lbrn2-schema.md).
+        if layer.wobble_step_mm > 0.0 {
+            field("wobbleStep", num(layer.wobble_step_mm));
+        }
+        if layer.wobble_size_mm > 0.0 {
+            field("wobbleSize", num(layer.wobble_size_mm));
+        }
+    }
     if layer.mode == LayerMode::Fill {
         field(
             "crossHatch",
@@ -449,15 +472,43 @@ mod tests {
     }
 
     #[test]
-    fn wobble_off_is_emitted_explicitly() {
-        // A Line layer with wobble off emits `wobbleEnable Value="0"` rather
-        // than omitting it and inheriting a device default (LR-36).
-        let doc = lbrn2_string(
-            "BSLFiber",
-            &[EmitLayer::line("C00", base_params(), Vec::new())],
-        )
-        .unwrap();
-        assert!(doc.contains("<wobbleEnable Value=\"0\"/>"), "{doc}");
+    fn wobble_defaults_off_and_is_emitted_explicitly() {
+        // Fill used to inherit the operator's base config (wobble on), which
+        // silently wobbled every export. Both modes now default OFF, and the
+        // off state is an explicit `wobbleEnable Value="0"` rather than an
+        // omission a device profile could override (LR-36).
+        for layer in [
+            EmitLayer::fill("C00", base_params(), Vec::new()),
+            EmitLayer::line("C00", base_params(), Vec::new()),
+        ] {
+            let xml = cut_setting_xml(0, &layer);
+            assert!(xml.contains("<wobbleEnable Value=\"0\"/>"), "{xml}");
+            assert!(!xml.contains("wobbleStep"), "{xml}");
+            assert!(!xml.contains("wobbleSize"), "{xml}");
+        }
+    }
+
+    #[test]
+    fn wobble_geometry_emitted_only_when_enabled_and_set() {
+        let mut layer = EmitLayer::fill("C00", base_params(), Vec::new());
+        layer.wobble = true;
+        let xml = cut_setting_xml(0, &layer);
+        assert!(xml.contains("<wobbleEnable Value=\"1\"/>"), "{xml}");
+        // step/size 0 ⇒ omitted ⇒ the device profile's wobble geometry.
+        assert!(!xml.contains("wobbleStep"), "{xml}");
+        assert!(!xml.contains("wobbleSize"), "{xml}");
+
+        layer.wobble_step_mm = 0.05;
+        layer.wobble_size_mm = 0.2;
+        let xml = cut_setting_xml(0, &layer);
+        assert!(xml.contains("<wobbleStep Value=\"0.05\"/>"), "{xml}");
+        assert!(xml.contains("<wobbleSize Value=\"0.2\"/>"), "{xml}");
+
+        // Disabling wobble suppresses the geometry fields with it.
+        layer.wobble = false;
+        let xml = cut_setting_xml(0, &layer);
+        assert!(!xml.contains("wobbleStep"), "{xml}");
+        assert!(!xml.contains("wobbleSize"), "{xml}");
     }
 
     #[test]

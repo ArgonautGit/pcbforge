@@ -354,6 +354,39 @@ fn lightburn_device_field_is_labelled_and_editable() {
 }
 
 #[test]
+fn wobble_is_opt_in_and_drivable() {
+    let mut h = console();
+    // The setting persists across runs (shared temp DB), so drive to the
+    // known OFF state before asserting rather than trusting the start value.
+    if summary_line(&h.state().debug_summary(), "gerbers:").contains("wobble=true") {
+        h.get_by_label("wobble").click();
+        h.run();
+    }
+    assert!(
+        summary_line(&h.state().debug_summary(), "gerbers:").contains("wobble=false"),
+        "wobble starts (or is driven) off:\n{}",
+        h.state().debug_summary()
+    );
+    // The checkbox is labelled, so an agent/operator can drive it; enabling it
+    // reveals the step/size fields in the same row.
+    h.get_by_label("wobble").click();
+    h.run();
+    assert!(
+        summary_line(&h.state().debug_summary(), "gerbers:").contains("wobble=true"),
+        "checkbox turns wobble on:\n{}",
+        h.state().debug_summary()
+    );
+    // Leave the persisted setting at the default (off) for the next test run.
+    h.get_by_label("wobble").click();
+    h.run();
+    assert!(
+        summary_line(&h.state().debug_summary(), "gerbers:").contains("wobble=false"),
+        "checkbox turns wobble back off:\n{}",
+        h.state().debug_summary()
+    );
+}
+
+#[test]
 fn the_accessibility_tree_exposes_labeled_widgets() {
     let h = console();
     // Buttons carry labels, so they're queryable/drivable by an agent. Use

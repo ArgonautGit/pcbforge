@@ -304,6 +304,46 @@ fn job_emit_without_an_accepted_field_map_warns_and_emits_unwarped() {
 }
 
 #[test]
+fn emit_passes_the_wobble_recipe_only_when_opted_in() {
+    // `echo` as the CLI prints the verb args back on stdout, so the log shows
+    // exactly what the button would run.
+    let run_emit = |wobble: bool| -> String {
+        let mut app = ConsoleApp::new(tmp_db(), vec!["echo".into()]);
+        app.job.emit_copper = "board.gbr".into();
+        app.job.wobble = wobble;
+        app.job.wobble_step_mm = 0.05;
+        app.job.wobble_size_mm = 0.2;
+        app.emit_clicked();
+        let ctx = Context::default();
+        for _ in 0..500 {
+            app.pump_verb(&ctx);
+            if app.runtime.verb_job.is_none() {
+                break;
+            }
+            std::thread::sleep(std::time::Duration::from_millis(3));
+        }
+        app.runtime
+            .log
+            .iter()
+            .map(|l| l.text.clone())
+            .collect::<Vec<_>>()
+            .join("\n")
+    };
+    let on = run_emit(true);
+    assert!(
+        on.contains("--wobble")
+            && on.contains("--wobble-step-mm 0.05")
+            && on.contains("--wobble-size-mm 0.2"),
+        "wobble recipe forwarded to the CLI:\n{on}"
+    );
+    let off = run_emit(false);
+    assert!(
+        !off.contains("--wobble"),
+        "no wobble args when off (the CLI default already writes wobbleEnable=0):\n{off}"
+    );
+}
+
+#[test]
 fn camera_ui_reports_active_and_invalid_nonlinear_projection() {
     let mut app = nonlinear_app();
     app.runtime.tab = CentralTab::Camera;
@@ -1427,6 +1467,9 @@ field_frame=\n";
             "job_passes",
             "job_pulse_ns",
             "job_speed_mm_s",
+            "job_wobble",
+            "job_wobble_size_mm",
+            "job_wobble_step_mm",
             "lens_px_bounds",
             "place_lightburn_device",
         ]

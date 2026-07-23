@@ -2235,3 +2235,19 @@ frame, clear MUST empty the string itself — clearing only search/found would
 be undone one frame later. Clear also drops rows/measured/homography and
 cancels any marking round, but leaves placement and the cached pose alone:
 removing markers must not move an already-registered job.
+
+## 2026-07-23 — Wobble is off by default and configurable per job
+
+Every export inherited `wobble: true` from `EmitLayer::fill` — transcribed
+from the operator's base config, where wobble is a device-profile choice, not
+a process default. Result: all emitted Fill jobs (emit, register, calibration
+grids, fiducial holes) silently ran wobbled, widening lines and softening
+calibration dots. `EmitLayer::fill` now defaults wobble OFF like `line`, and
+the file keeps writing an explicit `wobbleEnable=0` (LR-36) so the device
+profile can't re-enable it. Opting in is per job: `--wobble` on emit/register
+(with `--wobble-step-mm` / `--wobble-size-mm`, 0 = device default) and a
+wobble checkbox + step/size fields in the console's Job recipe, persisted and
+applied to both Emit and Place's "Etch here". `wobbleStep`/`wobbleSize` are
+inferred field names (no sample varies them — flagged in lbrn2-schema.md for
+verification on first live use). The golden test still reproduces the
+operator's base sample by setting wobble explicitly.

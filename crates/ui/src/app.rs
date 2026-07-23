@@ -144,6 +144,9 @@ impl ConsoleApp {
                 pulse_ns: 1,
                 interval_mm: 0.03,
                 passes: 1,
+                wobble: false,
+                wobble_step_mm: 0.0,
+                wobble_size_mm: 0.0,
                 preview_tex: None,
                 preview_note: "Set a copper Gerber and click “Render preview”.".into(),
             },
@@ -395,7 +398,8 @@ impl ConsoleApp {
                 .unwrap_or_else(|| "unset".into())
         };
         let gerbers = format!(
-            "copper={} outline={} speed={} freq_khz={} pulse_ns={} interval={} passes={}",
+            "copper={} outline={} speed={} freq_khz={} pulse_ns={} interval={} passes={} \
+             wobble={} wobble_step={} wobble_size={}",
             if self.job.emit_copper.trim().is_empty() {
                 "unset".into()
             } else {
@@ -411,6 +415,9 @@ impl ConsoleApp {
             self.job.pulse_ns,
             self.job.interval_mm,
             self.job.passes,
+            self.job.wobble,
+            self.job.wobble_step_mm,
+            self.job.wobble_size_mm,
         );
         // ④ auto fiducial-hole layout, resolved against the effective field
         // centre (kept in sync with the auto toggle by `sync_auto_field_center`).

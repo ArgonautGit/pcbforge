@@ -115,6 +115,14 @@ pub(super) struct JobState {
     pub(super) pulse_ns: u32,
     pub(super) interval_mm: f64,
     pub(super) passes: u32,
+    /// Wobble opt-in for the exports (emit + register). Off by default — the
+    /// emitted file says `wobbleEnable=0` explicitly so the device profile
+    /// can't re-enable it.
+    pub(super) wobble: bool,
+    /// Wobble step along the path, mm (0 = the device profile's value).
+    pub(super) wobble_step_mm: f64,
+    /// Wobble diameter, mm (0 = the device profile's value).
+    pub(super) wobble_size_mm: f64,
     pub(super) preview_tex: Option<TextureHandle>,
     pub(super) preview_note: String,
 }
