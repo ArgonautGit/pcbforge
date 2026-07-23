@@ -2557,9 +2557,10 @@ fn verts_bbox(pts: &[(f64, f64)]) -> (f64, f64, f64, f64) {
     )
 }
 
-/// "⤓ Emit drill holes (no burn)" writes the hole geometry at the placement
-/// affine (translation + rotation, NO frame normalization — the placement is
-/// the position) and never arms the LightBurn chain.
+/// "⤓ Emit drill holes → LightBurn (no burn)" writes the hole geometry at the
+/// placement affine (translation + rotation, NO frame normalization — the
+/// placement is the position), spawns a LOAD-ONLY LightBurn run, and never
+/// arms the etch path's export→start chain.
 #[test]
 fn emit_drill_holes_writes_placed_geometry_without_queueing_a_burn() {
     let mut app = ConsoleApp::new(tmp_db(), vec!["true".into()]);
@@ -2597,16 +2598,24 @@ fn emit_drill_holes_writes_placed_geometry_without_queueing_a_burn() {
         (y0 + y1) / 2.0
     );
 
-    // The whole point: the file exists but nothing was queued or started.
-    assert!(app.runtime.pending_lightburn.is_none(), "no run queued");
-    assert!(app.runtime.lightburn_run.is_none(), "no run started");
-    assert!(app.debug_summary().contains("lightburn=idle"));
+    // The whole point: the file goes TO LightBurn (a load-only run) but the
+    // start chain is never armed and the run can never press START.
+    assert!(
+        app.runtime.pending_lightburn.is_none(),
+        "the export→start chain is never armed"
+    );
+    let run = app
+        .runtime
+        .lightburn_run
+        .as_ref()
+        .expect("a LightBurn load was spawned");
+    assert!(run.load_only(), "the spawned run is load-only (no START)");
     assert!(
         app.runtime
             .log
             .iter()
-            .any(|l| !l.err && l.text.contains("NO burn")),
-        "the log says no burn was started"
+            .any(|l| !l.err && l.text.contains("NOT starting")),
+        "the log says the job is loaded, not started"
     );
     assert!(
         app.placement.note.contains("no burn started"),

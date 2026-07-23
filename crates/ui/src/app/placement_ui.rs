@@ -698,17 +698,64 @@ impl ConsoleApp {
         } else {
             " · UNWARPED geometry (no field calibration)"
         };
-        self.placement.note =
-            format!("drill holes → {out} · {holes} hole(s) + {slots} slot(s) — no burn started");
         self.runtime.log.push(LogLine {
             text: format!(
                 "Drill holes → {out}\n  {holes} hole(s) + {slots} slot(s) placed at \
-                 ({:.2}, {:.2}) mm, {:.1}°{field_note} — file written only, NO burn \
-                 started (open it in LightBurn yourself)",
+                 ({:.2}, {:.2}) mm, {:.1}°{field_note} — loading in LightBurn, NOT \
+                 starting it (press ▶ there to burn)",
                 self.placement.tx_mm, self.placement.ty_mm, self.placement.rot_deg
             ),
             err: false,
         });
+        // Load (never start) the written file in LightBurn: a load-only run —
+        // START stays with the operator, and `pending_lightburn` (the etch
+        // path's export→run chain) is never touched. A run already in flight
+        // is left alone; the file is written either way.
+        let lb_busy = self
+            .runtime
+            .lightburn_run
+            .as_ref()
+            .is_some_and(|r| !r.finished());
+        if lb_busy {
+            self.placement.note = format!(
+                "drill holes → {out} · {holes} hole(s) + {slots} slot(s) — written; \
+                 LightBurn is busy, open the file there yourself (no burn)"
+            );
+            self.runtime.log.push(LogLine {
+                text: "place: a LightBurn run is in flight — skipped the drill-file \
+                       load; open it in LightBurn yourself"
+                    .into(),
+                err: true,
+            });
+            return;
+        }
+        // Absolute path without canonicalizing: the file exists, but \\?\
+        // prefixes upset LightBurn's FORCELOAD (same rule as the etch chain).
+        match std::path::absolute(&out_path) {
+            Ok(abs) => {
+                self.runtime.lightburn_run = Some(spawn_lightburn_load(
+                    abs,
+                    self.placement.lightburn_device.clone(),
+                ));
+                self.placement.note = format!(
+                    "drill holes → {out} · {holes} hole(s) + {slots} slot(s) — \
+                     loading in LightBurn (no burn started)"
+                );
+            }
+            Err(e) => {
+                self.placement.note = format!(
+                    "drill holes → {out} · {holes} hole(s) + {slots} slot(s) — \
+                     written; couldn't load it in LightBurn ({e})"
+                );
+                self.runtime.log.push(LogLine {
+                    text: format!(
+                        "place: couldn't resolve an absolute path for the LightBurn \
+                         load ({e}) — the file is written; open it manually"
+                    ),
+                    err: true,
+                });
+            }
+        }
     }
 
     pub(super) fn place_view(&mut self, ui: &mut egui::Ui) {
@@ -834,19 +881,30 @@ impl ConsoleApp {
             {
                 self.drills_from_kicad();
             }
+            // Disabled while a LightBurn run is in flight, like "Etch + run":
+            // the load-only run replaces `lightburn_run`, and stomping a live
+            // burn's progress reporting would be rude.
+            let lb_running = self
+                .runtime
+                .lightburn_run
+                .as_ref()
+                .is_some_and(|r| !r.finished());
             if ui
-                .button("⤓ Emit drill holes (no burn)")
+                .add_enabled(
+                    !lb_running,
+                    egui::Button::new("⤓ Emit drill holes → LightBurn (no burn)"),
+                )
                 .on_hover_text(
                     "Writes ONLY the drill-hole geometry (round holes + slots) from \
                      the drill .drl file(s) at this placement to the drill out \
-                     .lbrn2 — the file is written for you to open in LightBurn; it \
-                     never starts a burn.",
+                     .lbrn2, then LOADS the file in LightBurn (FORCELOAD) without \
+                     pressing start — you burn it from LightBurn yourself.",
                 )
                 .clicked()
             {
                 self.emit_drill_at_placement();
             }
-            ui.weak("hole pattern at the placed pose — file only, never runs the laser");
+            ui.weak("hole pattern at the placed pose — loads in LightBurn, never presses start");
         });
         if self.calibration.field.is_some() && !self.calibration.field_accepted {
             ui.colored_label(

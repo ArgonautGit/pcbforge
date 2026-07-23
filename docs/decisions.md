@@ -2321,3 +2321,25 @@ removing markers must not move an already-registered job.
   Also recorded: kicad-cli is absent on this dev container, so every
   kicad-gated test self-skips (they print ok) — the export itself needs a
   machine with KiCad to verify.
+
+## 2026-07-23 — Drill emit now LOADS the file in LightBurn (still never starts)
+
+- The Place-tab drill emit grew the missing half of the handoff: after
+  writing the `.lbrn2` it now drives a **load-only** LightBurn run —
+  PING → device select → FORCELOAD → done. START is never sent (the
+  worker's `start_job` flag short-circuits before the STATUS gate), and
+  `pending_lightburn` (the etch path's export→start chain) is never
+  touched, so the "no burn" contract holds while the operator finds the
+  job already open in LightBurn; button renamed
+  `⤓ Emit drill holes → LightBurn (no burn)` to say so.
+- `spawn_lightburn_load` shares the whole worker with the etch path's
+  `spawn_lightburn_run` rather than duplicating the UDP dance;
+  `LightburnRun::load_only()` lets tests (and future UI) tell the two
+  apart. The fake-LightBurn UDP test proves a load-only run FORCELOADs
+  the path and that START never crosses the wire.
+- A LightBurn run already in flight skips the load with a warning (the
+  file is still written) — replacing a live run's progress reporting
+  would be rude; the button is also disabled while one runs, mirroring
+  "Etch + run". An unresolvable absolute path likewise degrades to
+  "written; open it manually" (FORCELOAD dislikes `\\?\` prefixes, same
+  rule as the etch chain).

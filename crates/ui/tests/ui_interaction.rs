@@ -384,13 +384,13 @@ fn place_tab_emits_drill_holes_without_a_burn() {
         h.state().debug_summary()
     );
     // Clicking emit with no frame + job loaded hits the guard: no file
-    // written, and — the point of the button — LightBurn stays idle with
-    // nothing queued.
-    h.get_by_label("⤓ Emit drill holes (no burn)").click();
+    // written, no load spawned — LightBurn stays idle with nothing queued.
+    h.get_by_label("⤓ Emit drill holes → LightBurn (no burn)")
+        .click();
     h.run();
     assert!(
         summary_line(&h.state().debug_summary(), "place:").contains("lightburn=idle"),
-        "drill emit never arms a LightBurn run:\n{}",
+        "a guarded drill emit spawns no LightBurn activity:\n{}",
         h.state().debug_summary()
     );
 }

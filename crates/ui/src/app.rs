@@ -42,7 +42,7 @@ use commands::spawn_verb;
 use commands::{JobShapes, VerbJob};
 pub use commands::{job_shapes, preview_image, run_capture};
 use job_ui::status_color;
-use lightburn_run::{LightburnRun, spawn_lightburn_run};
+use lightburn_run::{LightburnRun, spawn_lightburn_load, spawn_lightburn_run};
 use projection::CameraProjection;
 use state::*;
 
