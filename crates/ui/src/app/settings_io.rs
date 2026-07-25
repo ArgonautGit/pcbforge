@@ -39,6 +39,9 @@ impl ConsoleApp {
             ("job_pulse_ns", self.job.pulse_ns.to_string()),
             ("job_interval_mm", self.job.interval_mm.to_string()),
             ("job_passes", self.job.passes.to_string()),
+            ("job_wobble", self.job.wobble.to_string()),
+            ("job_wobble_step_mm", self.job.wobble_step_mm.to_string()),
+            ("job_wobble_size_mm", self.job.wobble_size_mm.to_string()),
             ("back_copper", self.job.back_copper.clone()),
             ("back_outline", self.job.back_outline.clone()),
             ("thickness_mm", self.job.board_thickness_mm.to_string()),
@@ -331,6 +334,23 @@ impl ConsoleApp {
             self.job.interval_mm = v.clamp(0.001, 1.0);
         }
         u32_field(&m, "job_passes", 1, 1000, &mut self.job.passes);
+        if let Some(v) = m.get("job_wobble").and_then(|s| s.trim().parse().ok()) {
+            self.job.wobble = v;
+        }
+        if let Some(v) = m
+            .get("job_wobble_step_mm")
+            .and_then(|s| s.trim().parse().ok())
+            .filter(|v: &f64| v.is_finite())
+        {
+            self.job.wobble_step_mm = v.clamp(0.0, 2.0);
+        }
+        if let Some(v) = m
+            .get("job_wobble_size_mm")
+            .and_then(|s| s.trim().parse().ok())
+            .filter(|v: &f64| v.is_finite())
+        {
+            self.job.wobble_size_mm = v.clamp(0.0, 2.0);
+        }
         f64_field(&m, "thickness_mm", &mut self.job.board_thickness_mm);
         f64_field(&m, "focal_mm", &mut self.job.focal_mm);
         f64_field(&m, "place_px_per_mm", &mut self.placement.px_per_mm);

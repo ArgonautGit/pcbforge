@@ -190,8 +190,34 @@ impl ConsoleApp {
                 )
                 .labelled_by(l.id);
                 ui.end_row();
+                ui.checkbox(&mut self.job.wobble, "wobble").on_hover_text(
+                    "Spiral the beam along the scan to widen the effective line. \
+                     OFF by default — the export writes wobbleEnable=0 explicitly \
+                     so the device profile can't re-enable it.",
+                );
+                ui.horizontal(|ui| {
+                    if self.job.wobble {
+                        ui.add(
+                            egui::DragValue::new(&mut self.job.wobble_step_mm)
+                                .speed(0.005)
+                                .range(0.0..=2.0)
+                                .prefix("step "),
+                        )
+                        .on_hover_text("wobble step along the path, mm (0 = device default)");
+                        ui.add(
+                            egui::DragValue::new(&mut self.job.wobble_size_mm)
+                                .speed(0.005)
+                                .range(0.0..=2.0)
+                                .prefix("size "),
+                        )
+                        .on_hover_text("wobble diameter, mm (0 = device default)");
+                    } else {
+                        ui.weak("off");
+                    }
+                });
+                ui.end_row();
             });
-            ui.weak("Recipe (speed / Q-pulse / interval / passes) applies to both this Emit and Place's “Etch here”.");
+        ui.weak("Recipe (speed / Q-pulse / interval / passes / wobble) applies to both this Emit and Place's “Etch here”.");
 
         // Double-sided (ORC-6): side selector + back-side inputs.
         ui.separator();
@@ -282,6 +308,21 @@ impl ConsoleApp {
         ui.weak("Live camera → the “📷 Camera” tab.");
     }
 
+    /// The wobble recipe args shared by Emit and Place's "Etch here" (empty
+    /// when wobble is off — the CLI default already writes wobbleEnable=0).
+    pub(super) fn wobble_args(&self) -> Vec<String> {
+        if !self.job.wobble {
+            return Vec::new();
+        }
+        vec![
+            "--wobble".into(),
+            "--wobble-step-mm".into(),
+            format!("{}", self.job.wobble_step_mm),
+            "--wobble-size-mm".into(),
+            format!("{}", self.job.wobble_size_mm),
+        ]
+    }
+
     pub(super) fn emit_clicked(&mut self) {
         let (copper, outline) = self.active_gerbers();
         let (copper, outline) = (crate::clean_path(copper), crate::clean_path(outline));
@@ -315,6 +356,7 @@ impl ConsoleApp {
             "--passes".into(),
             format!("{}", self.job.passes),
         ];
+        args.extend(self.wobble_args());
         // Field-warp when a usable calibration + map file exist; otherwise
         // emit unwarped with a warning (operator's call — the machine's own
         // correction is then the only field compensation).

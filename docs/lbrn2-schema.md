@@ -76,6 +76,16 @@ Notes:
 - **Absent ⇒ default.** LightBurn omits an element at its default (e.g. no
   `angle` means 0, no `numPasses` means 1). The emitter should likewise omit
   defaults to stay byte-close to hand-authored files.
+- **Wobble is opt-in and always explicit.** Every sample carries
+  `wobbleEnable=1` because the operator's base *config* runs wobble on — that
+  is device state, not a format default. The emitter defaults wobble OFF and
+  always writes an explicit 0/1 so an absent field can't inherit the device
+  profile (LR-36). When enabled, the wobble geometry can be set via
+  `wobbleStep` (spacing along the path, mm) and `wobbleSize` (diameter, mm);
+  these field names are **inferred** from LightBurn's galvo cut settings, not
+  observed in any sample (none varies them) — verify on first live use, like
+  the open-`Line` primitive. At 0 they are omitted ⇒ the device profile's
+  values apply.
 
 ## `Shape` — geometry
 

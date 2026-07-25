@@ -219,6 +219,17 @@ enum Command {
         /// fill lines by this much each pass (needs --passes > 1). 0 = off.
         #[arg(long, default_value_t = 0.0)]
         angle_step_deg: f64,
+        /// Enable wobble (spiral the beam along the scan to widen the
+        /// effective line). Off by default: the file says `wobbleEnable=0`
+        /// explicitly so the device profile can't re-enable it.
+        #[arg(long)]
+        wobble: bool,
+        /// Wobble step along the path, mm (with --wobble; 0 = device default).
+        #[arg(long, default_value_t = 0.0)]
+        wobble_step_mm: f64,
+        /// Wobble diameter, mm (with --wobble; 0 = device default).
+        #[arg(long, default_value_t = 0.0)]
+        wobble_size_mm: f64,
 
         // --- placement (FLD-6) ---
         /// Target x for the job, mm. By default the job's lower-left corner
@@ -329,6 +340,17 @@ enum Command {
         /// Fill line interval, mm.
         #[arg(long, default_value_t = 0.03)]
         interval_mm: f64,
+        /// Enable wobble (spiral the beam along the scan to widen the
+        /// effective line). Off by default: the file says `wobbleEnable=0`
+        /// explicitly so the device profile can't re-enable it.
+        #[arg(long)]
+        wobble: bool,
+        /// Wobble step along the path, mm (with --wobble; 0 = device default).
+        #[arg(long, default_value_t = 0.0)]
+        wobble_step_mm: f64,
+        /// Wobble diameter, mm (with --wobble; 0 = device default).
+        #[arg(long, default_value_t = 0.0)]
+        wobble_size_mm: f64,
 
         /// Laser field-distortion correction file (from the console's
         /// step-3 Laser-field calibration). When given, every emitted vertex is
@@ -691,6 +713,9 @@ fn run(cli: &Cli) -> Result<(), Box<dyn std::error::Error>> {
             interval_mm,
             angle_deg,
             angle_step_deg,
+            wobble,
+            wobble_step_mm,
+            wobble_size_mm,
             origin_x,
             origin_y,
             center,
@@ -716,6 +741,9 @@ fn run(cli: &Cli) -> Result<(), Box<dyn std::error::Error>> {
             interval_mm: *interval_mm,
             angle_deg: *angle_deg,
             angle_step_deg: *angle_step_deg,
+            wobble: *wobble,
+            wobble_step_mm: *wobble_step_mm,
+            wobble_size_mm: *wobble_size_mm,
             origin_x: *origin_x,
             origin_y: *origin_y,
             center: *center,
@@ -743,6 +771,9 @@ fn run(cli: &Cli) -> Result<(), Box<dyn std::error::Error>> {
             pulse_ns,
             passes,
             interval_mm,
+            wobble,
+            wobble_step_mm,
+            wobble_size_mm,
             field_map,
             field_seg_mm,
         } => register_cmd(RegisterArgs {
@@ -767,6 +798,9 @@ fn run(cli: &Cli) -> Result<(), Box<dyn std::error::Error>> {
                 passes: *passes,
             },
             interval_mm: *interval_mm,
+            wobble: *wobble,
+            wobble_step_mm: *wobble_step_mm,
+            wobble_size_mm: *wobble_size_mm,
             field_map: field_map.as_deref(),
             field_seg_mm: *field_seg_mm,
         }),
@@ -1543,6 +1577,9 @@ struct EmitArgs<'a> {
     interval_mm: f64,
     angle_deg: f64,
     angle_step_deg: f64,
+    wobble: bool,
+    wobble_step_mm: f64,
+    wobble_size_mm: f64,
     origin_x: f64,
     origin_y: f64,
     center: bool,
@@ -1698,6 +1735,9 @@ fn emit_cmd(a: EmitArgs) -> Result<(), Box<dyn std::error::Error>> {
     layer.interval_mm = a.interval_mm;
     layer.angle_deg = a.angle_deg;
     layer.fill_angle_step_deg = a.angle_step_deg;
+    layer.wobble = a.wobble;
+    layer.wobble_step_mm = a.wobble_step_mm;
+    layer.wobble_size_mm = a.wobble_size_mm;
     cam::lbrn2::write_lbrn2(a.device, &[layer], a.lbrn2)?;
     let rings: usize = shapes.iter().map(|p| 1 + p.holes.len()).sum();
     eprintln!(
@@ -1725,6 +1765,9 @@ struct RegisterArgs<'a> {
     max_rms_mm: f64,
     params: AblationParams,
     interval_mm: f64,
+    wobble: bool,
+    wobble_step_mm: f64,
+    wobble_size_mm: f64,
     field_map: Option<&'a std::path::Path>,
     field_seg_mm: f64,
 }
@@ -1824,6 +1867,9 @@ fn register_cmd(a: RegisterArgs) -> Result<(), Box<dyn std::error::Error>> {
 
     let mut layer = EmitLayer::fill("C00", a.params, cam::lbrn2::polys_to_elems(&placed));
     layer.interval_mm = a.interval_mm;
+    layer.wobble = a.wobble;
+    layer.wobble_step_mm = a.wobble_step_mm;
+    layer.wobble_size_mm = a.wobble_size_mm;
     cam::lbrn2::write_lbrn2(a.device, &[layer], a.lbrn2)?;
     let rings: usize = placed.iter().map(|p| 1 + p.holes.len()).sum();
     // Report where the job actually landed (bbox extent + center, machine mm)

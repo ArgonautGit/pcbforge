@@ -49,7 +49,10 @@ fn emitted_path_matches_committed_sample() {
 #[test]
 fn emitted_cutsetting_reproduces_base_values() {
     let base = std::fs::read_to_string(sample("base.lbrn2")).unwrap();
-    let layer = EmitLayer::fill("C00", base_params(), Vec::new());
+    let mut layer = EmitLayer::fill("C00", base_params(), Vec::new());
+    // The operator's base config runs wobble on; the emitter defaults it OFF
+    // (opt-in), so reproduce the sample by setting it explicitly.
+    layer.wobble = true;
     let doc = lbrn2::lbrn2_string("BSLFiber", &[layer]).unwrap();
 
     // Every process value present in base.lbrn2's CutSetting is reproduced.

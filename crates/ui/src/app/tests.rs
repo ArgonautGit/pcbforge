@@ -304,6 +304,46 @@ fn job_emit_without_an_accepted_field_map_warns_and_emits_unwarped() {
 }
 
 #[test]
+fn emit_passes_the_wobble_recipe_only_when_opted_in() {
+    // `echo` as the CLI prints the verb args back on stdout, so the log shows
+    // exactly what the button would run.
+    let run_emit = |wobble: bool| -> String {
+        let mut app = ConsoleApp::new(tmp_db(), vec!["echo".into()]);
+        app.job.emit_copper = "board.gbr".into();
+        app.job.wobble = wobble;
+        app.job.wobble_step_mm = 0.05;
+        app.job.wobble_size_mm = 0.2;
+        app.emit_clicked();
+        let ctx = Context::default();
+        for _ in 0..500 {
+            app.pump_verb(&ctx);
+            if app.runtime.verb_job.is_none() {
+                break;
+            }
+            std::thread::sleep(std::time::Duration::from_millis(3));
+        }
+        app.runtime
+            .log
+            .iter()
+            .map(|l| l.text.clone())
+            .collect::<Vec<_>>()
+            .join("\n")
+    };
+    let on = run_emit(true);
+    assert!(
+        on.contains("--wobble")
+            && on.contains("--wobble-step-mm 0.05")
+            && on.contains("--wobble-size-mm 0.2"),
+        "wobble recipe forwarded to the CLI:\n{on}"
+    );
+    let off = run_emit(false);
+    assert!(
+        !off.contains("--wobble"),
+        "no wobble args when off (the CLI default already writes wobbleEnable=0):\n{off}"
+    );
+}
+
+#[test]
 fn camera_ui_reports_active_and_invalid_nonlinear_projection() {
     let mut app = nonlinear_app();
     app.runtime.tab = CentralTab::Camera;
@@ -1427,6 +1467,9 @@ field_frame=\n";
             "job_passes",
             "job_pulse_ns",
             "job_speed_mm_s",
+            "job_wobble",
+            "job_wobble_size_mm",
+            "job_wobble_step_mm",
             "lens_px_bounds",
             "place_drill_lbrn2",
             "place_drills",
@@ -2474,6 +2517,42 @@ fn etch_and_run_arms_an_absolute_pending_path() {
         "queued path is absolute: {pending:?}"
     );
     assert!(app.debug_summary().contains("lightburn=pending"));
+}
+
+/// "Generate + burn holes" queues an ABSOLUTE holes path once the export
+/// launches, so `pump_verb` chains the LightBurn load + START — the holes
+/// burn immediately instead of waiting for a manual load-and-press-play.
+#[test]
+fn generate_holes_arms_an_absolute_pending_burn() {
+    let mut app = ConsoleApp::new(tmp_db(), vec!["true".into()]);
+    app.fiducial_generate_holes();
+    let pending = app
+        .runtime
+        .pending_lightburn
+        .as_ref()
+        .expect("a LightBurn burn was queued");
+    assert!(
+        pending.is_absolute(),
+        "queued path is absolute: {pending:?}"
+    );
+    assert!(
+        pending.ends_with("fid-holes.lbrn2"),
+        "queued path is the holes output: {pending:?}"
+    );
+    assert!(app.debug_summary().contains("lightburn=pending"));
+}
+
+/// A refused holes generation (bad layout) arms no burn.
+#[test]
+fn generate_holes_guard_refusal_arms_no_burn() {
+    let mut app = ConsoleApp::new(tmp_db(), vec!["true".into()]);
+    app.fiducials.layout = "not a layout".into();
+    app.fiducial_generate_holes();
+    assert!(
+        app.runtime.pending_lightburn.is_none(),
+        "nothing queued when the layout is rejected"
+    );
+    assert!(app.debug_summary().contains("lightburn=idle"));
 }
 
 /// The placement guard (no frame/job loaded) refuses before the export starts,
