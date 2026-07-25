@@ -2737,6 +2737,7 @@ dependencies = [
  "nalgebra",
  "orchestra",
  "pcb-core",
+ "tempfile",
  "testkit",
  "vision",
 ]

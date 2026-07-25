@@ -1,18 +1,22 @@
 //! End-to-end test of `pcbforge calib-grid`: emit an n×n dot grid `.lbrn2`
 //! at known commanded coordinates for camera→laser calibration.
 
-use std::path::PathBuf;
 use std::process::Command;
+use tempfile::TempDir;
 
-fn tmp() -> PathBuf {
-    let d = std::env::temp_dir().join(format!("pcbforge-calibgrid-{}", std::process::id()));
-    std::fs::create_dir_all(&d).unwrap();
-    d
+/// A scratch directory that removes itself. Keyed only by process id before, so
+/// concurrent runs shared one directory and every run left it behind.
+fn tmp() -> TempDir {
+    tempfile::Builder::new()
+        .prefix("pcbforge-calibgrid-")
+        .tempdir()
+        .unwrap()
 }
 
 #[test]
 fn calib_grid_emits_the_expected_dot_lattice() {
-    let out = tmp().join("grid.lbrn2");
+    let dir = tmp();
+    let out = dir.path().join("grid.lbrn2");
     let result = Command::new(env!("CARGO_BIN_EXE_pcbforge"))
         .args([
             "calib-grid",
@@ -51,7 +55,8 @@ fn calib_grid_emits_the_expected_dot_lattice() {
 
 #[test]
 fn calib_grid_rejects_bad_args() {
-    let out = tmp().join("bad.lbrn2");
+    let dir = tmp();
+    let out = dir.path().join("bad.lbrn2");
     let n1 = Command::new(env!("CARGO_BIN_EXE_pcbforge"))
         .args(["calib-grid", "--out", out.to_str().unwrap(), "--n", "1"])
         .output()

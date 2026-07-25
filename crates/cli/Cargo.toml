@@ -22,3 +22,6 @@ camera = ["capture/camera"]
 [dev-dependencies]
 testkit = { path = "../testkit" }
 image = { version = "0.25", default-features = false, features = ["png"] }
+# Self-removing scratch dirs for the e2e tests, so runs neither share a
+# directory nor leave one behind.
+tempfile = "3"
