@@ -42,3 +42,6 @@ accesskit_consumer = "0.25"
 # Integration tests are a separate crate and can't name `ui`'s normal deps, so
 # expose egui to them explicitly (same version).
 egui = "0.30"
+# Per-harness temp directories so persisted operator fields can't bleed between
+# tests or runs (see tests/common/mod.rs).
+tempfile = "3"

@@ -2,20 +2,10 @@
 //! accessibility tree with `egui_kittest` (no GPU/display needed). See
 //! AGENT_DEBUGGING.md and `examples/debug_driver.rs`.
 
-use egui_kittest::Harness;
 use egui_kittest::kittest::Queryable;
-use ui::ConsoleApp;
 
-/// A fresh headless console harness (temp DB, `true` as the verb command).
-fn console() -> Harness<'static, ConsoleApp> {
-    let db = std::env::temp_dir().join("pcbforge-kittest.sqlite");
-    let app = ConsoleApp::new(db, vec!["true".to_string()]);
-    let mut harness = Harness::builder()
-        .with_size(egui::vec2(1280.0, 820.0))
-        .build_state(|ctx, app: &mut ConsoleApp| app.ui(ctx), app);
-    harness.run();
-    harness
-}
+mod common;
+use common::console;
 
 #[test]
 fn clicking_a_tab_switches_the_central_view() {
