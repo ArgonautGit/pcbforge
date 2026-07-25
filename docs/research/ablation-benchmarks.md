@@ -1,5 +1,15 @@
 # RES-4: Ablation Benchmarks Survey — Fiber-Laser Copper Isolation on FR4 + UV Finishing
 
+> **⚠️ SUPERSEDED on the machine assumption — see
+> [`commarker-omni-x.md`](commarker-omni-x.md).**
+>
+> This survey was written around a **~20 W ComMarker B4-class fiber MOPA at
+> 1064 nm**. On 2026-07-14 the operator confirmed the production laser is a
+> **ComMarker Omni X, 355 nm UV galvo** — a different wavelength and a different
+> ablation mechanism. **Do not lift the process parameters below (passes,
+> fluence, PRESET-F0) as current.** The trace/space floor plan and the
+> char-mitigation *reasoning* still read usefully; the numbers do not transfer.
+
 **Task:** Survey documented (≤ 24 months preferred) results for fiber-laser copper isolation on FR4 and UV finishing quality: minimum trace/space, passes for 1 oz clearance, char mitigation. Check against the 8/8 → 6/6 → 4/4 mil floor plan and PRESET-F0 (~20 W ComMarker B4-class MOPA, 1 oz copper).
 **Date compiled:** 2026-07-08. All URLs accessed 2026-07-08.
 
