@@ -156,12 +156,7 @@ impl KicadCli {
             "-o",
             out_dir.to_str().unwrap_or_default(),
         ])?;
-        let files: Vec<PathBuf> = stdout
-            .lines()
-            .filter_map(|l| l.split_once('\'').map(|(_, rest)| rest))
-            .filter_map(|rest| rest.rsplit_once('\'').map(|(path, _)| PathBuf::from(path)))
-            .filter(|p| p.is_file())
-            .collect();
+        let files = quoted_created_files(&stdout);
         if files.is_empty() {
             return Err(KicadCliError::UnexpectedOutput {
                 command: "kicad-cli pcb export gerbers".into(),
@@ -206,15 +201,7 @@ impl KicadCli {
                 detail: "no plotted file for the layer".into(),
             })?;
         let dest = out_dir.join(dest_name);
-        if src != dest {
-            // rename within a dir usually works; fall back to copy across fs.
-            std::fs::rename(&src, &dest)
-                .or_else(|_| std::fs::copy(&src, &dest).map(|_| ()))
-                .map_err(|e| KicadCliError::UnexpectedOutput {
-                    command: format!("move {} -> {}", src.display(), dest.display()),
-                    detail: e.to_string(),
-                })?;
-        }
+        move_into(&src, &dest)?;
         Ok(dest)
     }
 
@@ -283,12 +270,7 @@ impl KicadCli {
             "-o",
             &dir,
         ])?;
-        let files: Vec<PathBuf> = stdout
-            .lines()
-            .filter_map(|l| l.split_once('\'').map(|(_, rest)| rest))
-            .filter_map(|rest| rest.rsplit_once('\'').map(|(path, _)| PathBuf::from(path)))
-            .filter(|p| p.is_file())
-            .collect();
+        let files = quoted_created_files(&stdout);
         if files.is_empty() {
             return Err(KicadCliError::UnexpectedOutput {
                 command: "kicad-cli pcb export drill".into(),
@@ -297,6 +279,105 @@ impl KicadCli {
         }
         Ok(files)
     }
+
+    /// Export the Excellon drill files a job needs from `board` under **stable
+    /// names** (`pth.drl`, `npth.drl`) in `out_dir`, regardless of kicad-cli's
+    /// own board-derived naming — the drill counterpart of
+    /// [`Self::export_job_gerbers`]. Passes `--excellon-separate-th` so plated
+    /// and non-plated holes always split into the two files; when the export
+    /// produces no file for one side (a board with no such holes), a valid
+    /// empty Excellon file is written there so downstream loaders see "zero
+    /// holes" rather than a missing path. Returns `(pth, npth)`.
+    pub fn export_job_drills(
+        &self,
+        board: &Path,
+        out_dir: &Path,
+    ) -> Result<(PathBuf, PathBuf), KicadCliError> {
+        let sub = ["pcb", "export", "drill"];
+        self.require_flags(&sub, &["--output", "--excellon-separate-th"])?;
+        std::fs::create_dir_all(out_dir).ok();
+        // kicad-cli 7 requires the output dir to end with a separator.
+        let mut dir = out_dir.to_str().unwrap_or_default().to_string();
+        if !dir.ends_with('/') {
+            dir.push('/');
+        }
+        let stdout = self.run(&[
+            "pcb",
+            "export",
+            "drill",
+            "--excellon-separate-th",
+            board.to_str().unwrap_or_default(),
+            "-o",
+            &dir,
+        ])?;
+        let files = quoted_created_files(&stdout);
+        if files.is_empty() {
+            return Err(KicadCliError::UnexpectedOutput {
+                command: "kicad-cli pcb export drill --excellon-separate-th".into(),
+                detail: format!("no 'Created file' lines found in: {stdout}"),
+            });
+        }
+        // Classify by kicad's naming (`<board>-PTH.drl` / `<board>-NPTH.drl`).
+        // A file matching neither (a merged export, should the flag ever be
+        // ignored) still holds every hole, so it stands in on the PTH side.
+        let (mut pth_src, mut npth_src) = (None, None);
+        for f in files {
+            let name = f.file_name().and_then(|n| n.to_str()).unwrap_or_default();
+            if name.contains("-NPTH") {
+                npth_src = Some(f);
+            } else if pth_src.is_none() {
+                pth_src = Some(f);
+            }
+        }
+        let pth = place_drill(pth_src, out_dir, "pth.drl")?;
+        let npth = place_drill(npth_src, out_dir, "npth.drl")?;
+        Ok((pth, npth))
+    }
+}
+
+/// The paths inside single quotes of kicad-cli's "Created file '…'" /
+/// "Plotted to '…'" stdout lines, kept only when the file really exists.
+fn quoted_created_files(stdout: &str) -> Vec<PathBuf> {
+    stdout
+        .lines()
+        .filter_map(|l| l.split_once('\'').map(|(_, rest)| rest))
+        .filter_map(|rest| rest.rsplit_once('\'').map(|(path, _)| PathBuf::from(path)))
+        .filter(|p| p.is_file())
+        .collect()
+}
+
+/// Move `src` to `dest` (no-op when equal): rename within a dir usually
+/// works; fall back to copy across filesystems.
+fn move_into(src: &Path, dest: &Path) -> Result<(), KicadCliError> {
+    if src == dest {
+        return Ok(());
+    }
+    std::fs::rename(src, dest)
+        .or_else(|_| std::fs::copy(src, dest).map(|_| ()))
+        .map_err(|e| KicadCliError::UnexpectedOutput {
+            command: format!("move {} -> {}", src.display(), dest.display()),
+            detail: e.to_string(),
+        })
+}
+
+/// A valid hole-free Excellon file — written for a drill side the export
+/// produced no file for (e.g. `npth.drl` on a board with no NPTH holes).
+const EMPTY_EXCELLON: &str = "M48\nFMAT,2\nMETRIC\n%\nM30\n";
+
+/// Land a drill export at `out_dir/name`: move the source file there, or
+/// write [`EMPTY_EXCELLON`] when the export produced none for this side.
+fn place_drill(src: Option<PathBuf>, out_dir: &Path, name: &str) -> Result<PathBuf, KicadCliError> {
+    let dest = out_dir.join(name);
+    match src {
+        Some(src) => move_into(&src, &dest)?,
+        None => {
+            std::fs::write(&dest, EMPTY_EXCELLON).map_err(|e| KicadCliError::UnexpectedOutput {
+                command: format!("write empty drill file {}", dest.display()),
+                detail: e.to_string(),
+            })?
+        }
+    }
+    Ok(dest)
 }
 
 /// Resolve a user-supplied path to a `.kicad_pcb` board file: a board file is
@@ -413,6 +494,38 @@ mod tests {
         assert!(copper.is_file() && outline.is_file());
         // Both are real Gerber output (G-code-ish `%` header).
         assert!(std::fs::read_to_string(&copper).unwrap().contains('%'));
+    }
+
+    #[test]
+    fn export_job_drills_writes_stable_names() {
+        if !available() {
+            eprintln!("SKIP: kicad-cli not installed");
+            return;
+        }
+        let cli = KicadCli::discover().unwrap();
+        let board = repo_root().join("samples/kicad/valdemo2.kicad_pcb");
+        let dir = tmp_dir("job-drills");
+        let (pth, npth) = cli.export_job_drills(&board, &dir).unwrap();
+        assert_eq!(pth, dir.join("pth.drl"));
+        assert_eq!(npth, dir.join("npth.drl"));
+        // valdemo2's holes are all plated: 4 round (2 pads + 2 vias) + 1 oval
+        // pad slot on the PTH side, zero NPTH ops (real or placeholder file).
+        let pth_ops = crate::excellon::load_excellon_full(&pth).unwrap();
+        assert_eq!(pth_ops.len(), 5, "4 holes + 1 slot: {pth_ops:?}");
+        let npth_ops = crate::excellon::load_excellon_full(&npth).unwrap();
+        assert!(
+            npth_ops.is_empty(),
+            "no NPTH holes on valdemo2: {npth_ops:?}"
+        );
+    }
+
+    #[test]
+    fn the_empty_excellon_placeholder_parses_to_zero_holes() {
+        // The placeholder written for a hole-free drill side must satisfy our
+        // own loader — a consumer pointed at npth.drl sees "no holes", never
+        // a parse error.
+        let ops = crate::excellon::parse_excellon(EMPTY_EXCELLON).unwrap();
+        assert!(ops.is_empty(), "placeholder holds no ops: {ops:?}");
     }
 
     #[test]

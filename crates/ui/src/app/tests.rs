@@ -1428,6 +1428,8 @@ field_frame=\n";
             "job_pulse_ns",
             "job_speed_mm_s",
             "lens_px_bounds",
+            "place_drill_lbrn2",
+            "place_drills",
             "place_lightburn_device",
         ]
     );
@@ -2514,6 +2516,227 @@ fn failed_export_skips_the_queued_lightburn_run() {
             .any(|l| l.err && l.text.contains("skipped")),
         "the skip is logged"
     );
+}
+
+/// KiCad-dialect Excellon for the drill-emit tests: two round holes + one
+/// G85 slot. Raw bbox x [9.5, 20.5], y [−10.5, −4.5] (center 15, −7.5).
+const DRILL_SAMPLE: &str = "\
+M48
+FMAT,2
+METRIC
+T1C1.000
+%
+G90
+G05
+T1
+X10.0Y-10.0
+X20.0Y-10.0
+X15.0Y-5.0G85X15.0Y-7.0
+G05
+M30
+";
+
+/// All shape vertices of an emitted document, mm.
+fn lbrn2_verts(doc: &str) -> Vec<(f64, f64)> {
+    doc.split("<VertList>")
+        .skip(1)
+        .flat_map(|s| s.split("</VertList>").next().unwrap_or("").split('V'))
+        .filter(|t| !t.is_empty())
+        .filter_map(|t| {
+            let xy = t.split('c').next()?;
+            let mut it = xy.split_whitespace();
+            Some((it.next()?.parse().ok()?, it.next()?.parse().ok()?))
+        })
+        .collect()
+}
+
+fn verts_bbox(pts: &[(f64, f64)]) -> (f64, f64, f64, f64) {
+    pts.iter().fold(
+        (f64::MAX, f64::MAX, f64::MIN, f64::MIN),
+        |(x0, y0, x1, y1), &(x, y)| (x0.min(x), y0.min(y), x1.max(x), y1.max(y)),
+    )
+}
+
+/// "⤓ Emit drill holes → LightBurn (no burn)" writes the hole geometry at the
+/// placement affine (translation + rotation, NO frame normalization — the
+/// placement is the position), spawns a LOAD-ONLY LightBurn run, and never
+/// arms the etch path's export→start chain.
+#[test]
+fn emit_drill_holes_writes_placed_geometry_without_queueing_a_burn() {
+    let mut app = ConsoleApp::new(tmp_db(), vec!["true".into()]);
+    let dir = std::env::temp_dir().join(format!("ui-drill-emit-{}", std::process::id()));
+    std::fs::create_dir_all(&dir).unwrap();
+    let drl = dir.join("holes.drl");
+    std::fs::write(&drl, DRILL_SAMPLE).unwrap();
+    let out = dir.join("drill-holes.lbrn2");
+
+    app.placement.job = vec![pcb_core::Poly::default()];
+    app.placement.frame_img = Some(image::GrayImage::new(800, 800));
+    app.placement.drills = drl.to_string_lossy().into_owned();
+    app.placement.drill_lbrn2 = out.to_string_lossy().into_owned();
+    app.placement.pivot = (0.0, 0.0);
+    app.placement.tx_mm = 100.0;
+    app.placement.ty_mm = 50.0;
+    app.placement.rot_deg = 0.0;
+
+    app.emit_drill_at_placement();
+
+    let doc = std::fs::read_to_string(&out).expect("the .lbrn2 was written");
+    assert!(doc.contains("<name Value=\"DRILL\"/>"));
+    assert_eq!(
+        doc.matches("Type=\"Path\"").count(),
+        3,
+        "2 round holes + 1 slot, one shape each"
+    );
+    // Pure translation (rot 0, pivot 0): the raw drill bbox center (15, −7.5)
+    // lands at (115, 42.5) — coordinates are bed mm, not re-normalized.
+    let (x0, y0, x1, y1) = verts_bbox(&lbrn2_verts(&doc));
+    assert!(
+        ((x0 + x1) / 2.0 - 115.0).abs() < 0.01 && ((y0 + y1) / 2.0 - 42.5).abs() < 0.01,
+        "placed center: ({}, {})",
+        (x0 + x1) / 2.0,
+        (y0 + y1) / 2.0
+    );
+
+    // The whole point: the file goes TO LightBurn (a load-only run) but the
+    // start chain is never armed and the run can never press START.
+    assert!(
+        app.runtime.pending_lightburn.is_none(),
+        "the export→start chain is never armed"
+    );
+    let run = app
+        .runtime
+        .lightburn_run
+        .as_ref()
+        .expect("a LightBurn load was spawned");
+    assert!(run.load_only(), "the spawned run is load-only (no START)");
+    assert!(
+        app.runtime
+            .log
+            .iter()
+            .any(|l| !l.err && l.text.contains("NOT starting")),
+        "the log says the job is loaded, not started"
+    );
+    assert!(
+        app.placement.note.contains("no burn started"),
+        "note: {}",
+        app.placement.note
+    );
+
+    // Rotating 90° about the pattern center swaps the emitted extents
+    // (11×6 mm → 6×11 mm) around the same target point.
+    app.placement.pivot = (15.0, -7.5);
+    app.placement.rot_deg = 90.0;
+    app.emit_drill_at_placement();
+    let doc = std::fs::read_to_string(&out).unwrap();
+    let (x0, y0, x1, y1) = verts_bbox(&lbrn2_verts(&doc));
+    assert!(
+        (x1 - x0 - 6.0).abs() < 0.01 && (y1 - y0 - 11.0).abs() < 0.01,
+        "rotated extents: {}×{}",
+        x1 - x0,
+        y1 - y0
+    );
+    assert!(
+        ((x0 + x1) / 2.0 - 100.0).abs() < 0.01 && ((y0 + y1) / 2.0 - 50.0).abs() < 0.01,
+        "rotation pivots about the placed center"
+    );
+    assert!(
+        app.runtime.pending_lightburn.is_none(),
+        "still nothing queued"
+    );
+}
+
+/// "⚙ Drills from KiCad" mirrors the Gerbers button: deterministic
+/// `pth.drl;npth.drl` paths (next to the Gerbers) fill the drill field
+/// immediately, and the export shells the `drills` verb in the background.
+#[test]
+fn drills_from_kicad_fills_the_field_with_stable_paths() {
+    let mut app = ConsoleApp::new(tmp_db(), vec!["true".into()]);
+
+    // Guard: no project set.
+    app.drills_from_kicad();
+    assert!(
+        app.runtime
+            .log
+            .iter()
+            .any(|l| l.err && l.text.contains("KiCad project")),
+        "missing-project guard logged"
+    );
+    assert!(
+        app.placement.drills.is_empty(),
+        "field untouched on refusal"
+    );
+
+    // A real (empty) board file: resolve_board only needs it to exist.
+    let dir = std::env::temp_dir().join(format!("ui-drills-kicad-{}", std::process::id()));
+    std::fs::create_dir_all(&dir).unwrap();
+    let board = dir.join("demo.kicad_pcb");
+    std::fs::write(&board, "").unwrap();
+    app.job.kicad_project = board.to_string_lossy().into_owned();
+
+    app.drills_from_kicad();
+    let gerber_dir = dir.join("pcbforge-gerbers");
+    assert_eq!(
+        app.placement.drills,
+        format!(
+            "{};{}",
+            gerber_dir.join("pth.drl").display(),
+            gerber_dir.join("npth.drl").display()
+        ),
+        "both stable drill paths land in the field"
+    );
+    assert!(
+        app.placement.note.contains("exporting drill files"),
+        "note: {}",
+        app.placement.note
+    );
+    assert!(
+        app.runtime.verb_job.is_some(),
+        "the drills verb was shelled"
+    );
+}
+
+/// The drill-emit guards refuse (back side, no job, no drill file) without
+/// writing anything or arming the LightBurn chain.
+#[test]
+fn emit_drill_holes_guards_refuse_without_queueing() {
+    let mut app = ConsoleApp::new(tmp_db(), vec!["true".into()]);
+
+    // No job loaded.
+    app.emit_drill_at_placement();
+    assert!(
+        app.runtime
+            .log
+            .iter()
+            .any(|l| l.err && l.text.contains("load a frame")),
+        "missing-job guard logged"
+    );
+
+    // Job loaded but no drill file named.
+    app.placement.job = vec![pcb_core::Poly::default()];
+    app.placement.frame_img = Some(image::GrayImage::new(800, 800));
+    app.emit_drill_at_placement();
+    assert!(
+        app.runtime
+            .log
+            .iter()
+            .any(|l| l.err && l.text.contains("set a drill file")),
+        "missing-drill-file guard logged"
+    );
+
+    // Back side: same chirality refusal as the etch buttons.
+    app.job.side = Side::Back;
+    app.emit_drill_at_placement();
+    assert!(
+        app.runtime
+            .log
+            .iter()
+            .any(|l| l.err && l.text.contains("back-side drill emit")),
+        "back-side guard logged"
+    );
+
+    assert!(app.runtime.pending_lightburn.is_none());
+    assert!(app.runtime.lightburn_run.is_none());
 }
 
 /// The LightBurn device name round-trips through a save + reload, and a fresh
