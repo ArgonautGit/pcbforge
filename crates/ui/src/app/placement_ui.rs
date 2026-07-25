@@ -655,12 +655,26 @@ impl ConsoleApp {
                     return;
                 }
             };
-            cam::register::transform_shapes_field(
+            match cam::register::transform_shapes_field(
                 &hole_polys,
                 &affine,
                 DRILL_FIELD_SEG_MM,
                 |x, y| field.precompensate(x, y),
-            )
+            ) {
+                Ok(warped) => warped,
+                Err(e) => {
+                    // Refuse rather than emit: a saturated vertex would send the
+                    // beam to the machine origin on its way to the hole.
+                    self.runtime.log.push(LogLine {
+                        text: format!(
+                            "place: field warp refused ({e}) — drill emit refused; \
+                             re-run the laser-field calibration"
+                        ),
+                        err: true,
+                    });
+                    return;
+                }
+            }
         } else {
             self.runtime.log.push(LogLine {
     text: format!(

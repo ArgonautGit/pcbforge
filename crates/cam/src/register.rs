@@ -43,15 +43,91 @@ impl Affine2 {
 
     /// Apply to an integer-nm point: nm → mm → affine → mm → nm (rounded).
     pub fn apply(&self, p: P) -> P {
-        let x = p.x as f64 / NM_PER_MM as f64;
-        let y = p.y as f64 / NM_PER_MM as f64;
-        let xp = self.m[0] * x + self.m[1] * y + self.m[2];
-        let yp = self.m[3] * x + self.m[4] * y + self.m[5];
+        let (xp, yp) = self.apply_mm(nm_to_mm(p.x), nm_to_mm(p.y));
         P::new(
             (xp * NM_PER_MM as f64).round() as i64,
             (yp * NM_PER_MM as f64).round() as i64,
         )
     }
+
+    /// Apply in millimeters, without rounding to the nm lattice.
+    fn apply_mm(&self, x: f64, y: f64) -> (f64, f64) {
+        (
+            self.m[0] * x + self.m[1] * y + self.m[2],
+            self.m[3] * x + self.m[4] * y + self.m[5],
+        )
+    }
+}
+
+/// Sanity envelope for a placed or warped coordinate, mm. Beyond this a value
+/// is a broken fit rather than a machine move — far outside any bed in this
+/// class, and far inside what the nm `i64` lattice represents.
+const MAX_COORD_MM: f64 = 10_000.0;
+
+fn nm_to_mm(v: pcb_core::Nm) -> f64 {
+    v as f64 / NM_PER_MM as f64
+}
+
+/// Why a field-warped transform refused to produce geometry.
+///
+/// Refusing is the point: `f64 as i64` **saturates**, so a NaN becomes `0` —
+/// the machine origin — and `±∞` becomes `±i64::MAX`. Either one turns a broken
+/// fit into a beam move across the board, so a bad vertex fails the whole job
+/// instead of being clamped.
+#[derive(Debug, Clone, Copy, PartialEq)]
+pub enum WarpError {
+    /// The transform returned NaN or ∞ for a vertex.
+    NonFinite {
+        /// The input vertex, mm.
+        src_mm: (f64, f64),
+    },
+    /// The transform returned a finite value outside `±MAX_COORD_MM`. Finite is
+    /// not enough: `1e300` mm still saturates the nm cast to `i64::MAX`.
+    OutOfEnvelope {
+        /// The input vertex, mm.
+        src_mm: (f64, f64),
+        /// The transformed vertex, mm.
+        out_mm: (f64, f64),
+    },
+}
+
+impl std::fmt::Display for WarpError {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        match self {
+            Self::NonFinite { src_mm } => write!(
+                f,
+                "transform returned a non-finite (NaN/∞) coordinate for the \
+                 vertex at ({:.3}, {:.3}) mm",
+                src_mm.0, src_mm.1
+            ),
+            Self::OutOfEnvelope { src_mm, out_mm } => write!(
+                f,
+                "transform moved the vertex at ({:.3}, {:.3}) mm to \
+                 ({:.3}, {:.3}) mm, outside the ±{MAX_COORD_MM:.0} mm sanity \
+                 envelope",
+                src_mm.0, src_mm.1, out_mm.0, out_mm.1
+            ),
+        }
+    }
+}
+
+impl std::error::Error for WarpError {}
+
+/// Round a transformed millimeter coordinate onto the nm lattice, refusing
+/// anything the `i64` cast would saturate. Checked in **mm, before** scaling by
+/// `NM_PER_MM`: a finite-but-huge mm value overflows the nm range silently.
+fn checked_nm(src_mm: (f64, f64), out_mm: (f64, f64)) -> Result<P, WarpError> {
+    let (x, y) = out_mm;
+    if !x.is_finite() || !y.is_finite() {
+        return Err(WarpError::NonFinite { src_mm });
+    }
+    if x.abs() > MAX_COORD_MM || y.abs() > MAX_COORD_MM {
+        return Err(WarpError::OutOfEnvelope { src_mm, out_mm });
+    }
+    Ok(P::new(
+        (x * NM_PER_MM as f64).round() as i64,
+        (y * NM_PER_MM as f64).round() as i64,
+    ))
 }
 
 /// Apply `a` to every vertex of `shapes` (outer rings and holes), returning
@@ -83,34 +159,44 @@ pub fn transform_shapes(shapes: &[Poly], a: &Affine2) -> Vec<Poly> {
 /// to the endpoints would leave the mid-edge pre-curvature out and the burn
 /// would bow. `warp` takes `(x_mm, y_mm)` physical and returns `(x_mm, y_mm)`
 /// commanded.
+///
+/// # Errors
+///
+/// - [`WarpError::NonFinite`] if the affine or `warp` yields NaN/∞ for a vertex.
+/// - [`WarpError::OutOfEnvelope`] if a transformed vertex leaves the sanity
+///   envelope.
+///
+/// Either refuses the whole job. Clamping would be worse: it would silently move
+/// a vertex the operator believes the calibration placed.
 pub fn transform_shapes_field<F>(
     shapes: &[Poly],
     a: &Affine2,
     max_seg_mm: f64,
     warp: F,
-) -> Vec<Poly>
+) -> Result<Vec<Poly>, WarpError>
 where
     F: Fn(f64, f64) -> (f64, f64),
 {
     let seg_nm = (max_seg_mm.max(1e-3) * NM_PER_MM as f64).max(1.0);
-    let warp_pt = |p: P| -> P {
-        let (cx, cy) = warp(p.x as f64 / NM_PER_MM as f64, p.y as f64 / NM_PER_MM as f64);
-        P::new(
-            (cx * NM_PER_MM as f64).round() as i64,
-            (cy * NM_PER_MM as f64).round() as i64,
-        )
+    let place_pt = |p: P| -> Result<P, WarpError> {
+        let src = (nm_to_mm(p.x), nm_to_mm(p.y));
+        checked_nm(src, a.apply_mm(src.0, src.1))
+    };
+    let warp_pt = |p: P| -> Result<P, WarpError> {
+        let src = (nm_to_mm(p.x), nm_to_mm(p.y));
+        checked_nm(src, warp(src.0, src.1))
     };
     // Densify a closed ring in the physical frame, then warp every point.
-    let ring = |r: &[P]| -> Vec<P> {
+    let ring = |r: &[P]| -> Result<Vec<P>, WarpError> {
         if r.len() < 2 {
-            return r.iter().map(|&p| warp_pt(a.apply(p))).collect();
+            return r.iter().map(|&p| warp_pt(place_pt(p)?)).collect();
         }
-        let placed: Vec<P> = r.iter().map(|&p| a.apply(p)).collect();
+        let placed: Vec<P> = r.iter().map(|&p| place_pt(p)).collect::<Result<_, _>>()?;
         let mut out = Vec::with_capacity(placed.len());
         for i in 0..placed.len() {
             let s = placed[i];
             let e = placed[(i + 1) % placed.len()]; // closed: last → first
-            out.push(warp_pt(s));
+            out.push(warp_pt(s)?);
             // Interior subdivision points (exclusive of both ends; the next
             // edge contributes its own start).
             let (dx, dy) = ((e.x - s.x) as f64, (e.y - s.y) as f64);
@@ -121,16 +207,22 @@ where
                 out.push(warp_pt(P::new(
                     (s.x as f64 + dx * t).round() as i64,
                     (s.y as f64 + dy * t).round() as i64,
-                )));
+                ))?);
             }
         }
-        out
+        Ok(out)
     };
     shapes
         .iter()
-        .map(|poly| Poly {
-            outer: ring(&poly.outer),
-            holes: poly.holes.iter().map(|h| ring(h)).collect(),
+        .map(|poly| {
+            Ok(Poly {
+                outer: ring(&poly.outer)?,
+                holes: poly
+                    .holes
+                    .iter()
+                    .map(|h| ring(h))
+                    .collect::<Result<_, _>>()?,
+            })
         })
         .collect()
 }
@@ -238,7 +330,8 @@ mod tests {
     #[test]
     fn field_warp_subdivides_edges_and_warps_interior_points() {
         // 10 mm segments over a 100 mm edge → 10 interior points per edge.
-        let out = transform_shapes_field(&[big_sq()], &Affine2::identity(), 10.0, pincushion);
+        let out = transform_shapes_field(&[big_sq()], &Affine2::identity(), 10.0, pincushion)
+            .expect("finite warp");
         let ring = &out[0].outer;
         // 4 corners + 10 interior each = 44 points (subdivision happened).
         assert_eq!(ring.len(), 44, "each 100 mm edge densified to 10 mm steps");
@@ -268,7 +361,8 @@ mod tests {
     #[test]
     fn field_warp_identity_keeps_edges_straight() {
         // Identity warp: subdivided points stay collinear on the original edge.
-        let out = transform_shapes_field(&[big_sq()], &Affine2::identity(), 10.0, |x, y| (x, y));
+        let out = transform_shapes_field(&[big_sq()], &Affine2::identity(), 10.0, |x, y| (x, y))
+            .expect("finite warp");
         let ring = &out[0].outer;
         assert_eq!(ring.len(), 44);
         // Every bottom-edge interior point (indices 1..=10) has y = 0.
@@ -290,8 +384,57 @@ mod tests {
             outer: big_sq().outer,
             holes: vec![hole],
         };
-        let out = transform_shapes_field(&[poly], &Affine2::identity(), 10.0, pincushion);
+        let out = transform_shapes_field(&[poly], &Affine2::identity(), 10.0, pincushion)
+            .expect("finite warp");
         assert_eq!(out[0].holes.len(), 1, "hole survives the warp");
         assert!(out[0].holes[0].len() > 4, "hole edges densified too");
+    }
+
+    #[test]
+    fn non_finite_warp_result_refuses_the_job() {
+        // NaN would cast to 0 nm — the machine origin — and the beam would draw
+        // a line across the board to reach it.
+        let out = transform_shapes_field(&[big_sq()], &Affine2::identity(), 10.0, |x, y| {
+            if x > 50.0 { (f64::NAN, y) } else { (x, y) }
+        });
+        assert!(matches!(out, Err(WarpError::NonFinite { .. })), "{out:?}");
+
+        let inf = transform_shapes_field(&[big_sq()], &Affine2::identity(), 10.0, |x, y| {
+            if y > 50.0 { (x, f64::INFINITY) } else { (x, y) }
+        });
+        assert!(matches!(inf, Err(WarpError::NonFinite { .. })), "{inf:?}");
+    }
+
+    #[test]
+    fn finite_but_absurd_warp_result_refuses_the_job() {
+        // 1e300 mm is finite, so a finiteness-only guard would pass it — and the
+        // nm cast saturates it to i64::MAX all the same.
+        let out = transform_shapes_field(&[big_sq()], &Affine2::identity(), 10.0, |x, y| {
+            if x > 50.0 { (1e300, y) } else { (x, y) }
+        });
+        match out {
+            Err(WarpError::OutOfEnvelope { out_mm, .. }) => assert_eq!(out_mm.0, 1e300),
+            other => panic!("expected OutOfEnvelope, got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn non_finite_affine_refuses_before_the_warp_runs() {
+        let a = Affine2 {
+            m: [1.0, 0.0, f64::NAN, 0.0, 1.0, 0.0],
+        };
+        let out = transform_shapes_field(&[big_sq()], &a, 10.0, |x, y| (x, y));
+        assert!(matches!(out, Err(WarpError::NonFinite { .. })), "{out:?}");
+    }
+
+    #[test]
+    fn warp_error_message_names_the_offending_vertex() {
+        let err = transform_shapes_field(&[big_sq()], &Affine2::identity(), 10.0, |_, _| {
+            (f64::NAN, 0.0)
+        })
+        .unwrap_err();
+        let text = err.to_string();
+        assert!(text.contains("non-finite"), "{text}");
+        assert!(text.contains("0.000, 0.000"), "{text}");
     }
 }

@@ -556,9 +556,13 @@ impl ConsoleApp {
         // survives a restart. Staleness is guarded at use time: the
         // frame-signature check refuses it if resolution/crop/orientation
         // changed, and a physically moved camera is re-anchored/re-fit anyway.
-        if let (Some(px), Some(mm)) = (
-            m.get("lens_px_to_mm").and_then(|s| parse_coeffs(s)),
-            m.get("lens_mm_to_px").and_then(|s| parse_coeffs(s)),
+        if let (Some(px_to_mm), Some(mm_to_px)) = (
+            m.get("lens_px_to_mm")
+                .and_then(|s| parse_coeffs(s))
+                .and_then(|c| vision::Poly2::from_coeffs(&c)),
+            m.get("lens_mm_to_px")
+                .and_then(|s| parse_coeffs(s))
+                .and_then(|c| vision::Poly2::from_coeffs(&c)),
         ) {
             let mut stats = m
                 .get("lens_stats")
@@ -567,8 +571,8 @@ impl ConsoleApp {
                 .flatten();
             self.calibration.lens = Some(crate::calib::CameraCal {
                 lens: vision::LensMap {
-                    px_to_mm: vision::Poly2::from_coeffs(&px),
-                    mm_to_px: vision::Poly2::from_coeffs(&mm),
+                    px_to_mm,
+                    mm_to_px,
                     rms_um: stats.next().and_then(|s| s.parse().ok()).unwrap_or(0.0),
                     max_um: stats.next().and_then(|s| s.parse().ok()).unwrap_or(0.0),
                     residuals: Vec::new(),

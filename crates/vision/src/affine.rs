@@ -38,6 +38,10 @@ pub enum AffineError {
     },
     /// The SVD solve itself failed (singular vectors unavailable).
     SolveFailed(&'static str),
+    /// A source or destination coordinate was non-finite (NaN/∞). nalgebra's
+    /// singular-value sort panics on NaN, and a NaN that survived would flow
+    /// into machine coordinates, so this fails closed before the solve.
+    NonFinite,
 }
 
 impl std::fmt::Display for AffineError {
@@ -54,6 +58,10 @@ impl std::fmt::Display for AffineError {
                  (design matrix rank {rank} < 6)"
             ),
             Self::SolveFailed(msg) => write!(f, "affine SVD solve failed: {msg}"),
+            Self::NonFinite => write!(
+                f,
+                "affine fit input contains a non-finite (NaN/∞) coordinate"
+            ),
         }
     }
 }
@@ -85,10 +93,16 @@ impl std::error::Error for AffineError {}
 /// - [`AffineError::DegenerateSources`] if the source points are collinear
 ///   (numerical rank of the design matrix below 6).
 /// - [`AffineError::SolveFailed`] if the SVD back-substitution fails.
+/// - [`AffineError::NonFinite`] if any coordinate is NaN or infinite.
 pub fn fit_affine(pairs: &[(Point2<f64>, Point2<f64>)]) -> Result<AffineFit, AffineError> {
     let n = pairs.len();
     if n < 3 {
         return Err(AffineError::TooFewPoints { got: n });
+    }
+    if pairs.iter().any(|(src, dst)| {
+        !src.x.is_finite() || !src.y.is_finite() || !dst.x.is_finite() || !dst.y.is_finite()
+    }) {
+        return Err(AffineError::NonFinite);
     }
 
     let mut design = DMatrix::<f64>::zeros(2 * n, 6);
@@ -255,6 +269,35 @@ mod tests {
             fit_affine(&[(p, p), (p, p)]),
             Err(AffineError::TooFewPoints { got: 2 })
         );
+    }
+
+    /// nalgebra's singular-value sort carries an `.expect("Singular value was
+    /// NaN")`, and a NaN that survived the solve would flow into machine
+    /// coordinates — so the guard runs before the SVD, like `fit_homography`'s.
+    #[test]
+    fn non_finite_input_is_rejected_before_the_solve() {
+        let truth = known_affine();
+        let base: Vec<_> = fiducials()
+            .into_iter()
+            .map(|p| (p, truth.transform_point(&p)))
+            .collect();
+
+        for bad in [f64::NAN, f64::INFINITY, f64::NEG_INFINITY] {
+            for slot in 0..4 {
+                let mut pairs = base.clone();
+                match slot {
+                    0 => pairs[1].0.x = bad,
+                    1 => pairs[1].0.y = bad,
+                    2 => pairs[3].1.x = bad,
+                    _ => pairs[3].1.y = bad,
+                }
+                assert_eq!(
+                    fit_affine(&pairs),
+                    Err(AffineError::NonFinite),
+                    "{bad} in slot {slot} must be refused"
+                );
+            }
+        }
     }
 
     #[test]

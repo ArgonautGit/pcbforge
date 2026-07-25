@@ -1083,7 +1083,7 @@ mod tests {
         c[11] = ay[0];
         c[12] = ay[1];
         c[22] = 1.0;
-        vision::Poly2::from_coeffs(&c)
+        vision::Poly2::from_coeffs(&c).expect("test poly has a valid normalization")
     }
 
     fn affine_maps() -> (LensMap, FieldMap) {
@@ -1283,7 +1283,7 @@ mod tests {
         let (lens, mut field) = affine_maps();
         let mut coeffs = field.to_physical.to_coeffs();
         coeffs[0] = f64::NAN;
-        field.to_physical = vision::Poly2::from_coeffs(&coeffs);
+        field.to_physical = vision::Poly2::from_coeffs(&coeffs).expect("scale still valid");
         assert!(!composed_projection_is_finite(&lens, &field));
         let frame = Rigid2::IDENTITY;
         assert!(commanded_to_camera_px(&lens, &frame, &field, (10.0, 10.0)).is_none());

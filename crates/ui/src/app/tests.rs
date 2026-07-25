@@ -240,7 +240,7 @@ fn invalid_nonlinear_projection_fails_closed_without_homography_fallback() {
     let field = &mut app.calibration.field.as_mut().unwrap().field;
     let mut coeffs = field.to_physical.to_coeffs();
     coeffs[0] = f64::NAN;
-    field.to_physical = vision::Poly2::from_coeffs(&coeffs);
+    field.to_physical = vision::Poly2::from_coeffs(&coeffs).expect("scale still valid");
     assert!(app.camera_projection((800, 800)).is_err());
     assert!(app.place_projection(800, 800).is_err());
 }
@@ -363,7 +363,7 @@ fn camera_ui_reports_active_and_invalid_nonlinear_projection() {
     let field = &mut app.calibration.field.as_mut().unwrap().field;
     let mut coeffs = field.to_physical.to_coeffs();
     coeffs[0] = f64::NAN;
-    field.to_physical = vision::Poly2::from_coeffs(&coeffs);
+    field.to_physical = vision::Poly2::from_coeffs(&coeffs).expect("scale still valid");
     let out = ctx.run(egui::RawInput::default(), |ctx| app.ui(ctx));
     assert!(
         !out.shapes.is_empty(),
