@@ -53,6 +53,8 @@ impl ConsoleApp {
                 self.placement.lightburn_device.clone(),
             ),
             ("place_px_per_mm", self.placement.px_per_mm.to_string()),
+            ("place_drills", self.placement.drills.clone()),
+            ("place_drill_lbrn2", self.placement.drill_lbrn2.clone()),
             ("fid_frame", self.fiducials.frame.clone()),
             ("fid_layout", self.fiducials.layout.clone()),
             ("fid_px_per_mm", self.fiducials.px_per_mm.to_string()),
@@ -276,6 +278,8 @@ impl ConsoleApp {
         str_field(&m, "back_outline", &mut self.job.back_outline);
         str_field(&m, "place_frame", &mut self.placement.frame);
         str_field(&m, "place_lbrn2", &mut self.placement.lbrn2);
+        str_field(&m, "place_drills", &mut self.placement.drills);
+        str_field(&m, "place_drill_lbrn2", &mut self.placement.drill_lbrn2);
         str_field(
             &m,
             "place_lightburn_device",

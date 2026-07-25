@@ -2267,3 +2267,110 @@ actually launched, the queued path is absolutized without canonicalizing
 disable while a run is in flight, like Etch + run. If LightBurn isn't open
 the run fails with the friendly not-responding note and the file is still on
 disk for a manual run.
+## 2026-07-23 — drill-emit: pure drill-hole geometry as a LightBurn job
+
+- New extraction path: `cam::drill::drill_polys` turns `DrillEntry` lists
+  (the CAM-6 ingest-free drill carrier) into pure hole outlines — a
+  circle-approximation polygon per round hole and a capsule (two straight
+  sides plus semicircular caps: the bit's swept outline) per G85 slot. Rings
+  wind CCW, vertices sit on the ideal circle under the `circle_segments`
+  2 µm chord bound, and coordinates pass through verbatim — placement stays
+  the emitter's concern.
+- `pcbforge drill-emit` wraps it: Excellon file(s) via `--drills`
+  (repeatable, because KiCad exports PTH and NPTH holes as two separate
+  files) or a board via `--board` + kicad-cli, emitted as a `DRILL` Fill
+  (filled discs) or Line (outline contours) layer through the existing
+  lbrn2 emitter with the emit-style recipe, placement, and field-warp
+  flags. The fid-holes field-warp helper was generalized (`warp_polys`)
+  rather than duplicated.
+- Frame decision: drill files share the Gerber y-up-but-offset-negative
+  frame, so the default normalization sends the drill pattern's own bbox
+  corner to the origin. That corner is NOT the copper job's corner, so
+  `--outline` (Edge.Cuts) pins the frame to the board region's corner
+  instead — the same corner `emit` normalizes to — keeping a drill job
+  co-registered with the copper job emitted from the same board; the
+  placement flags then anchor the board region, not the drill bbox, for
+  the same reason. Both exports must use the same origin convention
+  (KiCad's defaults agree).
+- Scope note: drilling is a hand operation today (ORC-7 drill-guide); this
+  verb only extracts and emits the geometry. Whether the UV laser actually
+  cuts hole outlines through FR4, and at what recipe, is the operator's
+  call — defaults mirror the other emit verbs.
+
+## 2026-07-23 — Place tab: "Emit drill holes (no burn)"
+
+- New Place-tab control emitting ONLY the drill-hole geometry at the current
+  placement: `drill .drl` input (`;`-separated — KiCad exports PTH and NPTH
+  as two files), `drill out .lbrn2` output (bare names land next to the
+  drill file), and a `⤓ Emit drill holes (no burn)` button. The button
+  writes the file and stops: it never touches `pending_lightburn`, so the
+  etch/run chain can't fire — the operator opens and starts the job in
+  LightBurn themselves.
+- Runs in-process (`ingest::excellon` → `cam::drill::drill_polys` →
+  `Placement::affine()` as a `cam::register::Affine2` →
+  `transform_shapes[_field]` → `cam::lbrn2::write_lbrn2`) instead of
+  shelling a verb: `drill-emit` only takes a translation origin, so a
+  rotated placement is not expressible through the CLI. The affine layouts
+  match ([a,b,c,d,e,f] row-major), and drill files share the Gerber frame,
+  so the copper job's placement affine positions the holes directly — no
+  normalization, the placement IS the position, exactly like "Etch here".
+- Field-warp fires under the same conditions as "Etch here" (valid
+  calibration for the loaded frame + the map file), reading the same
+  `pcbforge-field-map.txt` with the CLI's 0.25 mm segment default, so the
+  two exports land on the same physical geometry. An unreadable map file
+  REFUSES the emit rather than silently exporting unwarped — the operator
+  believes exports are warped while that file exists.
+- Same guards as the etch buttons: back side refused (no mirror pass —
+  wrong chirality at the wrong spot, silently), job + frame required (the
+  pose is meaningless before a Load). Recipe = Job-tab params over the
+  register verb's default 20 % power, layer name `DRILL`.
+
+## 2026-07-23 — Drill files extracted from the KiCad project, like the Gerbers
+
+- `ingest::kicad_cli::export_job_drills` is the drill counterpart of
+  `export_job_gerbers`: `--excellon-separate-th` (flag-checked via
+  `require_flags`) always splits plated/non-plated, and the outputs land
+  under stable names `pth.drl` + `npth.drl` regardless of kicad-cli's
+  board-derived naming. A side the export produced no file for (a board
+  with no NPTH holes) gets a valid empty Excellon placeholder — parser-
+  verified — so downstream loaders see "zero holes", never a missing path.
+  A merged file (should a kicad ever ignore the flag) stands in on the PTH
+  side; it still holds every hole. The "Created file" stdout parsing and
+  the rename-or-copy move were factored out (`quoted_created_files`,
+  `move_into`) and shared with the Gerber exporters.
+- New `pcbforge drills --project --out` verb mirrors `gerbers`: resolves
+  the board, exports, prints parseable `board:`/`pth:`/`npth:` lines.
+- Console: "⚙ Drills from KiCad" on the Place tab mirrors the Job tab's
+  Gerbers button — deterministic paths
+  (`<board dir>/pcbforge-gerbers/{pth,npth}.drl`, the same directory the
+  Gerbers land in) fill the `drill .drl` field immediately, and the verb
+  shells in the background with progress in the Log.
+- Test-honesty note: kittest consoles share one settings sidecar, and
+  focused text fields APPEND typed text — the new interaction test
+  select-alls before typing and asserts positively (path in → field
+  filled), because "field is unset" assertions are order-dependent there.
+  Also recorded: kicad-cli is absent on this dev container, so every
+  kicad-gated test self-skips (they print ok) — the export itself needs a
+  machine with KiCad to verify.
+
+## 2026-07-23 — Drill emit now LOADS the file in LightBurn (still never starts)
+
+- The Place-tab drill emit grew the missing half of the handoff: after
+  writing the `.lbrn2` it now drives a **load-only** LightBurn run —
+  PING → device select → FORCELOAD → done. START is never sent (the
+  worker's `start_job` flag short-circuits before the STATUS gate), and
+  `pending_lightburn` (the etch path's export→start chain) is never
+  touched, so the "no burn" contract holds while the operator finds the
+  job already open in LightBurn; button renamed
+  `⤓ Emit drill holes → LightBurn (no burn)` to say so.
+- `spawn_lightburn_load` shares the whole worker with the etch path's
+  `spawn_lightburn_run` rather than duplicating the UDP dance;
+  `LightburnRun::load_only()` lets tests (and future UI) tell the two
+  apart. The fake-LightBurn UDP test proves a load-only run FORCELOADs
+  the path and that START never crosses the wire.
+- A LightBurn run already in flight skips the load with a warning (the
+  file is still written) — replacing a live run's progress reporting
+  would be rude; the button is also disabled while one runs, mirroring
+  "Etch + run". An unresolvable absolute path likewise degrades to
+  "written; open it manually" (FORCELOAD dislikes `\\?\` prefixes, same
+  rule as the etch chain).

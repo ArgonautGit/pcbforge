@@ -3,6 +3,7 @@
 pub mod ablation;
 pub mod cut;
 pub mod drc;
+pub mod drill;
 pub mod export;
 pub mod features;
 pub mod flip;

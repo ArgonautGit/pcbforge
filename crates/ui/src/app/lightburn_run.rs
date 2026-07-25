@@ -63,11 +63,18 @@ pub(super) struct LightburnRun {
     done: Arc<AtomicBool>,
     phase: LightburnPhase,
     note: String,
+    /// The run only loads the file (no START) — the drill-emit contract.
+    load_only: bool,
 }
 
 impl LightburnRun {
     pub(super) fn finished(&self) -> bool {
         self.done.load(Ordering::Relaxed)
+    }
+
+    /// True for a load-only run: the worker never sends START.
+    pub(super) fn load_only(&self) -> bool {
+        self.load_only
     }
 
     /// Drain pending events into log lines, updating the phase/note snapshot.
@@ -161,6 +168,20 @@ impl ConsoleApp {
 /// and `PCBFORGE_LIGHTBURN_REPLY_PORT` override them (read here, at spawn time
 /// — headless tests point these at a fake server on ephemeral ports).
 pub(super) fn spawn_lightburn_run(lbrn2: PathBuf, device: String) -> LightburnRun {
+    let (target, reply_port) = env_endpoints();
+    spawn_lightburn_run_at(lbrn2, device, target, reply_port, true)
+}
+
+/// Spawn a **load-only** run: connect, select the device, FORCELOAD the file,
+/// and stop — START is never sent, so nothing burns until the operator presses
+/// play in LightBurn themselves. Same env overrides as [`spawn_lightburn_run`].
+pub(super) fn spawn_lightburn_load(lbrn2: PathBuf, device: String) -> LightburnRun {
+    let (target, reply_port) = env_endpoints();
+    spawn_lightburn_run_at(lbrn2, device, target, reply_port, false)
+}
+
+/// Target/reply endpoints from the environment, with the documented defaults.
+fn env_endpoints() -> (SocketAddr, u16) {
     let target = std::env::var("PCBFORGE_LIGHTBURN_ADDR")
         .ok()
         .and_then(|s| s.parse().ok())
@@ -169,7 +190,7 @@ pub(super) fn spawn_lightburn_run(lbrn2: PathBuf, device: String) -> LightburnRu
         .ok()
         .and_then(|s| s.parse().ok())
         .unwrap_or(drivers::lightburn::DEFAULT_REPLY_PORT);
-    spawn_lightburn_run_at(lbrn2, device, target, reply_port)
+    (target, reply_port)
 }
 
 /// Poll STATUS this often while a job runs.
@@ -187,30 +208,39 @@ pub(super) fn spawn_lightburn_run_at(
     device: String,
     target: SocketAddr,
     reply_port: u16,
+    start_job: bool,
 ) -> LightburnRun {
     let (tx, rx) = mpsc::channel::<LightburnEvent>();
     let done = Arc::new(AtomicBool::new(false));
     let done_t = done.clone();
     thread::spawn(move || {
-        run_worker(&tx, &lbrn2, &device, target, reply_port);
+        run_worker(&tx, &lbrn2, &device, target, reply_port, start_job);
         done_t.store(true, Ordering::Relaxed);
     });
     LightburnRun {
         rx,
         done,
         phase: LightburnPhase::Loading,
-        note: "starting LightBurn run".into(),
+        note: if start_job {
+            "starting LightBurn run".into()
+        } else {
+            "loading in LightBurn".into()
+        },
+        load_only: !start_job,
     }
 }
 
-/// The worker body: connect, load, gate, start, and poll to completion. Every
-/// exit path sends a terminal [`LightburnPhase`] event (`Done` or `Error`).
+/// The worker body: connect, load, and — for a full run (`start_job`) — gate,
+/// start, and poll to completion; a load-only run finishes right after the
+/// FORCELOAD. Every exit path sends a terminal [`LightburnPhase`] event
+/// (`Done` or `Error`).
 fn run_worker(
     tx: &Sender<LightburnEvent>,
     lbrn2: &std::path::Path,
     device: &str,
     target: SocketAddr,
     reply_port: u16,
+    start_job: bool,
 ) {
     let reply_bind = SocketAddr::new(IpAddr::V4(Ipv4Addr::LOCALHOST), reply_port);
     let client = match LightburnClient::connect(target, reply_bind) {
@@ -256,6 +286,19 @@ fn run_worker(
         let _ = tx.send(LightburnEvent::phase(
             LightburnPhase::Error,
             format!("FORCELOAD failed ({desc})"),
+        ));
+        return;
+    }
+
+    // Load-only: the file is in LightBurn, and that's the whole contract —
+    // START stays with the operator.
+    if !start_job {
+        let _ = tx.send(LightburnEvent::phase(
+            LightburnPhase::Done,
+            format!(
+                "loaded {} — NOT started; press ▶ in LightBurn to burn it",
+                lbrn2.display()
+            ),
         ));
         return;
     }
@@ -428,7 +471,7 @@ mod tests {
     fn end_to_end_run_reaches_done_and_sends_forceload_and_start() {
         let (addr, seen) = fake_lightburn_that_completes();
         let path = PathBuf::from("C:\\jobs\\placed.lbrn2");
-        let mut run = spawn_lightburn_run_at(path.clone(), "BSLFiber".into(), addr, 0);
+        let mut run = spawn_lightburn_run_at(path.clone(), "BSLFiber".into(), addr, 0, true);
 
         // Poll the run to completion (busy→idle finishes in ~2 polls ≈ 1 s).
         let deadline = Instant::now() + Duration::from_secs(20);
@@ -449,6 +492,40 @@ mod tests {
         assert!(cmds.iter().any(|c| c == "START"), "sent START: {cmds:?}");
     }
 
+    /// A load-only run (the drill-emit contract) FORCELOADs the file and
+    /// finishes done — START is never sent, so nothing can burn.
+    #[test]
+    fn load_only_run_loads_the_file_and_never_sends_start() {
+        let (addr, seen) = fake_lightburn_that_completes();
+        let path = PathBuf::from("C:\\jobs\\drill.lbrn2");
+        let mut run = spawn_lightburn_run_at(path.clone(), "BSLFiber".into(), addr, 0, false);
+        assert!(run.load_only(), "the run reports itself load-only");
+
+        let deadline = Instant::now() + Duration::from_secs(20);
+        while !run.finished() && Instant::now() < deadline {
+            let _ = run.drain();
+            thread::sleep(Duration::from_millis(20));
+        }
+        let _ = run.drain();
+        assert!(run.finished(), "run finished");
+        assert_eq!(run.token(), "done", "loaded and done: {}", run.note);
+        assert!(
+            run.note.contains("NOT started"),
+            "the done note says the job was not started: {}",
+            run.note
+        );
+
+        let cmds = seen.lock().unwrap();
+        assert!(
+            cmds.iter().any(|c| c == "FORCELOAD:C:\\jobs\\drill.lbrn2"),
+            "sent FORCELOAD with the path: {cmds:?}"
+        );
+        assert!(
+            !cmds.iter().any(|c| c == "START"),
+            "START must never be sent by a load-only run: {cmds:?}"
+        );
+    }
+
     #[test]
     fn a_dead_lightburn_fails_with_the_friendly_message() {
         // No server at this port: PING times out → the not-responding message.
@@ -457,6 +534,7 @@ mod tests {
             "BSLFiber".into(),
             loopback(0), // port 0 is never listening
             0,
+            true,
         );
         let deadline = Instant::now() + Duration::from_secs(20);
         while !run.finished() && Instant::now() < deadline {
