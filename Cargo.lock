@@ -1710,6 +1710,7 @@ dependencies = [
  "cam",
  "image",
  "pcb-core",
+ "proptest",
  "serde_json",
  "testkit",
  "usvg",
@@ -3741,6 +3742,7 @@ dependencies = [
  "nalgebra",
  "orchestra",
  "pcb-core",
+ "tempfile",
  "vision",
 ]
 

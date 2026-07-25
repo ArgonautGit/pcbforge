@@ -377,12 +377,18 @@ fn decimal_to_nm(s: &str, scale_nm: i64) -> Result<Nm, String> {
             .parse()
             .map_err(|_| format!("integer part of '{s}' out of range"))?
     };
-    let mut total = int_val * scale_nm as i128;
+    // `int_part` may carry up to 38 digits, so the scale multiply can overflow
+    // even i128 — it must not wrap into a plausible-looking coordinate.
+    let mut total = int_val
+        .checked_mul(scale_nm as i128)
+        .ok_or_else(|| format!("'{s}' out of i64 nanometer range"))?;
     if !frac_part.is_empty() {
         let frac_val: i128 = frac_part.parse().expect("all-digit string");
         let den = 10_i128.pow(frac_part.len() as u32);
         // Round half away from zero (sign applied below, so value is >= 0).
-        total += (frac_val * scale_nm as i128 + den / 2) / den;
+        total = total
+            .checked_add((frac_val * scale_nm as i128 + den / 2) / den)
+            .ok_or_else(|| format!("'{s}' out of i64 nanometer range"))?;
     }
     if neg {
         total = -total;
@@ -585,6 +591,31 @@ M30
                 err.msg
             );
             assert!(err.line > 0, "error must carry a line number");
+        }
+    }
+
+    #[test]
+    fn hostile_coordinate_magnitudes_error_instead_of_panicking() {
+        const HEADER: &str = "M48\nFMAT,2\nMETRIC\nT1C0.4\n%\nG90\nG05\nT1\n";
+        // A 38-digit integer part parses as i128 but overflows the scale
+        // multiply — in release that wraps into a plausible coordinate and
+        // drills a hole in the wrong place.
+        let long = "9".repeat(38);
+        let bodies = [
+            format!("X{long}.0Y1.0\nM30\n"),
+            format!("X1.0Y-{long}.0\nM30\n"),
+            format!("X{}.5Y1.0\nM30\n", "9".repeat(33)),
+            // Just inside the scale multiply, so the fractional `+=` is the op
+            // that overflows.
+            "X170141183460469231731687303715884.5Y1.0\nM30\n".to_string(),
+            format!("T2C{long}.0\n"),
+        ];
+        for body in bodies {
+            let src = format!("{HEADER}{body}");
+            assert!(
+                parse_excellon(&src).is_err(),
+                "expected a clean Err for body:\n{body}"
+            );
         }
     }
 
