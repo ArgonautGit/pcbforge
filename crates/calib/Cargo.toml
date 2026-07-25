@@ -1,0 +1,19 @@
+[package]
+name = "calib"
+version = "0.1.0"
+edition.workspace = true
+license.workspace = true
+
+# The operator calibration workflow layer: it composes `vision`'s primitives
+# (blob detection, homography/affine/lens fits) into the multi-step bench
+# procedure — print a paper grid, fit the camera lens, anchor the laser to the
+# camera, burn a grid and fit the laser field — plus the acceptance gating that
+# decides whether a fit is good enough to cut with.
+#
+# This lived in `crates/ui` and was reachable only from the GUI, so the whole
+# fitting pipeline was invisible to the CLI and testable only through the
+# console. It contains no egui.
+[dependencies]
+vision = { path = "../vision" }
+nalgebra = "0.35.0"
+image = { version = "0.25", default-features = false, features = ["png"] }

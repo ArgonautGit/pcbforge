@@ -380,7 +380,7 @@ pub fn fit_board_pose(
     if pairs.len() < 3 {
         return Err(format!("need ≥3 detected fiducials, have {}", pairs.len()));
     }
-    let fit = crate::calib::fit_rigid(&pairs)?;
+    let fit = calib::fit_rigid(&pairs)?;
     // b0 = centroid of the FULL layout (not just the detected subset), in the
     // RAW design frame — the pose is written as fit.apply(b0).
     let n = layout_mm.len() as f64;
@@ -620,7 +620,7 @@ mod tests {
     fn fit_board_pose_recovers_a_proper_front_pose() {
         let layout = [(10.0, 10.0), (80.0, 10.0), (10.0, 80.0), (80.0, 80.0)];
         let (s, c) = 5.0_f64.to_radians().sin_cos();
-        let t = crate::calib::Rigid2 {
+        let t = calib::Rigid2 {
             cos: c,
             sin: s,
             tx: 3.0,
@@ -668,7 +668,7 @@ mod tests {
         };
         // The physical flip: a reflection (map = R·F_neg) — R = +3°, chosen tx/ty.
         let (s, c) = 3.0_f64.to_radians().sin_cos();
-        let flip = crate::calib::Rigid2 {
+        let flip = calib::Rigid2 {
             cos: c,
             sin: s,
             tx: 90.0,
@@ -725,7 +725,7 @@ mod tests {
     fn fit_board_pose_flags_a_mirrored_pattern() {
         let layout = [(10.0, 10.0), (80.0, 10.0), (10.0, 80.0), (80.0, 80.0)];
         let (s, c) = 4.0_f64.to_radians().sin_cos();
-        let mirrored = crate::calib::Rigid2 {
+        let mirrored = calib::Rigid2 {
             cos: c,
             sin: s,
             tx: 7.0,

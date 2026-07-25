@@ -156,11 +156,11 @@ pub(super) struct GridParams {
     pub(super) n: usize,
     pub(super) pitch_mm: f64,
     pub(super) dot_mm: f64,
-    pub(super) dot_kind: crate::calib::DotKind,
+    pub(super) dot_kind: calib::DotKind,
 }
 
 pub(super) struct CalibrationState {
-    pub(super) anchor: Option<crate::calib::Calibration>,
+    pub(super) anchor: Option<calib::Calibration>,
     pub(super) saved_at: Option<u64>,
     /// ① printed paper: the MEASURED pitch (calipers — printers scale).
     pub(super) paper: GridParams,
@@ -175,9 +175,9 @@ pub(super) struct CalibrationState {
     pub(super) frame_tex: Option<TextureHandle>,
     pub(super) corners: Vec<(f64, f64)>,
     pub(super) mode: CalibMode,
-    pub(super) lens: Option<crate::calib::CameraCal>,
+    pub(super) lens: Option<calib::CameraCal>,
     pub(super) lens_frame_signature: Option<((u32, u32), Orientation)>,
-    pub(super) field: Option<crate::calib::FieldCal>,
+    pub(super) field: Option<calib::FieldCal>,
     pub(super) field_accepted: bool,
     /// Operator-configurable step 3 laser-field acceptance limits (µm): a fit
     /// whose residual RMS / worst per-dot error exceeds these is rejected. The

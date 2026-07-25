@@ -13,14 +13,14 @@ pub(super) enum CameraProjection {
     /// the field optics actually land each commanded point.
     CommandedField {
         lens: vision::LensMap,
-        frame: crate::calib::Rigid2,
+        frame: calib::Rigid2,
         field: vision::FieldMap,
     },
     /// Desired physical mm ↔ camera px. Production export applies
     /// physical→commanded field warping exactly once afterward.
     PhysicalLens {
         lens: vision::LensMap,
-        frame: crate::calib::Rigid2,
+        frame: calib::Rigid2,
     },
     Homography {
         mm_to_px: vision::Homography,
@@ -32,11 +32,9 @@ impl CameraProjection {
     pub(super) fn to_px(&self, mm: (f64, f64)) -> Option<(f64, f64)> {
         let p = match self {
             Self::CommandedField { lens, frame, field } => {
-                crate::calib::commanded_to_camera_px(lens, frame, field, mm)?
+                calib::commanded_to_camera_px(lens, frame, field, mm)?
             }
-            Self::PhysicalLens { lens, frame } => {
-                crate::calib::physical_to_camera_px(lens, frame, mm)?
-            }
+            Self::PhysicalLens { lens, frame } => calib::physical_to_camera_px(lens, frame, mm)?,
             Self::Homography { mm_to_px, .. } => {
                 let p = mm_to_px.apply(nalgebra::Point2::new(mm.0, mm.1));
                 (p.x, p.y)
@@ -51,11 +49,9 @@ impl CameraProjection {
     pub(super) fn from_px(&self, px: (f64, f64)) -> Option<(f64, f64)> {
         let p = match self {
             Self::CommandedField { lens, frame, field } => {
-                crate::calib::camera_px_to_commanded(lens, frame, field, px)?
+                calib::camera_px_to_commanded(lens, frame, field, px)?
             }
-            Self::PhysicalLens { lens, frame } => {
-                crate::calib::camera_px_to_physical(lens, frame, px)?
-            }
+            Self::PhysicalLens { lens, frame } => calib::camera_px_to_physical(lens, frame, px)?,
             Self::Homography { px_to_mm, .. } => {
                 let p = px_to_mm.apply(nalgebra::Point2::new(px.0, px.1));
                 (p.x, p.y)
@@ -104,7 +100,7 @@ impl ConsoleApp {
     pub(super) fn nonlinear_maps_for_frame(
         &self,
         dimensions: (u32, u32),
-    ) -> Result<Option<(vision::LensMap, crate::calib::Rigid2, vision::FieldMap)>, String> {
+    ) -> Result<Option<(vision::LensMap, calib::Rigid2, vision::FieldMap)>, String> {
         if !self.calibration.field_accepted {
             return Ok(None);
         }
@@ -125,7 +121,7 @@ impl ConsoleApp {
                 self.calibration.lens_frame_signature, signature
             ));
         }
-        if !crate::calib::composed_projection_is_finite(&lens.lens, &field.field)
+        if !calib::composed_projection_is_finite(&lens.lens, &field.field)
             || !field.paper_to_machine.is_finite()
         {
             return Err(

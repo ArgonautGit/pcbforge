@@ -1,8 +1,8 @@
 use super::*;
 
 impl ConsoleApp {
-    pub(super) fn calib_grid(&self) -> crate::calib::GridSpec {
-        crate::calib::GridSpec {
+    pub(super) fn calib_grid(&self) -> calib::GridSpec {
+        calib::GridSpec {
             // The origin the grid was generated (burned) at — NOT (0,0). The
             // burned-grid fit and bed overlay must match where the dots
             // actually landed (LR-02).
@@ -177,12 +177,12 @@ impl ConsoleApp {
                 // origin pinned to (0,0) rather than inheriting a burn origin
                 // left over from a generated laser grid (LR-02).
                 let p = self.calibration.paper;
-                let paper = crate::calib::GridSpec {
+                let paper = calib::GridSpec {
                     origin_mm: (0.0, 0.0),
                     pitch_mm: p.pitch_mm,
                     n: p.n,
                 };
-                match crate::calib::fit_camera_lens(frame, corners, &paper, p.dot_mm, p.dot_kind) {
+                match calib::fit_camera_lens(frame, corners, &paper, p.dot_mm, p.dot_kind) {
                     Ok(cal) => {
                         self.calibration.note = format!(
                             "lens fit: {}/{} dots, RMS {:.0} µm, worst {:.0} µm — camera is now a metric ruler; run step 3 again before using field correction",
@@ -209,9 +209,7 @@ impl ConsoleApp {
             CalibMode::LaserAnchor => {
                 let grid = self.calib_grid();
                 let b = self.calibration.burn;
-                match crate::calib::fit_camera_to_machine(
-                    frame, corners, &grid, b.dot_mm, b.dot_kind,
-                ) {
+                match calib::fit_camera_to_machine(frame, corners, &grid, b.dot_mm, b.dot_kind) {
                     Ok(cal) => {
                         self.calibration.note = format!(
                             "anchor: {}/{} dots, RMS {:.0} µm — Place now burns in machine coordinates",
@@ -248,7 +246,7 @@ impl ConsoleApp {
                     self.placement.field_correct = false;
                     return;
                 }
-                match crate::calib::fit_laser_field(
+                match calib::fit_laser_field(
                     frame,
                     corners,
                     &grid,
@@ -262,7 +260,7 @@ impl ConsoleApp {
                         // regardless of whether it met the acceptance limits.
                         self.calibration.show_fit_feedback = true;
                         let worst = cal.dots.iter().map(|d| d.field_um).fold(0.0_f64, f64::max);
-                        let acceptance = crate::calib::field_live_acceptance(
+                        let acceptance = calib::field_live_acceptance(
                             &cal,
                             &grid,
                             self.calibration.accept_rms_um,
@@ -319,7 +317,7 @@ impl ConsoleApp {
                                         // energy density differs by this factor.
                                         let scale_absorbed = if self.calibration.allow_machine_scale
                                             && (cal.scale - 1.0).abs()
-                                                > crate::calib::FIELD_SCALE_FAIL_FRAC
+                                                > calib::FIELD_SCALE_FAIL_FRAC
                                         {
                                             format!(
                                                 "machine scale {:+.1}% ABSORBED in software — physical speeds/hatch density differ from commanded by this factor; ",
@@ -375,7 +373,7 @@ impl ConsoleApp {
                         // (LR-16). For the scale setup-error gate, append the
                         // two entered pitches so a ①/③ pitch mix-up is
                         // checkable at a glance.
-                        let pitch_context = if e.contains(crate::calib::FIELD_SCALE_ERR_MARKER) {
+                        let pitch_context = if e.contains(calib::FIELD_SCALE_ERR_MARKER) {
                             let paper = self.calibration.paper.pitch_mm;
                             let burn = self.calibration.burn.pitch_mm;
                             format!(
@@ -407,7 +405,7 @@ impl ConsoleApp {
                 .as_ref()
                 .zip(self.calibration.field.as_ref())
                 .is_some_and(|(lens, field)| {
-                    crate::calib::composed_projection_is_finite(&lens.lens, &field.field)
+                    calib::composed_projection_is_finite(&lens.lens, &field.field)
                 })
     }
 
@@ -433,7 +431,7 @@ impl ConsoleApp {
         match crate::camera::grab(&self.cam_source()) {
             Ok(g) => {
                 let frame = self.camera.orientation.apply(g);
-                match crate::calib::re_anchor(&frame, &prev, &grid, dot, kind) {
+                match calib::re_anchor(&frame, &prev, &grid, dot, kind) {
                     Ok(cal) => {
                         self.calibration.note = format!(
                             "re-anchored: {}/{} dots, RMS {:.0} µm",
@@ -485,7 +483,7 @@ impl ConsoleApp {
             };
             self.calibration.frame_tex =
                 Some(ctx.load_texture("calib-frame", color, TextureOptions::NEAREST));
-            match crate::calib::re_anchor(
+            match calib::re_anchor(
                 &frame,
                 &prev,
                 &self.calib_grid(),
@@ -575,7 +573,7 @@ impl ConsoleApp {
             {
                 dot.px = native_px;
             } else {
-                dots.push(crate::calib::AnchorDot {
+                dots.push(calib::AnchorDot {
                     px: native_px,
                     mm,
                     resid_um: 0.0,
@@ -584,7 +582,7 @@ impl ConsoleApp {
             format!("corrected dot at ({:.0}, {:.0}) mm", mm.0, mm.1)
         };
 
-        match crate::calib::refit_anchor_dots(&dots, current.total) {
+        match calib::refit_anchor_dots(&dots, current.total) {
             Ok(calibration) => {
                 self.calibration.note = format!(
                     "{action}; re-fit {}/{} dots, RMS {:.0} µm",
@@ -804,13 +802,8 @@ impl ConsoleApp {
             let nonlinear: Option<Vec<egui::Pos2>> = pts
                 .iter()
                 .map(|&mm| {
-                    crate::calib::commanded_to_camera_px(
-                        &lens.lens,
-                        &cal.paper_to_machine,
-                        &cal.field,
-                        mm,
-                    )
-                    .map(|p| to_screen(p.0, p.1))
+                    calib::commanded_to_camera_px(&lens.lens, &cal.paper_to_machine, &cal.field, mm)
+                        .map(|p| to_screen(p.0, p.1))
                 })
                 .collect();
             if let Some(nodes) = nonlinear {
@@ -834,7 +827,7 @@ impl ConsoleApp {
                 let red = Color32::from_rgb(0xd0, 0x40, 0x40);
                 for d in &cal.dots {
                     let det = to_screen(d.px.0, d.px.1);
-                    if let Some(desired) = crate::calib::physical_to_camera_px(
+                    if let Some(desired) = calib::physical_to_camera_px(
                         &lens.lens,
                         &cal.paper_to_machine,
                         d.commanded_mm,
@@ -1040,13 +1033,13 @@ impl ConsoleApp {
                 ui.horizontal(|ui| {
                     ui.selectable_value(
                         &mut self.calibration.active_params_mut().dot_kind,
-                        crate::calib::DotKind::Dark,
+                        calib::DotKind::Dark,
                         "◉ dark-on-light",
                     )
                     .on_hover_text("Printed grid or dark-anodized burn.");
                     ui.selectable_value(
                         &mut self.calibration.active_params_mut().dot_kind,
-                        crate::calib::DotKind::Bright,
+                        calib::DotKind::Bright,
                         "◎ bright-on-dark",
                     )
                     .on_hover_text("Ablated mark on a dark plate, or a backlit hole.");

@@ -52,7 +52,7 @@ fn nonlinear_app() -> ConsoleApp {
         .iter()
         .map(|(physical, commanded)| {
             let px = lens.mm_to_px.apply(physical.x, physical.y);
-            crate::calib::FieldDot {
+            calib::FieldDot {
                 px,
                 physical_mm: (physical.x, physical.y),
                 commanded_mm: (commanded.x, commanded.y),
@@ -63,15 +63,15 @@ fn nonlinear_app() -> ConsoleApp {
             }
         })
         .collect();
-    app.calibration.lens = Some(crate::calib::CameraCal {
+    app.calibration.lens = Some(calib::CameraCal {
         lens,
         dots: vec![],
         found: 16,
         total: 16,
     });
-    app.calibration.field = Some(crate::calib::FieldCal {
+    app.calibration.field = Some(calib::FieldCal {
         field,
-        paper_to_machine: crate::calib::Rigid2::IDENTITY,
+        paper_to_machine: calib::Rigid2::IDENTITY,
         to_px: vision::Homography {
             matrix: Matrix3::new(10.0, 0.0, 20.0, 0.0, -10.0, 800.0, 0.0, 0.0, 1.0),
             residuals: vec![],
@@ -202,7 +202,7 @@ fn load_place_prefers_a_fresh_camera_grab_over_the_saved_frame_path() {
 #[test]
 fn anchor_only_place_previews_and_exports_unwarped_with_warning() {
     let mut app = ConsoleApp::new(tmp_db(), vec!["true".into()]);
-    app.calibration.anchor = Some(crate::calib::Calibration {
+    app.calibration.anchor = Some(calib::Calibration {
         px_to_mm: vision::Homography {
             matrix: nalgebra::Matrix3::new(0.1, 0.0, 0.0, 0.0, -0.1, 80.0, 0.0, 0.0, 1.0),
             residuals: vec![],
@@ -552,7 +552,7 @@ fn fiducial_check_sets_placement_and_load_preserves_it() {
     app.fiducials.px_per_mm = ppm;
     // Homography-fallback place_projection matching the frame's px↔mm map
     // (mm_x = px_x/ppm, mm_y = (H − px_y)/ppm), so from_px recovers machine mm.
-    app.calibration.anchor = Some(crate::calib::Calibration {
+    app.calibration.anchor = Some(calib::Calibration {
         px_to_mm: vision::Homography {
             matrix: Matrix3::new(
                 1.0 / ppm,
@@ -1462,7 +1462,7 @@ field_frame=\n";
     assert!(app.camera.use_device);
     assert_eq!(app.camera.device, 2);
     assert_eq!(app.calibration.burn.n, 9);
-    assert_eq!(app.calibration.burn.dot_kind, crate::calib::DotKind::Bright);
+    assert_eq!(app.calibration.burn.dot_kind, calib::DotKind::Bright);
     // A pre-split blob has one shared parameter set: the paper set is seeded
     // from it, since that's what ① was last fit with.
     assert_eq!(app.calibration.paper, app.calibration.burn);
@@ -1658,22 +1658,22 @@ fn field_frame_mirror_flag_round_trips() {
         residuals: vec![],
         rms: 0.0,
     };
-    let flipped = crate::calib::Rigid2 {
+    let flipped = calib::Rigid2 {
         cos: (0.2_f64).cos(),
         sin: (0.2_f64).sin(),
         tx: 3.5,
         ty: -1.25,
         flip_x: true,
     };
-    let make_app = |db: &PathBuf, frame: crate::calib::Rigid2| {
+    let make_app = |db: &PathBuf, frame: calib::Rigid2| {
         let mut a = ConsoleApp::new(db.clone(), vec!["true".into()]);
-        a.calibration.lens = Some(crate::calib::CameraCal {
+        a.calibration.lens = Some(calib::CameraCal {
             lens: lens.clone(),
             dots: vec![],
             found: 16,
             total: 16,
         });
-        a.calibration.field = Some(crate::calib::FieldCal {
+        a.calibration.field = Some(calib::FieldCal {
             field: field.clone(),
             paper_to_machine: frame,
             to_px: to_px.clone(),
@@ -1724,7 +1724,7 @@ fn field_frame_mirror_flag_round_trips() {
     let blob4: String = {
         let a = make_app(
             &legacy_db,
-            crate::calib::Rigid2 {
+            calib::Rigid2 {
                 flip_x: false,
                 ..flipped
             },
@@ -1805,23 +1805,23 @@ fn paper_and_burn_params_persist_independently() {
             n: 9,
             pitch_mm: 9.6,
             dot_mm: 0.3,
-            dot_kind: crate::calib::DotKind::Dark,
+            dot_kind: calib::DotKind::Dark,
         };
         a.calibration.burn = GridParams {
             n: 7,
             pitch_mm: 10.0,
             dot_mm: 0.4,
-            dot_kind: crate::calib::DotKind::Bright,
+            dot_kind: calib::DotKind::Bright,
         };
         a.save_settings_if_changed();
     }
     let b = ConsoleApp::new(db, vec!["true".into()]);
     assert_eq!(b.calibration.paper.n, 9);
     assert!((b.calibration.paper.pitch_mm - 9.6).abs() < 1e-9);
-    assert_eq!(b.calibration.paper.dot_kind, crate::calib::DotKind::Dark);
+    assert_eq!(b.calibration.paper.dot_kind, calib::DotKind::Dark);
     assert_eq!(b.calibration.burn.n, 7);
     assert!((b.calibration.burn.pitch_mm - 10.0).abs() < 1e-9);
-    assert_eq!(b.calibration.burn.dot_kind, crate::calib::DotKind::Bright);
+    assert_eq!(b.calibration.burn.dot_kind, calib::DotKind::Bright);
 }
 
 /// The ① lens fit's pixel bounds survive a save/reload, and a legacy blob
@@ -1843,7 +1843,7 @@ fn lens_calibration_pixel_bounds_round_trip() {
         .collect();
     let lens = vision::fit_lens(&pairs).unwrap();
     let expected = lens.calib_px_bounds.expect("fit records bounds");
-    let make_cal = |lens: vision::LensMap| crate::calib::CameraCal {
+    let make_cal = |lens: vision::LensMap| calib::CameraCal {
         lens,
         dots: Vec::new(),
         found: 16,
@@ -1981,7 +1981,7 @@ fn place_uses_calibration_when_present() {
 
     // A calibration wins: place_homography is the calibration's inverse
     // (machine-mm → px), independent of the fiducial fit.
-    app.calibration.anchor = Some(crate::calib::Calibration {
+    app.calibration.anchor = Some(calib::Calibration {
         // px_to_mm = 0.1 (10 px/mm); inverse = 10 (mm→px).
         px_to_mm: vision::Homography {
             matrix: Matrix3::new(0.1, 0.0, 0.0, 0.0, 0.1, 0.0, 0.0, 0.0, 1.0),
@@ -2011,7 +2011,7 @@ fn calibration_persists_as_a_reanchor_seed() {
     let mut a = ConsoleApp::new(db.clone(), vec!["true".into()]);
     a.calibration.burn.n = 7;
     a.calibration.burn.pitch_mm = 10.0;
-    a.calibration.anchor = Some(crate::calib::Calibration {
+    a.calibration.anchor = Some(calib::Calibration {
         px_to_mm: vision::Homography {
             matrix: Matrix3::new(0.1, 0.0, 1.0, 0.0, 0.1, 2.0, 0.0, 0.0, 1.0),
             residuals: vec![],
@@ -2040,7 +2040,7 @@ fn calibration_persists_as_a_reanchor_seed() {
 /// tab lays out with the arrows drawn.
 #[test]
 fn camera_lens_calibration_flow() {
-    let grid = crate::calib::GridSpec {
+    let grid = calib::GridSpec {
         origin_mm: (0.0, 0.0),
         pitch_mm: 10.0,
         n: 7,
@@ -2168,7 +2168,7 @@ fn anchor_overlay_renders_the_machine_grid() {
 fn anchor_dot_correction_moves_the_selected_grid_site_and_refits() {
     use nalgebra::Matrix3;
     let mut app = ConsoleApp::new(tmp_db(), vec!["true".into()]);
-    app.calibration.anchor = Some(crate::calib::Calibration {
+    app.calibration.anchor = Some(calib::Calibration {
         px_to_mm: vision::Homography {
             matrix: Matrix3::new(0.1, 0.0, -2.0, 0.0, 0.1, -3.0, 0.0, 0.0, 1.0),
             residuals: vec![],
@@ -2178,27 +2178,27 @@ fn anchor_dot_correction_moves_the_selected_grid_site_and_refits() {
         found: 5,
         total: 49,
         dots: vec![
-            crate::calib::AnchorDot {
+            calib::AnchorDot {
                 px: (20.0, 30.0),
                 mm: (0.0, 0.0),
                 resid_um: 0.0,
             },
-            crate::calib::AnchorDot {
+            calib::AnchorDot {
                 px: (620.0, 30.0),
                 mm: (60.0, 0.0),
                 resid_um: 0.0,
             },
-            crate::calib::AnchorDot {
+            calib::AnchorDot {
                 px: (620.0, 630.0),
                 mm: (60.0, 60.0),
                 resid_um: 0.0,
             },
-            crate::calib::AnchorDot {
+            calib::AnchorDot {
                 px: (20.0, 630.0),
                 mm: (0.0, 60.0),
                 resid_um: 0.0,
             },
-            crate::calib::AnchorDot {
+            calib::AnchorDot {
                 px: (320.0, 330.0),
                 mm: (30.0, 30.0),
                 resid_um: 0.0,
@@ -2235,7 +2235,7 @@ fn camera_bed_overlay_renders_when_calibrated() {
         image::GrayImage::from_pixel(200, 150, image::Luma([180])),
     );
     // A laser anchor: camera-px → mm at 10 px/mm.
-    app.calibration.anchor = Some(crate::calib::Calibration {
+    app.calibration.anchor = Some(calib::Calibration {
         px_to_mm: vision::Homography {
             matrix: Matrix3::new(0.1, 0.0, 0.0, 0.0, 0.1, 0.0, 0.0, 0.0, 1.0),
             residuals: vec![],
@@ -2456,7 +2456,7 @@ fn paper_out_path_persists() {
 #[test]
 fn a_failed_fit_keeps_the_previous_calibration() {
     let mut app = ConsoleApp::new(tmp_db(), vec!["true".into()]);
-    app.calibration.anchor = Some(crate::calib::Calibration {
+    app.calibration.anchor = Some(calib::Calibration {
         px_to_mm: vision::Homography {
             matrix: nalgebra::Matrix3::identity(),
             residuals: vec![],
@@ -2526,7 +2526,7 @@ fn back_side_etch_is_refused() {
 #[test]
 fn etch_and_run_arms_an_absolute_pending_path() {
     let mut app = ConsoleApp::new(tmp_db(), vec!["true".into()]);
-    app.calibration.anchor = Some(crate::calib::Calibration {
+    app.calibration.anchor = Some(calib::Calibration {
         px_to_mm: vision::Homography {
             matrix: nalgebra::Matrix3::new(0.1, 0.0, 0.0, 0.0, -0.1, 80.0, 0.0, 0.0, 1.0),
             residuals: vec![],
@@ -2882,7 +2882,7 @@ fn calibration_reports_age_not_just_this_session() {
         "never anchored"
     );
     // A restored (unconfirmed) calibration saved 3 days ago.
-    app.calibration.anchor = Some(crate::calib::Calibration {
+    app.calibration.anchor = Some(calib::Calibration {
         px_to_mm: vision::Homography {
             matrix: nalgebra::Matrix3::identity(),
             residuals: vec![],
