@@ -198,8 +198,7 @@ fn the_fiducial_holes_calibration_step_is_selectable() {
     h.run();
     let s = h.state().debug_summary();
     assert!(
-        s.contains("calib_mode=FidHoles")
-            && summary_line(&s, "fid_board:").contains("layout="),
+        s.contains("calib_mode=FidHoles") && summary_line(&s, "fid_board:").contains("layout="),
         "④ selects the fiducial-holes step and reports the board layout:\n{s}"
     );
 }

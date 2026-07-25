@@ -662,7 +662,7 @@ impl ConsoleApp {
                 |x, y| field.precompensate(x, y),
             )
         } else {
-self.runtime.log.push(LogLine {
+            self.runtime.log.push(LogLine {
     text: format!(
         "place: drill emit without field-warp (need accepted step 1 (Camera lens) + step 3 (Laser field) calibration and a readable {}) — exporting UNWARPED drill geometry",
         field_path.display()

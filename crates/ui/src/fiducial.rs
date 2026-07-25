@@ -627,8 +627,7 @@ mod tests {
             ty: -2.0,
             flip_x: false,
         };
-        let detected: Vec<Option<(f64, f64)>> =
-            layout.iter().map(|&p| Some(t.apply(p))).collect();
+        let detected: Vec<Option<(f64, f64)>> = layout.iter().map(|&p| Some(t.apply(p))).collect();
 
         let pose = fit_board_pose(&layout, &detected, None).unwrap();
         assert!(!pose.flipped, "a proper pattern is not flagged flipped");
@@ -701,8 +700,12 @@ mod tests {
             pivot_mm: pivot_back,
         };
         let a = placement.affine();
-        let apply_place =
-            |g: (f64, f64)| (a[0] * g.0 + a[1] * g.1 + a[2], a[3] * g.0 + a[4] * g.1 + a[5]);
+        let apply_place = |g: (f64, f64)| {
+            (
+                a[0] * g.0 + a[1] * g.1 + a[2],
+                a[3] * g.0 + a[4] * g.1 + a[5],
+            )
+        };
         for &g in &copper {
             let g_back = (-g.0, g.1);
             let bed_front = (g.0 - pivot_front.0 + b0.0, g.1 - pivot_front.1 + b0.1);
@@ -744,12 +747,7 @@ mod tests {
         let two = [Some((10.0, 10.0)), Some((80.0, 10.0)), None, None];
         assert!(fit_board_pose(&layout, &two, None).is_err(), "need ≥3");
         assert!(fit_board_pose(&[], &[], None).is_err(), "empty layout");
-        let collapsed = [
-            Some((5.0, 5.0)),
-            Some((5.0, 5.0)),
-            Some((5.0, 5.0)),
-            None,
-        ];
+        let collapsed = [Some((5.0, 5.0)), Some((5.0, 5.0)), Some((5.0, 5.0)), None];
         assert!(
             fit_board_pose(&layout, &collapsed, None).is_err(),
             "no target spread is degenerate"

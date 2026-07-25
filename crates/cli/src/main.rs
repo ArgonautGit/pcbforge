@@ -1295,6 +1295,9 @@ fn warp_polys(
 }
 
 /// `pcbforge fid-holes` — burn fiducial holes at operator-supplied positions.
+// The arguments mirror the clap variant one-for-one; grouping them into a
+// struct would only duplicate the flag definitions.
+#[allow(clippy::too_many_arguments)]
 fn fid_holes_cmd(
     out: &std::path::Path,
     layout: &str,
@@ -1312,9 +1315,11 @@ fn fid_holes_cmd(
         return Err("--w-mm must be positive".into());
     }
     if shape == "circle" && h_mm != 0.0 && h_mm != w_mm {
-        return Err("--h-mm is ignored for --shape circle (circles take only --w-mm); \
+        return Err(
+            "--h-mm is ignored for --shape circle (circles take only --w-mm); \
                      pass 0 or omit it, or match --w-mm"
-            .into());
+                .into(),
+        );
     }
     let resolved_h = if h_mm == 0.0 { w_mm } else { h_mm };
     if resolved_h <= 0.0 {
@@ -2573,7 +2578,7 @@ mod tests {
                 (0..n).map(move |col| (nm(ox + col as f64 * pitch), nm(oy + row as f64 * pitch)))
             })
             .collect();
-        let half_pitch_nm = (pitch * 0.5 * NM_PER_MM as f64) as f64;
+        let half_pitch_nm = pitch * 0.5 * NM_PER_MM as f64;
 
         for marker in [poly_center(&dots[n * n]), poly_center(&dots[n * n + 1])] {
             let nearest = sites

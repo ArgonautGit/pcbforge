@@ -280,30 +280,31 @@ impl ConsoleApp {
                             (grid.origin_mm.0 + span / 2.0, grid.origin_mm.1 + span / 2.0);
                         let off = (cx - self.camera.field_cx_mm as f64)
                             .hypot(cy - self.camera.field_cy_mm as f64);
-                        let off_center_note = (off > OFF_CENTER_FRAC * self.camera.field_mm as f64)
-                            .then(|| {
-                                format!(
-                                    " note: grid centre ({cx:.0},{cy:.0}) is {off:.0} mm off the \
-                                     configured field centre — an off-axis grid makes curvature \
-                                     read as uniform scale; centre the grid (or fix the work-area \
-                                     centre)"
-                                )
-                            })
-                            .unwrap_or_default();
+                        let off_center_note = if off > OFF_CENTER_FRAC * self.camera.field_mm as f64
+                        {
+                            format!(
+                                " note: grid centre ({cx:.0},{cy:.0}) is {off:.0} mm off the \
+                                 configured field centre — an off-axis grid makes curvature \
+                                 read as uniform scale; centre the grid (or fix the work-area \
+                                 centre)"
+                            )
+                        } else {
+                            String::new()
+                        };
                         // Burned dots outside the region the step-1 lens fit
                         // covered read through an extrapolating ruler, so their
                         // error hides in the scatter floor instead of surfacing.
-                        let extrapolated_note = (cal.extrapolated > 0)
-                            .then(|| {
-                                format!(
-                                    " note: {}/{} dots lie outside the region the step-1 lens \
-                                     calibration covered — the ruler extrapolates there and the \
-                                     error reads as scatter; print/calibrate a larger paper grid \
-                                     or shrink the burn grid",
-                                    cal.extrapolated, cal.found
-                                )
-                            })
-                            .unwrap_or_default();
+                        let extrapolated_note = if cal.extrapolated > 0 {
+                            format!(
+                                " note: {}/{} dots lie outside the region the step-1 lens \
+                                 calibration covered — the ruler extrapolates there and the \
+                                 error reads as scatter; print/calibrate a larger paper grid \
+                                 or shrink the burn grid",
+                                cal.extrapolated, cal.found
+                            )
+                        } else {
+                            String::new()
+                        };
                         self.calibration.note = match acceptance {
                             Ok(()) => {
                                 let path = self.field_map_path();
@@ -316,29 +317,28 @@ impl ConsoleApp {
                                         // machine's physical speeds and hatch
                                         // spacing stay in its oversized units, so
                                         // energy density differs by this factor.
-                                        let scale_absorbed = (self.calibration.allow_machine_scale
+                                        let scale_absorbed = if self.calibration.allow_machine_scale
                                             && (cal.scale - 1.0).abs()
-                                                > crate::calib::FIELD_SCALE_FAIL_FRAC)
-                                            .then(|| {
-                                                format!(
-                                                    "machine scale {:+.1}% ABSORBED in software — physical speeds/hatch density differ from commanded by this factor; ",
-                                                    (cal.scale - 1.0) * 100.0
-                                                )
-                                            })
-                                            .unwrap_or_default();
+                                                > crate::calib::FIELD_SCALE_FAIL_FRAC
+                                        {
+                                            format!(
+                                                "machine scale {:+.1}% ABSORBED in software — physical speeds/hatch density differ from commanded by this factor; ",
+                                                (cal.scale - 1.0) * 100.0
+                                            )
+                                        } else {
+                                            String::new()
+                                        };
                                         // A fitted mirror means the machine's X
                                         // axis runs backwards vs commanded
                                         // coordinates (a LightBurn axis-negate /
                                         // galvo mapping). The correction accounts
                                         // for it, but say so loudly so the
                                         // operator can undo it at the source.
-                                        let mirror_note = cal
-                                            .paper_to_machine
-                                            .flip_x
-                                            .then_some(
-                                                "machine X axis is MIRRORED relative to commanded coordinates — the correction accounts for it; clearing the axis negate in LightBurn and recalibrating removes this; ",
-                                            )
-                                            .unwrap_or_default();
+                                        let mirror_note = if cal.paper_to_machine.flip_x {
+                                            "machine X axis is MIRRORED relative to commanded coordinates — the correction accounts for it; clearing the axis negate in LightBurn and recalibrating removes this; "
+                                        } else {
+                                            ""
+                                        };
                                         format!(
                                             "field accepted: {}/{} dots, raw worst {:.0} µm, fit RMS/worst {:.0}/{:.0} µm — {mirror_note}{scale_absorbed}{}{off_center_note}{extrapolated_note}",
                                             cal.found,
@@ -375,18 +375,17 @@ impl ConsoleApp {
                         // (LR-16). For the scale setup-error gate, append the
                         // two entered pitches so a ①/③ pitch mix-up is
                         // checkable at a glance.
-                        let pitch_context = e
-                            .contains(crate::calib::FIELD_SCALE_ERR_MARKER)
-                            .then(|| {
-                                let paper = self.calibration.paper.pitch_mm;
-                                let burn = self.calibration.burn.pitch_mm;
-                                format!(
-                                    " (step-1 paper pitch entered: {paper} mm; step-3 commanded pitch: \
-                                     {burn} mm — ratio {:.3})",
-                                    burn / paper
-                                )
-                            })
-                            .unwrap_or_default();
+                        let pitch_context = if e.contains(crate::calib::FIELD_SCALE_ERR_MARKER) {
+                            let paper = self.calibration.paper.pitch_mm;
+                            let burn = self.calibration.burn.pitch_mm;
+                            format!(
+                                " (step-1 paper pitch entered: {paper} mm; step-3 commanded pitch: \
+                                 {burn} mm — ratio {:.3})",
+                                burn / paper
+                            )
+                        } else {
+                            String::new()
+                        };
                         self.calibration.note =
                             format!("laser-field fit failed (kept previous): {e}{pitch_context}");
                     }
@@ -1471,11 +1470,9 @@ impl ConsoleApp {
                     }
                 }
                 let lbl = ui.label("holes out");
-                ui.add(
-                    egui::TextEdit::singleline(&mut self.fiducials.out).desired_width(240.0),
-                )
-                .labelled_by(lbl.id)
-                .on_hover_text("Where the generated fiducial-holes .lbrn2 is written.");
+                ui.add(egui::TextEdit::singleline(&mut self.fiducials.out).desired_width(240.0))
+                    .labelled_by(lbl.id)
+                    .on_hover_text("Where the generated fiducial-holes .lbrn2 is written.");
                 ui.end_row();
             });
 
@@ -1483,7 +1480,10 @@ impl ConsoleApp {
         // centre after the form closure so the preview + validation reflect this
         // frame's edits, not the last one.
         self.sync_auto_field_center();
-        let (cx, cy) = (self.camera.field_cx_mm as f64, self.camera.field_cy_mm as f64);
+        let (cx, cy) = (
+            self.camera.field_cx_mm as f64,
+            self.camera.field_cy_mm as f64,
+        );
         let field = self.camera.field_mm as f64;
         let (w, h, margin) = (
             self.fiducials.board_w_mm,
@@ -1581,7 +1581,10 @@ impl ConsoleApp {
     /// it into the fiducial check's layout string, and generate the holes.
     fn fid_holes_generate(&mut self) {
         self.sync_auto_field_center();
-        let (cx, cy) = (self.camera.field_cx_mm as f64, self.camera.field_cy_mm as f64);
+        let (cx, cy) = (
+            self.camera.field_cx_mm as f64,
+            self.camera.field_cy_mm as f64,
+        );
         let (w, h, margin) = (
             self.fiducials.board_w_mm,
             self.fiducials.board_h_mm,

@@ -84,9 +84,14 @@ impl BedMap {
 /// The physical footprint of a fiducial mark.
 #[derive(Debug, Clone, Copy, PartialEq)]
 pub enum FidShape {
-    Circle { diameter_mm: f64 },
+    Circle {
+        diameter_mm: f64,
+    },
     /// Axis-aligned (in machine/board frame) rectangle.
-    Rect { w_mm: f64, h_mm: f64 },
+    Rect {
+        w_mm: f64,
+        h_mm: f64,
+    },
 }
 
 impl FidShape {

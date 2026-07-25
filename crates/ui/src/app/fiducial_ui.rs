@@ -98,8 +98,7 @@ impl ConsoleApp {
         self.fiducials.measured_ppm = None;
         self.fiducials.homography = None;
         self.fiducials.last_placed = false;
-        self.fiducials.note =
-            "markers cleared — type a layout or ✚ click-to-place new ones".into();
+        self.fiducials.note = "markers cleared — type a layout or ✚ click-to-place new ones".into();
     }
 
     /// Apply one placement click: drop the next search marker (layout order) at
@@ -322,11 +321,10 @@ impl ConsoleApp {
             args.push(field_path.to_string_lossy().into_owned());
         } else {
             self.runtime.log.push(LogLine {
-                text:
-                    "fid-holes: no accepted step 1 (Camera lens) + step 3 (Laser field) \
+                text: "fid-holes: no accepted step 1 (Camera lens) + step 3 (Laser field) \
                      calibration — holes will burn without lens correction (accept a laser field \
                      fit first)"
-                        .into(),
+                    .into(),
                 err: true,
             });
         }
@@ -626,13 +624,11 @@ impl ConsoleApp {
                 );
                 ui.end_row();
                 let lbl = ui.label("holes out");
-                ui.add(
-                    egui::TextEdit::singleline(&mut self.fiducials.out).desired_width(240.0),
-                )
-                .labelled_by(lbl.id)
-                .on_hover_text(
-                    "Where the generated fiducial-holes .lbrn2 is written (⚙ Generate holes).",
-                );
+                ui.add(egui::TextEdit::singleline(&mut self.fiducials.out).desired_width(240.0))
+                    .labelled_by(lbl.id)
+                    .on_hover_text(
+                        "Where the generated fiducial-holes .lbrn2 is written (⚙ Generate holes).",
+                    );
                 ui.end_row();
             });
         ui.horizontal(|ui| {
@@ -880,7 +876,8 @@ impl ConsoleApp {
                         painter.circle_stroke(fc, ring_r, stroke);
                     }
                     crate::fiducial::ShapeKind::Rect => {
-                        let hw = (self.fiducials.diameter_mm as f32 * ppm * 0.5 * xf.scale).max(3.0);
+                        let hw =
+                            (self.fiducials.diameter_mm as f32 * ppm * 0.5 * xf.scale).max(3.0);
                         let hh = (self.fiducials.height_mm as f32 * ppm * 0.5 * xf.scale).max(3.0);
                         let (l, r, t, b) = (fc.x - hw, fc.x + hw, fc.y - hh, fc.y + hh);
                         painter.line_segment([egui::pos2(l, t), egui::pos2(r, t)], stroke);

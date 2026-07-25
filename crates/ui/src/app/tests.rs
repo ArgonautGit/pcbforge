@@ -605,7 +605,11 @@ fn fiducial_check_sets_placement_and_load_preserves_it() {
         app.placement.tx_mm,
         app.placement.ty_mm
     );
-    assert!(app.placement.rot_deg.abs() < 0.5, "rot ~0: {}", app.placement.rot_deg);
+    assert!(
+        app.placement.rot_deg.abs() < 0.5,
+        "rot ~0: {}",
+        app.placement.rot_deg
+    );
     let pose1 = place_pose(&app);
     assert!(pose1.ends_with("auto_pose=true"), "line: {pose1}");
     assert!(
@@ -618,7 +622,11 @@ fn fiducial_check_sets_placement_and_load_preserves_it() {
         "note reports the auto-place: {}",
         app.fiducials.note
     );
-    let (tx1, ty1, rot1) = (app.placement.tx_mm, app.placement.ty_mm, app.placement.rot_deg);
+    let (tx1, ty1, rot1) = (
+        app.placement.tx_mm,
+        app.placement.ty_mm,
+        app.placement.rot_deg,
+    );
 
     // Load installs the job but must NOT recenter over the auto pose.
     let _ = ctx.run(egui::RawInput::default(), |ctx| app.load_place(ctx));
@@ -629,7 +637,11 @@ fn fiducial_check_sets_placement_and_load_preserves_it() {
             && (app.placement.rot_deg - rot1).abs() < 1e-9,
         "Load preserved the pose values"
     );
-    assert_eq!(place_pose(&app), pose1, "place line's pose portion unchanged");
+    assert_eq!(
+        place_pose(&app),
+        pose1,
+        "place line's pose portion unchanged"
+    );
 
     // Switching side clears the auto-pose flag.
     app.set_side(Side::Back);
@@ -683,7 +695,11 @@ fn marking_round_walks_the_fiducials_and_the_final_click_detects() {
     // A file Load opens the round at marker 0 and prompts for the first click;
     // nothing is detected yet.
     app.load_fid_frame(&ctx);
-    assert_eq!(app.fiducials.marking, Some(0), "load opens the marking round");
+    assert_eq!(
+        app.fiducials.marking,
+        Some(0),
+        "load opens the marking round"
+    );
     assert!(
         app.fiducials.note.starts_with("click fiducial 1 of 3"),
         "note prompts the first marker: {}",
@@ -712,7 +728,10 @@ fn marking_round_walks_the_fiducials_and_the_final_click_detects() {
 
     // The final click closes the round and runs detection on the marked holes.
     app.fid_mark_click(holes[2], &ctx);
-    assert_eq!(app.fiducials.marking, None, "round closed on the final click");
+    assert_eq!(
+        app.fiducials.marking, None,
+        "round closed on the final click"
+    );
     assert_eq!(
         app.fiducials.found.iter().filter(|f| f.is_some()).count(),
         3,
@@ -723,7 +742,11 @@ fn marking_round_walks_the_fiducials_and_the_final_click_detects() {
     // "reset markers" reopens the round from marker 0.
     app.reset_fid_markers();
     assert_eq!(app.fiducials.marking, Some(0), "reset reopens the round");
-    assert_eq!(app.fiducials.search.len(), 3, "markers reseeded from the layout");
+    assert_eq!(
+        app.fiducials.search.len(),
+        3,
+        "markers reseeded from the layout"
+    );
 
     std::fs::remove_dir_all(dir).ok();
 }
@@ -740,14 +763,20 @@ fn clear_markers_empties_the_layout_so_nothing_reseeds() {
     assert_eq!(app.fiducials.search.len(), 3);
 
     app.clear_fid_markers();
-    assert!(app.fiducials.layout.is_empty(), "layout emptied — it is the reseed source");
+    assert!(
+        app.fiducials.layout.is_empty(),
+        "layout emptied — it is the reseed source"
+    );
     assert!(app.fiducials.search.is_empty(), "all ✛ markers gone");
     assert!(app.fiducials.found.is_empty() && app.fiducials.rows.is_empty());
     assert_eq!(app.fiducials.marking, None, "any active round is cancelled");
 
     // Neither the per-frame sync nor an explicit reset may bring them back.
     app.sync_fid_markers();
-    assert!(app.fiducials.search.is_empty(), "sync must not reseed cleared markers");
+    assert!(
+        app.fiducials.search.is_empty(),
+        "sync must not reseed cleared markers"
+    );
     app.reset_fid_markers();
     assert!(
         app.fiducials.search.is_empty() && app.fiducials.marking.is_none(),
@@ -944,11 +973,7 @@ fn markers_follow_the_layout_field() {
     app.fiducials.layout = "10,10; 60,10; 10,60; 60,60".into();
     app.sync_fid_markers();
     assert_eq!(app.fiducials.search.len(), 4, "4th marker appears");
-    assert_eq!(
-        app.fiducials.search[0],
-        (11.5, 9.0),
-        "placed position kept"
-    );
+    assert_eq!(app.fiducials.search[0], (11.5, 9.0), "placed position kept");
     assert_eq!(
         app.fiducials.search[3],
         (60.0, 60.0),
@@ -1009,7 +1034,10 @@ fn clicking_the_lone_marker_places_and_detects() {
     // Click at the design nominal: the lone click closes the round and detects,
     // but the hole is 3 mm off so nothing is found there.
     app.fid_mark_click((10.0, 10.0), &ctx);
-    assert_eq!(app.fiducials.marking, None, "the lone click closed the round");
+    assert_eq!(
+        app.fiducials.marking, None,
+        "the lone click closed the round"
+    );
     assert!(
         app.fiducials.found[0].is_none(),
         "misses at nominal (hole is 3 mm off)"
@@ -1018,7 +1046,10 @@ fn clicking_the_lone_marker_places_and_detects() {
     // A fresh click with no active round implicitly reopens it; landing on the
     // actual hole makes detection lock on.
     app.fid_mark_click((13.0, 10.0), &ctx);
-    assert_eq!(app.fiducials.marking, None, "the reopened lone click closed again");
+    assert_eq!(
+        app.fiducials.marking, None,
+        "the reopened lone click closed again"
+    );
     assert!(
         app.fiducials.found[0].is_some(),
         "found the hole the click landed on"
