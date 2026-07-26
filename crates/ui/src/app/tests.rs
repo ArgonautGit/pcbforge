@@ -4,13 +4,17 @@ fn tmp_db() -> PathBuf {
     // Unique per call so each console gets its own settings sidecar
     // (`*.console-settings`) — a shared path would bleed persisted input
     // fields between tests.
+    //
+    // Nested under one per-process parent so a run leaves a single directory
+    // behind instead of one per call. The callers hold only a `PathBuf`, so
+    // there is nowhere to hang a `TempDir` guard without threading one through
+    // every call site; grouping keeps the leak proportional to runs rather
+    // than to tests (this suite alone calls it ~150 times).
     use std::sync::atomic::{AtomicU64, Ordering};
     static N: AtomicU64 = AtomicU64::new(0);
-    let dir = std::env::temp_dir().join(format!(
-        "ui-app-{}-{}",
-        std::process::id(),
-        N.fetch_add(1, Ordering::Relaxed)
-    ));
+    let dir = std::env::temp_dir()
+        .join(format!("ui-app-{}", std::process::id()))
+        .join(N.fetch_add(1, Ordering::Relaxed).to_string());
     std::fs::create_dir_all(&dir).unwrap();
     dir.join("t.sqlite")
 }
@@ -48,7 +52,7 @@ fn nonlinear_app() -> ConsoleApp {
         .iter()
         .map(|(physical, commanded)| {
             let px = lens.mm_to_px.apply(physical.x, physical.y);
-            crate::calib::FieldDot {
+            calib::FieldDot {
                 px,
                 physical_mm: (physical.x, physical.y),
                 commanded_mm: (commanded.x, commanded.y),
@@ -59,15 +63,15 @@ fn nonlinear_app() -> ConsoleApp {
             }
         })
         .collect();
-    app.calibration.lens = Some(crate::calib::CameraCal {
+    app.calibration.lens = Some(calib::CameraCal {
         lens,
         dots: vec![],
         found: 16,
         total: 16,
     });
-    app.calibration.field = Some(crate::calib::FieldCal {
+    app.calibration.field = Some(calib::FieldCal {
         field,
-        paper_to_machine: crate::calib::Rigid2::IDENTITY,
+        paper_to_machine: calib::Rigid2::IDENTITY,
         to_px: vision::Homography {
             matrix: Matrix3::new(10.0, 0.0, 20.0, 0.0, -10.0, 800.0, 0.0, 0.0, 1.0),
             residuals: vec![],
@@ -198,7 +202,7 @@ fn load_place_prefers_a_fresh_camera_grab_over_the_saved_frame_path() {
 #[test]
 fn anchor_only_place_previews_and_exports_unwarped_with_warning() {
     let mut app = ConsoleApp::new(tmp_db(), vec!["true".into()]);
-    app.calibration.anchor = Some(crate::calib::Calibration {
+    app.calibration.anchor = Some(calib::Calibration {
         px_to_mm: vision::Homography {
             matrix: nalgebra::Matrix3::new(0.1, 0.0, 0.0, 0.0, -0.1, 80.0, 0.0, 0.0, 1.0),
             residuals: vec![],
@@ -240,7 +244,7 @@ fn invalid_nonlinear_projection_fails_closed_without_homography_fallback() {
     let field = &mut app.calibration.field.as_mut().unwrap().field;
     let mut coeffs = field.to_physical.to_coeffs();
     coeffs[0] = f64::NAN;
-    field.to_physical = vision::Poly2::from_coeffs(&coeffs);
+    field.to_physical = vision::Poly2::from_coeffs(&coeffs).expect("scale still valid");
     assert!(app.camera_projection((800, 800)).is_err());
     assert!(app.place_projection(800, 800).is_err());
 }
@@ -363,7 +367,7 @@ fn camera_ui_reports_active_and_invalid_nonlinear_projection() {
     let field = &mut app.calibration.field.as_mut().unwrap().field;
     let mut coeffs = field.to_physical.to_coeffs();
     coeffs[0] = f64::NAN;
-    field.to_physical = vision::Poly2::from_coeffs(&coeffs);
+    field.to_physical = vision::Poly2::from_coeffs(&coeffs).expect("scale still valid");
     let out = ctx.run(egui::RawInput::default(), |ctx| app.ui(ctx));
     assert!(
         !out.shapes.is_empty(),
@@ -548,7 +552,7 @@ fn fiducial_check_sets_placement_and_load_preserves_it() {
     app.fiducials.px_per_mm = ppm;
     // Homography-fallback place_projection matching the frame's px↔mm map
     // (mm_x = px_x/ppm, mm_y = (H − px_y)/ppm), so from_px recovers machine mm.
-    app.calibration.anchor = Some(crate::calib::Calibration {
+    app.calibration.anchor = Some(calib::Calibration {
         px_to_mm: vision::Homography {
             matrix: Matrix3::new(
                 1.0 / ppm,
@@ -605,7 +609,11 @@ fn fiducial_check_sets_placement_and_load_preserves_it() {
         app.placement.tx_mm,
         app.placement.ty_mm
     );
-    assert!(app.placement.rot_deg.abs() < 0.5, "rot ~0: {}", app.placement.rot_deg);
+    assert!(
+        app.placement.rot_deg.abs() < 0.5,
+        "rot ~0: {}",
+        app.placement.rot_deg
+    );
     let pose1 = place_pose(&app);
     assert!(pose1.ends_with("auto_pose=true"), "line: {pose1}");
     assert!(
@@ -618,7 +626,11 @@ fn fiducial_check_sets_placement_and_load_preserves_it() {
         "note reports the auto-place: {}",
         app.fiducials.note
     );
-    let (tx1, ty1, rot1) = (app.placement.tx_mm, app.placement.ty_mm, app.placement.rot_deg);
+    let (tx1, ty1, rot1) = (
+        app.placement.tx_mm,
+        app.placement.ty_mm,
+        app.placement.rot_deg,
+    );
 
     // Load installs the job but must NOT recenter over the auto pose.
     let _ = ctx.run(egui::RawInput::default(), |ctx| app.load_place(ctx));
@@ -629,7 +641,11 @@ fn fiducial_check_sets_placement_and_load_preserves_it() {
             && (app.placement.rot_deg - rot1).abs() < 1e-9,
         "Load preserved the pose values"
     );
-    assert_eq!(place_pose(&app), pose1, "place line's pose portion unchanged");
+    assert_eq!(
+        place_pose(&app),
+        pose1,
+        "place line's pose portion unchanged"
+    );
 
     // Switching side clears the auto-pose flag.
     app.set_side(Side::Back);
@@ -683,7 +699,11 @@ fn marking_round_walks_the_fiducials_and_the_final_click_detects() {
     // A file Load opens the round at marker 0 and prompts for the first click;
     // nothing is detected yet.
     app.load_fid_frame(&ctx);
-    assert_eq!(app.fiducials.marking, Some(0), "load opens the marking round");
+    assert_eq!(
+        app.fiducials.marking,
+        Some(0),
+        "load opens the marking round"
+    );
     assert!(
         app.fiducials.note.starts_with("click fiducial 1 of 3"),
         "note prompts the first marker: {}",
@@ -712,7 +732,10 @@ fn marking_round_walks_the_fiducials_and_the_final_click_detects() {
 
     // The final click closes the round and runs detection on the marked holes.
     app.fid_mark_click(holes[2], &ctx);
-    assert_eq!(app.fiducials.marking, None, "round closed on the final click");
+    assert_eq!(
+        app.fiducials.marking, None,
+        "round closed on the final click"
+    );
     assert_eq!(
         app.fiducials.found.iter().filter(|f| f.is_some()).count(),
         3,
@@ -723,7 +746,11 @@ fn marking_round_walks_the_fiducials_and_the_final_click_detects() {
     // "reset markers" reopens the round from marker 0.
     app.reset_fid_markers();
     assert_eq!(app.fiducials.marking, Some(0), "reset reopens the round");
-    assert_eq!(app.fiducials.search.len(), 3, "markers reseeded from the layout");
+    assert_eq!(
+        app.fiducials.search.len(),
+        3,
+        "markers reseeded from the layout"
+    );
 
     std::fs::remove_dir_all(dir).ok();
 }
@@ -740,14 +767,20 @@ fn clear_markers_empties_the_layout_so_nothing_reseeds() {
     assert_eq!(app.fiducials.search.len(), 3);
 
     app.clear_fid_markers();
-    assert!(app.fiducials.layout.is_empty(), "layout emptied — it is the reseed source");
+    assert!(
+        app.fiducials.layout.is_empty(),
+        "layout emptied — it is the reseed source"
+    );
     assert!(app.fiducials.search.is_empty(), "all ✛ markers gone");
     assert!(app.fiducials.found.is_empty() && app.fiducials.rows.is_empty());
     assert_eq!(app.fiducials.marking, None, "any active round is cancelled");
 
     // Neither the per-frame sync nor an explicit reset may bring them back.
     app.sync_fid_markers();
-    assert!(app.fiducials.search.is_empty(), "sync must not reseed cleared markers");
+    assert!(
+        app.fiducials.search.is_empty(),
+        "sync must not reseed cleared markers"
+    );
     app.reset_fid_markers();
     assert!(
         app.fiducials.search.is_empty() && app.fiducials.marking.is_none(),
@@ -944,11 +977,7 @@ fn markers_follow_the_layout_field() {
     app.fiducials.layout = "10,10; 60,10; 10,60; 60,60".into();
     app.sync_fid_markers();
     assert_eq!(app.fiducials.search.len(), 4, "4th marker appears");
-    assert_eq!(
-        app.fiducials.search[0],
-        (11.5, 9.0),
-        "placed position kept"
-    );
+    assert_eq!(app.fiducials.search[0], (11.5, 9.0), "placed position kept");
     assert_eq!(
         app.fiducials.search[3],
         (60.0, 60.0),
@@ -1009,7 +1038,10 @@ fn clicking_the_lone_marker_places_and_detects() {
     // Click at the design nominal: the lone click closes the round and detects,
     // but the hole is 3 mm off so nothing is found there.
     app.fid_mark_click((10.0, 10.0), &ctx);
-    assert_eq!(app.fiducials.marking, None, "the lone click closed the round");
+    assert_eq!(
+        app.fiducials.marking, None,
+        "the lone click closed the round"
+    );
     assert!(
         app.fiducials.found[0].is_none(),
         "misses at nominal (hole is 3 mm off)"
@@ -1018,7 +1050,10 @@ fn clicking_the_lone_marker_places_and_detects() {
     // A fresh click with no active round implicitly reopens it; landing on the
     // actual hole makes detection lock on.
     app.fid_mark_click((13.0, 10.0), &ctx);
-    assert_eq!(app.fiducials.marking, None, "the reopened lone click closed again");
+    assert_eq!(
+        app.fiducials.marking, None,
+        "the reopened lone click closed again"
+    );
     assert!(
         app.fiducials.found[0].is_some(),
         "found the hole the click landed on"
@@ -1427,7 +1462,7 @@ field_frame=\n";
     assert!(app.camera.use_device);
     assert_eq!(app.camera.device, 2);
     assert_eq!(app.calibration.burn.n, 9);
-    assert_eq!(app.calibration.burn.dot_kind, crate::calib::DotKind::Bright);
+    assert_eq!(app.calibration.burn.dot_kind, calib::DotKind::Bright);
     // A pre-split blob has one shared parameter set: the paper set is seeded
     // from it, since that's what ① was last fit with.
     assert_eq!(app.calibration.paper, app.calibration.burn);
@@ -1623,22 +1658,22 @@ fn field_frame_mirror_flag_round_trips() {
         residuals: vec![],
         rms: 0.0,
     };
-    let flipped = crate::calib::Rigid2 {
+    let flipped = calib::Rigid2 {
         cos: (0.2_f64).cos(),
         sin: (0.2_f64).sin(),
         tx: 3.5,
         ty: -1.25,
         flip_x: true,
     };
-    let make_app = |db: &PathBuf, frame: crate::calib::Rigid2| {
+    let make_app = |db: &PathBuf, frame: calib::Rigid2| {
         let mut a = ConsoleApp::new(db.clone(), vec!["true".into()]);
-        a.calibration.lens = Some(crate::calib::CameraCal {
+        a.calibration.lens = Some(calib::CameraCal {
             lens: lens.clone(),
             dots: vec![],
             found: 16,
             total: 16,
         });
-        a.calibration.field = Some(crate::calib::FieldCal {
+        a.calibration.field = Some(calib::FieldCal {
             field: field.clone(),
             paper_to_machine: frame,
             to_px: to_px.clone(),
@@ -1689,7 +1724,7 @@ fn field_frame_mirror_flag_round_trips() {
     let blob4: String = {
         let a = make_app(
             &legacy_db,
-            crate::calib::Rigid2 {
+            calib::Rigid2 {
                 flip_x: false,
                 ..flipped
             },
@@ -1770,23 +1805,23 @@ fn paper_and_burn_params_persist_independently() {
             n: 9,
             pitch_mm: 9.6,
             dot_mm: 0.3,
-            dot_kind: crate::calib::DotKind::Dark,
+            dot_kind: calib::DotKind::Dark,
         };
         a.calibration.burn = GridParams {
             n: 7,
             pitch_mm: 10.0,
             dot_mm: 0.4,
-            dot_kind: crate::calib::DotKind::Bright,
+            dot_kind: calib::DotKind::Bright,
         };
         a.save_settings_if_changed();
     }
     let b = ConsoleApp::new(db, vec!["true".into()]);
     assert_eq!(b.calibration.paper.n, 9);
     assert!((b.calibration.paper.pitch_mm - 9.6).abs() < 1e-9);
-    assert_eq!(b.calibration.paper.dot_kind, crate::calib::DotKind::Dark);
+    assert_eq!(b.calibration.paper.dot_kind, calib::DotKind::Dark);
     assert_eq!(b.calibration.burn.n, 7);
     assert!((b.calibration.burn.pitch_mm - 10.0).abs() < 1e-9);
-    assert_eq!(b.calibration.burn.dot_kind, crate::calib::DotKind::Bright);
+    assert_eq!(b.calibration.burn.dot_kind, calib::DotKind::Bright);
 }
 
 /// The ① lens fit's pixel bounds survive a save/reload, and a legacy blob
@@ -1808,7 +1843,7 @@ fn lens_calibration_pixel_bounds_round_trip() {
         .collect();
     let lens = vision::fit_lens(&pairs).unwrap();
     let expected = lens.calib_px_bounds.expect("fit records bounds");
-    let make_cal = |lens: vision::LensMap| crate::calib::CameraCal {
+    let make_cal = |lens: vision::LensMap| calib::CameraCal {
         lens,
         dots: Vec::new(),
         found: 16,
@@ -1946,7 +1981,7 @@ fn place_uses_calibration_when_present() {
 
     // A calibration wins: place_homography is the calibration's inverse
     // (machine-mm → px), independent of the fiducial fit.
-    app.calibration.anchor = Some(crate::calib::Calibration {
+    app.calibration.anchor = Some(calib::Calibration {
         // px_to_mm = 0.1 (10 px/mm); inverse = 10 (mm→px).
         px_to_mm: vision::Homography {
             matrix: Matrix3::new(0.1, 0.0, 0.0, 0.0, 0.1, 0.0, 0.0, 0.0, 1.0),
@@ -1976,7 +2011,7 @@ fn calibration_persists_as_a_reanchor_seed() {
     let mut a = ConsoleApp::new(db.clone(), vec!["true".into()]);
     a.calibration.burn.n = 7;
     a.calibration.burn.pitch_mm = 10.0;
-    a.calibration.anchor = Some(crate::calib::Calibration {
+    a.calibration.anchor = Some(calib::Calibration {
         px_to_mm: vision::Homography {
             matrix: Matrix3::new(0.1, 0.0, 1.0, 0.0, 0.1, 2.0, 0.0, 0.0, 1.0),
             residuals: vec![],
@@ -2005,7 +2040,7 @@ fn calibration_persists_as_a_reanchor_seed() {
 /// tab lays out with the arrows drawn.
 #[test]
 fn camera_lens_calibration_flow() {
-    let grid = crate::calib::GridSpec {
+    let grid = calib::GridSpec {
         origin_mm: (0.0, 0.0),
         pitch_mm: 10.0,
         n: 7,
@@ -2133,7 +2168,7 @@ fn anchor_overlay_renders_the_machine_grid() {
 fn anchor_dot_correction_moves_the_selected_grid_site_and_refits() {
     use nalgebra::Matrix3;
     let mut app = ConsoleApp::new(tmp_db(), vec!["true".into()]);
-    app.calibration.anchor = Some(crate::calib::Calibration {
+    app.calibration.anchor = Some(calib::Calibration {
         px_to_mm: vision::Homography {
             matrix: Matrix3::new(0.1, 0.0, -2.0, 0.0, 0.1, -3.0, 0.0, 0.0, 1.0),
             residuals: vec![],
@@ -2143,27 +2178,27 @@ fn anchor_dot_correction_moves_the_selected_grid_site_and_refits() {
         found: 5,
         total: 49,
         dots: vec![
-            crate::calib::AnchorDot {
+            calib::AnchorDot {
                 px: (20.0, 30.0),
                 mm: (0.0, 0.0),
                 resid_um: 0.0,
             },
-            crate::calib::AnchorDot {
+            calib::AnchorDot {
                 px: (620.0, 30.0),
                 mm: (60.0, 0.0),
                 resid_um: 0.0,
             },
-            crate::calib::AnchorDot {
+            calib::AnchorDot {
                 px: (620.0, 630.0),
                 mm: (60.0, 60.0),
                 resid_um: 0.0,
             },
-            crate::calib::AnchorDot {
+            calib::AnchorDot {
                 px: (20.0, 630.0),
                 mm: (0.0, 60.0),
                 resid_um: 0.0,
             },
-            crate::calib::AnchorDot {
+            calib::AnchorDot {
                 px: (320.0, 330.0),
                 mm: (30.0, 30.0),
                 resid_um: 0.0,
@@ -2200,7 +2235,7 @@ fn camera_bed_overlay_renders_when_calibrated() {
         image::GrayImage::from_pixel(200, 150, image::Luma([180])),
     );
     // A laser anchor: camera-px → mm at 10 px/mm.
-    app.calibration.anchor = Some(crate::calib::Calibration {
+    app.calibration.anchor = Some(calib::Calibration {
         px_to_mm: vision::Homography {
             matrix: Matrix3::new(0.1, 0.0, 0.0, 0.0, 0.1, 0.0, 0.0, 0.0, 1.0),
             residuals: vec![],
@@ -2421,7 +2456,7 @@ fn paper_out_path_persists() {
 #[test]
 fn a_failed_fit_keeps_the_previous_calibration() {
     let mut app = ConsoleApp::new(tmp_db(), vec!["true".into()]);
-    app.calibration.anchor = Some(crate::calib::Calibration {
+    app.calibration.anchor = Some(calib::Calibration {
         px_to_mm: vision::Homography {
             matrix: nalgebra::Matrix3::identity(),
             residuals: vec![],
@@ -2491,7 +2526,7 @@ fn back_side_etch_is_refused() {
 #[test]
 fn etch_and_run_arms_an_absolute_pending_path() {
     let mut app = ConsoleApp::new(tmp_db(), vec!["true".into()]);
-    app.calibration.anchor = Some(crate::calib::Calibration {
+    app.calibration.anchor = Some(calib::Calibration {
         px_to_mm: vision::Homography {
             matrix: nalgebra::Matrix3::new(0.1, 0.0, 0.0, 0.0, -0.1, 80.0, 0.0, 0.0, 1.0),
             residuals: vec![],
@@ -2847,7 +2882,7 @@ fn calibration_reports_age_not_just_this_session() {
         "never anchored"
     );
     // A restored (unconfirmed) calibration saved 3 days ago.
-    app.calibration.anchor = Some(crate::calib::Calibration {
+    app.calibration.anchor = Some(calib::Calibration {
         px_to_mm: vision::Homography {
             matrix: nalgebra::Matrix3::identity(),
             residuals: vec![],

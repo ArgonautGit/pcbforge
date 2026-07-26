@@ -8,19 +8,10 @@
 //! Baselines land in `tests/snapshots/*.png`; on mismatch kittest writes
 //! `*.new.png` / `*.diff.png` next to them for inspection.
 
-use egui_kittest::Harness;
 use egui_kittest::kittest::Queryable;
-use ui::ConsoleApp;
 
-fn console() -> Harness<'static, ConsoleApp> {
-    let db = std::env::temp_dir().join("pcbforge-kittest-snap.sqlite");
-    let app = ConsoleApp::new(db, vec!["true".to_string()]);
-    let mut harness = Harness::builder()
-        .with_size(egui::vec2(1280.0, 820.0))
-        .build_state(|ctx, app: &mut ConsoleApp| app.ui(ctx), app);
-    harness.run();
-    harness
-}
+mod common;
+use common::console;
 
 #[test]
 #[ignore = "needs a wgpu adapter; run with --ignored after sourcing scripts/headless-gpu.sh"]

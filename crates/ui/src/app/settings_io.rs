@@ -1,10 +1,10 @@
 use super::*;
 
 /// Settings token for a dot polarity (round-trips through the loaders).
-fn dot_kind_token(kind: crate::calib::DotKind) -> &'static str {
+fn dot_kind_token(kind: calib::DotKind) -> &'static str {
     match kind {
-        crate::calib::DotKind::Dark => "dark",
-        crate::calib::DotKind::Bright => "bright",
+        calib::DotKind::Dark => "dark",
+        calib::DotKind::Bright => "bright",
     }
 }
 
@@ -427,8 +427,8 @@ impl ConsoleApp {
         f64_field(&m, "calib_dot_mm", &mut self.calibration.burn.dot_mm);
         if let Some(v) = m.get("calib_dot_kind") {
             self.calibration.burn.dot_kind = match v.trim() {
-                "bright" => crate::calib::DotKind::Bright,
-                _ => crate::calib::DotKind::Dark,
+                "bright" => calib::DotKind::Bright,
+                _ => calib::DotKind::Dark,
             };
         }
         str_field(&m, "calib_grid_out", &mut self.calibration.grid_out);
@@ -539,8 +539,8 @@ impl ConsoleApp {
             f64_field(&m, "calib_paper_dot_mm", &mut self.calibration.paper.dot_mm);
             if let Some(v) = m.get("calib_paper_dot_kind") {
                 self.calibration.paper.dot_kind = match v.trim() {
-                    "bright" => crate::calib::DotKind::Bright,
-                    _ => crate::calib::DotKind::Dark,
+                    "bright" => calib::DotKind::Bright,
+                    _ => calib::DotKind::Dark,
                 };
             }
             if let Some(v) = m
@@ -556,19 +556,23 @@ impl ConsoleApp {
         // survives a restart. Staleness is guarded at use time: the
         // frame-signature check refuses it if resolution/crop/orientation
         // changed, and a physically moved camera is re-anchored/re-fit anyway.
-        if let (Some(px), Some(mm)) = (
-            m.get("lens_px_to_mm").and_then(|s| parse_coeffs(s)),
-            m.get("lens_mm_to_px").and_then(|s| parse_coeffs(s)),
+        if let (Some(px_to_mm), Some(mm_to_px)) = (
+            m.get("lens_px_to_mm")
+                .and_then(|s| parse_coeffs(s))
+                .and_then(|c| vision::Poly2::from_coeffs(&c)),
+            m.get("lens_mm_to_px")
+                .and_then(|s| parse_coeffs(s))
+                .and_then(|c| vision::Poly2::from_coeffs(&c)),
         ) {
             let mut stats = m
                 .get("lens_stats")
                 .map(|s| s.split_whitespace())
                 .into_iter()
                 .flatten();
-            self.calibration.lens = Some(crate::calib::CameraCal {
+            self.calibration.lens = Some(calib::CameraCal {
                 lens: vision::LensMap {
-                    px_to_mm: vision::Poly2::from_coeffs(&px),
-                    mm_to_px: vision::Poly2::from_coeffs(&mm),
+                    px_to_mm,
+                    mm_to_px,
                     rms_um: stats.next().and_then(|s| s.parse().ok()).unwrap_or(0.0),
                     max_um: stats.next().and_then(|s| s.parse().ok()).unwrap_or(0.0),
                     residuals: Vec::new(),
@@ -629,7 +633,7 @@ impl ConsoleApp {
                     [cos, sin, tx, ty, flip] => (cos, sin, tx, ty, flip != 0.0),
                     _ => return None,
                 };
-                Some(crate::calib::Rigid2 {
+                Some(calib::Rigid2 {
                     cos,
                     sin,
                     tx,
@@ -646,7 +650,7 @@ impl ConsoleApp {
                     .map(|s| s.split_whitespace())
                     .into_iter()
                     .flatten();
-                self.calibration.field = Some(crate::calib::FieldCal {
+                self.calibration.field = Some(calib::FieldCal {
                     field,
                     paper_to_machine,
                     to_px,
@@ -684,7 +688,7 @@ impl ConsoleApp {
                 self.calibration.note = "ignored an invalid saved calibration matrix".into();
                 return;
             };
-            self.calibration.anchor = Some(crate::calib::Calibration {
+            self.calibration.anchor = Some(calib::Calibration {
                 px_to_mm,
                 rms_um: 0.0,
                 found: 0,

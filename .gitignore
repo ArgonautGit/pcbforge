@@ -12,9 +12,11 @@ pcbforge-gerbers/
 /logs/
 /shots/
 
-# Operator runtime artifacts written next to the console
+# Operator runtime artifacts written next to the console. Globbed on the
+# fiducial holes because operators keep manual backups beside the live file
+# (fid-holes_backup.lbrn2 was staged for commit once).
 calib-grid.lbrn2
-fid-holes.lbrn2
+fid-holes*.lbrn2
 job.lbrn2
 paper-grid.svg
 pcbforge-field-map.txt
@@ -23,3 +25,10 @@ pcbforge.sqlite
 
 # KiCad per-user local prefs generated next to sample boards
 *.kicad_prl
+
+# Agent worktrees live inside the repo, so git sees each one as a gitlink and
+# `git add -A` stages it as a bogus submodule (mode 160000 with no .gitmodules,
+# which clones as a broken empty dir). Personal harness prefs are local too.
+# Shared .claude config (settings.json, agents/, skills/) stays trackable.
+.claude/worktrees/
+.claude/settings.local.json

@@ -1281,6 +1281,7 @@ fn warp_polys(
                 field_seg_mm,
                 |x, y| field.precompensate(x, y),
             )
+            .map_err(|e| format!("{tag}: field warp refused — {e}"))?
         }
         None => {
             eprintln!(
@@ -1295,6 +1296,9 @@ fn warp_polys(
 }
 
 /// `pcbforge fid-holes` — burn fiducial holes at operator-supplied positions.
+// The arguments mirror the clap variant one-for-one; grouping them into a
+// struct would only duplicate the flag definitions.
+#[allow(clippy::too_many_arguments)]
 fn fid_holes_cmd(
     out: &std::path::Path,
     layout: &str,
@@ -1312,9 +1316,11 @@ fn fid_holes_cmd(
         return Err("--w-mm must be positive".into());
     }
     if shape == "circle" && h_mm != 0.0 && h_mm != w_mm {
-        return Err("--h-mm is ignored for --shape circle (circles take only --w-mm); \
+        return Err(
+            "--h-mm is ignored for --shape circle (circles take only --w-mm); \
                      pass 0 or omit it, or match --w-mm"
-            .into());
+                .into(),
+        );
     }
     let resolved_h = if h_mm == 0.0 { w_mm } else { h_mm };
     if resolved_h <= 0.0 {
@@ -1721,6 +1727,7 @@ fn emit_cmd(a: EmitArgs) -> Result<(), Box<dyn std::error::Error>> {
                 a.field_seg_mm,
                 |x, y| field.precompensate(x, y),
             )
+            .map_err(|e| format!("emit: field warp refused — {e}"))?
         }
         None => {
             eprintln!(
@@ -1778,6 +1785,16 @@ struct RegisterArgs<'a> {
 fn register_cmd(a: RegisterArgs) -> Result<(), Box<dyn std::error::Error>> {
     use nalgebra::Point2;
 
+    // The acceptance threshold itself has to be finite, or every comparison
+    // against it below is false and the gate stops gating.
+    if !a.max_rms_mm.is_finite() || a.max_rms_mm <= 0.0 {
+        return Err(format!(
+            "--max-rms-mm must be finite and positive, got {}",
+            a.max_rms_mm
+        )
+        .into());
+    }
+
     // (design_mm, machine_mm) correspondences.
     let pairs: Vec<(Point2<f64>, Point2<f64>)> = match (a.fiducials, a.frame) {
         (Some(_), Some(_)) => return Err("pass --fiducials OR --frame, not both".into()),
@@ -1801,7 +1818,9 @@ fn register_cmd(a: RegisterArgs) -> Result<(), Box<dyn std::error::Error>> {
         pairs.len(),
         fit.rms * 1000.0
     );
-    if fit.rms > a.max_rms_mm {
+    // Fail closed: `NaN > x` is false, so a plain `>` would wave a NaN fit
+    // straight through the acceptance gate and into machine coordinates.
+    if !fit.rms.is_finite() || fit.rms > a.max_rms_mm {
         return Err(format!(
             "fit RMS {:.1} µm exceeds --max-rms-mm {:.0} µm — bad correspondences or a mis-detection",
             fit.rms * 1000.0,
@@ -1820,10 +1839,15 @@ fn register_cmd(a: RegisterArgs) -> Result<(), Box<dyn std::error::Error>> {
             t[(1, 2)],
         ],
     };
-    if affine.determinant() <= 0.0 {
-        return Err(
-            "fitted transform reflects (negative determinant) — check fiducial order".into(),
-        );
+    // Fail closed on both counts: a non-finite coefficient makes the determinant
+    // NaN, and `NaN <= 0.0` is false, so a plain `<=` would let it through.
+    let det = affine.determinant();
+    if !affine.m.iter().all(|v| v.is_finite()) || !det.is_finite() || det <= 0.0 {
+        return Err(format!(
+            "fitted transform is unusable (determinant {det}) — non-finite or \
+             reflecting; check the fiducial correspondences and their order"
+        )
+        .into());
     }
 
     let job = build_job(
@@ -1852,7 +1876,8 @@ fn register_cmd(a: RegisterArgs) -> Result<(), Box<dyn std::error::Error>> {
                     &affine,
                     a.field_seg_mm,
                     |x, y| field.precompensate(x, y),
-                ),
+                )
+                .map_err(|e| format!("register: field warp refused — {e}"))?,
                 true,
             )
         }
@@ -1930,10 +1955,19 @@ fn parse_correspondences(spec: &str) -> Result<Vec<Corr>, Box<dyn std::error::Er
                 .trim()
                 .split_once(',')
                 .ok_or_else(|| format!("fiducial {}: bad point {s:?}", i + 1))?;
-            Ok(Point2::new(
-                x.trim().parse().map_err(|_| format!("bad x in {s:?}"))?,
-                y.trim().parse().map_err(|_| format!("bad y in {s:?}"))?,
-            ))
+            // `f64::from_str` accepts "nan"/"inf"/"-inf", so operator text can
+            // otherwise walk a non-finite straight into the fit.
+            let coord = |t: &str, axis: char| -> Result<f64, String> {
+                let v: f64 = t
+                    .trim()
+                    .parse()
+                    .map_err(|_| format!("bad {axis} in {s:?}"))?;
+                if !v.is_finite() {
+                    return Err(format!("non-finite {axis} in {s:?}"));
+                }
+                Ok(v)
+            };
+            Ok(Point2::new(coord(x, 'x')?, coord(y, 'y')?))
         };
         out.push((p(d)?, p(t)?));
     }
@@ -1949,8 +1983,12 @@ fn detect_correspondences(
     diameter_mm: f64,
 ) -> Result<Vec<Corr>, Box<dyn std::error::Error>> {
     use nalgebra::Point2;
-    if px_per_mm <= 0.0 {
-        return Err("--px-per-mm must be positive".into());
+    // `!is_finite` first: `NaN <= 0.0` is false, so a bare `<=` accepts NaN.
+    if !px_per_mm.is_finite() || px_per_mm <= 0.0 {
+        return Err("--px-per-mm must be finite and positive".into());
+    }
+    if !diameter_mm.is_finite() || diameter_mm <= 0.0 {
+        return Err("--diameter-mm must be finite and positive".into());
     }
     let design: Vec<Point2<f64>> = layout
         .split(';')
@@ -1960,10 +1998,17 @@ fn detect_correspondences(
             let (x, y) = s
                 .split_once(',')
                 .ok_or_else(|| format!("bad layout point {s:?}"))?;
-            Ok::<_, String>(Point2::new(
-                x.trim().parse().map_err(|_| format!("bad x in {s:?}"))?,
-                y.trim().parse().map_err(|_| format!("bad y in {s:?}"))?,
-            ))
+            let coord = |t: &str, axis: char| -> Result<f64, String> {
+                let v: f64 = t
+                    .trim()
+                    .parse()
+                    .map_err(|_| format!("bad {axis} in {s:?}"))?;
+                if !v.is_finite() {
+                    return Err(format!("non-finite {axis} in {s:?}"));
+                }
+                Ok(v)
+            };
+            Ok::<_, String>(Point2::new(coord(x, 'x')?, coord(y, 'y')?))
         })
         .collect::<Result<_, _>>()?;
 
@@ -2458,6 +2503,119 @@ mod tests {
             .collect()
     }
 
+    /// `f64::from_str` accepts "nan"/"inf", so `--fiducials` is a text path into
+    /// the fit — and a NaN correspondence makes `fit.rms` NaN, which the `>`
+    /// acceptance gate would wave through.
+    #[test]
+    fn correspondences_reject_non_finite_operator_text() {
+        assert!(parse_correspondences("0,0=1,1; 10,0=11,1; 0,10=1,11").is_ok());
+        for spec in [
+            "nan,0=1,1; 10,0=11,1; 0,10=1,11",
+            "0,inf=1,1; 10,0=11,1; 0,10=1,11",
+            "0,0=1,1; 10,0=-inf,1; 0,10=1,11",
+            "0,0=1,1; 10,0=11,NaN; 0,10=1,11",
+        ] {
+            let err = parse_correspondences(spec)
+                .err()
+                .map(|e| e.to_string())
+                .unwrap_or_else(|| panic!("{spec} must be refused"));
+            assert!(err.contains("non-finite"), "{spec}: {err}");
+        }
+    }
+
+    #[test]
+    fn detect_correspondences_rejects_non_finite_scale_and_diameter() {
+        let frame = std::path::Path::new("does-not-exist.png");
+        for (px, dia) in [
+            (f64::NAN, 1.0),
+            (f64::INFINITY, 1.0),
+            (10.0, f64::NAN),
+            (10.0, 0.0),
+        ] {
+            let err = detect_correspondences(frame, "0,0; 10,0; 0,10", px, dia)
+                .err()
+                .map(|e| e.to_string())
+                .unwrap_or_else(|| panic!("({px}, {dia}) must be refused"));
+            assert!(
+                err.contains("finite and positive"),
+                "({px}, {dia}): {err} — must be refused before the frame is read"
+            );
+        }
+    }
+
+    /// A field map whose normalization scale is zero maps every input to one
+    /// constant point: the whole job at one spot, at full dwell. The output is
+    /// finite, so only a scale check catches it.
+    #[test]
+    fn load_field_map_refuses_a_collapsed_normalization() {
+        use nalgebra::Point2;
+        let pairs: Vec<_> = (0..5)
+            .flat_map(|row| {
+                (0..5).map(move |col| {
+                    let p = Point2::new(col as f64 * 20.0, row as f64 * 20.0);
+                    (p, p)
+                })
+            })
+            .collect();
+        let text = vision::fit_field(&pairs).unwrap().serialize();
+        let collapsed = text
+            .lines()
+            .map(|l| match l.strip_prefix("to_commanded ") {
+                Some(rest) => {
+                    let mut v: Vec<&str> = rest.split_whitespace().collect();
+                    v[22] = "0.0";
+                    format!("to_commanded {}", v.join(" "))
+                }
+                None => l.to_string(),
+            })
+            .collect::<Vec<_>>()
+            .join("\n");
+
+        let dir = std::env::temp_dir().join(format!("pcbforge-collapsed-{}", std::process::id()));
+        std::fs::create_dir_all(&dir).unwrap();
+        let path = dir.join("collapsed-field.txt");
+        std::fs::write(&path, &collapsed).unwrap();
+        let err = load_field_map(&path).unwrap_err().to_string();
+        assert!(err.contains("unusable normalization"), "{err}");
+
+        // And the whole warp path refuses rather than emitting.
+        let polys = fid_holes_polys("rect", 2.0, 3.0, &[(10.0, 20.0)]);
+        assert!(warp_polys("fid holes", polys, Some(path.as_path()), 0.25).is_err());
+    }
+
+    /// A field map that loads cleanly can still pre-distort a vertex out of
+    /// range: a bicubic evaluated far outside its fit span returns a *finite*
+    /// but enormous value, which the nm cast would saturate to `i64::MAX`. The
+    /// CLI must surface the refusal, not emit the job.
+    #[test]
+    fn warp_polys_refuses_an_out_of_range_precompensation() {
+        use nalgebra::Point2;
+        // Fit over a 0..20 mm span with a strong cubic term, so extrapolating to
+        // thousands of mm blows up while staying finite.
+        let bend = |v: f64| v + 0.001 * (v - 10.0).powi(3);
+        let pairs: Vec<_> = (0..5)
+            .flat_map(|row| {
+                (0..5).map(move |col| {
+                    let (x, y) = (col as f64 * 5.0, row as f64 * 5.0);
+                    (Point2::new(x, y), Point2::new(bend(x), bend(y)))
+                })
+            })
+            .collect();
+        let dir = std::env::temp_dir().join(format!("pcbforge-extrap-{}", std::process::id()));
+        std::fs::create_dir_all(&dir).unwrap();
+        let path = dir.join("cubic-field.txt");
+        std::fs::write(&path, vision::fit_field(&pairs).unwrap().serialize()).unwrap();
+        // Loads fine: finite coefficients, usable normalization.
+        assert!(load_field_map(&path).is_ok());
+
+        let polys = fid_holes_polys("rect", 2.0, 3.0, &[(5000.0, 5000.0)]);
+        let err = warp_polys("fid holes", polys, Some(path.as_path()), 0.25)
+            .expect_err("an out-of-envelope precompensation must refuse the job")
+            .to_string();
+        assert!(err.starts_with("fid holes: field warp refused"), "{err}");
+        assert!(err.contains("sanity envelope"), "{err}");
+    }
+
     #[test]
     fn paper_grid_has_n_squared_dots() {
         for n in [2usize, 5, 9] {
@@ -2573,7 +2731,7 @@ mod tests {
                 (0..n).map(move |col| (nm(ox + col as f64 * pitch), nm(oy + row as f64 * pitch)))
             })
             .collect();
-        let half_pitch_nm = (pitch * 0.5 * NM_PER_MM as f64) as f64;
+        let half_pitch_nm = pitch * 0.5 * NM_PER_MM as f64;
 
         for marker in [poly_center(&dots[n * n]), poly_center(&dots[n * n + 1])] {
             let nearest = sites

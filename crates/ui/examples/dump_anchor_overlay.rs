@@ -21,7 +21,7 @@ fn main() {
     );
 
     let img = image::open(fixture).expect("fixture").to_luma8();
-    let grid = ui::GridSpec {
+    let grid = calib::GridSpec {
         origin_mm: (0.0, 0.0),
         pitch_mm: 10.0,
         n: 7,
@@ -33,7 +33,7 @@ fn main() {
         (606.277, 39.892),
         (43.744, 41.83),
     ];
-    let cal = ui::fit_camera_to_machine(&img, corners, &grid, 2.0, ui::DotKind::Dark)
+    let cal = calib::fit_camera_to_machine(&img, corners, &grid, 2.0, calib::DotKind::Dark)
         .expect("anchor fit");
     let worst = cal.dots.iter().map(|d| d.resid_um).fold(0.0_f64, f64::max);
     eprintln!(

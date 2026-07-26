@@ -66,25 +66,55 @@ impl Poly2 {
         v
     }
 
-    /// Rebuild a map from [`Poly2::to_coeffs`] output.
-    pub fn from_coeffs(v: &[f64; 23]) -> Poly2 {
+    /// Rebuild a map from [`Poly2::to_coeffs`] output, or `None` if the
+    /// normalization is unusable.
+    ///
+    /// `scale` must be finite and strictly positive and `center` finite:
+    /// `scale = 0` collapses `u = v = 0` for every input, so the basis
+    /// degenerates to `[1, 0, 0, …]` and the map returns the constant
+    /// `(cx[0], cy[0])` — the whole job burning at one spot. That output is
+    /// *finite*, so no downstream finiteness check catches it; it has to be
+    /// refused here.
+    ///
+    /// Coefficient finiteness is deliberately left to the callers, which
+    /// already enforce it on every path (see the crate's deserialization sites).
+    pub fn from_coeffs(v: &[f64; 23]) -> Option<Poly2> {
+        let (center, scale) = ((v[20], v[21]), v[22]);
+        if !center.0.is_finite() || !center.1.is_finite() || !scale.is_finite() || scale <= 0.0 {
+            return None;
+        }
         let mut cx = [0.0; 10];
         let mut cy = [0.0; 10];
         cx.copy_from_slice(&v[..10]);
         cy.copy_from_slice(&v[10..20]);
-        Poly2 {
+        Some(Poly2 {
             cx,
             cy,
-            center: (v[20], v[21]),
-            scale: v[22],
-        }
+            center,
+            scale,
+        })
     }
 
-    /// Fit `src → dst` (both `(x, y)`) by least squares. Needs ≥ 10 points.
+    /// Fit `src → dst` (both `(x, y)`) by least squares. Needs ≥ 11 points.
     fn fit(src: &[(f64, f64)], dst: &[(f64, f64)]) -> Result<Poly2, String> {
         let n = src.len();
-        if n < 10 {
-            return Err(format!("lens fit needs ≥10 points, got {n}"));
+        // 11, not 10: at exactly 10 points the 10-term basis is determined, so
+        // the residuals are 0 by construction and the fit reports "0 µm" no
+        // matter how wrong it is — the most reassuring number available from the
+        // least trustworthy fit.
+        if n < 11 {
+            return Err(format!(
+                "lens fit needs ≥11 points, got {n}: a 10-point fit has zero \
+                 residual degrees of freedom for the 10 polynomial terms, so \
+                 its reported residual would read 0 µm regardless of accuracy"
+            ));
+        }
+        if src
+            .iter()
+            .chain(dst)
+            .any(|&(x, y)| !x.is_finite() || !y.is_finite())
+        {
+            return Err("lens fit input contains non-finite coordinates".to_string());
         }
         // Normalize the input to ~[-1, 1] so the design matrix is well
         // conditioned (raw pixels or mm span hundreds).
@@ -134,6 +164,12 @@ impl Poly2 {
         for (i, (cx, cy)) in coeff_x.iter_mut().zip(coeff_y.iter_mut()).enumerate() {
             *cx = sol_x[i];
             *cy = sol_y[i];
+        }
+        // The solve can still emit a non-finite coefficient on a pathological
+        // design; catching it here keeps every `Poly2` in the process finite by
+        // construction rather than leaning on the downstream coefficient checks.
+        if !coeff_x.iter().chain(&coeff_y).all(|v: &f64| v.is_finite()) {
+            return Err("lens fit produced non-finite coefficients".to_string());
         }
         Ok(Poly2 {
             cx: coeff_x,
@@ -188,7 +224,7 @@ mod rank_tests {
 }
 
 /// Fit a lens model from `(pixel, true_mm)` correspondences (the imaged known
-/// grid). Needs ≥ 10 non-degenerate points.
+/// grid). Needs ≥ 11 non-degenerate points.
 pub fn fit_lens(pairs: &[(Point2<f64>, Point2<f64>)]) -> Result<LensMap, String> {
     let px: Vec<(f64, f64)> = pairs.iter().map(|(p, _)| (p.x, p.y)).collect();
     let mm: Vec<(f64, f64)> = pairs.iter().map(|(_, m)| (m.x, m.y)).collect();
@@ -274,7 +310,7 @@ impl FieldMap {
     pub fn parse(text: &str) -> Result<FieldMap, String> {
         let mut to_commanded = None;
         let mut to_physical = None;
-        let (mut rms_um, mut max_um) = (0.0, 0.0);
+        let (mut rms_um, mut max_um) = (0.0_f64, 0.0_f64);
         let coeffs = |rest: &str| -> Result<[f64; 23], String> {
             let nums: Vec<f64> = rest
                 .split_whitespace()
@@ -283,6 +319,9 @@ impl FieldMap {
             let arr: [f64; 23] = nums
                 .try_into()
                 .map_err(|_| "expected 23 coefficients".to_string())?;
+            if !arr.iter().all(|v| v.is_finite()) {
+                return Err("non-finite coefficient".to_string());
+            }
             Ok(arr)
         };
         for line in text.lines() {
@@ -296,12 +335,28 @@ impl FieldMap {
                         return Err(format!("unsupported field-map version {rest:?}"));
                     }
                 }
-                "to_commanded" => to_commanded = Some(Poly2::from_coeffs(&coeffs(rest)?)),
-                "to_physical" => to_physical = Some(Poly2::from_coeffs(&coeffs(rest)?)),
+                "to_commanded" => {
+                    to_commanded = Some(
+                        Poly2::from_coeffs(&coeffs(rest)?)
+                            .ok_or("to_commanded has an unusable normalization")?,
+                    );
+                }
+                "to_physical" => {
+                    to_physical = Some(
+                        Poly2::from_coeffs(&coeffs(rest)?)
+                            .ok_or("to_physical has an unusable normalization")?,
+                    );
+                }
                 "rms_um" => rms_um = rest.trim().parse().map_err(|_| "bad rms_um")?,
                 "max_um" => max_um = rest.trim().parse().map_err(|_| "bad max_um")?,
                 _ => {}
             }
+        }
+        // `f64::from_str` accepts "nan"/"inf", and this is the only validation
+        // the UI's drill-emit path runs (it calls `parse` directly, not the
+        // CLI's `load_field_map`).
+        if !rms_um.is_finite() || !max_um.is_finite() {
+            return Err("field map has non-finite rms_um/max_um".to_string());
         }
         Ok(FieldMap {
             to_commanded: to_commanded.ok_or("missing to_commanded")?,
@@ -315,7 +370,7 @@ impl FieldMap {
 /// Fit a laser-field pre-distortion from `(physical_mm, commanded_mm)`
 /// correspondences: the physical position each burned dot actually landed at
 /// (read through the metric camera-lens map) paired with the commanded
-/// coordinate it was burned at. Needs ≥ 10 non-degenerate points.
+/// coordinate it was burned at. Needs ≥ 11 non-degenerate points.
 pub fn fit_field(pairs: &[(Point2<f64>, Point2<f64>)]) -> Result<FieldMap, String> {
     let phys: Vec<(f64, f64)> = pairs.iter().map(|(p, _)| (p.x, p.y)).collect();
     let cmd: Vec<(f64, f64)> = pairs.iter().map(|(_, c)| (c.x, c.y)).collect();
@@ -873,6 +928,154 @@ mod tests {
             .map(|i| (Point2::new(i as f64, 0.0), Point2::new(i as f64, 0.0)))
             .collect();
         assert!(fit_lens(&pairs).is_err());
+    }
+
+    /// `n` `(px, mm)` pairs through the barrel camera model, scattered over a
+    /// 60 mm field by a fixed LCG. Generic position, so the bicubic design
+    /// matrix is full rank at any count — the point-count gate is what these
+    /// tests exercise, not degeneracy.
+    fn spread_pairs(n: usize) -> Vec<(Point2<f64>, Point2<f64>)> {
+        let mut seed = 0x2545_F491_4F6C_DD1D_u64;
+        let mut next = move || {
+            seed = seed
+                .wrapping_mul(6_364_136_223_846_793_005)
+                .wrapping_add(1_442_695_040_888_963_407);
+            (seed >> 40) as f64 / (1u64 << 24) as f64 * 60.0
+        };
+        (0..n)
+            .map(|_| {
+                let (x, y) = (next(), next());
+                let (u, v) = image((x, y));
+                (Point2::new(u, v), Point2::new(x, y))
+            })
+            .collect()
+    }
+
+    /// At exactly 10 points the 10-term basis is determined, so the residual is
+    /// 0 by construction — the operator would read "RMS 0 µm, worst 0 µm" off
+    /// the least trustworthy fit available.
+    #[test]
+    fn zero_degree_of_freedom_fit_is_refused_not_reported_as_perfect() {
+        let err = fit_lens(&spread_pairs(10)).unwrap_err();
+        assert!(err.contains("≥11 points"), "got: {err}");
+        assert!(err.contains("degrees of freedom"), "got: {err}");
+        // One more point buys a residual that means something.
+        let lens = fit_lens(&spread_pairs(11)).expect("11 points fit");
+        assert!(lens.rms_um > 0.0, "11-point fit reports a real residual");
+    }
+
+    #[test]
+    fn non_finite_fit_input_is_refused() {
+        for bad in [f64::NAN, f64::INFINITY] {
+            let mut pairs = spread_pairs(16);
+            pairs[5].0.y = bad;
+            let err = fit_lens(&pairs).unwrap_err();
+            assert!(err.contains("non-finite"), "{bad}: {err}");
+
+            let mut pairs = spread_pairs(16);
+            pairs[9].1.x = bad;
+            let err = fit_field(&pairs).unwrap_err();
+            assert!(err.contains("non-finite"), "{bad}: {err}");
+        }
+    }
+
+    /// `scale = 0` collapses every input to `(cx[0], cy[0])` — the whole job at
+    /// one spot, at full dwell — and the output is *finite*, so nothing
+    /// downstream catches it.
+    #[test]
+    fn from_coeffs_refuses_an_unusable_normalization() {
+        let mut good = [0.0_f64; 23];
+        good[1] = 1.0;
+        good[12] = 1.0;
+        good[22] = 0.01;
+        assert!(Poly2::from_coeffs(&good).is_some(), "baseline is accepted");
+
+        for (slot, bad) in [
+            (22, 0.0),
+            (22, -0.01),
+            (22, f64::NAN),
+            (22, f64::INFINITY),
+            (20, f64::NAN),
+            (21, f64::INFINITY),
+        ] {
+            let mut c = good;
+            c[slot] = bad;
+            assert!(
+                Poly2::from_coeffs(&c).is_none(),
+                "coefficient {slot} = {bad} must be refused"
+            );
+        }
+    }
+
+    #[test]
+    fn field_map_parse_refuses_broken_calibration_values() {
+        let pairs: Vec<(Point2<f64>, Point2<f64>)> = (0..16)
+            .map(|i| {
+                let cmd = ((i % 4) as f64 * 20.0, (i / 4) as f64 * 20.0);
+                let phys = laser_field(cmd);
+                (Point2::new(phys.0, phys.1), Point2::new(cmd.0, cmd.1))
+            })
+            .collect();
+        let text = fit_field(&pairs).unwrap().serialize();
+        assert!(FieldMap::parse(&text).is_ok(), "baseline parses");
+
+        // Zero the `to_commanded` scale (the 23rd number on its line).
+        let zero_scale = text
+            .lines()
+            .map(|l| match l.strip_prefix("to_commanded ") {
+                Some(rest) => {
+                    let mut v: Vec<&str> = rest.split_whitespace().collect();
+                    v[22] = "0.0";
+                    format!("to_commanded {}", v.join(" "))
+                }
+                None => l.to_string(),
+            })
+            .collect::<Vec<_>>()
+            .join("\n");
+        let err = FieldMap::parse(&zero_scale).unwrap_err();
+        assert!(err.contains("unusable normalization"), "got: {err}");
+
+        // A dropped coefficient.
+        let short = text.replacen("to_physical ", "to_physical 1.0 ", 1);
+        assert!(
+            FieldMap::parse(&short)
+                .unwrap_err()
+                .contains("23 coefficients")
+        );
+
+        // `f64::from_str` accepts these spellings.
+        for (line, token) in [("to_commanded", "nan"), ("to_physical", "inf")] {
+            let poisoned = text
+                .lines()
+                .map(|l| {
+                    if l.starts_with(&format!("{line} ")) {
+                        let mut v: Vec<&str> = l.split_whitespace().collect();
+                        v[1] = token;
+                        v.join(" ")
+                    } else {
+                        l.to_string()
+                    }
+                })
+                .collect::<Vec<_>>()
+                .join("\n");
+            let err = FieldMap::parse(&poisoned).unwrap_err();
+            assert!(err.contains("non-finite coefficient"), "{token}: {err}");
+        }
+        for key in ["rms_um", "max_um"] {
+            let poisoned = text
+                .lines()
+                .map(|l| {
+                    if l.starts_with(&format!("{key} ")) {
+                        format!("{key} nan")
+                    } else {
+                        l.to_string()
+                    }
+                })
+                .collect::<Vec<_>>()
+                .join("\n");
+            let err = FieldMap::parse(&poisoned).unwrap_err();
+            assert!(err.contains("non-finite rms_um/max_um"), "{key}: {err}");
+        }
     }
 
     /// The laser's field distortion: a commanded coordinate physically lands

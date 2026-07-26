@@ -169,9 +169,7 @@ impl ConsoleApp {
                         .range(0..=500),
                 )
                 .labelled_by(l.id)
-                .on_hover_text(
-                    "MOPA Q-pulse width; 0 = source default (omits QPulseWidth)",
-                );
+                .on_hover_text("MOPA Q-pulse width; 0 = source default (omits QPulseWidth)");
                 ui.end_row();
                 let l = ui.label("interval mm");
                 ui.add(

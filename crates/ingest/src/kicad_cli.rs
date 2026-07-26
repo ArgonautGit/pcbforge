@@ -544,7 +544,10 @@ mod tests {
         // "Failed to load board" from kicad-cli downstream.
         std::fs::remove_file(&pcb).unwrap();
         let err = resolve_board(&pro).unwrap_err().to_string();
-        assert!(err.contains("proj.kicad_pcb"), "must name the missing board: {err}");
+        assert!(
+            err.contains("proj.kicad_pcb"),
+            "must name the missing board: {err}"
+        );
         // The samples/kicad dir has >1 board → ambiguous, a named error.
         let dir = repo_root().join("samples/kicad");
         assert!(resolve_board(&dir).is_err());

@@ -2374,3 +2374,143 @@ disk for a manual run.
   "Etch + run". An unresolvable absolute path likewise degrades to
   "written; open it manually" (FORCELOAD dislikes `\\?\` prefixes, same
   rule as the etch chain).
+
+## 2026-07-25 — CI red for 41 straight runs; three gates in one job hid a red suite
+
+- CI's last green was **2026-07-20T21:48**, followed by **41 consecutive
+  failures**. Every one died at `cargo fmt --check`, which was step 1 of 3, so
+  for that whole stretch **`cargo clippy` and `cargo test --workspace` never
+  executed** — a trailing-comma diff masked both, and PRs #4 and #5 were merged
+  red. Behind that gate: 27 rustfmt diffs and 9 clippy lints under
+  `-D warnings`.
+- Measurement caveat worth recording, since it nearly became a wrong
+  conclusion: a `--limit 40` sample showed 40 failures and zero successes and
+  read as "CI has never passed." The window happened to start just after the
+  last green, so it captured exactly the red streak. Widening to 100 runs shows
+  32 earlier successes. The streak was the real finding; "never" was an
+  artifact of the sample size.
+- Split into three independent jobs (`fmt`, `clippy`, `test`) rather than
+  reordering or `continue-on-error`: three sequential gates in one job yield
+  one bit of signal, and the cheapest gate was the one masking the expensive
+  ones. Toolchain action pinned to 1.92 to match `rust-toolchain.toml`;
+  `@stable` read as if CI tested stable while rustup silently honoured the pin.
+- Not added: a `windows-latest` leg, despite Windows being the dev platform.
+  It is the right follow-up, but adding an unproven runner while making CI
+  green for the first time risks landing a required check that is already red.
+- `load_only` tripped the dead-code lint but is **not** dead: it is set from
+  live state in `run_worker` and read by two tests asserting START is never
+  sent. The lint fires only because clippy's non-test config cannot see those
+  readers, so the allow is scoped `not(test)` rather than the item deleted.
+
+## 2026-07-25 — The test suite was history-dependent, not flaky
+
+- `cargo test --workspace` passed once and failed on the very next run, same
+  tree, same command. `ui_interaction.rs` built every harness from a fixed
+  `temp_dir()/pcbforge-kittest.sqlite`, and `path_for_db` derives the settings
+  sidecar from the DB path — so 21 parallel tests shared one store, and the
+  console's own field persistence wrote the suite's inputs back for the next
+  run to read.
+- Two concrete poisonings were found in the leftover file:
+  `place_lightburn_device=BSLFiber` + `Galvo9`×11 (a test typing onto what a
+  previous run persisted), and an empty `fid_layout=` written by the test that
+  clicks `✕ clear markers` — which then fails that same test's own
+  precondition next run. Causation confirmed by injecting `fid_layout=` by
+  hand: the test fails; remove the file and it passes.
+- The assertions were correct and were left untouched; the isolation was the
+  defect. `src/app/tests.rs` had already solved this with a per-call unique
+  directory, and its comment diagnoses the exact bug — the integration tests
+  simply never got the fix. Lifted into `tests/common/mod.rs` behind a guard
+  that drops a `TempDir` after the harness.
+- That same helper was, however, the biggest *leaker* on a dev box: unique per
+  call but removed none, ~150 directories per run. Callers hold only a
+  `PathBuf`, so there is nowhere to hang a guard without threading one through
+  every call site; nesting under one per-process parent makes the residue
+  proportional to runs instead of tests. The pre-existing pile (~1700
+  `pcbforge-*` and ~5400 `ui-app-*` on this machine) was left for the operator
+  to clear.
+- `run_capture` came off the public surface while here: it blocks until the
+  child exits, which for the default `cargo run -q --bin pcbforge --` is a
+  compile plus a run with the window frozen. Only two tests call it.
+
+## 2026-07-25 — Malformed input must error, never wrap into a coordinate
+
+- **The Gerber coordinate path was not already guarded**, contrary to the
+  comment at `coord_to_nm`: it guarded the `i128→i64` cast but not magnitude,
+  and `signed_area2` squares coordinates into an `i128`, so a four-vertex `G36`
+  region at ±9e18 nm — legal under `%FSLAX36Y36*%` — overflows the area
+  accumulation. A wrapped area's sign flip **inverts ring orientation, turning
+  copper into void**. Bounded at `MAX_COORD_NM` = 1 km. This newly rejects
+  coordinates that previously parsed; 1 km is ~1000× any panel and the
+  alternative is a silently inverted layer.
+- `excellon::decimal_to_nm` overflowed `i128` on the scale multiply — the
+  integer part parses up to 38 digits while only the *fractional* side had a
+  9-digit cap. Reproduced as a panic; release would have wrapped.
+- Aperture and macro parameters were checked for presence but never magnitude
+  or finiteness. Guarding the two entry points (`parse_f`, the macro argument
+  vector) covers all eleven downstream cast sites, rather than patching casts.
+- Macro expression recursion is now depth-bounded: a stack overflow **aborts
+  the process and cannot be caught by `catch_unwind`**, so it is the one
+  failure this module's recovery discipline could not absorb. Depth-threading
+  was chosen over a record-length cap because a short record of unary minuses
+  still blows the stack.
+
+## 2026-07-25 — Non-finite values reached machine coordinates
+
+- Rust float→int casts saturate: `NaN → 0`, `∞ → i64::MAX`. Nothing checked
+  between a fit and the nm cast, so one non-finite vertex became machine
+  coordinate (0, 0) and the beam would draw a line across the board to reach
+  it. `transform_shapes_field` now returns `Result`, validating **in mm before
+  scaling** — finiteness alone is insufficient, since a finite 1e300 mm still
+  saturates the cast. Every field-corrected coordinate funnels through there.
+- `Poly2::from_coeffs` accepted `scale = 0`. Because `apply` *multiplies* by
+  scale, that collapsed the basis to `[1,0,0,…]` and mapped every point to a
+  constant — finite, so it passed every existing check, and the whole job would
+  burn at one spot at full dwell.
+- The CLI's acceptance gates failed **open**: `fit.rms > max` and
+  `det <= 0.0` are both false for `NaN`, so a NaN transform passed. Rewritten
+  fail-closed. `f64::from_str` accepts `"nan"`/`"inf"`, so this was reachable
+  from `--fiducials` operator text.
+- `Poly2::fit`'s floor went 10 → 11, not 20. At exactly 10 points the fit is
+  determined and its residual is **0 by construction**, so the operator was
+  told "RMS 0 µm — camera is now a metric ruler" for the least trustworthy fit
+  possible. 20 was rejected because 16-point grids are used by four existing
+  e2e tests and by the UI's own ≥4×4 field gating; 11–19 points are
+  optimistically biased but not fabricated.
+- `from_coeffs` validates `scale`/`center` but deliberately **not** the 20
+  coefficients: coefficient finiteness is already enforced on every path, and
+  moving it there would remove the only way to construct the non-finite map
+  that three existing fail-closed regression tests assert is refused.
+
+## 2026-07-25 — Calibration fitting split out of the console into `crates/calib`
+
+- `ui/src/calib.rs` + `ui/src/calib/square_grid.rs` were 3,129 lines with
+  **zero** egui references and zero references to anything else in `ui` — a
+  strict one-way consumer of `vision` parked in the GUI crate. Since nothing
+  depends on `ui`, the entire fitting pipeline was invisible to the CLI and
+  testable only through the console.
+- Moved to a **new `calib` crate rather than into `vision`**: `vision` owns
+  primitives (homography/affine/lens fits, blob detection, warp), `calib` owns
+  the operator workflow above them (paper grid → lens fit → anchor → laser
+  field) and the acceptance gating. Different layers, different reasons to
+  change; folding 3,129 lines into `vision` would have doubled it and blurred
+  that line.
+- Phase 1 is relocation only — no logic changed, tests moved with the code.
+  `refit_anchor_dots` was the single item widened (`pub(crate)` → `pub`); the
+  other 22 items `ui` uses were already public. The burn-grid fixture moved
+  too: `CARGO_MANIFEST_DIR` now resolves to the new crate, which is how the
+  suite caught the one thing the mechanical move missed.
+- `ui`'s public re-exports of the calibration API were **dropped** rather than
+  kept as a shim, so the console re-exports only console things; its `dump_*`
+  examples name `calib::` directly.
+- `ui/src` drops from 16,305 to 12,702 lines. The egui-free residue left in it
+  is now a short list: `app/settings_io.rs` (738, legitimately UI — it
+  serializes `ConsoleApp`'s own fields), `app/lightburn_run.rs` (557, a
+  candidate for `drivers`), `app/projection.rs` (182), and
+  `settings.rs`/`status.rs` (265).
+- Still to do: promote the true primitives that remain mixed into `calib`
+  (`Rigid2`/`fit_rigid`, `Similarity2`/`fit_similarity`, `invert_poly`, the
+  `camera_px_to_*` helpers) down into `vision`; then `app/projection.rs`; then
+  split `fiducial.rs` and `place.rs` at the egui boundary — `fit_board_pose` is
+  the valuable one, it decides whether the job moves on the board. A
+  `pcbforge calib-fit` verb is the payoff, since it makes the fit pipeline
+  testable against real captured frames.

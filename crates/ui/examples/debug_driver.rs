@@ -29,13 +29,24 @@ fn main() {
         }
     };
 
-    // A fresh app each run (deterministic replay). Temp DB. The verb command
-    // is `true` (shelling a CLI verb is a harmless no-op) unless PCBFORGE_CLI
-    // names a real binary — set it to drive actual verbs, e.g. the KiCad Gerber
-    // export: `PCBFORGE_CLI=./target/debug/pcbforge`.
-    let db = std::env::var_os("PCBFORGE_DB")
-        .map(std::path::PathBuf::from)
-        .unwrap_or_else(|| std::env::temp_dir().join("pcbforge-debug-driver.sqlite"));
+    // A fresh app each run (deterministic replay). The default DB lives in a
+    // temp directory unique to this run and removed on exit — the console
+    // persists operator fields beside the DB, so a shared path would carry one
+    // session's typed input into the next. PCBFORGE_DB overrides it (and then
+    // persists, which is the point of the override).
+    let (db, scratch) = match std::env::var_os("PCBFORGE_DB") {
+        Some(p) => (std::path::PathBuf::from(p), None),
+        None => {
+            let dir = tempfile::Builder::new()
+                .prefix("pcbforge-debug-driver-")
+                .tempdir()
+                .expect("temp dir for the console store");
+            (dir.path().join("console.sqlite"), Some(dir))
+        }
+    };
+    // The verb command is `true` (shelling a CLI verb is a harmless no-op)
+    // unless PCBFORGE_CLI names a real binary — set it to drive actual verbs,
+    // e.g. the KiCad Gerber export: `PCBFORGE_CLI=./target/debug/pcbforge`.
     let cli_cmd = std::env::var("PCBFORGE_CLI")
         .ok()
         .map(|s| s.split_whitespace().map(String::from).collect::<Vec<_>>())
@@ -61,6 +72,9 @@ fn main() {
             }
         }
     }
+    // `process::exit` skips destructors, so release the store first.
+    drop(harness);
+    drop(scratch);
     if failed {
         std::process::exit(1);
     }

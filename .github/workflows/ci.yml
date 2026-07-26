@@ -7,19 +7,41 @@ on:
 env:
   CARGO_TERM_COLOR: always
 
+# Three independent jobs rather than three steps in one. As one job the gates ran
+# in sequence, so a rustfmt whitespace diff short-circuited the run and clippy and
+# the test suite never executed at all — 40 consecutive red runs reported only the
+# formatting. Split, every gate reports its own verdict on every push.
+#
+# The toolchain is pinned to match rust-toolchain.toml (channel 1.92); keep the
+# two in sync when bumping. Previously this said `@stable`, which read as if CI
+# tested stable while rustup silently honoured the pin.
 jobs:
-  test:
-    name: fmt + clippy + test
+  fmt:
+    name: fmt
     runs-on: ubuntu-latest
     steps:
       - uses: actions/checkout@v7
-      - uses: dtolnay/rust-toolchain@stable
+      - uses: dtolnay/rust-toolchain@1.92
         with:
-          components: clippy, rustfmt
+          components: rustfmt
+      - run: cargo fmt --check
+
+  clippy:
+    name: clippy
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v7
+      - uses: dtolnay/rust-toolchain@1.92
+        with:
+          components: clippy
       - uses: Swatinem/rust-cache@v2
-      - name: cargo fmt
-        run: cargo fmt --check
-      - name: cargo clippy
-        run: cargo clippy --all-targets -- -D warnings
-      - name: cargo test
-        run: cargo test --workspace
+      - run: cargo clippy --all-targets -- -D warnings
+
+  test:
+    name: test
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v7
+      - uses: dtolnay/rust-toolchain@1.92
+      - uses: Swatinem/rust-cache@v2
+      - run: cargo test --workspace

@@ -64,6 +64,8 @@ pub(super) struct LightburnRun {
     phase: LightburnPhase,
     note: String,
     /// The run only loads the file (no START) — the drill-emit contract.
+    /// Read by the load-only run tests, which assert START is never sent.
+    #[cfg_attr(not(test), allow(dead_code))]
     load_only: bool,
 }
 
@@ -72,7 +74,9 @@ impl LightburnRun {
         self.done.load(Ordering::Relaxed)
     }
 
-    /// True for a load-only run: the worker never sends START.
+    /// True for a load-only run: the worker never sends START. Only the tests
+    /// read this; the UI distinguishes the two runs at the spawn site.
+    #[cfg_attr(not(test), allow(dead_code))]
     pub(super) fn load_only(&self) -> bool {
         self.load_only
     }

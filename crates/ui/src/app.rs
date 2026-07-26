@@ -39,8 +39,14 @@ use crate::status::{self, StatusSnapshot};
 use camera_ui::{CAM_VIEW_MAX, downscale_view};
 #[cfg(test)]
 use commands::spawn_verb;
+// Blocking: it shells out and waits for the child to exit, which for the
+// default `cargo run -q --bin pcbforge --` is a compile plus a run with the
+// window frozen. The console always uses `spawn_verb`; only tests want the
+// synchronous form, so it is not part of the crate's surface.
+#[cfg(test)]
+use commands::run_capture;
 use commands::{JobShapes, VerbJob};
-pub use commands::{job_shapes, preview_image, run_capture};
+pub use commands::{job_shapes, preview_image};
 use job_ui::status_color;
 use lightburn_run::{LightburnRun, spawn_lightburn_load, spawn_lightburn_run};
 use projection::CameraProjection;
@@ -176,13 +182,13 @@ impl ConsoleApp {
                     n: 7,
                     pitch_mm: 10.0,
                     dot_mm: 0.4,
-                    dot_kind: crate::calib::DotKind::Dark,
+                    dot_kind: calib::DotKind::Dark,
                 },
                 burn: GridParams {
                     n: 7,
                     pitch_mm: 10.0,
                     dot_mm: 0.4,
-                    dot_kind: crate::calib::DotKind::Dark,
+                    dot_kind: calib::DotKind::Dark,
                 },
                 grid_origin_mm: (0.0, 0.0),
                 grid_out: "calib-grid.lbrn2".into(),
@@ -572,7 +578,7 @@ fn field_verdict_phrase(v: &vision::FieldVerdict, scale: f64) -> String {
             }
         ),
     };
-    if (scale - 1.0).abs() > crate::calib::FIELD_SCALE_NOTE_FRAC {
+    if (scale - 1.0).abs() > calib::FIELD_SCALE_NOTE_FRAC {
         format!(
             "{phrase}; burn reads {:.1}% {} than commanded — check the machine's field-size \
              setting",

@@ -380,7 +380,7 @@ pub fn fit_board_pose(
     if pairs.len() < 3 {
         return Err(format!("need ≥3 detected fiducials, have {}", pairs.len()));
     }
-    let fit = crate::calib::fit_rigid(&pairs)?;
+    let fit = calib::fit_rigid(&pairs)?;
     // b0 = centroid of the FULL layout (not just the detected subset), in the
     // RAW design frame — the pose is written as fit.apply(b0).
     let n = layout_mm.len() as f64;
@@ -620,15 +620,14 @@ mod tests {
     fn fit_board_pose_recovers_a_proper_front_pose() {
         let layout = [(10.0, 10.0), (80.0, 10.0), (10.0, 80.0), (80.0, 80.0)];
         let (s, c) = 5.0_f64.to_radians().sin_cos();
-        let t = crate::calib::Rigid2 {
+        let t = calib::Rigid2 {
             cos: c,
             sin: s,
             tx: 3.0,
             ty: -2.0,
             flip_x: false,
         };
-        let detected: Vec<Option<(f64, f64)>> =
-            layout.iter().map(|&p| Some(t.apply(p))).collect();
+        let detected: Vec<Option<(f64, f64)>> = layout.iter().map(|&p| Some(t.apply(p))).collect();
 
         let pose = fit_board_pose(&layout, &detected, None).unwrap();
         assert!(!pose.flipped, "a proper pattern is not flagged flipped");
@@ -669,7 +668,7 @@ mod tests {
         };
         // The physical flip: a reflection (map = R·F_neg) — R = +3°, chosen tx/ty.
         let (s, c) = 3.0_f64.to_radians().sin_cos();
-        let flip = crate::calib::Rigid2 {
+        let flip = calib::Rigid2 {
             cos: c,
             sin: s,
             tx: 90.0,
@@ -701,8 +700,12 @@ mod tests {
             pivot_mm: pivot_back,
         };
         let a = placement.affine();
-        let apply_place =
-            |g: (f64, f64)| (a[0] * g.0 + a[1] * g.1 + a[2], a[3] * g.0 + a[4] * g.1 + a[5]);
+        let apply_place = |g: (f64, f64)| {
+            (
+                a[0] * g.0 + a[1] * g.1 + a[2],
+                a[3] * g.0 + a[4] * g.1 + a[5],
+            )
+        };
         for &g in &copper {
             let g_back = (-g.0, g.1);
             let bed_front = (g.0 - pivot_front.0 + b0.0, g.1 - pivot_front.1 + b0.1);
@@ -722,7 +725,7 @@ mod tests {
     fn fit_board_pose_flags_a_mirrored_pattern() {
         let layout = [(10.0, 10.0), (80.0, 10.0), (10.0, 80.0), (80.0, 80.0)];
         let (s, c) = 4.0_f64.to_radians().sin_cos();
-        let mirrored = crate::calib::Rigid2 {
+        let mirrored = calib::Rigid2 {
             cos: c,
             sin: s,
             tx: 7.0,
@@ -744,12 +747,7 @@ mod tests {
         let two = [Some((10.0, 10.0)), Some((80.0, 10.0)), None, None];
         assert!(fit_board_pose(&layout, &two, None).is_err(), "need ≥3");
         assert!(fit_board_pose(&[], &[], None).is_err(), "empty layout");
-        let collapsed = [
-            Some((5.0, 5.0)),
-            Some((5.0, 5.0)),
-            Some((5.0, 5.0)),
-            None,
-        ];
+        let collapsed = [Some((5.0, 5.0)), Some((5.0, 5.0)), Some((5.0, 5.0)), None];
         assert!(
             fit_board_pose(&layout, &collapsed, None).is_err(),
             "no target spread is degenerate"

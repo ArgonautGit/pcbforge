@@ -41,6 +41,10 @@ use pcb_core::{Layer, Nm, P, Poly, Ring};
 /// Maximum chord sagitta when tessellating curves, nm (1 µm).
 pub const CHORD_TOL_NM: f64 = 1_000.0;
 
+/// Largest coordinate magnitude accepted from a file, nm (1 km). See
+/// [`Parser::coord_to_nm`] for why fitting in `i64` is not a sufficient bound.
+const MAX_COORD_NM: i128 = 1_000_000_000_000;
+
 /// Parse error with 1-based line information.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct GerberError {
@@ -642,7 +646,17 @@ impl<'a> Parser<'a> {
             (v - d / 2) / d
         };
         // An absurd-but-parseable coordinate must not wrap silently through
-        // the i128→i64 cast — error naming it instead.
+        // the i128→i64 cast — error naming it instead. Fitting in i64 is not
+        // enough: `signed_area2` squares coordinates into an i128, so a region
+        // spanning most of the i64 range overflows the area accumulation, and a
+        // wrapped area's sign flip inverts ring orientation. 1 km is many
+        // orders of magnitude past any panel and keeps that product safe.
+        if r.abs() > MAX_COORD_NM {
+            return Err(self.err(format!(
+                "coordinate {raw} is beyond the {} m working range",
+                MAX_COORD_NM / 1_000_000_000
+            )));
+        }
         Nm::try_from(r).map_err(|_| self.err(format!("coordinate {raw} overflows the nm range")))
     }
 
@@ -723,8 +737,11 @@ impl<'a> Parser<'a> {
             None => (&rest[split..], Vec::new()),
         };
         let parse_f = |s: &str| -> Result<f64, GerberError> {
-            s.parse::<f64>()
-                .map_err(|_| self.err(format!("malformed aperture parameter '{s}' in ADD{rest}")))
+            let v = s.parse::<f64>().map_err(|_| {
+                self.err(format!("malformed aperture parameter '{s}' in ADD{rest}"))
+            })?;
+            check_param(v).map_err(|e| self.err(format!("aperture ADD{rest}: {e}")))?;
+            Ok(v)
         };
         let ap = match name {
             "C" => {
@@ -1258,27 +1275,55 @@ enum Expr {
     Neg(Box<Expr>),
 }
 
+/// Nesting budget for macro expressions. The bound exists because `parse_atom`
+/// recurses per unary `-` and per `(`, and a stack overflow aborts the process
+/// instead of surfacing as an `Err`. It equally bounds the recursion in
+/// `eval_expr` and in the `Expr` drop glue. Charged per parser call, so one
+/// paren level costs three; real macros nest 3-4 deep either way.
+const MAX_EXPR_DEPTH: u32 = 64;
+
+/// Reject aperture/macro parameters that would poison the nm geometry.
+///
+/// Values reach `circle_ring`/`rect_ring` and friends as `f64`, where a
+/// non-finite or astronomical magnitude saturates the `as Nm` cast to
+/// `i64::MAX` and then overflows the i128 area accumulation — in release that
+/// wraps, and a sign flip there inverts ring orientation (copper becomes void).
+/// The bound is in file units and deliberately not unit-aware: 10^6 mm and
+/// 10^6 inch are both many orders of magnitude past any PCB feature. Sign is
+/// not constrained — macro centres, rotations and RoundRect offsets are
+/// legitimately negative.
+fn check_param(v: f64) -> Result<(), String> {
+    if !v.is_finite() {
+        return Err(format!("non-finite parameter {v}"));
+    }
+    if v.abs() > 1e6 {
+        return Err(format!("parameter {v} out of plausible range (|v| <= 1e6)"));
+    }
+    Ok(())
+}
+
 fn parse_expr(s: &str) -> Result<Expr, String> {
     let tokens: Vec<char> = s.chars().collect();
     let mut pos = 0;
-    let e = parse_sum(&tokens, &mut pos)?;
+    let e = parse_sum(&tokens, &mut pos, 0)?;
     if pos != tokens.len() {
         return Err(format!("trailing input in expression '{s}'"));
     }
     Ok(e)
 }
 
-fn parse_sum(t: &[char], pos: &mut usize) -> Result<Expr, String> {
-    let mut lhs = parse_product(t, pos)?;
+fn parse_sum(t: &[char], pos: &mut usize, depth: u32) -> Result<Expr, String> {
+    let depth = check_depth(depth)?;
+    let mut lhs = parse_product(t, pos, depth)?;
     while *pos < t.len() {
         match t[*pos] {
             '+' => {
                 *pos += 1;
-                lhs = Expr::Add(Box::new(lhs), Box::new(parse_product(t, pos)?));
+                lhs = Expr::Add(Box::new(lhs), Box::new(parse_product(t, pos, depth)?));
             }
             '-' => {
                 *pos += 1;
-                lhs = Expr::Sub(Box::new(lhs), Box::new(parse_product(t, pos)?));
+                lhs = Expr::Sub(Box::new(lhs), Box::new(parse_product(t, pos, depth)?));
             }
             _ => break,
         }
@@ -1286,17 +1331,18 @@ fn parse_sum(t: &[char], pos: &mut usize) -> Result<Expr, String> {
     Ok(lhs)
 }
 
-fn parse_product(t: &[char], pos: &mut usize) -> Result<Expr, String> {
-    let mut lhs = parse_atom(t, pos)?;
+fn parse_product(t: &[char], pos: &mut usize, depth: u32) -> Result<Expr, String> {
+    let depth = check_depth(depth)?;
+    let mut lhs = parse_atom(t, pos, depth)?;
     while *pos < t.len() {
         match t[*pos] {
             'x' | 'X' => {
                 *pos += 1;
-                lhs = Expr::Mul(Box::new(lhs), Box::new(parse_atom(t, pos)?));
+                lhs = Expr::Mul(Box::new(lhs), Box::new(parse_atom(t, pos, depth)?));
             }
             '/' => {
                 *pos += 1;
-                lhs = Expr::Div(Box::new(lhs), Box::new(parse_atom(t, pos)?));
+                lhs = Expr::Div(Box::new(lhs), Box::new(parse_atom(t, pos, depth)?));
             }
             _ => break,
         }
@@ -1304,22 +1350,33 @@ fn parse_product(t: &[char], pos: &mut usize) -> Result<Expr, String> {
     Ok(lhs)
 }
 
-fn parse_atom(t: &[char], pos: &mut usize) -> Result<Expr, String> {
+fn check_depth(depth: u32) -> Result<u32, String> {
+    if depth >= MAX_EXPR_DEPTH {
+        Err(format!(
+            "macro expression exceeds the {MAX_EXPR_DEPTH}-level nesting budget"
+        ))
+    } else {
+        Ok(depth + 1)
+    }
+}
+
+fn parse_atom(t: &[char], pos: &mut usize, depth: u32) -> Result<Expr, String> {
+    let depth = check_depth(depth)?;
     if *pos >= t.len() {
         return Err("unexpected end of expression".into());
     }
     match t[*pos] {
         '-' => {
             *pos += 1;
-            Ok(Expr::Neg(Box::new(parse_atom(t, pos)?)))
+            Ok(Expr::Neg(Box::new(parse_atom(t, pos, depth)?)))
         }
         '+' => {
             *pos += 1;
-            parse_atom(t, pos)
+            parse_atom(t, pos, depth)
         }
         '(' => {
             *pos += 1;
-            let e = parse_sum(t, pos)?;
+            let e = parse_sum(t, pos, depth)?;
             if *pos >= t.len() || t[*pos] != ')' {
                 return Err("missing ')'".into());
             }
@@ -1379,6 +1436,13 @@ fn eval_macro(def: &MacroDef, args: &[f64], unit_nm: f64) -> Result<Vec<Poly>, S
             }
             MacroStmt::Primitive(code, exprs) => {
                 let a: Vec<f64> = exprs.iter().map(|e| eval_expr(e, &env)).collect();
+                // Division and unbounded literals inside the expression can
+                // produce inf/NaN or absurd magnitudes that `eval_primitive`
+                // casts to Nm (and, for the outline primitive, to a vertex
+                // count) — screen them before any cast saturates.
+                for v in &a {
+                    check_param(*v).map_err(|e| format!("macro primitive {code}: {e}"))?;
+                }
                 let (exposure, ring_sets) = eval_primitive(*code, &a, unit_nm)?;
                 let polys: Vec<Poly> = ring_sets.into_iter().map(ring_poly).collect();
                 acc = if exposure {
@@ -1811,6 +1875,57 @@ mod tests {
                 err.msg
             );
         }
+    }
+
+    #[test]
+    fn hostile_numerics_error_instead_of_panicking() {
+        // Each of these reaches an `as Nm` cast or an i128 area accumulation if
+        // it is not screened at the parameter boundary: a saturated cast makes
+        // the accumulation overflow (debug panic; release wraps, and a sign
+        // flip there inverts ring orientation).
+        let deep_parens = format!("{}1{}", "(".repeat(300), ")".repeat(300));
+        let bodies = [
+            // absurd aperture magnitudes
+            "%ADD10C,1e300*%\nD10*\nX0Y0D03*\n".to_string(),
+            "%ADD10C,-1e300*%\nD10*\nX0Y0D03*\n".to_string(),
+            "%ADD10R,1e300X1e300*%\nD10*\nX0Y0D03*\n".to_string(),
+            "%ADD10P,1e300X6*%\nD10*\nX0Y0D03*\n".to_string(),
+            // macro division by zero -> inf, and 0/0 -> NaN
+            "%AMBAD*1,1,$1/0,0,0*%\n%ADD10BAD,1.0*%\nD10*\nX0Y0D03*\n".to_string(),
+            "%AMBAD*1,1,0/0,0,0*%\n%ADD10BAD,1.0*%\nD10*\nX0Y0D03*\n".to_string(),
+            // an inf vertex count for the outline primitive saturates `as usize`
+            "%AMBAD*4,1,1/0,0,0,0,0,0,0*%\n%ADD10BAD,1.0*%\nD10*\nX0Y0D03*\n".to_string(),
+            // absurd macro argument passed in from the aperture definition
+            "%AMOK*1,1,$1,0,0*%\n%ADD10OK,1e300*%\nD10*\nX0Y0D03*\n".to_string(),
+            // expression recursion: a long unary run and deep parens would
+            // overflow the stack, which aborts and cannot be caught
+            format!("%AMBAD*1,1,{}1,0,0*%\n", "-".repeat(5000)),
+            format!("%AMBAD*1,1,{deep_parens},0,0*%\n"),
+            // A region whose vertices sit at the far end of the nm range: the
+            // cast guard in `coord_to_nm` passes them, but the i128 cross-term
+            // accumulation in `signed_area2` still has to survive them.
+            concat!(
+                "G36*\nX-9000000000000000000Y-9000000000000000000D02*\n",
+                "X9000000000000000000Y-9000000000000000000D01*\n",
+                "X9000000000000000000Y9000000000000000000D01*\n",
+                "X-9000000000000000000Y9000000000000000000D01*\nG37*\n"
+            )
+            .to_string(),
+        ];
+        for body in bodies {
+            let src = format!("{HEADER}{body}M02*\n");
+            assert!(
+                parse_gerber(&src).is_err(),
+                "expected a clean Err for body:\n{body}"
+            );
+        }
+    }
+
+    #[test]
+    fn plausible_negative_macro_parameters_still_parse() {
+        // The magnitude guard must not reject legitimate negative centres.
+        let layer = parse("%AMOFF*1,1,1.0,-2.0,-3.0*%\n%ADD10OFF*%\nD10*\nX0Y0D03*\n");
+        assert_eq!(layer.polys.len(), 1);
     }
 
     #[test]

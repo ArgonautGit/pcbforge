@@ -2,13 +2,17 @@
 //!
 //! The console is an egui application (`app::ConsoleApp`) that renders a
 //! board/stage status panel, an actions panel shelling the `pcbforge` CLI
-//! verbs, a rasterized job preview, a log pane, and a stubbed camera panel
-//! (pending VIS-1). All UI is egui-only so it lays out and is tested
-//! *headlessly*; the actual OS window is an `eframe` wrapper behind the
-//! `native` feature (see `src/main.rs`), which needs a display + GL/X11.
+//! verbs, a rasterized job preview, a log pane, and a live camera panel. All
+//! UI is egui-only so it lays out and is tested *headlessly*; the actual OS
+//! window is an `eframe` wrapper behind the `native` feature (see
+//! `src/main.rs`), which needs a display + GL/X11.
+//!
+//! This crate holds presentation only. The calibration fitting it drives lives
+//! in the egui-free [`calib`] crate, which sits above [`vision`]'s primitives —
+//! it used to live here, which left the whole fitting pipeline reachable only
+//! from the GUI and invisible to the CLI.
 
 mod app;
-mod calib;
 mod fiducial;
 mod imgview;
 mod place;
@@ -20,13 +24,7 @@ mod status;
 // alias it as `camera` so `crate::camera::…` paths keep resolving.
 use capture as camera;
 
-pub use app::{ConsoleApp, LogLine, default_cli_cmd, job_shapes, preview_image, run_capture};
-pub use calib::{
-    AnchorDot, Calibration, CameraCal, DotKind, FieldCal, FieldDot, GridSpec, LensDot, Rigid2,
-    camera_px_to_commanded, camera_px_to_physical, commanded_to_camera_px,
-    composed_projection_is_finite, field_live_acceptance, fit_camera_lens, fit_camera_to_machine,
-    fit_laser_field, fit_rigid, physical_to_camera_px,
-};
+pub use app::{ConsoleApp, LogLine, default_cli_cmd, job_shapes, preview_image};
 pub use capture::{Capture, Source, clean_path, grab, list_devices};
 pub use fiducial::{
     FidKind, FidResult, FidRow, ProfileKind, check as fiducial_check, check_frame, parse_layout,

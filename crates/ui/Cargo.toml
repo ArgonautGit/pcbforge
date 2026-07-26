@@ -12,6 +12,7 @@ cam = { path = "../cam" }
 drivers = { path = "../drivers" }
 ingest = { path = "../ingest" }
 vision = { path = "../vision" }
+calib = { path = "../calib" }
 pcb-core = { workspace = true }
 nalgebra = "0.35.0"
 image = { version = "0.25", default-features = false, features = ["png", "jpeg"] }
@@ -42,3 +43,6 @@ accesskit_consumer = "0.25"
 # Integration tests are a separate crate and can't name `ui`'s normal deps, so
 # expose egui to them explicitly (same version).
 egui = "0.30"
+# Per-harness temp directories so persisted operator fields can't bleed between
+# tests or runs (see tests/common/mod.rs).
+tempfile = "3"

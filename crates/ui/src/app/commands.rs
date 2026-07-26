@@ -143,7 +143,8 @@ impl ConsoleApp {
 /// Shell `cmd[0] cmd[1..] args`, capturing stdout (info) and stderr (warn) as
 /// log lines plus a header and an exit-status footer. A spawn failure — or an
 /// empty command — is one error line.
-pub fn run_capture(cmd: &[String], args: &[String]) -> Vec<LogLine> {
+#[cfg(test)]
+pub(super) fn run_capture(cmd: &[String], args: &[String]) -> Vec<LogLine> {
     let Some((program, prefix)) = cmd.split_first() else {
         return vec![LogLine {
             text: "no CLI command configured".into(),

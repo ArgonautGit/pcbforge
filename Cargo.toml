@@ -6,6 +6,7 @@ members = [
     "crates/ingest",
     "crates/cam",
     "crates/vision",
+    "crates/calib",
     "crates/orchestra",
     "crates/drivers",
     "crates/testkit",
