@@ -8,6 +8,7 @@ pub(super) enum CentralTab {
     Calibrate,
     Fiducials,
     Place,
+    Drill,
 }
 
 /// Which face of a (possibly double-sided) board the operator is working.
@@ -92,6 +93,10 @@ pub(super) struct RuntimeState {
     /// A "run in LightBurn" queued to fire when `verb_job` finishes (the
     /// absolute .lbrn2 the export is writing). Cleared once consumed or skipped.
     pub(super) pending_lightburn: Option<PathBuf>,
+    /// A KiCad drill export queued to fire when the Gerber `verb_job` finishes
+    /// (the cleaned project path and the output dir the Gerbers are landing in).
+    /// Cleared once consumed or skipped.
+    pub(super) pending_drills: Option<(String, String)>,
     /// The active (or most recent) LightBurn run — kept after it finishes so the
     /// terminal state stays visible; a new run replaces it.
     pub(super) lightburn_run: Option<LightburnRun>,
@@ -282,12 +287,32 @@ pub(super) struct PlacementState {
     pub(super) field_correct: bool,
     /// LightBurn device name for the one-click "Etch + run in LightBurn".
     pub(super) lightburn_device: String,
-    /// Excellon drill file path(s) for "Emit drill holes" — `;`-separated
-    /// (KiCad exports PTH and NPTH holes as two files).
-    pub(super) drills: String,
-    /// Output `.lbrn2` path for "Emit drill holes" — separate from the etch
-    /// output so the two exports never overwrite each other.
-    pub(super) drill_lbrn2: String,
+}
+
+/// The Drill tab's paths and its own process recipe.
+///
+/// Deliberately separate from [`JobState`]: drilling a hole outline is a
+/// different process from etching copper. The etch fills a region with hatch
+/// lines; the drill traces a vector contour around each hole, so it wants its
+/// own power/speed/frequency/pulse/passes — the settings that make a good
+/// isolation fill are not the settings that punch through FR-4.
+///
+/// There is deliberately **no interval field**: a Line layer omits the fill
+/// interval (see `cam::lbrn2::cut_setting_xml`), so a drill interval control
+/// would be dead — it could never reach the emitted file.
+pub(super) struct DrillState {
+    /// Excellon drill file path(s), ;-separated.
+    pub(super) files: String,
+    /// Output .lbrn2 path.
+    pub(super) out_lbrn2: String,
+    pub(super) power_pct: f64,
+    pub(super) speed_mm_s: f64,
+    pub(super) frequency_khz: f64,
+    pub(super) pulse_ns: u32,
+    pub(super) passes: u32,
+    pub(super) wobble: bool,
+    pub(super) wobble_step_mm: f64,
+    pub(super) wobble_size_mm: f64,
 }
 
 pub(super) struct ArState {

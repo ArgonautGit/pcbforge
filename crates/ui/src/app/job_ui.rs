@@ -38,7 +38,11 @@ impl ConsoleApp {
     /// (`<board dir>/pcbforge-gerbers/{copper,outline}.gbr`), so the fields are
     /// filled immediately; the files appear when the background job finishes,
     /// whose progress/errors stream to the Log.
-    fn gerbers_from_kicad(&mut self) {
+    ///
+    /// The drill export is queued behind it (`pending_drills`) rather than
+    /// shelled here: only one verb runs at a time, so a second `run_verb` call
+    /// would be refused and leave the Drill tab pointing at files nobody wrote.
+    pub(super) fn gerbers_from_kicad(&mut self) {
         let proj = crate::clean_path(&self.job.kicad_project);
         if proj.trim().is_empty() {
             self.runtime.log.push(LogLine {
@@ -78,10 +82,10 @@ impl ConsoleApp {
                 self.job.back_outline = outline;
             }
         }
-        self.run_verb(&[
+        let started = self.run_verb(&[
             "gerbers".into(),
             "--project".into(),
-            proj,
+            proj.clone(),
             "--out".into(),
             out_dir.display().to_string(),
             "--copper-layer".into(),
@@ -89,6 +93,11 @@ impl ConsoleApp {
             "--outline-layer".into(),
             outline_layer.into(),
         ]);
+        if started {
+            // Same out_dir the Gerbers are going to — never re-resolved later,
+            // so the drill paths can't point somewhere else.
+            self.runtime.pending_drills = Some((proj, out_dir.display().to_string()));
+        }
         self.job.preview_note =
             format!("exporting {copper_layer} + {outline_layer} from KiCad… (see Log)");
     }
@@ -116,7 +125,9 @@ impl ConsoleApp {
         if ui
             .button("⚙ Gerbers from KiCad")
             .on_hover_text(
-                "Run kicad-cli to export copper.gbr + outline.gbr and fill the fields below.",
+                "Run kicad-cli to export copper.gbr + outline.gbr and fill the fields below. \
+                 Once that finishes it also exports pth.drl + npth.drl into the same \
+                 directory and fills the Drill tab.",
             )
             .clicked()
         {
@@ -397,6 +408,7 @@ impl ConsoleApp {
                 CentralTab::Place,
                 "✋ Place on board",
             );
+            ui.selectable_value(&mut self.runtime.tab, CentralTab::Drill, "⌀ Drill");
         });
         ui.separator();
         match self.runtime.tab {
@@ -405,6 +417,7 @@ impl ConsoleApp {
             CentralTab::Calibrate => self.calibrate_view(ui),
             CentralTab::Fiducials => self.fiducial_view(ui),
             CentralTab::Place => self.place_view(ui),
+            CentralTab::Drill => self.drill_view(ui),
         }
     }
 

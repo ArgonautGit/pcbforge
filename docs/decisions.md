@@ -2514,3 +2514,59 @@ disk for a manual run.
   the valuable one, it decides whether the job moves on the board. A
   `pcbforge calib-fit` verb is the payoff, since it makes the fit pipeline
   testable against real captured frames.
+
+## 2026-07-25 — Drill gets its own tab, its own recipe, and Line mode
+
+- The console's drill emit borrowed the **Job tab's** speed/frequency/pulse/
+  passes/interval and hardcoded `power_pct: 20.0`. Etching copper and punching
+  FR-4 are not the same process, so sharing one recipe meant every drill export
+  inherited whatever the operator last tuned for isolation milling — with a
+  power number they could not see, let alone change. Drill now has a `DrillState`
+  of its own behind a `⌀ Drill` tab. `JobState` and the Job tab's widgets are
+  untouched: that recipe is still advertised as shared between Emit and Place's
+  "Etch here", and it still is.
+- **Fill → Line.** A hole is a traced outline, not a filled region: `drill_polys`
+  has always produced outline rings, and emitting them as a `Fill` layer meant
+  LightBurn's scan engine was inventing the infill from geometry that only ever
+  described the boundary. The layer is now `type="Cut"`. The *geometry* is
+  byte-identical either way — only the `CutSetting` changes.
+- **No drill interval control**, deliberately. A Line layer omits the fill
+  interval (`cam::lbrn2::cut_setting_xml`), so an interval widget on the Drill
+  tab could never reach the emitted file. A dead control that looks live is
+  worse than no control.
+- `power_pct` becomes operator-visible for the first time and defaults to the
+  same 20.0 the code hardcoded, so the **only** intentional behaviour change
+  here is the mode switch. Every other new field defaults to what the emit
+  effectively used yesterday.
+- The persisted `place_drills` / `place_drill_lbrn2` keys are renamed to
+  `drill_files` / `drill_out_lbrn2`, with a legacy read when the new keys are
+  absent — otherwise every operator loses their saved drill paths on upgrade.
+  The `place:` summary line keeps its `drills=` / `drill_out=` tokens (they're
+  pinned by a headless test); the values just come from the new fields.
+- The CLI's `drill-emit --mode` default (`fill`) was left alone as out of scope.
+  The console's in-process path and the CLI verb are already divergent — the
+  verb only takes a translation origin, so a rotated placement isn't expressible
+  through it, which is why the console never shelled it. Aligning the two is a
+  separate change.
+
+### "Gerbers from KiCad" now exports the drills too
+
+- Preparing a board needed two clicks on two tabs — "⚙ Gerbers from KiCad" for
+  copper + outline, then "⚙ Drills from KiCad" for the holes — for what is one
+  operation on one project. The Job tab's button now does both. The Drill tab's
+  button stays: it is the only way to re-export drills without also re-running
+  the Gerber export.
+- It had to be a **completion chain**, not a second `run_verb` call.
+  `run_verb` holds exactly one job slot and refuses a second while one runs, so
+  calling `drills_from_kicad()` from `gerbers_from_kicad()` would have spawned
+  nothing — while still filling `drill.files` with paths to `.drl` files that
+  were never written, which `settings_io` would then persist. A `pending_drills`
+  slot armed only when the Gerber verb actually spawned, and drained by
+  `pump_verb` after the job clears, mirrors the existing `pending_lightburn`
+  pattern; the two chains use different slots and never contend.
+- **The drill paths are filled when the drills verb spawns, not when the button
+  is clicked.** The Gerber field-filling can afford to be optimistic — those
+  paths are the operator's own inputs and are visibly wrong if the export fails.
+  The chained drill paths are not: nobody is looking at the Drill tab at that
+  moment, so a failed Gerber export would leave persisted paths to files that do
+  not exist. A failure logs the skip and leaves `drill.files` alone.

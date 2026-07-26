@@ -323,16 +323,18 @@ fn etch_and_run_in_lightburn_button_is_present_and_guards_without_a_job() {
     );
 }
 
-/// The Place tab carries the no-burn drill-emit controls: the path fields and
+/// The Drill tab carries the no-burn drill-emit controls: the path fields and
 /// buttons are present and labelled (drivable), "⚙ Drills from KiCad" fills
 /// the drill field with the stable pth/npth paths, and clicking the emit
 /// button never queues a LightBurn run. Assertions are positive (type a path,
-/// expect the fill) because the kittest consoles share one settings sidecar —
-/// an "unset" assertion would be order-dependent.
+/// expect the fill): each `console()` gets its own settings sidecar, but the
+/// fill is the behaviour worth pinning either way.
 #[test]
-fn place_tab_emits_drill_holes_without_a_burn() {
+fn drill_tab_emits_drill_holes_without_a_burn() {
     let mut h = console();
-    h.get_by_label_contains("Place on board").click();
+    // The central panel only builds the selected tab's form, so the drill
+    // widgets exist only once the Drill tab is up.
+    h.get_by_label("⌀ Drill").click();
     h.run();
     let s = h.state().debug_summary();
     assert!(
@@ -381,6 +383,50 @@ fn place_tab_emits_drill_holes_without_a_burn() {
         summary_line(&h.state().debug_summary(), "place:").contains("lightburn=idle"),
         "a guarded drill emit spawns no LightBurn activity:\n{}",
         h.state().debug_summary()
+    );
+}
+
+/// The Drill tab's recipe is its own set of labelled, drivable widgets — and
+/// editing one moves the `drill:` summary line without touching the Job tab's
+/// `gerbers:` recipe.
+#[test]
+fn drill_tab_recipe_widgets_are_reachable_by_label() {
+    let mut h = console();
+    h.get_by_label("⌀ Drill").click();
+    h.run();
+    for label in [
+        "drill power %",
+        "drill speed mm/s",
+        "drill frequency kHz",
+        "drill Q-pulse ns",
+        "drill passes",
+        "drill wobble",
+    ] {
+        assert!(
+            h.query_by_label(label).is_some(),
+            "the Drill tab exposes a labelled {label} widget"
+        );
+    }
+    let s = h.state().debug_summary();
+    assert!(
+        summary_line(&s, "drill:").contains("mode=line"),
+        "the drill line reports the Line layer mode:\n{s}"
+    );
+    // The drill recipe is independent: toggling its wobble moves the drill
+    // line and leaves the Job tab's recipe untouched.
+    let before = summary_line(&s, "gerbers:").to_string();
+    assert!(summary_line(&s, "drill:").contains("wobble=false"));
+    h.get_by_label("drill wobble").click();
+    h.run();
+    let s = h.state().debug_summary();
+    assert!(
+        summary_line(&s, "drill:").contains("wobble=true"),
+        "the drill wobble checkbox is wired to the drill state:\n{s}"
+    );
+    assert_eq!(
+        summary_line(&s, "gerbers:"),
+        before,
+        "editing the drill recipe leaves the Job tab's recipe alone"
     );
 }
 

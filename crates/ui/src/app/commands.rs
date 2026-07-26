@@ -53,6 +53,7 @@ impl ConsoleApp {
             self.runtime.verb_job = None;
             self.refresh();
             self.chain_lightburn_after_verb(succeeded);
+            self.chain_drills_after_verb(succeeded);
         } else {
             ctx.request_repaint();
         }
@@ -93,6 +94,43 @@ impl ConsoleApp {
             err: false,
         });
         self.runtime.lightburn_run = Some(spawn_lightburn_run(path, device));
+    }
+
+    /// After a Gerber export finishes, run the drill export the Job tab's
+    /// "⚙ Gerbers from KiCad" queued behind it, so one click prepares copper,
+    /// outline and drills. A failed export skips it (and says so).
+    ///
+    /// The drill paths are filled *here*, when the verb is actually spawned —
+    /// not when the button was clicked. Filling them at click time would leave
+    /// the operator with persisted paths to `.drl` files that never got written
+    /// whenever the Gerber export failed.
+    ///
+    /// Re-entrant by construction: when the chained drills verb itself
+    /// finishes, `pump_verb` calls this again and the `take()` above already
+    /// left `pending_drills` empty.
+    pub(super) fn chain_drills_after_verb(&mut self, succeeded: bool) {
+        let Some((proj, out_dir)) = self.runtime.pending_drills.take() else {
+            return;
+        };
+        if !succeeded {
+            self.runtime.log.push(LogLine {
+                text: "drills: skipped — the Gerber export did not finish cleanly".into(),
+                err: true,
+            });
+            return;
+        }
+        self.drill.files = drill_files_in(std::path::Path::new(&out_dir));
+        self.runtime.log.push(LogLine {
+            text: "drills: exporting the PTH + NPTH drill files from KiCad…".into(),
+            err: false,
+        });
+        self.run_verb(&[
+            "drills".into(),
+            "--project".into(),
+            proj,
+            "--out".into(),
+            out_dir,
+        ]);
     }
 
     /// (Re)build the preview texture from the active side's Gerbers (the back
