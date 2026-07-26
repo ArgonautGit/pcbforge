@@ -2,9 +2,17 @@
 //! land in the camera image, so a placement in the camera view can be turned
 //! into machine coordinates the laser actually burns at.
 //!
+//! This is the *workflow* layer above [`vision`]: `vision` owns the primitives
+//! (blob detection, homography/affine/lens fits), and this crate composes them
+//! into the multi-step bench procedure — print a paper grid, fit the camera
+//! lens, anchor the laser to the camera, burn a grid and fit the laser field —
+//! plus the acceptance gating that decides whether a fit is good enough to cut
+//! with. It contains no egui: it lived in `crates/ui` and so was reachable only
+//! from the console, which left the whole fitting pipeline invisible to the CLI.
+//!
 //! Fiducials tie the design to the board; they do NOT tie the camera to the
 //! laser. That second link is what makes "place it here → burn it here" true,
-//! and this module measures it: the operator burns a grid of dots at known
+//! and this crate measures it: the operator burns a grid of dots at known
 //! commanded coordinates, images it, and we fit a **camera-px → commanded-mm**
 //! homography (perspective, so a tilted camera is absorbed).
 //!
@@ -211,7 +219,7 @@ fn refit(
 /// Refit an anchor after the operator has corrected one or more detected
 /// square centers. The grid identity (`mm`) of every point is retained; only
 /// its observed pixel center changes.
-pub(crate) fn refit_anchor_dots(dots: &[AnchorDot], total: usize) -> Result<Calibration, String> {
+pub fn refit_anchor_dots(dots: &[AnchorDot], total: usize) -> Result<Calibration, String> {
     if dots.len() < 4 {
         return Err(format!(
             "only {}/{} anchor dots remain — need ≥4",

@@ -182,13 +182,13 @@ impl ConsoleApp {
                     n: 7,
                     pitch_mm: 10.0,
                     dot_mm: 0.4,
-                    dot_kind: crate::calib::DotKind::Dark,
+                    dot_kind: calib::DotKind::Dark,
                 },
                 burn: GridParams {
                     n: 7,
                     pitch_mm: 10.0,
                     dot_mm: 0.4,
-                    dot_kind: crate::calib::DotKind::Dark,
+                    dot_kind: calib::DotKind::Dark,
                 },
                 grid_origin_mm: (0.0, 0.0),
                 grid_out: "calib-grid.lbrn2".into(),
@@ -578,7 +578,7 @@ fn field_verdict_phrase(v: &vision::FieldVerdict, scale: f64) -> String {
             }
         ),
     };
-    if (scale - 1.0).abs() > crate::calib::FIELD_SCALE_NOTE_FRAC {
+    if (scale - 1.0).abs() > calib::FIELD_SCALE_NOTE_FRAC {
         format!(
             "{phrase}; burn reads {:.1}% {} than commanded — check the machine's field-size \
              setting",

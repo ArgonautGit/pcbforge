@@ -2480,3 +2480,37 @@ disk for a manual run.
   coefficients: coefficient finiteness is already enforced on every path, and
   moving it there would remove the only way to construct the non-finite map
   that three existing fail-closed regression tests assert is refused.
+
+## 2026-07-25 — Calibration fitting split out of the console into `crates/calib`
+
+- `ui/src/calib.rs` + `ui/src/calib/square_grid.rs` were 3,129 lines with
+  **zero** egui references and zero references to anything else in `ui` — a
+  strict one-way consumer of `vision` parked in the GUI crate. Since nothing
+  depends on `ui`, the entire fitting pipeline was invisible to the CLI and
+  testable only through the console.
+- Moved to a **new `calib` crate rather than into `vision`**: `vision` owns
+  primitives (homography/affine/lens fits, blob detection, warp), `calib` owns
+  the operator workflow above them (paper grid → lens fit → anchor → laser
+  field) and the acceptance gating. Different layers, different reasons to
+  change; folding 3,129 lines into `vision` would have doubled it and blurred
+  that line.
+- Phase 1 is relocation only — no logic changed, tests moved with the code.
+  `refit_anchor_dots` was the single item widened (`pub(crate)` → `pub`); the
+  other 22 items `ui` uses were already public. The burn-grid fixture moved
+  too: `CARGO_MANIFEST_DIR` now resolves to the new crate, which is how the
+  suite caught the one thing the mechanical move missed.
+- `ui`'s public re-exports of the calibration API were **dropped** rather than
+  kept as a shim, so the console re-exports only console things; its `dump_*`
+  examples name `calib::` directly.
+- `ui/src` drops from 16,305 to 12,702 lines. The egui-free residue left in it
+  is now a short list: `app/settings_io.rs` (738, legitimately UI — it
+  serializes `ConsoleApp`'s own fields), `app/lightburn_run.rs` (557, a
+  candidate for `drivers`), `app/projection.rs` (182), and
+  `settings.rs`/`status.rs` (265).
+- Still to do: promote the true primitives that remain mixed into `calib`
+  (`Rigid2`/`fit_rigid`, `Similarity2`/`fit_similarity`, `invert_poly`, the
+  `camera_px_to_*` helpers) down into `vision`; then `app/projection.rs`; then
+  split `fiducial.rs` and `place.rs` at the egui boundary — `fit_board_pose` is
+  the valuable one, it decides whether the job moves on the board. A
+  `pcbforge calib-fit` verb is the payoff, since it makes the fit pipeline
+  testable against real captured frames.

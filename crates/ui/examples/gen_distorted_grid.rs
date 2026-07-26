@@ -16,8 +16,8 @@
 //!
 //! Run: `cargo run -p ui --example gen_distorted_grid`
 
+use calib::{DotKind, GridSpec, fit_camera_lens};
 use image::{GrayImage, Luma};
-use ui::{DotKind, GridSpec, fit_camera_lens};
 
 const PX_PER_MM: f64 = 9.0;
 const MARGIN: f64 = 60.0;

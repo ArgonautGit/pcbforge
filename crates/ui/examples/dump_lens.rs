@@ -6,7 +6,7 @@
 fn main() {
     let a: Vec<String> = std::env::args().collect();
     let out = a.get(1).cloned().unwrap_or_else(|| "lens.png".into());
-    let grid = ui::GridSpec {
+    let grid = calib::GridSpec {
         origin_mm: (0.0, 0.0),
         pitch_mm: 10.0,
         n: 7,
@@ -34,7 +34,7 @@ fn main() {
         let (u, v) = base(mx, my);
         distort(u, v)
     });
-    let cal = ui::fit_camera_lens(&img, corners, &grid, dot, ui::DotKind::Dark).expect("fit");
+    let cal = calib::fit_camera_lens(&img, corners, &grid, dot, calib::DotKind::Dark).expect("fit");
     eprintln!(
         "lens RMS {:.0} µm, worst {:.0} µm, {} dots",
         cal.lens.rms_um, cal.lens.max_um, cal.found
