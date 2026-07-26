@@ -2375,14 +2375,20 @@ disk for a manual run.
   "written; open it manually" (FORCELOAD dislikes `\\?\` prefixes, same
   rule as the etch chain).
 
-## 2026-07-25 — CI had never passed; three gates in one job hid a red suite
+## 2026-07-25 — CI red for 41 straight runs; three gates in one job hid a red suite
 
-- `gh run list --workflow=ci.yml --limit 40` returned **40 failures and zero
-  successes**, oldest 2026-07-21. The job died at `cargo fmt --check`, which
-  was step 1 of 3, so **`cargo clippy` and `cargo test --workspace` had never
-  executed in CI on this repo** — a trailing-comma diff was masking both, and
-  PRs #4 and #5 were merged red. Behind that gate: 27 rustfmt diffs and 9
-  clippy lints under `-D warnings`.
+- CI's last green was **2026-07-20T21:48**, followed by **41 consecutive
+  failures**. Every one died at `cargo fmt --check`, which was step 1 of 3, so
+  for that whole stretch **`cargo clippy` and `cargo test --workspace` never
+  executed** — a trailing-comma diff masked both, and PRs #4 and #5 were merged
+  red. Behind that gate: 27 rustfmt diffs and 9 clippy lints under
+  `-D warnings`.
+- Measurement caveat worth recording, since it nearly became a wrong
+  conclusion: a `--limit 40` sample showed 40 failures and zero successes and
+  read as "CI has never passed." The window happened to start just after the
+  last green, so it captured exactly the red streak. Widening to 100 runs shows
+  32 earlier successes. The streak was the real finding; "never" was an
+  artifact of the sample size.
 - Split into three independent jobs (`fmt`, `clippy`, `test`) rather than
   reordering or `continue-on-error`: three sequential gates in one job yield
   one bit of signal, and the cheapest gate was the one masking the expensive
