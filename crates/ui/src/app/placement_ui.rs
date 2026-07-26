@@ -5,21 +5,34 @@ use super::*;
 const DRILL_FIELD_SEG_MM: f64 = 0.25;
 
 impl ConsoleApp {
-    /// Move the placement so its pivot's **pixel** position shifts by
-    /// `(dpx, dpy)` frame pixels. Dragging felt wrong under perspective because
-    /// the old code added a uniform mm delta — a uniform mm step is *not* a
-    /// uniform pixel step on a tilted plane, so the overlay slid along the plane
-    /// instead of following the cursor. Here we map the pivot to pixels through
-    /// the same homography the composite uses, shift in pixels, and invert back
-    /// to bed-mm — so the geometry tracks where the mouse moves over the image.
-    pub(super) fn drag_place_px(&mut self, dpx: f64, dpy: f64) -> Result<(), String> {
-        let dimensions = self
-            .placement
+    /// The frame the placement is measured against, in pixels: the fiducial
+    /// frame the pose was fitted in, else the last camera grab. Only the
+    /// DIMENSIONS matter — they are what `place_projection` validates the lens
+    /// calibration against (resolution/crop/orientation must match the fit).
+    pub(super) fn place_frame_dims(&self) -> Option<(u32, u32)> {
+        self.fiducials
             .frame_img
             .as_ref()
+            .or(self.camera.last.as_ref())
             .map(image::GenericImageView::dimensions)
-            .ok_or("load a placement frame first")?;
-        let projection = self.place_projection(dimensions.0, dimensions.1)?;
+    }
+
+    /// Move the placement so its pivot's **pixel** position shifts by
+    /// `(dpx, dpy)` frame pixels of a `width`×`height` frame. Dragging felt
+    /// wrong under perspective because the old code added a uniform mm delta —
+    /// a uniform mm step is *not* a uniform pixel step on a tilted plane, so
+    /// the overlay slid along the plane instead of following the cursor. Here
+    /// we map the pivot to pixels through the same projection the outline is
+    /// drawn with, shift in pixels, and invert back to bed-mm — so the geometry
+    /// tracks where the mouse moves over the image.
+    pub(super) fn drag_place_px(
+        &mut self,
+        width: u32,
+        height: u32,
+        dpx: f64,
+        dpy: f64,
+    ) -> Result<(), String> {
+        let projection = self.place_projection(width, height)?;
         let (px, py) = projection
             .to_px((self.placement.tx_mm, self.placement.ty_mm))
             .ok_or("active camera projection returned a non-finite placement")?;
@@ -126,6 +139,12 @@ impl ConsoleApp {
         self.fiducials.last_placed = false;
         self.fiducials.homography = None;
         self.fiducials.pose = None;
+        // The other face's fit is not a frame this face's placement can be
+        // measured against, so there is no offset to carry into its first Check.
+        self.fiducials.last_fit = None;
+        // The other face's measurements are in a mirrored frame — not a layout
+        // this side could adopt.
+        self.fiducials.detected_mm.clear();
         self.ar.board.clear();
         self.ar.copper.clear();
         self.ar.ablate.clear();
@@ -133,51 +152,53 @@ impl ConsoleApp {
         // The fitted pose was for the old face's detection — drop it so the
         // next Load recenters normally until a fresh Check re-fits.
         self.placement.auto_pose = false;
-        // Also drop the cached frame/textures, or both tabs keep painting the
-        // other side's image until a new frame is loaded (LR-41).
-        self.placement.frame_img = None;
-        self.placement.tex = None;
+        // …and with it the fitted resize: the other face's scale is not this
+        // face's, and a stale one would silently resize the next job.
+        self.placement.scale = 1.0;
+        // Also drop the cached preview, or the Job tab keeps painting the other
+        // side's render until a new one is made (LR-41).
         self.job.preview_tex = None;
     }
 
     /// Current manual placement.
-    fn placement(&self) -> crate::place::Placement {
+    pub(super) fn placement(&self) -> crate::place::Placement {
         crate::place::Placement {
             tx_mm: self.placement.tx_mm,
             ty_mm: self.placement.ty_mm,
             rot_deg: self.placement.rot_deg,
+            scale: self.placement.scale,
             pivot_mm: self.placement.pivot,
         }
     }
 
-    /// Load the bed frame + job geometry into the place cache and center the
-    /// job on the frame. Uses the Job-tab Gerber paths for the geometry.
-    pub fn load_place(&mut self, ctx: &Context) {
-        // ALWAYS grab a fresh frame from the camera source first, so Load
-        // reflects the board as it sits now (the bed-frame path is persisted —
-        // preferring it would silently keep re-loading a stale file). The file
-        // is the fallback when no camera source is reachable.
-        let img = match crate::camera::grab(&self.cam_source()) {
-            Ok(img) => self.camera.orientation.apply(img),
-            Err(cam_err) => {
-                let path = crate::clean_path(&self.placement.frame);
-                if path.trim().is_empty() {
-                    self.placement.note = format!("camera: {cam_err}");
-                    return;
-                }
-                match image::open(path) {
-                    Ok(i) => {
-                        self.placement.note =
-                            format!("camera unavailable ({cam_err}) — loaded the bed-frame file");
-                        i.to_luma8()
-                    }
-                    Err(e) => {
-                        self.placement.note = format!("camera: {cam_err}; frame file: {e}");
-                        return;
-                    }
-                }
-            }
-        };
+    /// Where a freshly loaded design starts, in bed mm, plus how that was
+    /// chosen (for the note). Preferred: the centre of the fiducial frame the
+    /// operator is looking at, mapped through the SAME projection the outline
+    /// is drawn with — under an active homography a uniform px/mm would land
+    /// the job far off-centre until dragged (LR-42). With no frame, or no
+    /// calibration to map one with, the middle of the work area is still a
+    /// position the operator can drag from.
+    fn initial_place_center_mm(&self) -> ((f64, f64), &'static str) {
+        if let Some((w, h)) = self.fiducials.frame_img.as_ref().map(|f| f.dimensions())
+            && let Ok(center) = self.initial_center_mm(w as f64, h as f64)
+        {
+            return (center, "centred on the fiducial frame");
+        }
+        (
+            (
+                self.camera.field_cx_mm as f64,
+                self.camera.field_cy_mm as f64,
+            ),
+            "centred on the work area",
+        )
+    }
+
+    /// Load the DESIGN — the Job-tab Gerbers for the active side — into the
+    /// placement cache and give it a starting position. There is no bed image
+    /// to load any more: the Fiducial-check tab draws the job over the frame it
+    /// already has, so grabbing a camera frame here would cost a capture and
+    /// prove nothing.
+    pub fn load_place(&mut self) {
         let (_, _, ablate) = match self.active_job() {
             Ok(t) => t,
             Err(e) => {
@@ -186,100 +207,25 @@ impl ConsoleApp {
             }
         };
         self.placement.pivot = crate::place::bbox_center_mm(&ablate);
-        // Convert the frame to RGBA once; recompose clones this per drag step.
-        let base = ColorImage {
-            size: [img.width() as usize, img.height() as usize],
-            pixels: img.pixels().map(|p| Color32::from_gray(p[0])).collect(),
-        };
-        // Start centered on the frame — in the SAME frame the overlay draws in.
-        // Under an active homography, uniform px/mm would land the job far
-        // off-centre until dragged (LR-42). Skip when the pose was fitted from
-        // fiducials: Load must not recenter/zero over an auto-placement.
-        if !self.placement.auto_pose {
-            let (cx, cy) = match self.initial_center_mm(img.width() as f64, img.height() as f64) {
-                Ok(center) => center,
-                Err(e) => {
-                    // No projection at all — still show the bare frame so the
-                    // operator sees what loaded; the note says what's missing.
-                    self.placement.note =
-                        format!("frame loaded, but placement needs calibration: {e}");
-                    self.placement.job.clear();
-                    self.placement.frame_img = Some(img);
-                    self.set_place_tex(ctx, base.clone());
-                    self.placement.base_rgba = Some(base);
-                    return;
-                }
-            };
+        // Skip when the pose was fitted from fiducials: Load must not
+        // recenter/zero over an auto-placement.
+        let where_note = if self.placement.auto_pose {
+            "kept the fiducial-locked pose"
+        } else {
+            let ((cx, cy), note) = self.initial_place_center_mm();
             self.placement.tx_mm = cx;
             self.placement.ty_mm = cy;
             self.placement.rot_deg = 0.0;
-        }
+            // Recentering means "nominal placement" — the job must go back to
+            // its design size too, not keep a previous fit's resize.
+            self.placement.scale = 1.0;
+            note
+        };
         self.placement.job = ablate;
-        self.placement.frame_img = Some(img);
-        self.placement.base_rgba = Some(base);
-        self.recompose(ctx);
-    }
-
-    /// Re-blend the placed job over the cached frame into the display texture.
-    pub(super) fn recompose(&mut self, ctx: &Context) {
-        let Some(frame) = &self.placement.frame_img else {
-            return;
-        };
-        if self.placement.job.is_empty() {
-            return;
-        }
-        let projection = match self.place_projection(frame.width(), frame.height()) {
-            Ok(p) => p,
-            Err(e) => {
-                self.placement.note = format!("placement projection unavailable: {e}");
-                self.placement.tex = None;
-                return;
-            }
-        };
-        // Blend over a clone of the cached RGBA base (built once at load);
-        // rebuild the cache here only for state set up outside load_place.
-        let mut img = match &self.placement.base_rgba {
-            Some(base) if base.size == [frame.width() as usize, frame.height() as usize] => {
-                base.clone()
-            }
-            _ => {
-                let base = ColorImage {
-                    size: [frame.width() as usize, frame.height() as usize],
-                    pixels: frame.pixels().map(|p| Color32::from_gray(p[0])).collect(),
-                };
-                self.placement.base_rgba = Some(base.clone());
-                base
-            }
-        };
-        if let Err(e) = crate::place::composite_over_projected(
-            &mut img,
-            &self.placement.job,
-            &self.placement(),
-            &|x, y| projection.to_px((x, y)),
-            [0xf0, 0x50, 0x30],
-            0.55,
-        ) {
-            self.placement.note = format!("placement projection unavailable: {e}");
-            self.placement.tex = None;
-            return;
-        }
-        let frame_note = projection.label();
         self.placement.note = format!(
-            "placed at ({:.1}, {:.1}) mm, {:.0}° · {frame_note}",
+            "design loaded, {where_note} — at ({:.1}, {:.1}) mm, {:.0}°",
             self.placement.tx_mm, self.placement.ty_mm, self.placement.rot_deg
         );
-        self.set_place_tex(ctx, img);
-    }
-
-    /// Upload the composed image, reusing the existing GPU texture when one is
-    /// live (a fresh `load_texture` per drag step allocates a new texture).
-    fn set_place_tex(&mut self, ctx: &Context, img: ColorImage) {
-        match &mut self.placement.tex {
-            Some(tex) => tex.set(img, TextureOptions::NEAREST),
-            None => {
-                self.placement.tex = Some(ctx.load_texture("place", img, TextureOptions::NEAREST));
-            }
-        }
     }
 
     /// Emit the job registered to the current manual placement by encoding it
@@ -304,7 +250,7 @@ impl ConsoleApp {
         }
         if self.placement.job.is_empty() {
             self.runtime.log.push(LogLine {
-                text: "place: load a frame + job first".into(),
+                text: "place: load the design first (⤵ Load design)".into(),
                 err: true,
             });
             return;
@@ -316,14 +262,11 @@ impl ConsoleApp {
             });
             return;
         }
-        let Some(dimensions) = self
-            .placement
-            .frame_img
-            .as_ref()
-            .map(image::GenericImageView::dimensions)
-        else {
+        let Some(dimensions) = self.place_frame_dims() else {
             self.runtime.log.push(LogLine {
-                text: "place: load the current camera frame before export".into(),
+                text: "place: check fiducials (or grab a camera frame) before export — \
+                       the field warp is only valid for the frame it was calibrated in"
+                    .into(),
                 err: true,
             });
             return;
@@ -401,7 +344,15 @@ impl ConsoleApp {
             ),
             err: false,
         });
+        // Record 4a — the placement, its affine, the correspondences string it
+        // was encoded as and the argv, before the CLI ever sees them.
+        self.diag_export("etch", &args, &out_path, use_field);
         let started = self.run_verb(&args);
+        // Measure the written file once the verb reports, but only if it really
+        // started: a refused click must not attribute an older file to it.
+        if started {
+            self.diag_arm_readback("etch", out_path.clone(), use_field);
+        }
         // Queue the LightBurn run only when the export actually launched — a
         // refused click (a job already running) must not arm the chain against
         // a file this click never wrote. Resolve to an ABSOLUTE path without
@@ -410,7 +361,10 @@ impl ConsoleApp {
         if run_after && started {
             match std::path::absolute(&out_path) {
                 Ok(abs) => {
-                    self.runtime.pending_lightburn = Some(abs);
+                    self.runtime.pending_lightburn = Some(PendingLightburn {
+                        path: abs,
+                        start: true,
+                    });
                     self.runtime.log.push(LogLine {
                         text: "queued: load + run in LightBurn once the export finishes".into(),
                         err: false,
@@ -453,6 +407,31 @@ impl ConsoleApp {
             Some(dir) if !dir.as_os_str().is_empty() => dir.join(&raw),
             _ => raw,
         }
+    }
+
+    /// The drill files the KiCad export writes for the Job-tab project, at
+    /// their deterministic location (`<board dir>/pcbforge-gerbers/{pth,npth}.drl`
+    /// — the same pair [`Self::drills_from_kicad`] fills in) — but only the ones
+    /// that are actually on disk. `None` when no project is set, the board
+    /// can't be resolved, or neither file exists: nothing to emit, so the
+    /// caller's "name a drill file" error still stands.
+    fn kicad_drill_paths(&self) -> Option<Vec<String>> {
+        let proj = crate::clean_path(&self.job.kicad_project);
+        if proj.trim().is_empty() {
+            return None;
+        }
+        let board = ingest::kicad_cli::resolve_board(std::path::Path::new(&proj)).ok()?;
+        let out_dir = board
+            .parent()
+            .map(|p| p.join("pcbforge-gerbers"))
+            .unwrap_or_else(|| PathBuf::from("pcbforge-gerbers"));
+        let found: Vec<String> = ["pth.drl", "npth.drl"]
+            .into_iter()
+            .map(|name| out_dir.join(name))
+            .filter(|p| p.exists())
+            .map(|p| p.display().to_string())
+            .collect();
+        (!found.is_empty()).then_some(found)
     }
 
     /// Fill the drill-file field from the Actions-panel KiCad project and
@@ -529,35 +508,46 @@ impl ConsoleApp {
         // loaded and placed — same precondition as the etch buttons.
         if self.placement.job.is_empty() {
             self.runtime.log.push(LogLine {
-                text: "place: load a frame + job first".into(),
+                text: "place: load the design first (⤵ Load design)".into(),
                 err: true,
             });
             return;
         }
-        let drill_paths: Vec<String> = self
+        let mut drill_paths: Vec<String> = self
             .placement
             .drills
             .split(';')
             .map(crate::clean_path)
             .filter(|p| !p.trim().is_empty())
             .collect();
+        // An empty field is not an error while the Job tab names a KiCad
+        // project: the export writes its .drl files at a fixed place, so derive
+        // them and fill the field instead of refusing. The files are re-read
+        // from disk on every emit, so a fresh kicad-cli export is picked up
+        // without re-exporting from here.
         if drill_paths.is_empty() {
-            self.runtime.log.push(LogLine {
-                text: "place: set a drill file (.drl) first — KiCad exports PTH and \
-                       NPTH holes as two files; list both separated by ;"
-                    .into(),
-                err: true,
-            });
-            return;
+            match self.kicad_drill_paths() {
+                Some(found) => {
+                    self.placement.drills = found.join(";");
+                    drill_paths = found;
+                }
+                None => {
+                    self.runtime.log.push(LogLine {
+                        text: "place: set a drill file (.drl) first — KiCad exports PTH and \
+                               NPTH holes as two files; list both separated by ; (or set the \
+                               KiCad project and run ⚙ Drills from KiCad)"
+                            .into(),
+                        err: true,
+                    });
+                    return;
+                }
+            }
         }
-        let Some(dimensions) = self
-            .placement
-            .frame_img
-            .as_ref()
-            .map(image::GenericImageView::dimensions)
-        else {
+        let Some(dimensions) = self.place_frame_dims() else {
             self.runtime.log.push(LogLine {
-                text: "place: load the current camera frame before export".into(),
+                text: "place: check fiducials (or grab a camera frame) before export — \
+                       the field warp is only valid for the frame it was calibrated in"
+                    .into(),
                 err: true,
             });
             return;
@@ -699,6 +689,10 @@ impl ConsoleApp {
         layer.interval_mm = self.job.interval_mm;
         let out_path = self.resolve_drill_output(&drill_paths[0]);
         let out = out_path.to_string_lossy().into_owned();
+        // Record 4a. There is no argv — this path writes the file itself rather
+        // than shelling `register` — so the "argv" is the input list it read.
+        let inputs: Vec<String> = drill_paths.clone();
+        self.diag_export("drill", &inputs, &out_path, use_field);
         if let Err(e) =
             cam::lbrn2::write_lbrn2(&self.placement.lightburn_device, &[layer], &out_path)
         {
@@ -709,6 +703,15 @@ impl ConsoleApp {
             });
             return;
         }
+        // Record 4b, inline: this export is in-process, so the file is already
+        // on disk and there is no verb completion to wait for.
+        let readback = DiagReadback {
+            path: out_path.clone(),
+            kind: "drill",
+            check: self.runtime.diag_check_seq,
+            field_warped: use_field,
+        };
+        self.diag_export_readback(&readback);
         let field_note = if use_field {
             " · field-warped geometry"
         } else {
@@ -774,23 +777,18 @@ impl ConsoleApp {
         }
     }
 
-    pub(super) fn place_view(&mut self, ui: &mut egui::Ui) {
-        let mut changed = false;
-        egui::Grid::new("place-form")
+    /// The bed/output path fields the Job tab renders — the design's
+    /// destinations (etch + drill `.lbrn2`, the LightBurn device, the drill
+    /// inputs). They sit beside the Gerbers that feed them rather than next to
+    /// the buttons: they are typed once and then left alone.
+    pub(super) fn placement_paths_form(&mut self, ui: &mut egui::Ui) {
+        egui::Grid::new("place-paths-form")
             .num_columns(2)
             .spacing([8.0, 6.0])
             .show(ui, |ui| {
-                let lbl = ui.label("bed frame");
-                ui.add(egui::TextEdit::singleline(&mut self.placement.frame).desired_width(240.0))
-                    .labelled_by(lbl.id)
-                    .on_hover_text(
-                        "Optional fallback image: \"Load frame + job\" always grabs a \
-                         fresh frame from the camera source picked in the Camera tab, \
-                         and loads this file only when that grab fails (offline work).",
-                    );
-                ui.end_row();
-                ui.label("out .lbrn2");
+                let lbl = ui.label("out .lbrn2");
                 ui.add(egui::TextEdit::singleline(&mut self.placement.lbrn2).desired_width(240.0))
+                    .labelled_by(lbl.id)
                     .on_hover_text(
                         "Where \"Etch here\" writes the registered job — separate \
                          from the Job tab's emit output so they don't overwrite \
@@ -805,9 +803,9 @@ impl ConsoleApp {
                 )
                 .labelled_by(dev.id)
                 .on_hover_text(
-                    "Device name for \"Etch + run in LightBurn\" — must match a \
-                     configured LightBurn device (the LASER: automation command \
-                     selects it before loading the file).",
+                    "Device name for \"🔥 Etch + Run\" — must match a configured \
+                     LightBurn device (the LASER: automation command selects it \
+                     before loading the file).",
                 );
                 ui.end_row();
                 let drl = ui.label("drill .drl");
@@ -816,8 +814,8 @@ impl ConsoleApp {
                     .on_hover_text(
                         "Excellon drill file(s) for \"Emit drill holes\" — KiCad \
                          exports PTH and NPTH holes as two files; list both \
-                         separated by ; to get every hole. \"⚙ Drills from \
-                         KiCad\" fills this from the Actions-panel project.",
+                         separated by ; to get every hole. Left empty, the emit \
+                         derives them from the Actions-panel KiCad project.",
                     );
                 ui.end_row();
                 let drl_out = ui.label("drill out .lbrn2");
@@ -833,30 +831,56 @@ impl ConsoleApp {
                      prints the full path it wrote.",
                 );
                 ui.end_row();
+                let bed = ui.label("bed frame");
+                ui.add(egui::TextEdit::singleline(&mut self.placement.frame).desired_width(240.0))
+                    .labelled_by(bed.id)
+                    .on_hover_text(
+                        "Where the Camera tab's \"save snapshot\" writes the bed \
+                         image. Nothing reads it back — the Fiducial-check tab \
+                         works from the frame it grabbed.",
+                    );
+                ui.end_row();
             });
-        ui.horizontal(|ui| {
+    }
+
+    /// The placement action block in the right-hand Actions panel: load the
+    /// design, export/burn it where it now sits, and the pose readout that says
+    /// where that is. The Place tab that used to host these is gone — the job
+    /// is placed by dragging it on the Fiducial-check tab, over the very frame
+    /// its registration was measured in.
+    pub(super) fn placement_actions(&mut self, ui: &mut egui::Ui) {
+        ui.label(egui::RichText::new("Place on the board").strong());
+        // Wrapped throughout this panel: it is a ~300 px side panel and these
+        // button labels are long, so a plain `horizontal` pushes the second
+        // button off the right edge where it cannot be clicked at all.
+        ui.horizontal_wrapped(|ui| {
             if ui
-                .button("⤵ Load frame + job")
+                .button("⤵ Load design")
                 .on_hover_text(
-                    "Grabs a fresh frame from the camera source picked in the Camera \
-                     tab and loads the Job-tab Gerbers onto it; the bed-frame file is \
-                     used only when the camera grab fails.",
+                    "Load the Job-tab Gerbers as the placed design and start it in \
+                     the middle of the current fiducial frame (or of the work area \
+                     when there is none). A fiducial lock is never recentred over.",
                 )
                 .clicked()
             {
-                let ctx = ui.ctx().clone();
-                self.load_place(&ctx);
+                self.load_place();
             }
-            if ui.button("▶ Etch here (register)").clicked() {
+            if ui
+                .button("▶ Etch here (register)")
+                .on_hover_text(
+                    "Export the registered job at this placement without touching \
+                     LightBurn — open the written file yourself.",
+                )
+                .clicked()
+            {
                 self.emit_at_placement(false);
             }
+        });
+        ui.horizontal_wrapped(|ui| {
             // One-click: export, then load + run it in LightBurn. Disabled while
             // a run is in flight so a second click can't stack a second job.
             if ui
-                .add_enabled(
-                    !self.lightburn_busy(),
-                    egui::Button::new("▶ Etch + run in LightBurn"),
-                )
+                .add_enabled(!self.lightburn_busy(), egui::Button::new("🔥 Etch + Run"))
                 .on_hover_text(
                     "Runs the register export, then drives LightBurn over its UDP \
                      automation interface to load the file and START the job — \
@@ -867,23 +891,6 @@ impl ConsoleApp {
             {
                 self.emit_at_placement(true);
             }
-            let has_field = self.has_usable_field_cal();
-            self.placement.field_correct = has_field;
-            ui.colored_label(
-                status_color(has_field),
-                if has_field {
-                    "● field-warped export active"
-                } else {
-                    "⚠ UNWARPED export (no step 1 Camera lens + step 3 Laser field)"
-                },
-            )
-            .on_hover_text(
-                "With an accepted laser-field map, geometry is densified and pre-warped \
-                 physical→commanded. Without one, \"Etch here\" exports the placement \
-                 unwarped — field accuracy is then the machine's own correction.",
-            );
-        });
-        ui.horizontal(|ui| {
             if ui
                 .button("⚙ Drills from KiCad")
                 .on_hover_text(
@@ -895,84 +902,88 @@ impl ConsoleApp {
             {
                 self.drills_from_kicad();
             }
-            // Disabled while a LightBurn run is in flight, like "Etch + run":
-            // the load-only run replaces `lightburn_run`, and stomping a live
-            // burn's progress reporting would be rude.
-            let lb_running = self
-                .runtime
-                .lightburn_run
-                .as_ref()
-                .is_some_and(|r| !r.finished());
-            if ui
-                .add_enabled(
-                    !lb_running,
-                    egui::Button::new("⤓ Emit drill holes → LightBurn (no burn)"),
-                )
-                .on_hover_text(
-                    "Writes ONLY the drill-hole geometry (round holes + slots) from \
-                     the drill .drl file(s) at this placement to the drill out \
-                     .lbrn2, then LOADS the file in LightBurn (FORCELOAD) without \
-                     pressing start — you burn it from LightBurn yourself.",
-                )
-                .clicked()
-            {
-                self.emit_drill_at_placement();
-            }
-            ui.weak("hole pattern at the placed pose — loads in LightBurn, never presses start");
         });
+        // Disabled while a LightBurn run is in flight, like "🔥 Etch + Run": the
+        // load-only run replaces `lightburn_run`, and stomping a live burn's
+        // progress reporting would be rude.
+        let lb_running = self
+            .runtime
+            .lightburn_run
+            .as_ref()
+            .is_some_and(|r| !r.finished());
+        if ui
+            .add_enabled(
+                !lb_running,
+                egui::Button::new("⤓ Emit drill holes → LightBurn (no burn)"),
+            )
+            .on_hover_text(
+                "Writes ONLY the drill-hole geometry (round holes + slots) from \
+                 the drill .drl file(s) at this placement to the drill out \
+                 .lbrn2, then LOADS the file in LightBurn (FORCELOAD) without \
+                 pressing start — you burn it from LightBurn yourself.",
+            )
+            .clicked()
+        {
+            self.emit_drill_at_placement();
+        }
+        let has_field = self.has_usable_field_cal();
+        self.placement.field_correct = has_field;
+        ui.colored_label(
+            status_color(has_field),
+            if has_field {
+                "● field-warped export active"
+            } else {
+                "⚠ UNWARPED export (no step 1 Camera lens + step 3 Laser field)"
+            },
+        )
+        .on_hover_text(
+            "With an accepted laser-field map, geometry is densified and pre-warped \
+             physical→commanded. Without one, \"Etch here\" exports the placement \
+             unwarped — field accuracy is then the machine's own correction.",
+        );
         if self.calibration.field.is_some() && !self.calibration.field_accepted {
             ui.colored_label(
                 status_color(false),
                 "⚠ latest step-3 field fit was rejected; nonlinear placement and correction are disabled",
             );
         }
-        ui.horizontal(|ui| {
+        ui.horizontal_wrapped(|ui| {
             ui.label("x mm");
-            changed |= ui
-                .add(egui::DragValue::new(&mut self.placement.tx_mm).speed(0.1))
-                .changed();
+            ui.add(egui::DragValue::new(&mut self.placement.tx_mm).speed(0.1));
             ui.label("y mm");
-            changed |= ui
-                .add(egui::DragValue::new(&mut self.placement.ty_mm).speed(0.1))
-                .changed();
+            ui.add(egui::DragValue::new(&mut self.placement.ty_mm).speed(0.1));
             ui.label("rot°");
-            changed |= ui
-                .add(
-                    egui::DragValue::new(&mut self.placement.rot_deg)
-                        .speed(0.5)
-                        .range(-180.0..=180.0),
-                )
-                .changed();
+            ui.add(
+                egui::DragValue::new(&mut self.placement.rot_deg)
+                    .speed(0.5)
+                    .range(-180.0..=180.0),
+            );
         });
-        ui.label(egui::RichText::new(&self.placement.note).weak());
-        ui.weak("Uses the Job-tab Gerbers. Drag to place; “Etch here” field-warps every edge when a field calibration is accepted, else exports unwarped.");
-        ui.weak(NAV_HINT);
-        ui.separator();
-
-        if let Some(tex) = self.placement.tex.clone() {
-            let (xf, resp) = self.show_image(ui, "place", &tex);
-            // Plain drag repositions the job; Ctrl+drag pans the view instead.
-            if !crate::imgview::is_navigating(ui) && resp.dragged() {
-                let d = resp.drag_delta();
-                // Convert the screen-space drag back to native frame pixels
-                // (divide by the display scale). The move is applied in pixel
-                // space (see drag_place_px) so the overlay tracks the cursor
-                // even when a perspective homography is active.
-                let s = xf.scale.max(1e-3) as f64;
-                match self.drag_place_px(d.x as f64 / s, d.y as f64 / s) {
-                    Ok(()) => changed = true,
-                    Err(e) => {
-                        self.placement.note = format!("placement projection unavailable: {e}")
-                    }
-                }
-            }
+        // The fiducial-fitted resize, read-only + a reset. It changes the
+        // burned dimensions, so it cannot sit only in the fiducial note on
+        // another tab — the operator must see it where they see x/y/rot.
+        let off = (self.placement.scale - 1.0).abs() > super::fiducial_ui::POSE_SCALE_QUIET;
+        let text = if off {
+            format!(
+                "scale {:.4} — job burns {:+.2}% (from fiducials)",
+                self.placement.scale,
+                (self.placement.scale - 1.0) * 100.0
+            )
         } else {
-            ui.weak("(load a frame + job to place)");
+            format!(
+                "scale {:.4} — job burns at design size",
+                self.placement.scale
+            )
+        };
+        ui.colored_label(status_color(!off), text);
+        if off && ui.button("reset scale to 1.000").clicked() {
+            self.placement.scale = 1.0;
         }
-
-        if changed {
-            let ctx = ui.ctx().clone();
-            self.recompose(&ctx);
-        }
+        ui.label(egui::RichText::new(&self.placement.note).weak());
+        ui.weak(
+            "Uses the Job-tab Gerbers; drag the design on the Fiducial-check tab. \
+             \u{201c}Etch here\u{201d} field-warps every edge when a field calibration is \
+             accepted, else exports unwarped.",
+        );
     }
 }

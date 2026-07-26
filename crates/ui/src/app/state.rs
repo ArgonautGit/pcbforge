@@ -7,7 +7,6 @@ pub(super) enum CentralTab {
     Camera,
     Calibrate,
     Fiducials,
-    Place,
 }
 
 /// Which face of a (possibly double-sided) board the operator is working.
@@ -81,20 +80,124 @@ impl Orientation {
     }
 }
 
+/// The ③ scale-handling choices, in the order they are offered. `calib` owns
+/// the enum (it is a fit parameter), so the label/token pattern the other
+/// persisted enums carry as inherent methods lives here as free functions.
+pub(super) const FIELD_SCALE_ALL: [calib::FieldScale; 3] = [
+    calib::FieldScale::Refuse,
+    calib::FieldScale::Compensate,
+    calib::FieldScale::DistortionOnly,
+];
+
+pub(super) fn field_scale_label(s: calib::FieldScale) -> &'static str {
+    match s {
+        calib::FieldScale::Refuse => "refuse a machine scale error",
+        calib::FieldScale::Compensate => "compensate machine scale",
+        calib::FieldScale::DistortionOnly => "correct distortion only (keep 1:1 work area)",
+    }
+}
+
+pub(super) fn field_scale_token(s: calib::FieldScale) -> &'static str {
+    match s {
+        calib::FieldScale::Refuse => "refuse",
+        calib::FieldScale::Compensate => "compensate",
+        calib::FieldScale::DistortionOnly => "distortion_only",
+    }
+}
+
+pub(super) fn field_scale_from_token(s: &str) -> Option<calib::FieldScale> {
+    FIELD_SCALE_ALL
+        .into_iter()
+        .find(|m| field_scale_token(*m) == s)
+}
+
 pub(super) struct RuntimeState {
     pub(super) settings_path: PathBuf,
+    /// The durable diagnostic log beside the settings blob (`<db>.console-log`).
+    /// Written on state changes and operator actions only — never per frame.
+    pub(super) diag: crate::diag::Diag,
+    /// Correlation id for one fiducial check and everything that follows from
+    /// it. The check record, the overlay bbox and both halves of an export all
+    /// carry `check=N`, because the records they need to be read against each
+    /// other are produced by different code paths, frames apart — the export
+    /// readback lands only when the CLI child exits. `grep check=7` is what
+    /// makes them adjacent.
+    pub(super) diag_check_seq: u64,
+    /// How many entries of `log` have been mirrored into the diagnostic file.
+    /// Kept in step with the 500-line trim in `pump_verb`.
+    pub(super) diag_mirrored: usize,
+    /// A diagnostic write failure has already been reported to the operator.
+    /// Latched, so a broken sink can't push an error line that fails to mirror
+    /// and pushes another.
+    pub(super) diag_failure_reported: bool,
+    /// A `.lbrn2` an in-flight export verb is writing, to be re-read and its
+    /// geometry bbox logged once the verb reports success (see `pump_verb`).
+    /// Armed only when the verb actually started, alongside `pending_lightburn`.
+    pub(super) diag_readback: Option<DiagReadback>,
+    /// The placement the overlay bbox was last computed for — `[tx, ty, rot,
+    /// scale, pivot_x, pivot_y, job_len]`. The overlay redraws every frame, so
+    /// this guards the recompute (a pass over every design vertex) as well as
+    /// the record.
+    pub(super) diag_overlay_key: Option<[f64; 7]>,
+    /// The last LOGGED overlay bbox in machine mm, `[x0, y0, x1, y1]`. A new one
+    /// is only recorded once it moves by more than `OVERLAY_EPS_MM`, so a drag
+    /// writes a handful of records instead of one per frame.
+    pub(super) diag_overlay_bbox: Option<[f64; 4]>,
     pub(super) last_settings: String,
     pub(super) settings_error: Option<String>,
     pub(super) status: StatusSnapshot,
     pub(super) log: Vec<LogLine>,
     pub(super) tab: CentralTab,
     pub(super) verb_job: Option<VerbJob>,
-    /// A "run in LightBurn" queued to fire when `verb_job` finishes (the
-    /// absolute .lbrn2 the export is writing). Cleared once consumed or skipped.
-    pub(super) pending_lightburn: Option<PathBuf>,
+    /// A LightBurn hand-off queued to fire when `verb_job` finishes. Cleared
+    /// once consumed or skipped.
+    pub(super) pending_lightburn: Option<PendingLightburn>,
     /// The active (or most recent) LightBurn run — kept after it finishes so the
     /// terminal state stays visible; a new run replaces it.
     pub(super) lightburn_run: Option<LightburnRun>,
+    /// The console's ONE capture thread, shared by every tab that wants frames.
+    ///
+    /// There is one camera, so there can only be one open device: the Camera,
+    /// Calibration and Fiducial tabs used to each own a `Capture`, and two Live
+    /// toggles at once fought over the device. Worse, every one-shot grab opened
+    /// and closed the device itself — ~2.1 s of pure init (open 280 ms,
+    /// first-frame warm-up ~1.2 s, close 630 ms) on the UI thread, every time.
+    /// Keeping the thread alive between grabs turns each later grab into a slot
+    /// read; [`should_release_capture`](super::camera_ui::should_release_capture)
+    /// hands the device back once no tab needs it (the CLI can't open a busy
+    /// camera).
+    pub(super) camera_capture: Option<crate::camera::Capture>,
+    /// The source `camera_capture` was started for, so a source change restarts
+    /// it instead of streaming the wrong camera.
+    pub(super) camera_capture_src: Option<crate::camera::Source>,
+    /// When the shared capture was last started or read, for the idle release.
+    pub(super) camera_last_used: Option<std::time::Instant>,
+}
+
+/// An export whose written file should be re-read and measured once the verb
+/// that writes it finishes — the "what the machine will actually do" half of an
+/// export record, which cannot be known at argv time.
+pub(super) struct DiagReadback {
+    pub(super) path: PathBuf,
+    /// Which export wrote it (`etch` / `fid-holes`), for the record's label.
+    pub(super) kind: &'static str,
+    /// The `check=N` the export was made under.
+    pub(super) check: u64,
+    /// The export applied a laser-field map, so the file's coordinates are
+    /// COMMANDED mm rather than physical mm.
+    pub(super) field_warped: bool,
+}
+
+/// A LightBurn hand-off waiting on the export verb that writes its file.
+pub(super) struct PendingLightburn {
+    /// The ABSOLUTE .lbrn2 the export is writing (not canonicalized — `\\?\`
+    /// prefixes upset LightBurn's FORCELOAD).
+    pub(super) path: PathBuf,
+    /// Send START once the file is loaded. `false` is a **load-only** hand-off:
+    /// the job opens in LightBurn and the operator presses play — the contract
+    /// the drill and fiducial-hole exports hold, since neither click may fire
+    /// the laser.
+    pub(super) start: bool,
 }
 
 pub(super) struct JobState {
@@ -143,8 +246,6 @@ pub(super) struct CameraState {
     pub(super) field_center_auto: bool,
     pub(super) field_cx_mm: f32,
     pub(super) field_cy_mm: f32,
-    pub(super) capture: Option<crate::camera::Capture>,
-    pub(super) capture_src: Option<crate::camera::Source>,
 }
 
 /// One grid-parameter set (dots per side, pitch, dot size, contrast). The ①
@@ -184,10 +285,15 @@ pub(super) struct CalibrationState {
     /// defaults accept the rig's demonstrated measurement floor.
     pub(super) accept_rms_um: f64,
     pub(super) accept_worst_um: f64,
-    /// Operator opt-in: absorb a large uniform burn-vs-paper scale (an oversized
-    /// machine field) into the ③ field correction instead of refusing the fit.
-    /// Off by default — fixing the field size in LightBurn is the cleaner fix.
-    pub(super) allow_machine_scale: bool,
+    /// What the ③ fit does about a large uniform burn-vs-paper scale. Defaults
+    /// to `Refuse` — a gross scale is usually a setup error, and fixing the
+    /// field size in LightBurn is the cleaner fix when it isn't.
+    pub(super) field_scale: calib::FieldScale,
+    /// The mode that produced the ACTIVE `field` — which is not `field_scale`
+    /// once the operator changes the control without re-fitting, nor after a
+    /// restore from disk. The ③ status line reads this, so it describes the
+    /// calibration in force rather than the pending choice.
+    pub(super) field_scale_used: calib::FieldScale,
     pub(super) lens_arrow_scale: f32,
     pub(super) anchor_resid_scale: f32,
     pub(super) edit_anchor_dots: bool,
@@ -197,8 +303,6 @@ pub(super) struct CalibrationState {
     /// Not persisted — like `corners`, it resets with each session/frame.
     pub(super) show_fit_feedback: bool,
     pub(super) live: bool,
-    pub(super) capture: Option<crate::camera::Capture>,
-    pub(super) capture_src: Option<crate::camera::Source>,
     pub(super) note: String,
 }
 
@@ -226,13 +330,23 @@ pub(super) struct FiducialState {
     pub(super) profile: crate::fiducial::ProfileKind,
     /// Output path for the generated fiducial-holes .lbrn2 (`fid-holes` verb).
     pub(super) out: String,
-    /// ④ board width for the auto fiducial-hole layout (mm).
-    pub(super) board_w_mm: f64,
-    /// ④ board height for the auto fiducial-hole layout (mm).
-    pub(super) board_h_mm: f64,
-    /// ④ margin from board edge to hole CENTRE for the auto layout (mm).
-    pub(super) margin_mm: f64,
+    /// Width of the fiducial rectangle — the x span between hole CENTRES. The
+    /// rectangle is centred in the work area, so this plus [`rect_h_mm`] fixes
+    /// all four positions without typing coordinates.
+    ///
+    /// [`rect_h_mm`]: Self::rect_h_mm
+    pub(super) rect_w_mm: f64,
+    /// Height of the fiducial rectangle — the y span between hole CENTRES,
+    /// centred in the work area (mm).
+    pub(super) rect_h_mm: f64,
     pub(super) click_place: bool,
+    /// Draw the placed job over the fiducial frame, so a lock can be judged
+    /// against the holes it was fitted to without leaving the tab.
+    pub(super) show_placement: bool,
+    /// The most recent detection in MACHINE mm (`place_projection`-mapped),
+    /// aligned with the layout. This is the frame `fit_board_pose` fits in, so
+    /// it is what "⌖ layout from detection" writes back as the new nominal.
+    pub(super) detected_mm: Vec<Option<(f64, f64)>>,
     pub(super) note: String,
     pub(super) rows: Vec<FidRow>,
     pub(super) measured_ppm: Option<f64>,
@@ -253,12 +367,31 @@ pub(super) struct FiducialState {
     pub(super) last_placed: bool,
     pub(super) homography: Option<vision::Homography>,
     /// The most recently APPLIED board pose (only cached on a successful,
-    /// side-matching, in-tolerance fit that wrote the Place tab); a rejected
+    /// side-matching, in-tolerance fit that wrote the placement); a rejected
     /// fit leaves this unchanged and the note carries the reason.
     pub(super) pose: Option<crate::fiducial::BoardPose>,
+    /// The nominal-layout → measured-bed fit of the most recent APPLIED Check.
+    /// It is the reference frame the operator's manual placement offset is
+    /// measured in: mapping the current placement back through it says where
+    /// the design sits RELATIVE TO THE BOARD, which the next Check re-applies
+    /// under its own fit so the adjustment travels with the board instead of
+    /// being overwritten. `None` (no applied Check yet, or the layout changed
+    /// under it) means there is no offset to carry and the design re-centres.
+    pub(super) last_fit: Option<calib::Similarity2>,
+    /// Latched on `drag_started` when the pointer went down INSIDE the drawn
+    /// design: for the rest of that drag the gesture moves/rotates the job and
+    /// must not also drop a ✛ or add a click-placed fiducial. A per-frame local
+    /// can't hold it — the overlay function re-runs every frame — and it is a
+    /// gesture, not a setting, so it is never persisted.
+    pub(super) design_drag: bool,
+    /// Latched on `drag_started` when the pointer went down on an existing ✛:
+    /// for the rest of that drag the gesture moves THAT marker (index into
+    /// `search`) and must not mark, add or remove one. Re-picking the nearest
+    /// marker every frame instead would let a fast drag hop between markers.
+    /// Beats `design_drag` — the design's hit test is a coarse bbox that
+    /// usually contains the markers. A gesture, not a setting: never persisted.
+    pub(super) marker_drag: Option<usize>,
     pub(super) live: bool,
-    pub(super) capture: Option<crate::camera::Capture>,
-    pub(super) capture_src: Option<crate::camera::Source>,
 }
 
 pub(super) struct PlacementState {
@@ -268,16 +401,17 @@ pub(super) struct PlacementState {
     pub(super) tx_mm: f64,
     pub(super) ty_mm: f64,
     pub(super) rot_deg: f64,
+    /// The fiducial-fitted uniform scale about the pivot (`fit_board_pose`).
+    /// This RESIZES THE EMITTED JOB — at 1.038 the burn comes out 3.8% larger
+    /// than the design — so it travels into the `.lbrn2` via the placement
+    /// affine, not just the on-screen overlay. Nominal is 1.0; there is no
+    /// manual control, only a reset.
+    pub(super) scale: f64,
     /// The placement was set from detected fiducials (see `fit_board_pose`).
     /// `load_place` must not recenter/zero over an auto-fitted pose.
     pub(super) auto_pose: bool,
     pub(super) job: Vec<pcb_core::Poly>,
-    pub(super) frame_img: Option<image::GrayImage>,
-    /// The frame pre-converted to RGBA, cached so each drag-step recompose
-    /// clones it instead of redoing the full-frame gray→color conversion.
-    pub(super) base_rgba: Option<ColorImage>,
     pub(super) pivot: (f64, f64),
-    pub(super) tex: Option<TextureHandle>,
     pub(super) note: String,
     pub(super) field_correct: bool,
     /// LightBurn device name for the one-click "Etch + run in LightBurn".

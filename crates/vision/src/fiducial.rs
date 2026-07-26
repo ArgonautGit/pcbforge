@@ -226,6 +226,227 @@ const MIN_CIRCULARITY: f64 = 0.25;
 const ASPECT_MIN: f64 = 0.3;
 const ASPECT_MAX: f64 = 3.3;
 
+/// Per-pixel mask threshold for the whole-frame scan, in local σ above the
+/// local background. Deliberately half [`MIN_SNR`]: that gate is on the
+/// matched-filter PEAK of a window, while this one has to keep the blob's
+/// anti-aliased skirt as well — thresholding a dot at its own peak level
+/// shaves it down to a few core pixels, which then fails the area gate.
+const SCAN_THR_SIGMA: f64 = MIN_SNR * 0.5;
+/// Tile edge for the whole-frame local statistics: a multiple of the nominal
+/// dot diameter, clamped to a sane pixel range. Large enough that a tile is
+/// overwhelmingly background (so its median IS the background even with a
+/// fiducial in it), small enough to track the bed glare gradient the module
+/// header warns about — a single global threshold drowns in that gradient.
+///
+/// The clamp BINDS at bench resolution: a 30 px dot in the 2592×1944 grab wants
+/// 240 px and gets 128, i.e. ~4.3 dot diameters, where a dot still covers only
+/// ~4% of the tile. The ceiling is what keeps the tile smaller than the glare
+/// gradient's own scale on a big sensor, so it is the intended behaviour rather
+/// than a limit being hit by accident.
+const SCAN_TILE_DOTS: f64 = 8.0;
+const SCAN_TILE_MIN: f64 = 32.0;
+const SCAN_TILE_MAX: f64 = 128.0;
+
+/// One fiducial-sized blob found anywhere in the frame.
+#[derive(Debug, Clone, Copy, PartialEq)]
+pub struct Candidate {
+    /// Intensity-weighted centre, frame pixels.
+    pub px: Point2<f64>,
+    /// Thresholded component area, px².
+    pub area_px: f64,
+    /// `[0, 1]` plausibility — SNR × shape fill × area agreement. Ranks the
+    /// list; it is NOT a decoy filter (see below).
+    pub score: f64,
+}
+
+/// Every blob in the WHOLE frame whose size and shape could be a fiducial,
+/// best-scoring first and truncated to `max_candidates`.
+///
+/// This is the recovery path for when the caller has no usable guess at where
+/// the fiducials image — bad calibration, board moved, no projection — so
+/// [`find_fiducials`]' local windows all miss. It cannot resolve the honeycomb
+/// decoy hazard on its own (the module header): with no expected position
+/// there is no distance tiebreaker, and the loose [`AREA_MAX_FRAC`] band that
+/// makes the local search forgiving admits bed holes here. That is by design —
+/// the caller rejects decoys by matching the fiducials' known ARRANGEMENT
+/// against this list, which is a far stronger discriminator than any per-blob
+/// gate. Hence `max_candidates` is an O(n²)-budget for that matcher, not a
+/// quality filter: it should be generous.
+///
+/// Returns empty (never panics) for a non-positive `px_per_mm`, a non-finite
+/// or sub-2-pixel dot, or a degenerate frame.
+pub fn find_fiducial_candidates(
+    frame: &GrayImage,
+    profile: &FiducialProfile,
+    px_per_mm: f64,
+    max_candidates: usize,
+) -> Vec<Candidate> {
+    let (w, h) = (frame.width() as usize, frame.height() as usize);
+    let shape = profile.shape();
+    let (w_mm, h_mm) = shape.dims_mm();
+    let (wx_px, wy_px) = (w_mm * px_per_mm, h_mm * px_per_mm);
+    let dot_px = wx_px.min(wy_px);
+    // Stated positively so the whole precondition reads at once. Sub-2-px dots
+    // are excluded for the same reason `find_one` reports `Miss::DotTooSmall`:
+    // no centroid over one or two pixels means anything.
+    let usable = px_per_mm.is_finite()
+        && px_per_mm > 0.0
+        && wx_px.is_finite()
+        && wy_px.is_finite()
+        && dot_px >= 2.0
+        && w >= 3
+        && h >= 3
+        && max_candidates > 0;
+    if !usable {
+        return Vec::new();
+    }
+
+    // Polarity-normalise the whole frame exactly as `find_one` does its
+    // window: the target ends up the bright class either way.
+    let dark = profile.is_dark();
+    let v: Vec<f64> = frame
+        .pixels()
+        .map(|p| {
+            let x = f64::from(p[0]);
+            if dark { 255.0 - x } else { x }
+        })
+        .collect();
+
+    // Tiled robust statistics — median + MAD per tile, the same estimator the
+    // local search uses, for the same reason (a mean/std would be dragged by
+    // the very blobs we are looking for, and by specular highlights).
+    let tile = (SCAN_TILE_DOTS * dot_px).clamp(SCAN_TILE_MIN, SCAN_TILE_MAX);
+    let nx = ((w as f64 / tile).ceil() as usize).max(1);
+    let ny = ((h as f64 / tile).ceil() as usize).max(1);
+    let (mut t_bg, mut t_sigma) = (vec![0.0; nx * ny], vec![0.0; nx * ny]);
+    let mut buf: Vec<f64> = Vec::new();
+    for ty in 0..ny {
+        let y0 = ((ty as f64 * tile) as usize).min(h - 1);
+        let y1 = (((ty + 1) as f64 * tile) as usize).min(h);
+        for tx in 0..nx {
+            let x0 = ((tx as f64 * tile) as usize).min(w - 1);
+            let x1 = (((tx + 1) as f64 * tile) as usize).min(w);
+            buf.clear();
+            for y in y0..y1 {
+                buf.extend_from_slice(&v[y * w + x0..y * w + x1]);
+            }
+            let m = median_mut(&mut buf);
+            for e in buf.iter_mut() {
+                *e = (*e - m).abs();
+            }
+            t_bg[ty * nx + tx] = m;
+            t_sigma[ty * nx + tx] = (1.4826 * median_mut(&mut buf)).max(1e-6);
+        }
+    }
+    // Bilinear from TILE CENTRES, not tile cells: sampling the cell value
+    // directly would step at every tile edge and stamp a grid of false
+    // components along the seams.
+    let interp = |arr: &[f64], x: f64, y: f64| -> f64 {
+        let fx = (x / tile - 0.5).clamp(0.0, (nx - 1) as f64);
+        let fy = (y / tile - 0.5).clamp(0.0, (ny - 1) as f64);
+        let (i0, j0) = (fx.floor() as usize, fy.floor() as usize);
+        let (i1, j1) = ((i0 + 1).min(nx - 1), (j0 + 1).min(ny - 1));
+        let (ax, ay) = (fx - i0 as f64, fy - j0 as f64);
+        let top = arr[j0 * nx + i0] * (1.0 - ax) + arr[j0 * nx + i1] * ax;
+        let bot = arr[j1 * nx + i0] * (1.0 - ax) + arr[j1 * nx + i1] * ax;
+        top * (1.0 - ay) + bot * ay
+    };
+
+    let mut mask = vec![false; w * h];
+    for y in 0..h {
+        for x in 0..w {
+            let (fx, fy) = (x as f64, y as f64);
+            let thr = interp(&t_bg, fx, fy) + SCAN_THR_SIGMA * interp(&t_sigma, fx, fy);
+            mask[y * w + x] = v[y * w + x] > thr;
+        }
+    }
+
+    // Same shape-aware nominal footprint and gates as `find_one`, minus its
+    // distance-to-expected test (there is no expected position here).
+    let nominal_area = match shape {
+        FidShape::Circle { .. } => std::f64::consts::FRAC_PI_4 * wx_px * wy_px,
+        FidShape::Rect { .. } => wx_px * wy_px,
+    };
+    let expected_aspect = wx_px / wy_px;
+    let mut out: Vec<Candidate> = Vec::new();
+    for c in components(&mask, w, h) {
+        let area = c.pixels.len() as f64;
+        if !(nominal_area * AREA_MIN_FRAC..=nominal_area * AREA_MAX_FRAC).contains(&area) {
+            continue;
+        }
+        // A blob touching the border is clipped, so its area/aspect/centroid
+        // are all measurements of the crop, not of the mark.
+        if c.min_x == 0 || c.min_y == 0 || c.max_x == w - 1 || c.max_y == h - 1 {
+            continue;
+        }
+        let bw = (c.max_x - c.min_x + 1) as f64;
+        let bh = (c.max_y - c.min_y + 1) as f64;
+        let maxdim = bw.max(bh);
+        let shape_fill = match shape {
+            FidShape::Circle { .. } => area / (std::f64::consts::FRAC_PI_4 * maxdim * maxdim),
+            FidShape::Rect { .. } => area / (bw * bh),
+        };
+        let rel_aspect = (bw / bh) / expected_aspect;
+        if shape_fill < MIN_CIRCULARITY || !(ASPECT_MIN..=ASPECT_MAX).contains(&rel_aspect) {
+            continue;
+        }
+
+        let (mx, my) = c.mean();
+        let bg = interp(&t_bg, mx, my);
+        let sigma = interp(&t_sigma, mx, my);
+        let peak = c
+            .pixels
+            .iter()
+            .map(|&(x, y)| v[y * w + x])
+            .fold(f64::MIN, f64::max);
+
+        // Intensity-weighted centroid over the component dilated one pixel, so
+        // anti-aliased edge pixels count fractionally — the same sub-pixel
+        // estimate `find_one` makes. The pedestal sits at half the mask
+        // threshold so those skirt pixels carry a small positive weight
+        // instead of being zeroed by the threshold that excluded them.
+        let pedestal = bg + 0.5 * SCAN_THR_SIGMA * sigma;
+        let (mut sw, mut swx, mut swy) = (0.0, 0.0, 0.0);
+        let mut seen = std::collections::HashSet::with_capacity(c.pixels.len() * 9);
+        for &(x, y) in &c.pixels {
+            for dy in -1i64..=1 {
+                for dx in -1i64..=1 {
+                    let (px, py) = (x as i64 + dx, y as i64 + dy);
+                    if px < 0 || py < 0 || px >= w as i64 || py >= h as i64 {
+                        continue;
+                    }
+                    let (px, py) = (px as usize, py as usize);
+                    if !seen.insert(py * w + px) {
+                        continue;
+                    }
+                    let wgt = (v[py * w + px] - pedestal).max(0.0);
+                    sw += wgt;
+                    swx += wgt * px as f64;
+                    swy += wgt * py as f64;
+                }
+            }
+        }
+        if sw <= 0.0 {
+            continue;
+        }
+
+        // Area agreement is symmetric in the ratio: 1.0 at nominal, decaying
+        // either way. It is what keeps an oversize honeycomb hole (admitted by
+        // the loose AREA_MAX_FRAC) below a true dot in the ranking.
+        let area_agree = (area / nominal_area).min(nominal_area / area);
+        let snr = (peak - bg) / sigma;
+        let score = (snr / 10.0).min(1.0) * shape_fill.min(1.0) * area_agree;
+        out.push(Candidate {
+            px: Point2::new(swx / sw, swy / sw),
+            area_px: area,
+            score,
+        });
+    }
+    out.sort_by(|a, b| b.score.total_cmp(&a.score));
+    out.truncate(max_candidates);
+    out
+}
+
 /// Find each of `expected_mm` in `frame`, searching `search_mm` around the
 /// expected spot. The result is aligned with `expected_mm`: index `i`
 /// answers `expected_mm[i]`.
@@ -889,6 +1110,36 @@ mod tests {
             "expected DotTooSmall, got {:?}",
             r[0]
         );
+    }
+
+    /// Whole-frame recovery: every drilled hole is a candidate no matter where
+    /// it sits, and the sub-pixel centres survive the tiled thresholding.
+    #[test]
+    fn whole_frame_candidates_include_every_hole() {
+        let truth = [(60.4, 55.2), (540.7, 58.9), (63.1, 430.6), (538.2, 433.3)];
+        let dots: Vec<_> = truth.iter().map(|&(x, y)| (x, y, 10.0)).collect();
+        let frame = render(600, 500, &dots, 85.0, 5.0, 31);
+
+        let cands = find_fiducial_candidates(&frame, &dark_1mm(), PX_PER_MM, 64);
+        for &(tx, ty) in &truth {
+            let hit = cands
+                .iter()
+                .any(|c| ((c.px.x - tx).powi(2) + (c.px.y - ty).powi(2)).sqrt() < 0.5);
+            assert!(hit, "no candidate at ({tx}, {ty}); got {cands:?}");
+        }
+        // Sorted best-first.
+        assert!(cands.windows(2).all(|p| p[0].score >= p[1].score));
+    }
+
+    /// The guards return an empty list rather than panicking.
+    #[test]
+    fn whole_frame_candidates_guard_bad_scale() {
+        let frame = render(100, 100, &[(50.0, 50.0, 10.0)], 85.0, 4.0, 5);
+        assert!(find_fiducial_candidates(&frame, &dark_1mm(), 0.0, 32).is_empty());
+        assert!(find_fiducial_candidates(&frame, &dark_1mm(), f64::NAN, 32).is_empty());
+        // 1 px/mm → a 1 mm dot images sub-2-px: nothing meaningful to centre.
+        assert!(find_fiducial_candidates(&frame, &dark_1mm(), 1.0, 32).is_empty());
+        assert!(find_fiducial_candidates(&frame, &dark_1mm(), PX_PER_MM, 0).is_empty());
     }
 
     /// Render a frame with anti-aliased **axis-aligned rectangles** on the

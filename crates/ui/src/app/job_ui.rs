@@ -97,7 +97,17 @@ impl ConsoleApp {
         ui.heading("Actions");
         ui.label(egui::RichText::new("These shell the `pcbforge` CLI.").weak());
         ui.separator();
+        // Scrollable: the emit recipe, the back-side block and the placement
+        // controls together are taller than the panel on a normal window, and
+        // an unreachable “🔥 Etch + Run” is worse than a scrollbar (the same fix
+        // the Calibrate and Fiducial tabs already carry).
+        egui::ScrollArea::vertical()
+            .id_salt("actions-scroll")
+            .auto_shrink([false, false])
+            .show(ui, |ui| self.actions_body(ui));
+    }
 
+    fn actions_body(&mut self, ui: &mut egui::Ui) {
         egui::Grid::new("kicad-form")
             .num_columns(2)
             .spacing([8.0, 6.0])
@@ -215,7 +225,7 @@ impl ConsoleApp {
                 });
                 ui.end_row();
             });
-        ui.weak("Recipe (speed / Q-pulse / interval / passes / wobble) applies to both this Emit and Place's “Etch here”.");
+        ui.weak("Recipe (speed / Q-pulse / interval / passes / wobble) applies to both this Emit and “Etch here”.");
 
         // Double-sided (ORC-6): side selector + back-side inputs.
         ui.separator();
@@ -299,6 +309,11 @@ impl ConsoleApp {
         ui.weak(
             "With an accepted step 1 (Camera lens) + step 3 (Laser field) map the export field-warps every edge; without one it emits unwarped (warned in the log).",
         );
+
+        ui.separator();
+        self.placement_actions(ui);
+
+        ui.separator();
         if ui.button("⏭ Next stage (bring-up)").clicked() {
             self.run_verb(&["next".into(), "--bringup-stubs".into()]);
         }
@@ -306,7 +321,7 @@ impl ConsoleApp {
         ui.weak("Live camera → the “📷 Camera” tab.");
     }
 
-    /// The wobble recipe args shared by Emit and Place's "Etch here" (empty
+    /// The wobble recipe args shared by Emit and "Etch here" (empty
     /// when wobble is off — the CLI default already writes wobbleEnable=0).
     pub(super) fn wobble_args(&self) -> Vec<String> {
         if !self.job.wobble {
@@ -392,11 +407,6 @@ impl ConsoleApp {
                 CentralTab::Fiducials,
                 "◎ Fiducial check",
             );
-            ui.selectable_value(
-                &mut self.runtime.tab,
-                CentralTab::Place,
-                "✋ Place on board",
-            );
         });
         ui.separator();
         match self.runtime.tab {
@@ -404,11 +414,14 @@ impl ConsoleApp {
             CentralTab::Camera => self.camera_view(ui),
             CentralTab::Calibrate => self.calibrate_view(ui),
             CentralTab::Fiducials => self.fiducial_view(ui),
-            CentralTab::Place => self.place_view(ui),
         }
     }
 
     pub(super) fn job_view(&mut self, ui: &mut egui::Ui) {
+        // The job's output destinations live here, beside the Gerbers that feed
+        // them, now that the Place tab that used to hold them is gone.
+        self.placement_paths_form(ui);
+        ui.separator();
         ui.label(egui::RichText::new(&self.job.preview_note).weak());
         if let Some(tex) = self.job.preview_tex.clone() {
             self.show_image(ui, "preview", &tex);

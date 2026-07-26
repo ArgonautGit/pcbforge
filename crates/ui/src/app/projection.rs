@@ -59,14 +59,6 @@ impl CameraProjection {
         };
         finite_pair(p)
     }
-
-    pub(super) fn label(&self) -> &'static str {
-        match self {
-            Self::CommandedField { .. } => "commanded mm (lens + laser-field warp)",
-            Self::PhysicalLens { .. } => "physical mm (burned-grid frame, field-warped export)",
-            Self::Homography { .. } => "machine mm (approximate homography)",
-        }
-    }
 }
 
 pub(super) fn finite_pair(p: (f64, f64)) -> Option<(f64, f64)> {

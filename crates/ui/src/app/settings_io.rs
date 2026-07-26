@@ -64,9 +64,8 @@ impl ConsoleApp {
             ("fid_search_mm", self.fiducials.search_mm.to_string()),
             ("fid_profile", self.fiducials.profile.token().to_string()),
             ("fid_out", self.fiducials.out.clone()),
-            ("fid_board_w_mm", self.fiducials.board_w_mm.to_string()),
-            ("fid_board_h_mm", self.fiducials.board_h_mm.to_string()),
-            ("fid_margin_mm", self.fiducials.margin_mm.to_string()),
+            ("fid_rect_w_mm", self.fiducials.rect_w_mm.to_string()),
+            ("fid_rect_h_mm", self.fiducials.rect_h_mm.to_string()),
             ("cam_file", self.camera.file.clone()),
             (
                 "cam_orientation",
@@ -108,8 +107,8 @@ impl ConsoleApp {
             ),
             ("calib_grid_out", self.calibration.grid_out.clone()),
             (
-                "calib_allow_machine_scale",
-                self.calibration.allow_machine_scale.to_string(),
+                "calib_field_scale",
+                field_scale_token(self.calibration.field_scale).to_string(),
             ),
             (
                 "calib_accept_rms_um",
@@ -233,7 +232,21 @@ impl ConsoleApp {
                     .field
                     .as_ref()
                     .filter(|_| self.calibration.field_accepted)
-                    .map(|f| format!("{} {} {}", f.found, f.total, f.scale))
+                    .map(|f| {
+                        // Fifth token: how many dots the fit EXCLUDED as
+                        // outliers. Persisted for the same reason the fit mode
+                        // is — a restored calibration has to describe itself
+                        // honestly, and "passed once a dot was thrown away"
+                        // must not come back looking like a clean pass.
+                        format!(
+                            "{} {} {} {} {}",
+                            f.found,
+                            f.total,
+                            f.scale,
+                            field_scale_token(self.calibration.field_scale_used),
+                            f.rejected
+                        )
+                    })
                     .unwrap_or_default(),
             ),
             // The burned-grid frame anchor (paper mm → machine mm rigid). Five
@@ -378,28 +391,24 @@ impl ConsoleApp {
         {
             self.fiducials.search_mm = v.clamp(0.1, 20.0);
         }
-        // ④ auto fiducial-layout board size + margin, clamped to the DragValue
-        // ranges (a hand-edited or corrupt blob can't push them out of bounds).
+        // Fiducial-rectangle spans, clamped to the DragValue ranges (a
+        // hand-edited or corrupt blob can't push them out of bounds). The
+        // superseded `fid_board_*` / `fid_margin_mm` keys are deliberately NOT
+        // read: a stored board size is an OUTLINE, and reading it as a
+        // centre-to-centre span would silently widen the layout by 2×margin.
         if let Some(v) = m
-            .get("fid_board_w_mm")
+            .get("fid_rect_w_mm")
             .and_then(|s| s.trim().parse().ok())
             .filter(|v: &f64| v.is_finite())
         {
-            self.fiducials.board_w_mm = v.clamp(5.0, 500.0);
+            self.fiducials.rect_w_mm = v.clamp(5.0, 500.0);
         }
         if let Some(v) = m
-            .get("fid_board_h_mm")
+            .get("fid_rect_h_mm")
             .and_then(|s| s.trim().parse().ok())
             .filter(|v: &f64| v.is_finite())
         {
-            self.fiducials.board_h_mm = v.clamp(5.0, 500.0);
-        }
-        if let Some(v) = m
-            .get("fid_margin_mm")
-            .and_then(|s| s.trim().parse().ok())
-            .filter(|v: &f64| v.is_finite())
-        {
-            self.fiducials.margin_mm = v.clamp(0.5, 50.0);
+            self.fiducials.rect_h_mm = v.clamp(5.0, 500.0);
         }
         if let Some(k) = m
             .get("fid_shape")
@@ -470,11 +479,20 @@ impl ConsoleApp {
         if let Some(v) = m.get("cam_show_bed").and_then(|s| s.trim().parse().ok()) {
             self.camera.show_bed = v;
         }
-        if let Some(v) = m
+        // The three-way choice replaced a bool. Read the retired key first so an
+        // operator who had opted into compensation keeps it, then let the new key
+        // win where both are present (a settings blob written since the change).
+        if let Some(true) = m
             .get("calib_allow_machine_scale")
-            .and_then(|s| s.trim().parse().ok())
+            .and_then(|s| s.trim().parse::<bool>().ok())
         {
-            self.calibration.allow_machine_scale = v;
+            self.calibration.field_scale = calib::FieldScale::Compensate;
+        }
+        if let Some(v) = m
+            .get("calib_field_scale")
+            .and_then(|s| field_scale_from_token(s.trim()))
+        {
+            self.calibration.field_scale = v;
         }
         if let Some(v) = m
             .get("calib_accept_rms_um")
@@ -668,7 +686,31 @@ impl ConsoleApp {
                     // Per-fit feedback like `dots` — not persisted; a restored
                     // field has no fresh detection to count against.
                     extrapolated: 0,
+                    // Filled from the fifth token below, once the fourth has
+                    // been consumed. The COUNT restores the distinction the
+                    // standing status keys off; the prose does not, so a
+                    // restored fit says how many were excluded, not which.
+                    rejected: 0,
+                    rejection_note: String::new(),
                 });
+                // Fourth token is new; older saves predate the choice and were
+                // necessarily fit in a scale-corrected mode, so `Refuse` (the
+                // default) describes them.
+                self.calibration.field_scale_used = stats
+                    .next()
+                    .and_then(field_scale_from_token)
+                    .unwrap_or(calib::FieldScale::Refuse);
+                // Fifth token is newer still; older saves predate outlier
+                // rejection and were necessarily fit over every detected dot.
+                if let Some(field) = self.calibration.field.as_mut() {
+                    let rejected: usize = stats.next().and_then(|s| s.parse().ok()).unwrap_or(0);
+                    field.rejected = rejected;
+                    if rejected > 0 {
+                        field.rejection_note = format!(
+                            "{rejected} dot(s) were EXCLUDED from this fit as outliers; its                              RMS/worst are over the dots that remained. Re-run step 3 to see                              which, and by how much."
+                        );
+                    }
+                }
                 self.calibration.field_accepted = true;
             }
         }

@@ -28,6 +28,7 @@ fn main() {
         tx_mm: 40.0,
         ty_mm: 30.0,
         rot_deg: 15.0,
+        scale: 1.0,
         pivot_mm: pivot,
     };
     println!("register correspondences: {}", placement.correspondences());

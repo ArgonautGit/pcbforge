@@ -1,9 +1,42 @@
+use std::time::{Duration, Instant};
+
 use super::*;
 
 /// Longest-side cap for the live camera *view* texture. The full-resolution
 /// frame is always kept for calibration/detection; only the on-screen preview
 /// is downscaled to this, so streaming a 2K/4K sensor stays cheap.
 pub(super) const CAM_VIEW_MAX: usize = 1280;
+
+/// How long the shared capture may sit unused before the console hands the
+/// device back. Opening device N keeps every other program off it — a live
+/// `pcbforge cam --grab --device 1` fails device-busy — so the fast path is
+/// only worth holding while the operator is plausibly still using it. Ten
+/// seconds outlasts the pause between two clicks of “grab once” (which is what
+/// makes the second one cheap) without locking the CLI out for a shift.
+pub(super) const CAMERA_IDLE_RELEASE: Duration = Duration::from_secs(10);
+
+/// How long a one-shot grab waits for the first frame off a freshly opened
+/// device. The measured warm-up is ~1.2–1.5 s (device init, not bandwidth —
+/// it is ~1.04 s even at 1280×720), so 4 s leaves headroom for a slow device
+/// while still failing with a message rather than hanging the console.
+const FIRST_FRAME_TIMEOUT: Duration = Duration::from_secs(4);
+
+/// Poll interval while waiting for that first frame.
+const FIRST_FRAME_POLL: Duration = Duration::from_millis(20);
+
+/// Whether the shared capture should be dropped: nothing is streaming from it
+/// and it has gone idle. Free-standing so the release rule is testable without
+/// a camera or a running app.
+pub(super) fn should_release_capture(
+    any_live: bool,
+    last_used: Option<Instant>,
+    now: Instant,
+    idle: Duration,
+) -> bool {
+    // No timestamp means nobody ever read it — release rather than hold the
+    // device on a capture whose owner vanished.
+    !any_live && last_used.is_none_or(|t| now.duration_since(t) >= idle)
+}
 
 /// Nearest-neighbour downscale of a display image so its longest side is
 /// ≤ `max_dim`. Returns the (possibly unchanged) image and the applied ratio
@@ -41,6 +74,107 @@ impl ConsoleApp {
             crate::camera::Source::Device(self.camera.device)
         } else {
             crate::camera::Source::File(self.camera.file.clone())
+        }
+    }
+
+    /// Start the shared capture for the current source, or restart it if the
+    /// operator switched source, and mark it as wanted right now.
+    pub(super) fn ensure_capture(&mut self) {
+        let src = self.cam_source();
+        if self.runtime.camera_capture.is_none()
+            || self.runtime.camera_capture_src.as_ref() != Some(&src)
+        {
+            // Drop the old one first: its thread must release the device before
+            // the new thread tries to open it.
+            self.runtime.camera_capture = None;
+            self.runtime.camera_capture = Some(crate::camera::Capture::start(src.clone()));
+            self.runtime.camera_capture_src = Some(src);
+        }
+        // Stamp on creation too, not only on a successful read — a capture whose
+        // first frame never arrives must still age out rather than linger.
+        self.runtime.camera_last_used = Some(Instant::now());
+    }
+
+    /// The newest frame from the shared capture, non-blocking. This is what the
+    /// tabs' ● Live pumps poll; none of them owns a `Capture` of its own.
+    pub(super) fn capture_latest(&mut self) -> Option<Result<image::GrayImage, String>> {
+        self.ensure_capture();
+        self.runtime
+            .camera_capture
+            .as_ref()
+            .and_then(|c| c.latest())
+    }
+
+    /// Grab one frame for the synchronous "grab once" paths, reusing the shared
+    /// capture so the device is opened at most once instead of per grab.
+    pub(super) fn grab_shared(&mut self) -> Result<image::GrayImage, String> {
+        let src = self.cam_source();
+        // A file grab is cheap and needs no device; routing it through a capture
+        // thread would buy nothing and would swap a guaranteed-current read for
+        // whatever frame the thread happened to have on hand.
+        if matches!(src, crate::camera::Source::File(_)) {
+            return crate::camera::grab(&src);
+        }
+        self.ensure_capture();
+        // Fast path: the thread is already streaming, so the frame is waiting.
+        // Slow path — only the FIRST grab after the device opens. That is the
+        // ~1.2–1.5 s warm-up the device charges no matter who pays it; every
+        // later grab takes the fast path and costs a slot read.
+        let deadline = Instant::now() + FIRST_FRAME_TIMEOUT;
+        let mut result = self
+            .runtime
+            .camera_capture
+            .as_ref()
+            .and_then(|c| c.latest());
+        while result.is_none() && Instant::now() < deadline {
+            std::thread::sleep(FIRST_FRAME_POLL);
+            result = self
+                .runtime
+                .camera_capture
+                .as_ref()
+                .and_then(|c| c.latest());
+        }
+        match result {
+            Some(Ok(frame)) => {
+                self.runtime.camera_last_used = Some(Instant::now());
+                Ok(frame)
+            }
+            other => {
+                // Don't cache a failure for the whole idle window. A capture
+                // whose device failed to open has already exited its thread, so
+                // reusing it would starve every later grab into the timeout
+                // below and bury the real error. Drop it and let the next grab
+                // reopen and report what actually went wrong.
+                self.runtime.camera_capture = None;
+                self.runtime.camera_capture_src = None;
+                self.runtime.camera_last_used = None;
+                other.unwrap_or_else(|| {
+                    Err(format!(
+                        "no frame from the camera within {}s — check the device is \
+                         connected and not in use by another program",
+                        FIRST_FRAME_TIMEOUT.as_secs()
+                    ))
+                })
+            }
+        }
+    }
+
+    /// Hand the camera back when no tab is streaming and the shared capture has
+    /// gone idle. Called every frame from [`ConsoleApp::ui`].
+    pub(super) fn release_idle_capture(&mut self) {
+        if self.runtime.camera_capture.is_none() {
+            return;
+        }
+        let any_live = self.camera.live || self.calibration.live || self.fiducials.live;
+        if should_release_capture(
+            any_live,
+            self.runtime.camera_last_used,
+            Instant::now(),
+            CAMERA_IDLE_RELEASE,
+        ) {
+            self.runtime.camera_capture = None; // stops + joins the thread
+            self.runtime.camera_capture_src = None;
+            self.runtime.camera_last_used = None;
         }
     }
 
@@ -114,6 +248,7 @@ impl ConsoleApp {
             tx_mm: 0.0,
             ty_mm: 0.0,
             rot_deg: 0.0,
+            scale: 1.0,
             pivot_mm: (0.0, 0.0),
         };
         let hgt = self.fiducials.homography.as_ref();
@@ -146,11 +281,10 @@ impl ConsoleApp {
         img
     }
 
-    /// Grab one frame synchronously (the "grab once" button). For Live, the
-    /// background [`Capture`](crate::camera::Capture) thread is used instead so
-    /// I/O never blocks the GUI.
+    /// Grab one frame synchronously (the "grab once" button), off the shared
+    /// capture. For Live, the same thread is polled non-blocking instead.
     pub fn grab_camera(&mut self, ctx: &Context) {
-        match crate::camera::grab(&self.cam_source()) {
+        match self.grab_shared() {
             Ok(gray) => {
                 let gray = self.camera.orientation.apply(gray);
                 self.set_camera_frame(ctx, gray);
@@ -159,37 +293,33 @@ impl ConsoleApp {
         }
     }
 
-    /// Ensure the background capture matches Live state + the current source,
-    /// and pull the newest frame from it (non-blocking).
+    /// Pull the newest frame from the shared capture into the camera view
+    /// (non-blocking). Live-off just stops asking: the capture belongs to the
+    /// console, not this tab, and only the idle rule in [`ConsoleApp::ui`] may
+    /// drop it — otherwise turning this tab's Live off would kill a Calibrate
+    /// or Fiducial feed running at the same time.
+    ///
+    /// Unlike the other two pumps this one runs from `camera_view`, i.e. only
+    /// while the Camera tab is visible. With a shared capture that is now
+    /// harmless: another tab's Live keeps the device open, and the idle rule
+    /// releases it if none does.
     pub(super) fn pump_camera(&mut self, ctx: &Context) {
-        if self.camera.live {
-            let src = self.cam_source();
-            let restart =
-                self.camera.capture.is_none() || self.camera.capture_src.as_ref() != Some(&src);
-            if restart {
-                // Dropping the old Capture stops its thread before the new one.
-                self.camera.capture = None;
-                self.camera.capture = Some(crate::camera::Capture::start(src.clone()));
-                self.camera.capture_src = Some(src);
-            }
-            let latest = self.camera.capture.as_ref().and_then(|c| c.latest());
-            if let Some(res) = latest {
-                match res {
-                    Ok(gray) => {
-                        let gray = self.camera.orientation.apply(gray);
-                        self.set_camera_frame(ctx, gray);
-                    }
-                    Err(e) => self.camera.note = e,
-                }
-            }
-            ctx.request_repaint(); // keep the loop alive
-        } else if self.camera.capture.is_some() {
-            self.camera.capture = None; // stop the thread
-            self.camera.capture_src = None;
+        if !self.camera.live {
+            return;
         }
+        if let Some(res) = self.capture_latest() {
+            match res {
+                Ok(gray) => {
+                    let gray = self.camera.orientation.apply(gray);
+                    self.set_camera_frame(ctx, gray);
+                }
+                Err(e) => self.camera.note = e,
+            }
+        }
+        ctx.request_repaint(); // keep the loop alive
     }
 
-    /// Save the last grabbed frame to a PNG and point the Fiducial + Place tabs
+    /// Save the last grabbed frame to a PNG and point the Fiducial-check tab
     /// at it — the bridge from live view into detection / placement.
     pub(super) fn snapshot_to_tabs(&mut self) {
         let Some(frame) = &self.camera.last else {
@@ -202,7 +332,7 @@ impl ConsoleApp {
                 let p = path.to_string_lossy().into_owned();
                 self.fiducials.frame = p.clone();
                 self.placement.frame = p;
-                self.camera.note = format!("snapshot → Fiducial + Place tabs ({})", path.display());
+                self.camera.note = format!("snapshot → Fiducial-check tab ({})", path.display());
             }
             Err(e) => self.camera.note = format!("save: {e}"),
         }
@@ -285,7 +415,7 @@ impl ConsoleApp {
 
         // AR overlay (UI-2): the registered design projected over the feed.
         let mut ar_changed = false;
-        ui.horizontal(|ui| {
+        ui.horizontal_wrapped(|ui| {
             ar_changed |= ui
                 .checkbox(&mut self.ar.overlay, "🔲 AR overlay")
                 .on_hover_text(

@@ -20,8 +20,12 @@ fn tmp_db() -> PathBuf {
 }
 
 fn nonlinear_app() -> ConsoleApp {
+    nonlinear_app_with_db(&tmp_db())
+}
+
+fn nonlinear_app_with_db(db: &std::path::Path) -> ConsoleApp {
     use nalgebra::{Matrix3, Point2, Vector2};
-    let mut app = ConsoleApp::new(tmp_db(), vec!["true".into()]);
+    let mut app = ConsoleApp::new(db.to_path_buf(), vec!["true".into()]);
     let coords = [0.0, 20.0, 40.0, 60.0];
     let lens_pairs: Vec<_> = coords
         .iter()
@@ -60,6 +64,7 @@ fn nonlinear_app() -> ConsoleApp {
                     .sqrt()
                     * 1000.0,
                 resid_um: 0.0,
+                rejected: false,
             }
         })
         .collect();
@@ -88,6 +93,8 @@ fn nonlinear_app() -> ConsoleApp {
         ),
         scale: 1.0,
         extrapolated: 0,
+        rejected: 0,
+        rejection_note: String::new(),
     });
     app.calibration.field_accepted = true;
     app.calibration.lens_frame_signature = Some(((800, 800), Orientation::Normal));
@@ -112,6 +119,72 @@ fn accepted_field_composes_machine_overlay_and_uses_physical_place_projection() 
     ));
 }
 
+/// The exclusion count survives a restart. A restored field map that only
+/// passed because a dot was thrown away must not come back indistinguishable
+/// from a clean pass — the same argument that persists the fit mode.
+#[test]
+fn the_excluded_dot_count_survives_a_restart() {
+    let db = tmp_db();
+    let blob = {
+        let mut a = nonlinear_app_with_db(&db);
+        let cal = a.calibration.field.as_mut().unwrap();
+        cal.rejected = 2;
+        a.calibration.field_accepted = true;
+        std::fs::write(
+            a.field_map_path(),
+            a.calibration.field.as_ref().unwrap().field.serialize(),
+        )
+        .unwrap();
+        a.save_settings_if_changed();
+        a.settings_blob()
+    };
+    assert!(
+        blob.lines()
+            .any(|l| l.starts_with("field_stats=") && l.trim_end().ends_with(" 2")),
+        "the count serializes as the 5th field_stats token:
+{blob}"
+    );
+
+    let b = ConsoleApp::new(db, vec!["true".into()]);
+    let restored = b.calibration.field.as_ref().expect("field restored");
+    assert_eq!(restored.rejected, 2);
+    assert!(
+        restored.rejection_note.contains("EXCLUDED"),
+        "note: {}",
+        restored.rejection_note
+    );
+    assert!(b.debug_summary().contains("rejected=2"));
+}
+
+/// A field fit that only passed because a dot was excluded must not read the
+/// same as one that passed outright: the count reaches `debug_summary`, and the
+/// calib crate's sentence reaches the ③ block through the standing status.
+#[test]
+fn excluded_field_dots_are_reported_to_the_operator() {
+    let mut app = nonlinear_app();
+    assert!(app.debug_summary().contains("rejected=0"));
+
+    {
+        let cal = app.calibration.field.as_mut().unwrap();
+        cal.rejected = 1;
+        cal.dots[0].rejected = true;
+        cal.rejection_note =
+            "1 of 16 dots EXCLUDED from the fit as outliers (residual 2075 µm)".into();
+    }
+    app.calibration.field_accepted = true;
+    app.calibration.mode = CalibMode::LaserField;
+    app.runtime.tab = CentralTab::Calibrate;
+
+    // Renders without panicking on a fit carrying excluded dots: the overlay's
+    // strike-out path and the standing exclusion line. The strings themselves
+    // are not asserted here — the ③ block lives inside a fixed-height
+    // ScrollArea, so its text is clipped out of the shape list.
+    let ctx = egui::Context::default();
+    let out = ctx.run(egui::RawInput::default(), |ctx| app.ui(ctx));
+    assert!(!out.shapes.is_empty());
+    assert!(app.debug_summary().contains("rejected=1"));
+}
+
 #[test]
 fn place_with_no_calibration_at_all_has_no_projection() {
     let app = ConsoleApp::new(tmp_db(), vec!["true".into()]);
@@ -119,81 +192,57 @@ fn place_with_no_calibration_at_all_has_no_projection() {
     assert!(error.contains("needs a projection"), "got: {error}");
 }
 
-/// With no projection at all, "Load frame + job" still displays the bare
-/// frame (so the operator sees what loaded) and says what calibration is
-/// missing, instead of showing nothing.
+/// With no projection at all, "⤵ Load design" still loads the geometry and
+/// parks it in the middle of the WORK AREA — a position the operator can drag
+/// from — instead of refusing because nothing can be mapped yet.
 #[test]
-fn load_place_without_any_calibration_still_shows_the_frame() {
+fn load_design_without_any_calibration_centers_on_the_work_area() {
     let mut app = ConsoleApp::new(tmp_db(), vec!["true".into()]);
-    let dir = std::env::temp_dir().join(format!("pcbforge-place-test-{}", std::process::id()));
-    std::fs::create_dir_all(&dir).unwrap();
-    let frame = dir.join("frame.png");
-    image::GrayImage::from_pixel(64, 48, image::Luma([90]))
-        .save(&frame)
-        .unwrap();
-    // A dead camera source (File("")) so the grab-first path falls back to
-    // the bed-frame file without touching real hardware in tests.
-    app.camera.use_device = false;
-    app.camera.file = String::new();
-    app.placement.frame = frame.to_string_lossy().into_owned();
+    app.camera.field_center_auto = false;
+    app.camera.field_cx_mm = 42.0;
+    app.camera.field_cy_mm = 17.0;
     let fixtures = concat!(env!("CARGO_MANIFEST_DIR"), "/../cli/tests/fixtures");
     app.job.emit_copper = format!("{fixtures}/uv_test-F_Cu.gbr");
     app.job.emit_outline = format!("{fixtures}/uv_test-Edge_Cuts.gbr");
-    let ctx = Context::default();
-    let _ = ctx.run(egui::RawInput::default(), |ctx| app.load_place(ctx));
-    assert!(app.placement.frame_img.is_some(), "frame image cached");
-    assert!(app.placement.tex.is_some(), "bare frame texture shown");
+    app.load_place();
+    assert!(!app.placement.job.is_empty(), "the design geometry loaded");
     assert!(
-        app.placement.note.contains("needs calibration"),
-        "note explains the gap: {}",
+        (app.placement.tx_mm - 42.0).abs() < 1e-9 && (app.placement.ty_mm - 17.0).abs() < 1e-9,
+        "parked on the work-area centre: ({}, {})",
+        app.placement.tx_mm,
+        app.placement.ty_mm
+    );
+    assert!(
+        app.placement.note.contains("work area"),
+        "note says where it went: {}",
         app.placement.note
     );
-    std::fs::remove_dir_all(dir).unwrap();
 }
 
-/// "Load frame + job" ALWAYS grabs a fresh frame from the camera source (a
-/// File source here) — even when a bed-frame path is set. The persisted path
-/// must not silently win over the camera, or Place keeps showing a stale
-/// image of the bed (the file is only the fallback when the grab fails).
+/// With a fiducial frame loaded, "⤵ Load design" starts the design in the
+/// middle of THAT frame, mapped through the same projection the outline is
+/// drawn with — so it appears where the operator is looking.
 #[test]
-fn load_place_prefers_a_fresh_camera_grab_over_the_saved_frame_path() {
-    let mut app = ConsoleApp::new(tmp_db(), vec!["true".into()]);
-    let dir = std::env::temp_dir().join(format!("pcbforge-place-cam-{}", std::process::id()));
-    std::fs::create_dir_all(&dir).unwrap();
-    let cam = dir.join("cam.png");
-    image::GrayImage::from_pixel(64, 48, image::Luma([90]))
-        .save(&cam)
-        .unwrap();
-    app.camera.use_device = false;
-    app.camera.file = cam.to_string_lossy().into_owned();
-    // A stale saved bed-frame path of a DIFFERENT size: the camera grab must
-    // win, which the cached frame's dimensions prove below.
-    let stale = dir.join("stale.png");
-    image::GrayImage::from_pixel(32, 32, image::Luma([40]))
-        .save(&stale)
-        .unwrap();
-    app.placement.frame = stale.to_string_lossy().into_owned();
+fn load_design_centers_on_the_fiducial_frame_when_there_is_one() {
+    let mut app = nonlinear_app();
+    app.fiducials.frame_img = Some(image::GrayImage::new(800, 800));
     let fixtures = concat!(env!("CARGO_MANIFEST_DIR"), "/../cli/tests/fixtures");
     app.job.emit_copper = format!("{fixtures}/uv_test-F_Cu.gbr");
     app.job.emit_outline = format!("{fixtures}/uv_test-Edge_Cuts.gbr");
-    let ctx = Context::default();
-    let _ = ctx.run(egui::RawInput::default(), |ctx| app.load_place(ctx));
-    let frame = app
-        .placement
-        .frame_img
-        .as_ref()
-        .expect("camera frame cached");
-    assert_eq!(
-        (frame.width(), frame.height()),
-        (64, 48),
-        "the fresh camera grab won over the stale bed-frame file"
+    app.load_place();
+    let center = app.initial_center_mm(800.0, 800.0).unwrap();
+    assert!(
+        (app.placement.tx_mm - center.0).abs() < 1e-9
+            && (app.placement.ty_mm - center.1).abs() < 1e-9,
+        "started on the frame centre: ({}, {}) vs {center:?}",
+        app.placement.tx_mm,
+        app.placement.ty_mm
     );
     assert!(
-        app.placement.note.contains("needs calibration"),
-        "note explains the gap: {}",
+        app.placement.note.contains("fiducial frame"),
+        "note says where it went: {}",
         app.placement.note
     );
-    std::fs::remove_dir_all(dir).unwrap();
 }
 
 /// A saved ② laser anchor gives Place an approximate homography preview;
@@ -219,7 +268,7 @@ fn anchor_only_place_previews_and_exports_unwarped_with_warning() {
     ));
 
     app.placement.job = vec![pcb_core::Poly::default()];
-    app.placement.frame_img = Some(image::GrayImage::new(800, 800));
+    app.fiducials.frame_img = Some(image::GrayImage::new(800, 800));
     app.job.emit_copper = "board.gbr".into();
     app.emit_at_placement(false);
     assert!(
@@ -253,7 +302,7 @@ fn invalid_nonlinear_projection_fails_closed_without_homography_fallback() {
 fn field_corrected_emit_with_a_missing_map_file_warns_and_emits_unwarped() {
     let mut app = nonlinear_app();
     app.placement.job = vec![pcb_core::Poly::default()];
-    app.placement.frame_img = Some(image::GrayImage::new(800, 800));
+    app.fiducials.frame_img = Some(image::GrayImage::new(800, 800));
     app.job.emit_copper = "board.gbr".into();
     assert!(!app.field_map_path().exists());
     app.emit_at_placement(false);
@@ -278,7 +327,7 @@ fn field_corrected_emit_with_a_missing_map_file_warns_and_emits_unwarped() {
 fn place_export_always_arms_the_field_warp_when_the_map_exists() {
     let mut app = nonlinear_app();
     app.placement.job = vec![pcb_core::Poly::default()];
-    app.placement.frame_img = Some(image::GrayImage::new(800, 800));
+    app.fiducials.frame_img = Some(image::GrayImage::new(800, 800));
     app.job.emit_copper = "board.gbr".into();
     let map = app.calibration.field.as_ref().unwrap().field.serialize();
     std::fs::write(app.field_map_path(), map).unwrap();
@@ -445,14 +494,16 @@ fn fiducial_tab_lays_out_with_rect_shape() {
     );
 }
 
-/// The Place-on-board tab lays out headless (form + placement controls).
+/// The Job tab lays out headless with the placement path fields it inherited
+/// from the deleted Place tab, and the Actions panel carries the placement
+/// controls that came with them.
 #[test]
-fn place_tab_lays_out_headless() {
+fn job_tab_lays_out_with_the_placement_paths_and_actions() {
     let mut app = ConsoleApp::new(tmp_db(), vec!["true".into()]);
-    app.runtime.tab = CentralTab::Place;
+    app.runtime.tab = CentralTab::Job;
     let ctx = Context::default();
     let out = ctx.run(egui::RawInput::default(), |ctx| app.ui(ctx));
-    assert!(!out.shapes.is_empty(), "place tab must render");
+    assert!(!out.shapes.is_empty(), "job tab must render");
 }
 
 /// The fiducial check runs straight off the camera: "Grab & check" pulls
@@ -522,6 +573,101 @@ fn fiducial_check_grabs_from_the_camera() {
     );
 }
 
+/// The scale gate. The pose fit is a similarity, so holes at a uniformly wrong
+/// spacing fit with a near-zero residual — `POSE_MAX_RMS_MM` waves them
+/// through. Only the scale band stops them, and it has to, because applying the
+/// fit would resize the burn by that same factor. The placement must be left
+/// exactly as it was and the note must name the measured scale.
+#[test]
+fn an_implausible_fiducial_scale_leaves_the_placement_alone() {
+    use nalgebra::Matrix3;
+    let dir = std::env::temp_dir().join(format!("ui-fidscale-{}", std::process::id()));
+    std::fs::create_dir_all(&dir).unwrap();
+    let path = dir.join("cam.png");
+    let ppm = 10.0;
+    // Nominal layout, and the holes actually drilled at 0.85× that spacing
+    // about the layout centroid — a 15% shrink, well outside the band.
+    let layout = [(10.0, 10.0), (60.0, 10.0), (10.0, 60.0)];
+    let c = (80.0 / 3.0, 80.0 / 3.0);
+    let holes: Vec<(f64, f64)> = layout
+        .iter()
+        .map(|&(x, y)| (c.0 + 0.85 * (x - c.0), c.1 + 0.85 * (y - c.1)))
+        .collect();
+    let img = image::GrayImage::from_fn(700, 700, |x, y| {
+        let mut v = 170.0;
+        for &(mx, my) in &holes {
+            let (cx, cy) = (mx * ppm, 700.0 - my * ppm); // bed y-up
+            if (((x as f64) - cx).powi(2) + ((y as f64) - cy).powi(2)).sqrt() < 0.5 * ppm {
+                v -= 110.0;
+            }
+        }
+        image::Luma([v as u8])
+    });
+    img.save(&path).unwrap();
+
+    let mut app = ConsoleApp::new(tmp_db(), vec!["true".into()]);
+    app.camera.use_device = false;
+    app.camera.file = path.to_string_lossy().into();
+    app.fiducials.layout = "10,10; 60,10; 10,60".into();
+    app.fiducials.px_per_mm = ppm;
+    // Wide enough that each nominal window still contains its shifted hole —
+    // the point of the test is the GATE, not the detector's reach.
+    app.fiducials.search_mm = 7.0;
+    app.calibration.anchor = Some(calib::Calibration {
+        px_to_mm: vision::Homography {
+            matrix: Matrix3::new(
+                1.0 / ppm,
+                0.0,
+                0.0,
+                0.0,
+                -1.0 / ppm,
+                700.0 / ppm,
+                0.0,
+                0.0,
+                1.0,
+            ),
+            residuals: vec![],
+            rms: 0.0,
+        },
+        rms_um: 10.0,
+        found: 3,
+        total: 3,
+        dots: Vec::new(),
+    });
+    // A placement the operator set by hand; the refused fit must not touch it.
+    app.placement.tx_mm = 11.0;
+    app.placement.ty_mm = 22.0;
+    app.placement.rot_deg = 3.0;
+    app.placement.scale = 1.0;
+
+    app.grab_fid_frame(&Context::default());
+    assert_eq!(
+        app.fiducials.found.iter().filter(|f| f.is_some()).count(),
+        3,
+        "all three shrunken holes detected: {:?}",
+        app.fiducials.rows
+    );
+    assert!(
+        app.fiducials.note.contains("scale") && app.fiducials.note.contains("not updated"),
+        "the note names the measured scale and refuses: {}",
+        app.fiducials.note
+    );
+    assert!(
+        !app.placement.auto_pose && !app.fiducials.last_placed,
+        "nothing was placed"
+    );
+    assert_eq!(
+        (
+            app.placement.tx_mm,
+            app.placement.ty_mm,
+            app.placement.rot_deg,
+            app.placement.scale
+        ),
+        (11.0, 22.0, 3.0, 1.0),
+        "the manual placement is untouched"
+    );
+}
+
 /// After a fiducial Check, the Place tab's placement is set from the detected
 /// holes (rotation + translation) and flagged `auto_pose`; a subsequent Load
 /// must NOT recenter over it, and switching side clears the flag.
@@ -588,7 +734,7 @@ fn fiducial_check_sets_placement_and_load_preserves_it() {
             .find(|l| l.trim_start().starts_with("place:"))
             .unwrap()
             .to_string();
-        line[..line.find(" frame=").unwrap()].trim().to_string()
+        line[..line.find(" job_polys=").unwrap()].trim().to_string()
     };
 
     // Detection maps px→machine mm, fits the (identity) pose, and writes it.
@@ -633,7 +779,7 @@ fn fiducial_check_sets_placement_and_load_preserves_it() {
     );
 
     // Load installs the job but must NOT recenter over the auto pose.
-    let _ = ctx.run(egui::RawInput::default(), |ctx| app.load_place(ctx));
+    app.load_place();
     assert!(app.placement.auto_pose, "Load kept the auto-pose flag");
     assert!(
         (app.placement.tx_mm - tx1).abs() < 1e-9
@@ -715,14 +861,14 @@ fn marking_round_walks_the_fiducials_and_the_final_click_detects() {
     );
 
     // Marking the first two holes advances the round but must NOT detect yet.
-    app.fid_mark_click(holes[0], &ctx);
+    app.fid_mark_click(holes[0]);
     assert_eq!(app.fiducials.marking, Some(1), "advanced to marker 1");
     assert!(
         app.fiducials.note.starts_with("click fiducial 2 of 3"),
         "note advanced: {}",
         app.fiducials.note
     );
-    app.fid_mark_click(holes[1], &ctx);
+    app.fid_mark_click(holes[1]);
     assert_eq!(app.fiducials.marking, Some(2), "advanced to marker 2");
     assert!(
         app.fiducials.rows.is_empty(),
@@ -731,7 +877,7 @@ fn marking_round_walks_the_fiducials_and_the_final_click_detects() {
     );
 
     // The final click closes the round and runs detection on the marked holes.
-    app.fid_mark_click(holes[2], &ctx);
+    app.fid_mark_click(holes[2]);
     assert_eq!(
         app.fiducials.marking, None,
         "round closed on the final click"
@@ -786,6 +932,16 @@ fn clear_markers_empties_the_layout_so_nothing_reseeds() {
         app.fiducials.search.is_empty() && app.fiducials.marking.is_none(),
         "reset after clear has nothing to reseed and opens no round"
     );
+
+    // ⟳ layout from W×H is the ONE way back — an explicit rebuild, not a reset
+    // that silently resurrects a cleared set.
+    app.apply_fid_rect();
+    assert_eq!(
+        app.fiducials.search.len(),
+        4,
+        "the rectangle's four corners are rebuilt: {:?}",
+        app.fiducials.layout
+    );
 }
 
 /// A camera Grab auto-detects at the seeded positions, so it must NOT open a
@@ -836,8 +992,7 @@ fn a_plain_click_with_no_round_implicitly_starts_marking() {
     app.sync_fid_markers();
     assert_eq!(app.fiducials.marking, None, "no round active to begin with");
 
-    let ctx = Context::default();
-    app.fid_mark_click((12.0, 9.0), &ctx);
+    app.fid_mark_click((12.0, 9.0));
     assert_eq!(
         app.fiducials.marking,
         Some(1),
@@ -853,6 +1008,173 @@ fn a_plain_click_with_no_round_implicitly_starts_marking() {
         "note advanced to the second marker: {}",
         app.fiducials.note
     );
+}
+
+/// Dragging one ✛ touches ONLY that search marker. The layout is the design
+/// nominal the pose fit and the measured px/mm are taken against, so a dragged
+/// position must never leak into it (LR-17) — and the dragged marker's old
+/// detection is stale the moment it moves.
+#[test]
+fn dragging_a_marker_moves_only_its_own_search_entry() {
+    let mut app = ConsoleApp::new(tmp_db(), vec!["true".into()]);
+    app.fiducials.layout = "10,10; 60,10; 10,60".into();
+    app.sync_fid_markers();
+    let layout_before = app.fiducials.layout.clone();
+    let search_before = app.fiducials.search.clone();
+    app.fiducials.found = vec![
+        Some((100.0, 600.0)),
+        Some((600.0, 600.0)),
+        Some((100.0, 100.0)),
+    ];
+
+    // Two frames of one gesture: the nudges accumulate on the grabbed marker.
+    app.fiducials.marker_drag = Some(1);
+    app.fid_drag_marker(1, (0.8, -0.3));
+    app.fid_drag_marker(1, (0.2, -0.2));
+
+    assert_eq!(
+        app.fiducials.layout, layout_before,
+        "the expected layout is byte-identical after a drag"
+    );
+    let (x, y) = app.fiducials.search[1];
+    assert!(
+        (x - (search_before[1].0 + 1.0)).abs() < 1e-9
+            && (y - (search_before[1].1 - 0.5)).abs() < 1e-9,
+        "marker 1 moved by the summed delta: {:?}",
+        app.fiducials.search[1]
+    );
+    assert_eq!(
+        (app.fiducials.search[0], app.fiducials.search[2]),
+        (search_before[0], search_before[2]),
+        "the other markers stayed put"
+    );
+    assert_eq!(
+        app.fiducials.found[1], None,
+        "the dragged marker's detection is stale and cleared"
+    );
+    assert!(
+        app.fiducials.found[0].is_some() && app.fiducials.found[2].is_some(),
+        "the other detections survive"
+    );
+
+    // A layout edit can shrink the ✛ set under an in-flight drag; the latched
+    // index must not index past it.
+    app.fiducials.marker_drag = Some(7);
+    app.fid_drag_marker(7, (1.0, 1.0));
+    assert_eq!(
+        app.fiducials.marker_drag, None,
+        "an out-of-range latch is dropped, not indexed"
+    );
+}
+
+/// A drag that grabbed a ✛ owns the whole gesture: it must not also drop the
+/// next marker of a marking round, add a click-to-place fiducial, or remove one
+/// on right-click. Same latch-and-gate shape as the design drag.
+#[test]
+fn a_marker_drag_suppresses_the_marking_and_click_to_place_paths() {
+    let mut app = ConsoleApp::new(tmp_db(), vec!["true".into()]);
+    app.fiducials.layout = "10,10; 60,10; 10,60".into();
+    app.sync_fid_markers();
+    assert!(app.fid_marking_allowed(), "idle canvas marks as usual");
+
+    app.fiducials.marker_drag = Some(0);
+    assert!(
+        !app.fid_marking_allowed(),
+        "a grabbed marker suppresses marking / click-to-place"
+    );
+    app.fiducials.marker_drag = None;
+    app.fiducials.design_drag = true;
+    assert!(
+        !app.fid_marking_allowed(),
+        "the design latch still suppresses them too"
+    );
+
+    // The hit test the grab runs: nearest ✛ within the grab radius, nothing
+    // outside it.
+    use super::fiducial_ui::MARKER_GRAB_PX;
+    let markers = [(100.0_f32, 100.0_f32), (140.0, 100.0)];
+    assert_eq!(
+        crate::fiducial::nearest_marker(&markers, (108.0, 104.0), MARKER_GRAB_PX),
+        Some(0),
+        "a press near marker 0 grabs it"
+    );
+    assert_eq!(
+        crate::fiducial::nearest_marker(&markers, (125.0, 100.0), MARKER_GRAB_PX),
+        Some(1),
+        "between the two, the NEAREST inside the radius wins"
+    );
+    assert_eq!(
+        crate::fiducial::nearest_marker(&markers, (120.0, 100.0), MARKER_GRAB_PX),
+        None,
+        "a press outside every marker's radius grabs nothing"
+    );
+}
+
+/// The point of the gesture: nudge a marker the detector missed onto its hole,
+/// let go, and the check re-runs and finds it — without redoing the other three
+/// and without the ladder seeding over the correction.
+#[test]
+fn releasing_a_dragged_marker_rechecks_and_keeps_the_manual_position() {
+    let dir = std::env::temp_dir().join(format!("ui-fiddrag-{}", std::process::id()));
+    std::fs::create_dir_all(&dir).unwrap();
+    let path = dir.join("bed.png");
+    let ppm = 10.0;
+    let holes = [(10.0, 10.0), (60.0, 10.0), (10.0, 60.0), (60.0, 60.0)];
+    write_hole_frame(&path, ppm, &holes);
+
+    let mut app = ConsoleApp::new(tmp_db(), vec!["true".into()]);
+    app.fiducials.frame = path.to_string_lossy().into();
+    app.fiducials.layout = "10,10; 60,10; 10,60; 60,60".into();
+    app.fiducials.px_per_mm = ppm;
+    app.fiducials.search_mm = 2.0;
+    let ctx = Context::default();
+    app.load_fid_frame(&ctx);
+
+    // Marker 2 sits 3 mm off its hole — well outside the 2 mm search window —
+    // so a check finds the other three and misses that one.
+    app.fiducials.search[2] = (7.0, 60.0);
+    app.render_fiducials(&ctx);
+    assert_eq!(
+        app.fiducials.found.iter().filter(|f| f.is_some()).count(),
+        3,
+        "the offset marker misses: {:?}",
+        app.fiducials.rows
+    );
+    assert_eq!(
+        app.fiducials.found[2], None,
+        "and it is marker 2 that missed"
+    );
+    let layout_before = app.fiducials.layout.clone();
+
+    // Drag it onto the hole and let go.
+    app.fiducials.marker_drag = Some(2);
+    app.fid_drag_marker(2, (2.0, 0.0));
+    app.fid_drag_marker(2, (1.0, 0.0));
+    app.fid_marker_drag_release();
+
+    assert_eq!(
+        app.fiducials.marker_drag, None,
+        "the latch is released with the pointer"
+    );
+    assert_eq!(
+        app.fiducials.found.iter().filter(|f| f.is_some()).count(),
+        4,
+        "the release re-checked and the nudged marker locked: {:?}",
+        app.fiducials.rows
+    );
+    // The detection ladder installs the winning stage's seeds, so this is the
+    // assertion that the manual placement was kept rather than seeded over.
+    assert_eq!(
+        app.fiducials.search[2],
+        (10.0, 60.0),
+        "the dragged position survives the re-check"
+    );
+    assert_eq!(
+        app.fiducials.layout, layout_before,
+        "the expected layout is untouched by the whole gesture"
+    );
+
+    std::fs::remove_dir_all(dir).ok();
 }
 
 /// FLD-11: live tracking pulls frames from the camera source and re-detects
@@ -902,11 +1224,111 @@ fn live_fiducial_tracking_detects_on_the_feed() {
         "perspective fitted from 4 live fiducials"
     );
 
+    // Live off: this tab stops pumping, but the shared capture is the console's
+    // and survives until the idle rule releases it (another tab may be live).
     app.fiducials.live = false;
     app.pump_fid_live(&ctx);
+    app.runtime.camera_last_used = Some(std::time::Instant::now() - CAMERA_IDLE_RELEASE);
+    app.release_idle_capture();
     assert!(
-        app.fiducials.capture.is_none(),
-        "capture stops when Live is off"
+        app.runtime.camera_capture.is_none(),
+        "the shared capture is released once no tab is live and it has gone idle"
+    );
+}
+
+/// One capture, shared: the tabs' pumps reuse the same thread instead of each
+/// opening the source, and a source change restarts it. (`File` source — the
+/// device timings this exists for need real hardware and aren't testable here.)
+#[test]
+fn shared_capture_is_reused_and_restarts_on_source_change() {
+    let dir = std::env::temp_dir().join(format!("ui-sharedcap-{}", std::process::id()));
+    std::fs::create_dir_all(&dir).unwrap();
+    let a = dir.join("a.png");
+    let b = dir.join("b.png");
+    image::GrayImage::from_pixel(20, 10, image::Luma([90]))
+        .save(&a)
+        .unwrap();
+    image::GrayImage::from_pixel(30, 12, image::Luma([90]))
+        .save(&b)
+        .unwrap();
+
+    let mut app = ConsoleApp::new(tmp_db(), vec!["true".into()]);
+    app.camera.use_device = false;
+    app.camera.file = a.to_string_lossy().into();
+
+    app.ensure_capture();
+    let first = app.runtime.camera_capture.as_ref().unwrap() as *const _;
+    app.ensure_capture();
+    assert_eq!(
+        app.runtime.camera_capture.as_ref().unwrap() as *const _,
+        first,
+        "an unchanged source reuses the running capture"
+    );
+
+    // Every tab pulls from that same capture.
+    let ctx = Context::default();
+    app.camera.live = true;
+    app.fiducials.live = true;
+    app.pump_camera(&ctx);
+    app.pump_fid_live(&ctx);
+    assert_eq!(
+        app.runtime.camera_capture.as_ref().unwrap() as *const _,
+        first,
+        "the live pumps share one capture rather than starting their own"
+    );
+    assert_eq!(
+        app.runtime.camera_capture_src,
+        Some(crate::camera::Source::File(a.to_string_lossy().into())),
+        "still streaming the source it was started for"
+    );
+
+    // Switching source restarts it — checked by the frames that arrive, since a
+    // freed capture's address can be handed straight back to the new one.
+    app.camera.file = b.to_string_lossy().into();
+    app.ensure_capture();
+    assert_eq!(
+        app.runtime.camera_capture_src,
+        Some(crate::camera::Source::File(b.to_string_lossy().into()))
+    );
+    let mut dims = None;
+    for _ in 0..200 {
+        if let Some(Ok(f)) = app.capture_latest() {
+            dims = Some(f.dimensions());
+            break;
+        }
+        std::thread::sleep(std::time::Duration::from_millis(5));
+    }
+    assert_eq!(
+        dims,
+        Some((30, 12)),
+        "the restarted capture streams the new source"
+    );
+}
+
+/// The idle-release rule: hold the device while any tab streams, hand it back
+/// once nothing does and it has gone quiet — the CLI can't open a busy camera.
+#[test]
+fn idle_release_holds_while_live_and_frees_when_quiet() {
+    let now = std::time::Instant::now();
+    let idle = CAMERA_IDLE_RELEASE;
+    let fresh = Some(now - idle / 2);
+    let stale = Some(now - idle * 2);
+
+    assert!(
+        !should_release_capture(true, stale, now, idle),
+        "a live tab keeps the device however long ago the last read was"
+    );
+    assert!(
+        !should_release_capture(false, fresh, now, idle),
+        "a recent grab keeps the fast path warm for the next one"
+    );
+    assert!(
+        should_release_capture(false, stale, now, idle),
+        "nothing live and long idle: release"
+    );
+    assert!(
+        should_release_capture(false, None, now, idle),
+        "a capture nobody ever read is released, not held"
     );
 }
 
@@ -1037,7 +1459,7 @@ fn clicking_the_lone_marker_places_and_detects() {
 
     // Click at the design nominal: the lone click closes the round and detects,
     // but the hole is 3 mm off so nothing is found there.
-    app.fid_mark_click((10.0, 10.0), &ctx);
+    app.fid_mark_click((10.0, 10.0));
     assert_eq!(
         app.fiducials.marking, None,
         "the lone click closed the round"
@@ -1049,7 +1471,7 @@ fn clicking_the_lone_marker_places_and_detects() {
 
     // A fresh click with no active round implicitly reopens it; landing on the
     // actual hole makes detection lock on.
-    app.fid_mark_click((13.0, 10.0), &ctx);
+    app.fid_mark_click((13.0, 10.0));
     assert_eq!(
         app.fiducials.marking, None,
         "the reopened lone click closed again"
@@ -1235,7 +1657,6 @@ fn ar_overlay_projects_design_through_the_homography() {
 #[test]
 fn place_drag_tracks_cursor_in_the_physical_lens_frame() {
     let mut app = nonlinear_app();
-    app.placement.frame_img = Some(image::GrayImage::from_pixel(800, 800, image::Luma([120])));
     app.placement.tx_mm = 30.0;
     app.placement.ty_mm = 25.0;
 
@@ -1246,7 +1667,7 @@ fn place_drag_tracks_cursor_in_the_physical_lens_frame() {
             .unwrap()
     };
     let before = pivot(&app);
-    app.drag_place_px(12.0, -7.0).unwrap();
+    app.drag_place_px(800, 800, 12.0, -7.0).unwrap();
     let after = pivot(&app);
     assert!(
         (after.0 - (before.0 + 12.0)).abs() < 1e-6,
@@ -1265,15 +1686,37 @@ fn place_drag_tracks_cursor_in_the_physical_lens_frame() {
 #[test]
 fn place_drag_refuses_an_uncalibrated_uniform_fallback() {
     let mut app = ConsoleApp::new(tmp_db(), vec!["true".into()]);
-    app.placement.frame_img = Some(image::GrayImage::from_pixel(100, 100, image::Luma([120])));
     app.placement.tx_mm = 5.0;
     app.placement.ty_mm = 5.0;
     assert!(
-        app.drag_place_px(20.0, -30.0)
+        app.drag_place_px(100, 100, 20.0, -30.0)
             .unwrap_err()
             .contains("needs a projection"),
         "no anchor and no nonlinear cal: dragging has no frame to move in"
     );
+}
+
+/// Shift+drag on the design rotates it the way the pointer sweeps ON THE BED,
+/// not on the screen. The two senses are opposite (screen y grows down, machine
+/// y grows up), and getting it backwards is the obvious failure — so pin the
+/// sign: from the pivot's +x axis, dragging the pointer UP the screen is toward
+/// machine +y, i.e. a quarter turn counter-clockwise on the bed, i.e. +90°
+/// (`Placement::affine` is `[cos, −sin; sin, cos]`, CCW-positive).
+#[test]
+fn shift_drag_rotates_in_the_machine_sense_not_the_screen_sense() {
+    use super::fiducial_ui::rot_delta_deg;
+    let pivot = egui::pos2(0.0, 0.0);
+    let quarter = rot_delta_deg(pivot, egui::pos2(1.0, 0.0), egui::pos2(0.0, -1.0));
+    assert!(
+        (quarter - 90.0).abs() < 1e-9,
+        "pointer swept up-screen = +90° on the bed, got {quarter}"
+    );
+    // …and the mirror image of that drag is the mirror image of the rotation.
+    let back = rot_delta_deg(pivot, egui::pos2(1.0, 0.0), egui::pos2(0.0, 1.0));
+    assert!((back + 90.0).abs() < 1e-9, "swept down-screen: {back}");
+    // A sweep across the ±180 seam nudges rather than spinning a full turn.
+    let seam = rot_delta_deg(pivot, egui::pos2(-1.0, -0.01), egui::pos2(-1.0, 0.01));
+    assert!(seam.abs() < 2.0, "no ±360 jump at the seam: {seam}");
 }
 
 /// Double-sided: on the back, the expected fiducial positions are the
@@ -1482,19 +1925,18 @@ field_frame=\n";
         vec![
             "calib_accept_rms_um",
             "calib_accept_worst_um",
-            "calib_allow_machine_scale",
+            "calib_field_scale",
             "calib_paper_dot_kind",
             "calib_paper_dot_mm",
             "calib_paper_n",
             "calib_paper_out",
             "calib_paper_pitch_mm",
-            "fid_board_h_mm",
-            "fid_board_w_mm",
             "fid_diameter_mm",
             "fid_height_mm",
-            "fid_margin_mm",
             "fid_out",
             "fid_profile",
+            "fid_rect_h_mm",
+            "fid_rect_w_mm",
             "fid_search_mm",
             "fid_shape",
             "job_frequency_khz",
@@ -1520,6 +1962,56 @@ field_frame=\n";
     for (key, value) in before {
         assert_eq!(after.get(&key), Some(&value), "setting {key}");
     }
+}
+
+/// The ③ scale handling used to be a bool (`calib_allow_machine_scale`). A
+/// blob written by that build must still land the operator on the equivalent
+/// three-way choice — and the save writes only the new key.
+#[test]
+fn retired_machine_scale_bool_migrates_to_the_three_way_choice() {
+    for (legacy, want) in [
+        ("true", calib::FieldScale::Compensate),
+        ("false", calib::FieldScale::Refuse),
+    ] {
+        let db = tmp_db();
+        let settings = crate::settings::path_for_db(&db);
+        std::fs::write(
+            &settings,
+            format!("pcbforge console settings v1\ncalib_allow_machine_scale={legacy}\n"),
+        )
+        .unwrap();
+        let app = ConsoleApp::new(&db, vec!["true".into()]);
+        assert_eq!(app.calibration.field_scale, want, "legacy {legacy}");
+        let saved = crate::settings::parse(&app.settings_blob());
+        assert_eq!(
+            saved.get("calib_field_scale").map(String::as_str),
+            Some(field_scale_token(want))
+        );
+    }
+    // An absent key (a blob from before either setting existed) is the default.
+    let db = tmp_db();
+    std::fs::write(
+        crate::settings::path_for_db(&db),
+        "pcbforge console settings v1\n",
+    )
+    .unwrap();
+    let app = ConsoleApp::new(&db, vec!["true".into()]);
+    assert_eq!(app.calibration.field_scale, calib::FieldScale::Refuse);
+
+    // The new key wins over a stale bool left behind by an older build.
+    let db = tmp_db();
+    std::fs::write(
+        crate::settings::path_for_db(&db),
+        "pcbforge console settings v1\n\
+calib_allow_machine_scale=true\n\
+calib_field_scale=distortion_only\n",
+    )
+    .unwrap();
+    let app = ConsoleApp::new(&db, vec!["true".into()]);
+    assert_eq!(
+        app.calibration.field_scale,
+        calib::FieldScale::DistortionOnly
+    );
 }
 
 /// The operator-configurable step 3 field acceptance limits round-trip.
@@ -1568,44 +2060,40 @@ fn job_export_recipe_persists() {
     assert_eq!(fresh.job.passes, 1);
 }
 
-/// The ④ auto fiducial-layout board size + margin round-trip through a save +
-/// reload; a blob without them keeps the 70/50/5 defaults.
+/// The fiducial rectangle's spans round-trip through a save + reload; a blob
+/// without them keeps the 50/50 defaults.
 #[test]
-fn fid_board_dimensions_persist() {
+fn fid_rect_dimensions_persist() {
     let db = tmp_db();
     {
         let mut a = ConsoleApp::new(db.clone(), vec!["true".into()]);
-        a.fiducials.board_w_mm = 90.0;
-        a.fiducials.board_h_mm = 60.0;
-        a.fiducials.margin_mm = 3.0;
+        a.fiducials.rect_w_mm = 90.0;
+        a.fiducials.rect_h_mm = 60.0;
         a.save_settings_if_changed();
     }
     let b = ConsoleApp::new(db, vec!["true".into()]);
-    assert!((b.fiducials.board_w_mm - 90.0).abs() < 1e-9);
-    assert!((b.fiducials.board_h_mm - 60.0).abs() < 1e-9);
-    assert!((b.fiducials.margin_mm - 3.0).abs() < 1e-9);
+    assert!((b.fiducials.rect_w_mm - 90.0).abs() < 1e-9);
+    assert!((b.fiducials.rect_h_mm - 60.0).abs() < 1e-9);
 
     // A fresh console with no persisted keys keeps the operator defaults.
     let fresh = ConsoleApp::new(tmp_db(), vec!["true".into()]);
-    assert!((fresh.fiducials.board_w_mm - 70.0).abs() < 1e-9);
-    assert!((fresh.fiducials.board_h_mm - 50.0).abs() < 1e-9);
-    assert!((fresh.fiducials.margin_mm - 5.0).abs() < 1e-9);
+    assert!((fresh.fiducials.rect_w_mm - 50.0).abs() < 1e-9);
+    assert!((fresh.fiducials.rect_h_mm - 50.0).abs() < 1e-9);
 }
 
-/// ④ Fiducial holes: the `fid_board:` summary line reports the board/margin
+/// ④ Fiducial holes: the `fid_rect:` summary line reports the rectangle spans
 /// and the layout computed against the auto-centred field. Field 90 auto →
-/// centre 45,45; board 70×50, margin 5 → x 15..75, y 25..65.
+/// centre 45,45; rect 60×40 → x 15..75, y 25..65.
 #[test]
-fn fid_board_summary_reports_the_computed_layout() {
+fn fid_rect_summary_reports_the_computed_layout() {
     let mut app = ConsoleApp::new(tmp_db(), vec!["true".into()]);
     app.runtime.tab = CentralTab::Calibrate;
     app.calibration.mode = CalibMode::FidHoles;
     app.camera.field_mm = 90.0;
     app.camera.field_center_auto = true;
     app.sync_auto_field_center();
-    app.fiducials.board_w_mm = 70.0;
-    app.fiducials.board_h_mm = 50.0;
-    app.fiducials.margin_mm = 5.0;
+    app.fiducials.rect_w_mm = 60.0;
+    app.fiducials.rect_h_mm = 40.0;
 
     let summary = app.debug_summary();
     assert!(
@@ -1614,10 +2102,10 @@ fn fid_board_summary_reports_the_computed_layout() {
     );
     assert!(
         summary.contains(
-            "fid_board: w=70 h=50 margin=5 \
+            "fid_rect: w=60 h=40 \
              layout=15.00,25.00; 75.00,25.00; 15.00,65.00; 75.00,65.00"
         ),
-        "fid_board line reports the computed layout:\n{summary}"
+        "fid_rect line reports the computed layout:\n{summary}"
     );
 }
 
@@ -1683,6 +2171,8 @@ fn field_frame_mirror_flag_round_trips() {
             field_verdict: vision::classify_field_error(&[]),
             scale: 1.0,
             extrapolated: 0,
+            rejected: 0,
+            rejection_note: String::new(),
         });
         a.calibration.field_accepted = true;
         a.calibration.lens_frame_signature = Some(((800, 800), Orientation::Normal));
@@ -2538,7 +3028,7 @@ fn etch_and_run_arms_an_absolute_pending_path() {
         dots: Vec::new(),
     });
     app.placement.job = vec![pcb_core::Poly::default()];
-    app.placement.frame_img = Some(image::GrayImage::new(800, 800));
+    app.fiducials.frame_img = Some(image::GrayImage::new(800, 800));
     app.job.emit_copper = "board.gbr".into();
 
     app.emit_at_placement(true);
@@ -2548,46 +3038,58 @@ fn etch_and_run_arms_an_absolute_pending_path() {
         .as_ref()
         .expect("a LightBurn run was queued");
     assert!(
-        pending.is_absolute(),
-        "queued path is absolute: {pending:?}"
+        pending.path.is_absolute(),
+        "queued path is absolute: {:?}",
+        pending.path
     );
+    assert!(pending.start, "the etch chain presses START");
     assert!(app.debug_summary().contains("lightburn=pending"));
 }
 
-/// "Generate + burn holes" queues an ABSOLUTE holes path once the export
-/// launches, so `pump_verb` chains the LightBurn load + START — the holes
-/// burn immediately instead of waiting for a manual load-and-press-play.
+/// "⚙ Generate holes" queues an ABSOLUTE holes path once the export launches,
+/// so the file LOADS in LightBurn — but as a load-only hand-off: `start` is
+/// false, so the chain can never press START and the click cannot fire the
+/// laser.
 #[test]
-fn generate_holes_arms_an_absolute_pending_burn() {
+fn generate_holes_arms_an_absolute_load_only_handoff() {
     let mut app = ConsoleApp::new(tmp_db(), vec!["true".into()]);
     app.fiducial_generate_holes();
     let pending = app
         .runtime
         .pending_lightburn
         .as_ref()
-        .expect("a LightBurn burn was queued");
+        .expect("a LightBurn load was queued");
     assert!(
-        pending.is_absolute(),
-        "queued path is absolute: {pending:?}"
+        pending.path.is_absolute(),
+        "queued path is absolute: {:?}",
+        pending.path
     );
     assert!(
-        pending.ends_with("fid-holes.lbrn2"),
-        "queued path is the holes output: {pending:?}"
+        pending.path.ends_with("fid-holes.lbrn2"),
+        "queued path is the holes output: {:?}",
+        pending.path
     );
-    assert!(app.debug_summary().contains("lightburn=pending"));
+    assert!(!pending.start, "load-only: the chain never presses START");
+    assert!(app.debug_summary().contains("lightburn=pending-load"));
 }
 
-/// A refused holes generation (bad layout) arms no burn.
+/// A bad layout is refused BEFORE the export shells: the note names the layout
+/// error and no verb job is spawned. (Asserting "no burn was queued" would be
+/// vacuous now that this path never queues one for any input.)
 #[test]
-fn generate_holes_guard_refusal_arms_no_burn() {
+fn generate_holes_refuses_a_bad_layout_before_exporting() {
     let mut app = ConsoleApp::new(tmp_db(), vec!["true".into()]);
     app.fiducials.layout = "not a layout".into();
     app.fiducial_generate_holes();
     assert!(
-        app.runtime.pending_lightburn.is_none(),
-        "nothing queued when the layout is rejected"
+        app.runtime.verb_job.is_none(),
+        "the export never shelled for a rejected layout"
     );
-    assert!(app.debug_summary().contains("lightburn=idle"));
+    assert!(
+        app.fiducials.note.starts_with("layout:"),
+        "the note names the layout error: {:?}",
+        app.fiducials.note
+    );
 }
 
 /// The placement guard (no frame/job loaded) refuses before the export starts,
@@ -2595,7 +3097,7 @@ fn generate_holes_guard_refusal_arms_no_burn() {
 #[test]
 fn guard_refusal_does_not_arm_a_lightburn_run() {
     let mut app = ConsoleApp::new(tmp_db(), vec!["true".into()]);
-    // Front side, but no placement job loaded → the "load a frame + job" guard.
+    // Front side, but no placement job loaded → the "load the design" guard.
     app.emit_at_placement(true);
     assert!(
         app.runtime.pending_lightburn.is_none(),
@@ -2605,7 +3107,7 @@ fn guard_refusal_does_not_arm_a_lightburn_run() {
         app.runtime
             .log
             .iter()
-            .any(|l| l.err && l.text.contains("load a frame")),
+            .any(|l| l.err && l.text.contains("load the design first")),
         "the guard error was logged"
     );
     assert!(app.debug_summary().contains("lightburn=idle"));
@@ -2616,7 +3118,10 @@ fn guard_refusal_does_not_arm_a_lightburn_run() {
 #[test]
 fn failed_export_skips_the_queued_lightburn_run() {
     let mut app = ConsoleApp::new(tmp_db(), vec!["true".into()]);
-    app.runtime.pending_lightburn = Some(std::path::PathBuf::from("/tmp/placed.lbrn2"));
+    app.runtime.pending_lightburn = Some(PendingLightburn {
+        path: std::path::PathBuf::from("/tmp/placed.lbrn2"),
+        start: true,
+    });
     app.chain_lightburn_after_verb(false);
     assert!(
         app.runtime.pending_lightburn.is_none(),
@@ -2650,26 +3155,10 @@ G05
 M30
 ";
 
-/// All shape vertices of an emitted document, mm.
-fn lbrn2_verts(doc: &str) -> Vec<(f64, f64)> {
-    doc.split("<VertList>")
-        .skip(1)
-        .flat_map(|s| s.split("</VertList>").next().unwrap_or("").split('V'))
-        .filter(|t| !t.is_empty())
-        .filter_map(|t| {
-            let xy = t.split('c').next()?;
-            let mut it = xy.split_whitespace();
-            Some((it.next()?.parse().ok()?, it.next()?.parse().ok()?))
-        })
-        .collect()
-}
-
-fn verts_bbox(pts: &[(f64, f64)]) -> (f64, f64, f64, f64) {
-    pts.iter().fold(
-        (f64::MAX, f64::MAX, f64::MIN, f64::MIN),
-        |(x0, y0, x1, y1), &(x, y)| (x0.min(x), y0.min(y), x1.max(x), y1.max(y)),
-    )
-}
+// The emitted-geometry parser is shared with the diagnostic log's export
+// readback: the record that says where a job landed must read the file the same
+// way the tests that assert it do.
+use crate::diag::{lbrn2_verts, verts_bbox};
 
 /// "⤓ Emit drill holes → LightBurn (no burn)" writes the hole geometry at the
 /// placement affine (translation + rotation, NO frame normalization — the
@@ -2685,7 +3174,7 @@ fn emit_drill_holes_writes_placed_geometry_without_queueing_a_burn() {
     let out = dir.join("drill-holes.lbrn2");
 
     app.placement.job = vec![pcb_core::Poly::default()];
-    app.placement.frame_img = Some(image::GrayImage::new(800, 800));
+    app.fiducials.frame_img = Some(image::GrayImage::new(800, 800));
     app.placement.drills = drl.to_string_lossy().into_owned();
     app.placement.drill_lbrn2 = out.to_string_lossy().into_owned();
     app.placement.pivot = (0.0, 0.0);
@@ -2810,6 +3299,54 @@ fn drills_from_kicad_fills_the_field_with_stable_paths() {
     );
 }
 
+/// An empty drill field is not a refusal while a KiCad project is set: the
+/// emit derives the export's deterministic pth/npth pair, fills the field with
+/// the files that exist, and proceeds — one click instead of a dead end.
+#[test]
+fn drill_emit_derives_the_drill_paths_from_the_kicad_project() {
+    let mut app = ConsoleApp::new(tmp_db(), vec!["true".into()]);
+    let dir = std::env::temp_dir().join(format!("ui-drill-derive-{}", std::process::id()));
+    let gerbers = dir.join("pcbforge-gerbers");
+    std::fs::create_dir_all(&gerbers).unwrap();
+    let board = dir.join("demo.kicad_pcb");
+    std::fs::write(&board, "").unwrap();
+    std::fs::write(gerbers.join("pth.drl"), DRILL_SAMPLE).unwrap();
+    let out = dir.join("drill-holes.lbrn2");
+
+    app.placement.job = vec![pcb_core::Poly::default()];
+    app.fiducials.frame_img = Some(image::GrayImage::new(800, 800));
+    app.placement.drill_lbrn2 = out.to_string_lossy().into_owned();
+    assert!(app.placement.drills.is_empty(), "the field starts empty");
+
+    // No project either: the clear error still stands.
+    app.emit_drill_at_placement();
+    assert!(
+        app.runtime
+            .log
+            .iter()
+            .any(|l| l.err && l.text.contains("set a drill file")),
+        "no project, no derivation — the error is kept"
+    );
+    assert!(!out.exists(), "nothing written");
+
+    // With the project set, the existing pth.drl is found and used. npth.drl
+    // was never exported here, so only the file that exists lands in the field.
+    app.job.kicad_project = board.to_string_lossy().into_owned();
+    app.emit_drill_at_placement();
+    assert_eq!(
+        app.placement.drills,
+        gerbers.join("pth.drl").display().to_string(),
+        "the derived path filled the field"
+    );
+    assert!(
+        out.exists(),
+        "the drill job was written: {}",
+        app.placement.note
+    );
+
+    std::fs::remove_dir_all(dir).ok();
+}
+
 /// The drill-emit guards refuse (back side, no job, no drill file) without
 /// writing anything or arming the LightBurn chain.
 #[test]
@@ -2822,13 +3359,13 @@ fn emit_drill_holes_guards_refuse_without_queueing() {
         app.runtime
             .log
             .iter()
-            .any(|l| l.err && l.text.contains("load a frame")),
+            .any(|l| l.err && l.text.contains("load the design first")),
         "missing-job guard logged"
     );
 
     // Job loaded but no drill file named.
     app.placement.job = vec![pcb_core::Poly::default()];
-    app.placement.frame_img = Some(image::GrayImage::new(800, 800));
+    app.fiducials.frame_img = Some(image::GrayImage::new(800, 800));
     app.emit_drill_at_placement();
     assert!(
         app.runtime
@@ -2910,4 +3447,288 @@ fn app_survives_refresh_and_relayout() {
     for _ in 0..2 {
         let _ = ctx.run(egui::RawInput::default(), |ctx| app.ui(ctx));
     }
+}
+
+/// A Check keeps the operator's own markers when they work. Detection must try
+/// them FIRST — re-seeding through the calibrated projection up front used to
+/// throw away markers that were already on the holes, which turned a working
+/// 4-of-4 Check into 0-of-4 for any layout whose coordinates were click-derived
+/// rather than true machine coordinates.
+#[test]
+fn check_locates_via_the_operators_markers_when_they_work() {
+    let dir = std::env::temp_dir().join(format!("ui-fidladder-a-{}", std::process::id()));
+    std::fs::create_dir_all(&dir).unwrap();
+    let path = dir.join("bed4.png");
+    let ppm = 10.0;
+    let holes = [(15.0, 25.0), (55.0, 25.0), (55.0, 60.0), (15.0, 60.0)];
+    write_hole_frame(&path, ppm, &holes);
+
+    let mut app = ConsoleApp::new(tmp_db(), vec!["true".into()]);
+    app.runtime.tab = CentralTab::Fiducials;
+    app.fiducials.frame = path.to_string_lossy().into();
+    app.fiducials.layout = "15,25; 55,25; 55,60; 15,60".into();
+    app.fiducials.px_per_mm = ppm;
+    app.fiducials.diameter_mm = 1.0;
+    app.fiducials.search_mm = 2.0;
+    let ctx = Context::default();
+    app.load_fid_frame(&ctx);
+    app.render_fiducials(&ctx);
+
+    assert_eq!(
+        app.fiducials.found.iter().filter(|f| f.is_some()).count(),
+        4,
+        "all four found: {}",
+        app.fiducials.note
+    );
+    assert!(
+        app.fiducials.note.contains("located via markers"),
+        "the operator's markers were used as-is: {}",
+        app.fiducials.note
+    );
+    // The markers stayed where they were — no stage moved them.
+    for (m, h) in app.fiducials.search.iter().zip(&holes) {
+        assert!(
+            (m.0 - h.0).abs() < 1e-9 && (m.1 - h.1).abs() < 1e-9,
+            "marker {m:?} moved off {h:?}"
+        );
+    }
+}
+
+/// The board is 10 mm from where the layout says and there is no calibration,
+/// so neither the markers nor a projection can find it. The whole-frame
+/// rectangle match recovers all four, moves the markers onto them, and the note
+/// says which stage did it plus why the earlier ones did not.
+#[test]
+fn check_recovers_a_displaced_board_via_the_rectangle_match() {
+    let dir = std::env::temp_dir().join(format!("ui-fidladder-c-{}", std::process::id()));
+    std::fs::create_dir_all(&dir).unwrap();
+    let path = dir.join("bed5.png");
+    let ppm = 10.0;
+    // Layout corners, and the board actually sitting 10 mm right / 10 mm down
+    // from them — five times the 2 mm search window, so every local window is
+    // looking at bare copper.
+    let layout = [(15.0, 25.0), (55.0, 25.0), (55.0, 60.0), (15.0, 60.0)];
+    let holes: Vec<(f64, f64)> = layout.iter().map(|&(x, y)| (x + 10.0, y - 10.0)).collect();
+    write_hole_frame(&path, ppm, &holes);
+
+    let mut app = ConsoleApp::new(tmp_db(), vec!["true".into()]);
+    app.runtime.tab = CentralTab::Fiducials;
+    app.fiducials.frame = path.to_string_lossy().into();
+    app.fiducials.layout = "15,25; 55,25; 55,60; 15,60".into();
+    app.fiducials.px_per_mm = ppm;
+    app.fiducials.diameter_mm = 1.0;
+    app.fiducials.search_mm = 2.0;
+    let ctx = Context::default();
+    app.load_fid_frame(&ctx);
+    app.render_fiducials(&ctx);
+
+    assert_eq!(
+        app.fiducials.found.iter().filter(|f| f.is_some()).count(),
+        4,
+        "recovered all four: {}",
+        app.fiducials.note
+    );
+    assert!(
+        app.fiducials.note.contains("located via rectangle match")
+            && app.fiducials.note.contains("candidates"),
+        "the note names the stage and its candidate count: {}",
+        app.fiducials.note
+    );
+    // The markers were moved onto the real holes, so the ✛ set now shows where
+    // the board actually is.
+    for (m, h) in app.fiducials.search.iter().zip(&holes) {
+        assert!(
+            (m.0 - h.0).abs() < 0.5 && (m.1 - h.1).abs() < 0.5,
+            "marker {m:?} not on hole {h:?}"
+        );
+    }
+}
+
+/// Nothing matches: no stage improves on the operator's markers, so the ✛ set
+/// is left exactly where they put it rather than parked wherever the last
+/// failed attempt happened to leave it.
+#[test]
+fn a_failed_check_leaves_the_markers_where_the_operator_put_them() {
+    let dir = std::env::temp_dir().join(format!("ui-fidladder-d-{}", std::process::id()));
+    std::fs::create_dir_all(&dir).unwrap();
+    let path = dir.join("bed6.png");
+    let ppm = 10.0;
+    // A blank bed: no holes at all, so every stage comes up empty.
+    write_hole_frame(&path, ppm, &[]);
+
+    let mut app = ConsoleApp::new(tmp_db(), vec!["true".into()]);
+    app.runtime.tab = CentralTab::Fiducials;
+    app.fiducials.frame = path.to_string_lossy().into();
+    app.fiducials.layout = "15,25; 55,25; 55,60; 15,60".into();
+    app.fiducials.px_per_mm = ppm;
+    app.fiducials.diameter_mm = 1.0;
+    app.fiducials.search_mm = 2.0;
+    let ctx = Context::default();
+    app.load_fid_frame(&ctx);
+    let placed = [(16.0, 26.0), (54.0, 24.0), (56.0, 61.0), (14.0, 59.0)];
+    app.fiducials.search = placed.to_vec();
+    app.render_fiducials(&ctx);
+
+    assert_eq!(
+        app.fiducials.found.iter().filter(|f| f.is_some()).count(),
+        0,
+        "nothing to find: {}",
+        app.fiducials.note
+    );
+    assert_eq!(
+        app.fiducials.search,
+        placed.to_vec(),
+        "the markers survived a failed Check: {}",
+        app.fiducials.note
+    );
+    assert!(
+        app.fiducials.note.contains("rectangle match"),
+        "the note says the rescan was tried and why it came up short: {}",
+        app.fiducials.note
+    );
+}
+
+/// Everything a diagnostic-log reader depends on: the records exist, they carry
+/// the `check=N` that makes a check greppable as one unit, and the overlay
+/// record — the only one reached from a per-frame path — writes once per
+/// position rather than once per frame.
+#[test]
+fn the_diagnostic_log_records_a_check_and_its_overlay_without_flooding() {
+    use nalgebra::Matrix3;
+    let mut app = ConsoleApp::new(tmp_db(), vec!["true".into()]);
+    let log_path = app.runtime.diag.path().to_path_buf();
+    // A laser anchor at 10 px/mm, so camera px → machine mm is exact.
+    app.calibration.anchor = Some(calib::Calibration {
+        px_to_mm: vision::Homography {
+            matrix: Matrix3::new(0.1, 0.0, 0.0, 0.0, 0.1, 0.0, 0.0, 0.0, 1.0),
+            residuals: vec![],
+            rms: 0.0,
+        },
+        rms_um: 0.0,
+        found: 4,
+        total: 4,
+        dots: vec![],
+    });
+    app.fiducials.frame_img = Some(image::GrayImage::new(800, 800));
+    app.fiducials.layout = "10,10; 60,10; 10,60; 60,60".into();
+    // Detected exactly on the nominal layout: an identity fit, so the check is
+    // applied rather than gated.
+    app.fiducials.found = vec![
+        Some((100.0, 100.0)),
+        Some((600.0, 100.0)),
+        Some((100.0, 600.0)),
+        Some((600.0, 600.0)),
+    ];
+    app.update_placement_from_fiducials();
+    assert!(app.fiducials.last_placed, "the fit was applied");
+
+    let text = std::fs::read_to_string(&log_path).expect("the log file exists");
+    assert!(
+        text.starts_with(|c: char| c.is_ascii_digit()),
+        "timestamped"
+    );
+    assert!(text.contains("startup version="), "record 1");
+    assert!(
+        text.contains("fid-check check=1") && text.contains("projection=homography"),
+        "record 2a names the projection variant: {text}"
+    );
+    assert!(
+        text.contains("detected_machine_mm=[10.000,10.000 60.000,10.000"),
+        "record 2a carries the detections in MACHINE mm: {text}"
+    );
+    assert!(
+        text.contains("layout_centroid_mm=35.000,35.000"),
+        "record 2b carries the layout centroid: {text}"
+    );
+    assert!(text.contains("outcome=applied"), "record 2c: {text}");
+
+    // Record 3: the overlay bbox. It is called from the frame path, so it must
+    // write once for a position and stay silent while nothing moves.
+    app.placement.job = vec![pcb_core::Poly {
+        outer: vec![
+            pcb_core::P { x: 0, y: 0 },
+            pcb_core::P {
+                x: 10 * NM_PER_MM,
+                y: 0,
+            },
+            pcb_core::P {
+                x: 10 * NM_PER_MM,
+                y: 10 * NM_PER_MM,
+            },
+        ],
+        holes: vec![],
+    }];
+    app.placement.pivot = (5.0, 5.0);
+    for _ in 0..20 {
+        app.diag_overlay(None, (800, 800));
+    }
+    let overlays = |t: &str| t.matches("overlay check=").count();
+    let text = std::fs::read_to_string(&log_path).unwrap();
+    assert_eq!(overlays(&text), 1, "20 frames, one record: {text}");
+
+    // A sub-epsilon nudge is not a new position.
+    app.placement.tx_mm += 0.001;
+    app.diag_overlay(None, (800, 800));
+    let text = std::fs::read_to_string(&log_path).unwrap();
+    assert_eq!(overlays(&text), 1, "jitter below the epsilon is not logged");
+
+    // A real move is.
+    app.placement.tx_mm += 5.0;
+    app.diag_overlay(None, (800, 800));
+    let text = std::fs::read_to_string(&log_path).unwrap();
+    assert_eq!(overlays(&text), 2, "a real move is recorded");
+    assert!(
+        text.contains("overlay check=1"),
+        "the overlay is tagged with the check it belongs to: {text}"
+    );
+}
+
+/// A gated-out check still records its fit and names the gate that refused it —
+/// a refusal is the case the log exists for.
+#[test]
+fn the_diagnostic_log_names_the_gate_that_refused_a_check() {
+    let mut app = ConsoleApp::new(tmp_db(), vec!["true".into()]);
+    let log_path = app.runtime.diag.path().to_path_buf();
+    app.fiducials.frame_img = Some(image::GrayImage::new(800, 800));
+    // No calibration at all, so `place_projection` refuses.
+    app.update_placement_from_fiducials();
+    let text = std::fs::read_to_string(&log_path).unwrap();
+    assert!(
+        text.contains("outcome=refused-projection"),
+        "the gate is named: {text}"
+    );
+    // Record 5: the projection failure also reaches the file as an error line
+    // once the frame's log sweep runs.
+    app.runtime.log.push(LogLine {
+        text: "synthetic failure".into(),
+        err: true,
+    });
+    app.diag_mirror_errors();
+    let text = std::fs::read_to_string(&log_path).unwrap();
+    assert!(text.contains("error synthetic failure"), "record 5: {text}");
+}
+
+/// The error mirror tracks an index into a log the verb pump trims from the
+/// front. A shrunk log must clamp, not slice out of bounds.
+#[test]
+fn the_error_mirror_survives_the_log_being_trimmed() {
+    let mut app = ConsoleApp::new(tmp_db(), vec!["true".into()]);
+    for i in 0..600 {
+        app.runtime.log.push(LogLine {
+            text: format!("line {i}"),
+            err: i % 100 == 0,
+        });
+    }
+    app.diag_mirror_errors();
+    // The pump's 500-line trim, and then a full clear — both leave the cursor
+    // past the end.
+    app.runtime.log.clear();
+    app.diag_mirror_errors();
+    app.runtime.log.push(LogLine {
+        text: "after the trim".into(),
+        err: true,
+    });
+    app.diag_mirror_errors();
+    let text = std::fs::read_to_string(app.runtime.diag.path()).unwrap();
+    assert!(text.contains("error after the trim"), "mirroring resumes");
 }

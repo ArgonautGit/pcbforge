@@ -188,8 +188,8 @@ fn the_fiducial_holes_calibration_step_is_selectable() {
     h.run();
     let s = h.state().debug_summary();
     assert!(
-        s.contains("calib_mode=FidHoles") && summary_line(&s, "fid_board:").contains("layout="),
-        "④ selects the fiducial-holes step and reports the board layout:\n{s}"
+        s.contains("calib_mode=FidHoles") && summary_line(&s, "fid_rect:").contains("layout="),
+        "④ selects the fiducial-holes step and reports the rectangle layout:\n{s}"
     );
 }
 
@@ -223,32 +223,34 @@ fn fit_feedback_visibility_toggle_is_drivable() {
 }
 
 #[test]
-fn laser_field_scale_compensation_opt_in_is_drivable() {
+fn laser_field_scale_handling_choice_is_drivable() {
     let mut h = console();
     h.get_by_label("🎯 Calibrate").click();
     h.run();
     // Exact label: "③ Laser field" also appears in the Job-tab export help.
     h.get_by_label("3) Laser field (burned grid)").click();
     h.run();
-    // The setting persists across runs (shared temp DB), so drive to a known
-    // OFF state before toggling rather than trusting the starting value.
-    if summary_line(&h.state().debug_summary(), "laser_field:").contains("scale_comp=on") {
-        h.get_by_label("compensate machine scale").click();
+    // Each of the three choices is its own labelled node, so an operator (or a
+    // headless driver) can select any of them by name. The setting persists
+    // across runs on the shared temp DB, so drive to a known one first.
+    for (label, token) in [
+        ("refuse a machine scale error", "refuse"),
+        ("compensate machine scale", "compensate"),
+        (
+            "correct distortion only (keep 1:1 work area)",
+            "distortion_only",
+        ),
+        ("refuse a machine scale error", "refuse"),
+    ] {
+        h.get_by_label(label).click();
         h.run();
+        assert!(
+            summary_line(&h.state().debug_summary(), "laser_field:")
+                .contains(&format!("scale_mode={token}")),
+            "{label} selects {token}:\n{}",
+            h.state().debug_summary()
+        );
     }
-    assert!(
-        summary_line(&h.state().debug_summary(), "laser_field:").contains("scale_comp=off"),
-        "opt-in driven to off:\n{}",
-        h.state().debug_summary()
-    );
-    // The checkbox is labelled, so an agent/operator can drive it.
-    h.get_by_label("compensate machine scale").click();
-    h.run();
-    assert!(
-        summary_line(&h.state().debug_summary(), "laser_field:").contains("scale_comp=on"),
-        "checkbox turns scale compensation on:\n{}",
-        h.state().debug_summary()
-    );
 }
 
 #[test]
@@ -283,14 +285,12 @@ fn laser_anchor_exposes_manual_dot_correction() {
 
 #[test]
 fn place_advertises_conditional_field_warp() {
-    let mut h = console();
-    h.get_by_label_contains("Place on board").click();
-    h.run();
+    let h = console();
     // The export gate is a warning, not a lockout: uncalibrated exports emit
     // unwarped geometry and say so, rather than blocking the operator.
     assert!(
         h.query_by_label_contains("else exports unwarped").is_some(),
-        "Place must state that exports without a field map are unwarped"
+        "the placement controls must state that exports without a field map are unwarped"
     );
     assert!(h.query_by_label_contains("export disabled until").is_none());
     assert!(h.query_by_label("compensate field").is_none());
@@ -299,8 +299,6 @@ fn place_advertises_conditional_field_warp() {
 #[test]
 fn etch_and_run_in_lightburn_button_is_present_and_guards_without_a_job() {
     let mut h = console();
-    h.get_by_label_contains("Place on board").click();
-    h.run();
     // A fresh console reports the LightBurn defaults on the place: line.
     let s = h.state().debug_summary();
     assert!(
@@ -309,12 +307,12 @@ fn etch_and_run_in_lightburn_button_is_present_and_guards_without_a_job() {
     );
     // The one-click button exists and is drivable by label.
     assert!(
-        h.query_by_label("▶ Etch + run in LightBurn").is_some(),
-        "the Etch + run button must be present and labelled"
+        h.query_by_label("🔥 Etch + Run").is_some(),
+        "the Etch + Run button must be present and labelled"
     );
-    // Clicking with no frame + job loaded hits the existing guard: nothing is
+    // Clicking with no design loaded hits the existing guard: nothing is
     // armed, so the summary still reports lightburn=idle.
-    h.get_by_label("▶ Etch + run in LightBurn").click();
+    h.get_by_label("🔥 Etch + Run").click();
     h.run();
     assert!(
         summary_line(&h.state().debug_summary(), "place:").contains("lightburn=idle"),
@@ -323,17 +321,15 @@ fn etch_and_run_in_lightburn_button_is_present_and_guards_without_a_job() {
     );
 }
 
-/// The Place tab carries the no-burn drill-emit controls: the path fields and
-/// buttons are present and labelled (drivable), "⚙ Drills from KiCad" fills
-/// the drill field with the stable pth/npth paths, and clicking the emit
-/// button never queues a LightBurn run. Assertions are positive (type a path,
-/// expect the fill) because the kittest consoles share one settings sidecar —
-/// an "unset" assertion would be order-dependent.
+/// The no-burn drill-emit controls: the Job-tab path fields and the
+/// Actions-panel buttons are present and labelled (drivable), "⚙ Drills from
+/// KiCad" fills the drill field with the stable pth/npth paths, and clicking
+/// the emit button never queues a LightBurn run. Assertions are positive (type
+/// a path, expect the fill) because the kittest consoles share one settings
+/// sidecar — an "unset" assertion would be order-dependent.
 #[test]
-fn place_tab_emits_drill_holes_without_a_burn() {
+fn drill_holes_are_emitted_without_a_burn() {
     let mut h = console();
-    h.get_by_label_contains("Place on board").click();
-    h.run();
     let s = h.state().debug_summary();
     assert!(
         summary_line(&s, "place:").contains("drill_out=drill.lbrn2"),
@@ -372,8 +368,8 @@ fn place_tab_emits_drill_holes_without_a_burn() {
         "the KiCad button filled the drill field (summary shows the pair's basename):\n{}",
         h.state().debug_summary()
     );
-    // Clicking emit with no frame + job loaded hits the guard: no file
-    // written, no load spawned — LightBurn stays idle with nothing queued.
+    // Clicking emit with no design loaded hits the guard: no file written,
+    // no load spawned — LightBurn stays idle with nothing queued.
     h.get_by_label("⤓ Emit drill holes → LightBurn (no burn)")
         .click();
     h.run();
@@ -387,8 +383,6 @@ fn place_tab_emits_drill_holes_without_a_burn() {
 #[test]
 fn lightburn_device_field_is_labelled_and_editable() {
     let mut h = console();
-    h.get_by_label_contains("Place on board").click();
-    h.run();
     // The device field is labelled_by its label, so it's drivable.
     let field = h.get_by_label("LightBurn device");
     field.focus();
@@ -404,23 +398,25 @@ fn lightburn_device_field_is_labelled_and_editable() {
 }
 
 #[test]
-fn generate_and_burn_holes_buttons_are_present_and_labelled() {
+fn generate_holes_buttons_are_present_and_labelled() {
     let mut h = console();
-    // Fiducial tab: the button says it burns, not just generates — the export
-    // chains a LightBurn load + START, so the label must promise the burn.
+    // Fiducial tab: the button writes the .lbrn2 and LOADS it in LightBurn
+    // without starting it, so the label must say "(no burn)" — matching the
+    // Actions panel's drill emit.
     h.get_by_label("◎ Fiducial check").click();
     h.run();
     assert!(
-        h.query_by_label("⚙ Generate + burn holes").is_some(),
+        h.query_by_label("⚙ Generate holes → LightBurn (no burn)")
+            .is_some(),
         "the fiducial-tab generate button must be present and labelled"
     );
-    // ④ Fiducial holes step: same promise on the calibration flow's button.
+    // ④ Fiducial holes step: same contract on the calibration flow's button.
     h.get_by_label("🎯 Calibrate").click();
     h.run();
     h.get_by_label("4) Fiducial holes (board)").click();
     h.run();
     assert!(
-        h.query_by_label("⚙ Generate + burn fiducial holes")
+        h.query_by_label("⚙ Generate fiducial holes → LightBurn (no burn)")
             .is_some(),
         "the ④-step generate button must be present and labelled"
     );

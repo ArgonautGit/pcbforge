@@ -50,7 +50,7 @@ command failed. Lines starting with `#` and blank lines are ignored.
 - Matched **exactly first, then by substring**; if several share a label the
   driver takes the first. `click "⟳ Refresh"` and `click Refresh` both work.
 - **Quote labels containing spaces:** `click "📷 Camera"`. Tab labels carry an
-  emoji prefix (`🎯 Calibrate`, `✋ Place on board`) — run `tree` to read them.
+  emoji prefix (`🎯 Calibrate`, `◎ Fiducial check`) — run `tree` to read them.
 - Buttons, checkboxes, and sliders carry labels. Bare `text_edit_singleline`
   fields do **not** (see *Adding widgets* below), so target them by a nearby
   labelled widget or drive via `tree`-discovered structure.
@@ -63,7 +63,7 @@ Window
   Button label="🖼 Job preview"
   Button label="📷 Camera"
   Button label="🎯 Calibrate"
-  Button label="✋ Place on board"
+  Button label="◎ Fiducial check"
 ```
 
 ## The debugging loop

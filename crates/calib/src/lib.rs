@@ -538,9 +538,15 @@ pub fn fit_rigid(pairs: &[(Point2<f64>, Point2<f64>)]) -> Result<Rigid2, String>
 }
 
 /// A similarity (uniform scale · rotation + translation) alignment `src → dst`.
-/// DIAGNOSTIC ONLY — the metric paper→machine anchor stays rigid
-/// ([`fit_rigid`]) so galvo scale errors remain measurable against the printed
-/// pitch; this exists to *detect* a scale mismatch, never to absorb one.
+///
+/// Two callers with opposite intent, so read the doc of the one you mean:
+/// the metric **calibration anchor** (`FieldCal::paper_to_machine`) stays rigid
+/// ([`fit_rigid`]) so a galvo scale error keeps showing up as residual against
+/// the printed pitch — there, a similarity is a *diagnostic* (`FieldCal::scale`)
+/// and must never absorb the mismatch. The **fiducial board pose**
+/// (`ui::fiducial::fit_board_pose`) deliberately does absorb it: the board's
+/// measured hole spacing is the thing being registered to, so scale belongs in
+/// the fit and is carried into the emitted job.
 #[derive(Debug, Clone, Copy, PartialEq)]
 pub struct Similarity2 {
     /// src units → dst units, > 0.
@@ -552,6 +558,19 @@ pub struct Similarity2 {
 impl Similarity2 {
     pub fn apply(&self, p: (f64, f64)) -> (f64, f64) {
         self.rigid.apply((p.0 * self.scale, p.1 * self.scale))
+    }
+
+    /// dst → src: undo the rigid part, then the scale. Every constructor goes
+    /// through [`fit_similarity_proper`], which rejects a non-positive scale,
+    /// so the division is safe for any `Similarity2` this module hands out.
+    pub fn inverse_apply(&self, p: (f64, f64)) -> (f64, f64) {
+        let r = self.rigid.inverse_apply(p);
+        (r.0 / self.scale, r.1 / self.scale)
+    }
+
+    /// Rotation angle of the `R` factor, degrees — see [`Rigid2::angle_deg`].
+    pub fn angle_deg(&self) -> f64 {
+        self.rigid.angle_deg()
     }
 }
 
@@ -652,11 +671,21 @@ pub struct FieldDot {
     pub physical_mm: (f64, f64),
     /// The commanded machine coordinate it was burned at (mm).
     pub commanded_mm: (f64, f64),
-    /// Field error at this dot: `|physical − commanded|`, µm. This is what the
-    /// pre-distortion cancels.
+    /// Field error at this dot: `|physical − commanded|`, µm. The RAW measured
+    /// error — under [`FieldScale::DistortionOnly`] the uniform scale is
+    /// deliberately NOT cancelled, so this stays much larger than `resid_um`;
+    /// that gap is the machine's mis-size, reported rather than hidden.
     pub field_um: f64,
-    /// Post-fit residual of the field map at this dot, µm.
+    /// Post-fit residual of the field map at this dot, µm. Measured in the same
+    /// frame the map was fit in, so it always agrees with `FieldMap::rms_um`
+    /// — for the SURVIVING dots. A rejected dot's residual is measured against
+    /// the same final map but did not contribute to it, so it reads large; that
+    /// is the point, and the overlay draws it distinctly.
     pub resid_um: f64,
+    /// Excluded from the field polynomial as an outlier (see
+    /// [`FIELD_OUTLIER_K`]). Still detected, still counted in `found`, still
+    /// drawn — rejection is not "not found".
+    pub rejected: bool,
 }
 
 /// A fitted laser field-distortion calibration: the `physical ↔ commanded`
@@ -691,6 +720,17 @@ pub struct FieldCal {
     /// distortion. `0` when the lens map carries no bounds. Per-fit feedback —
     /// not persisted.
     pub extrapolated: usize,
+    /// How many detected dots were excluded from the field polynomial as
+    /// outliers. `field.rms_um` / `field.max_um` are over the survivors, so a
+    /// non-zero count here is the difference between "this fit passed" and
+    /// "this fit passed once a dot was thrown away" — the console must show it.
+    /// Per-fit feedback, not persisted.
+    pub rejected: usize,
+    /// Operator-facing sentence about the outlier rejection: what was excluded
+    /// and how far out it was, or why nothing was (the cap fired, a boundary
+    /// corner was protected, the refit failed). Empty when there is nothing to
+    /// say. Per-fit feedback, not persisted.
+    pub rejection_note: String,
 }
 
 /// Map a camera pixel into the laser's **commanded** coordinate frame by
@@ -871,15 +911,251 @@ pub const FIELD_SCALE_NOTE_FRAC: f64 = 0.01;
 /// without matching prose.
 pub const FIELD_SCALE_ERR_MARKER: &str = "burn-vs-paper scale";
 
-/// `allow_machine_scale` lets the operator opt into absorbing a large uniform
-/// burn-vs-paper scale (e.g. a machine whose configured field size is wrong) in
-/// software: with it set, the `> FIELD_SCALE_FAIL_FRAC` hard gate is skipped and
-/// the scale is absorbed by the field polynomial's linear terms downstream.
-/// Shapes then burn dimensionally true, but the machine's speeds and hatch
-/// spacing stay in its own oversized units, so energy density shifts — the UI
-/// warns and records the choice. The mirror guard below is independent of this
-/// flag: a mirrored view or scrambled corner order cannot be fixed by scale +
-/// rotation + translation, so it is caught in either mode.
+/// What the ③ fit does about a large uniform burn-vs-paper scale (a machine
+/// whose configured field size is wrong, or a setup mistake that reads like
+/// one). The mirror guard is independent of this choice: a scrambled corner
+/// order cannot be fixed by scale + rotation + translation + reflection, so it
+/// is caught in every mode.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum FieldScale {
+    /// Refuse the fit above [`FIELD_SCALE_FAIL_FRAC`]. A gross scale mismatch is
+    /// far more often a setup error than a real field, so this is the default.
+    Refuse,
+    /// Absorb the scale into the field polynomial's linear terms. Shapes burn
+    /// dimensionally true, but the commanded coordinates are stretched by
+    /// `1/scale` — a machine reading 32% small needs 132 mm commanded for 90 mm
+    /// physical, so the usable work area shrinks by the same factor. The
+    /// machine's speeds and hatch spacing also stay in its own units, so energy
+    /// density shifts; the UI warns and records the choice.
+    Compensate,
+    /// Fit and apply the NON-UNIFORM distortion only: the uniform scale is
+    /// divided out of the fit targets and merely reported (`FieldCal::scale`),
+    /// so the resulting map has unit magnification — commanding X mm asks for
+    /// X mm plus the distortion correction, and the whole configured work area
+    /// stays addressable. The scale gate never fires in this mode.
+    DistortionOnly,
+}
+
+/// Outlier cut for the ③ field fit, in robust sigmas above the MEDIAN residual.
+///
+/// The cut is `median + K·sigma`, not `K·sigma` about zero: `resid_um` is a
+/// Euclidean magnitude, so its distribution sits well away from zero and a
+/// zero-centred cut is far too aggressive. On the case this was built for (49
+/// dots, median residual ≈ 90 µm, MAD-sigma ≈ 40 µm) a zero-centred 3.5-sigma
+/// cut lands at ~155 µm and would eat perfectly healthy 160–200 µm dots.
+///
+/// 3.5 sits in the conventional 3–4 band. Below 3 the ordinary upper tail of a
+/// 50-dot grid starts tripping it; above 4 a single 2 mm scuff on a grid that
+/// is otherwise loose can survive.
+pub const FIELD_OUTLIER_K: f64 = 3.5;
+
+/// Absolute floor on the outlier cut, µm — nothing below this is ever rejected.
+///
+/// A near-perfect grid has a tiny MAD-sigma, and `median + K·sigma` would then
+/// start rejecting healthy dots for being merely ordinary. The floor is tied to
+/// the reason rejection exists at all: a dot whose residual is inside the
+/// WORST-DOT acceptance limit can never be why a fit was refused, so there is
+/// nothing to gain by dropping it. This is the console's default
+/// `accept_worst_um` (see [`field_live_acceptance`]). Those limits are
+/// operator-configurable and are deliberately NOT threaded into the fit — the
+/// coupling is by value, so that lowering the acceptance limits tightens what
+/// must be met without also licensing the fit to discard more evidence.
+pub const FIELD_OUTLIER_FLOOR_UM: f64 = 250.0;
+
+/// Largest share of the detected dots the fit will ever exclude.
+///
+/// Above this it is not a scuff on the paper — it is a bad capture, a bad
+/// corner-click order, or a field the bi-cubic does not describe. Deleting an
+/// eighth of the evidence to make a laser calibration pass is exactly the
+/// failure this guard exists to prevent, so when the cut would take more than
+/// this share NOTHING is dropped and the existing gates refuse as before. 10%
+/// still covers several genuinely bad dots on a realistic 49–81 dot grid.
+pub const FIELD_OUTLIER_MAX_FRAC: f64 = 0.10;
+
+/// Reject/refit passes. The cut comes from a robust spread, so the first pass
+/// already sees a sigma the outliers have not inflated and the second finds
+/// nothing in practice; each further pass only adds a way for the dot set to
+/// erode one dot at a time until whatever is left agrees with itself.
+const FIELD_OUTLIER_PASSES: usize = 2;
+
+/// Median of `v`, reordering it. Used for both the median residual and the MAD.
+fn median_in_place(v: &mut [f64]) -> f64 {
+    v.sort_by(f64::total_cmp);
+    let n = v.len();
+    if n % 2 == 1 {
+        v[n / 2]
+    } else {
+        0.5 * (v[n / 2 - 1] + v[n / 2])
+    }
+}
+
+/// Per-pair residual of `map` in µm, in the frame the map was fit in.
+fn field_resid_um(map: &FieldMap, pairs: &[(Point2<f64>, Point2<f64>)]) -> Vec<f64> {
+    pairs
+        .iter()
+        .map(|(p, c)| {
+            let (ex, ey) = map.to_commanded.apply(p.x, p.y);
+            ((ex - c.x).powi(2) + (ey - c.y).powi(2)).sqrt() * 1000.0
+        })
+        .collect()
+}
+
+/// The field map plus which dots it was fit over and what to tell the operator.
+struct RobustFieldFit {
+    field: FieldMap,
+    /// Parallel to the fit pairs: `false` = excluded from `field`.
+    keep: Vec<bool>,
+    note: String,
+}
+
+/// Refit `base` with outlying dots excluded, so one bad dot cannot veto an
+/// otherwise-good calibration.
+///
+/// Spread is the MAD (`1.4826·median|r − median r|`), never the standard
+/// deviation — the SD is inflated by the very outliers being looked for, which
+/// is how a 2 mm dot hides itself. `is_corner` marks the four boundary corner
+/// dots: if any of them is an outlier, rejection is suspended altogether — the
+/// corner gate exists to constrain the fit where distortion is largest, and
+/// fitting around a bad corner (by deleting it, or by deleting the neighbours
+/// that were holding the polynomial away from it) defeats it either way.
+///
+/// Every path returns a usable fit. A refit that fails, or a cut that would
+/// take too many dots, falls back to `base` over all dots and says so — the
+/// operator still gets numbers to read, and the existing gates still refuse.
+fn reject_field_outliers(
+    fit_pairs: &[(Point2<f64>, Point2<f64>)],
+    base: FieldMap,
+    is_corner: &[bool],
+    extrapolated_dot: &[bool],
+) -> RobustFieldFit {
+    let n = fit_pairs.len();
+    let unrejected = |note: String| RobustFieldFit {
+        field: base.clone(),
+        keep: vec![true; n],
+        note,
+    };
+    let max_drop = (FIELD_OUTLIER_MAX_FRAC * n as f64).floor() as usize;
+
+    let mut keep = vec![true; n];
+    let mut field = base.clone();
+    let mut dropped: Vec<usize> = Vec::new();
+    let mut final_resid = field_resid_um(&field, fit_pairs);
+
+    for _ in 0..FIELD_OUTLIER_PASSES {
+        let resid = field_resid_um(&field, fit_pairs);
+        let mut surviving: Vec<f64> = (0..n).filter(|&i| keep[i]).map(|i| resid[i]).collect();
+        let median = median_in_place(&mut surviving);
+        let mut deviations: Vec<f64> = surviving.iter().map(|r| (r - median).abs()).collect();
+        let sigma = 1.4826 * median_in_place(&mut deviations);
+        let cut = (median + FIELD_OUTLIER_K * sigma).max(FIELD_OUTLIER_FLOOR_UM);
+
+        let mut bad_corners: Vec<f64> = Vec::new();
+        let mut flagged = Vec::new();
+        for i in 0..n {
+            if !keep[i] || resid[i] <= cut {
+                continue;
+            }
+            if is_corner[i] {
+                bad_corners.push(resid[i]);
+            } else {
+                flagged.push(i);
+            }
+        }
+        // An off-lattice boundary corner suspends rejection ENTIRELY — not just
+        // for that corner. Dropping its neighbours would remove the constraints
+        // holding the polynomial away from it, the fit would bend toward the bad
+        // corner, and its residual would fall back under the acceptance limit:
+        // the same defeat the corner gate exists to prevent, arriving by
+        // deleting the witnesses instead of the corner. Nothing is dropped, and
+        // the note names the corner so the accept/reject stays honest.
+        if !bad_corners.is_empty() {
+            return unrejected(format!(
+                "{} of the 4 boundary corner dots are outliers ({}) — outlier rejection is \
+                 SUSPENDED and nothing was excluded. The corner gate exists to constrain the fit \
+                 where distortion is largest, so a bad corner has to fail the fit rather than be \
+                 fitted around; recapture those corners.",
+                bad_corners.len(),
+                bad_corners
+                    .iter()
+                    .map(|r| format!("{r:.0} µm"))
+                    .collect::<Vec<_>>()
+                    .join(", ")
+            ));
+        }
+        if flagged.is_empty() {
+            break;
+        }
+        if dropped.len() + flagged.len() > max_drop {
+            let total = dropped.len() + flagged.len();
+            return unrejected(format!(
+                "{total} of {n} fitted dots read as outliers (over the {:.0}% cap) — that is a bad \
+                 capture or a model that doesn't describe this field, not stray dots, so NOTHING \
+                 was excluded and the residuals below are over all {n}",
+                FIELD_OUTLIER_MAX_FRAC * 100.0
+            ));
+        }
+
+        for &i in &flagged {
+            keep[i] = false;
+        }
+        dropped.extend_from_slice(&flagged);
+        let survivors: Vec<(Point2<f64>, Point2<f64>)> =
+            (0..n).filter(|&i| keep[i]).map(|i| fit_pairs[i]).collect();
+        match fit_field(&survivors) {
+            Ok(refit) => {
+                field = refit;
+                final_resid = field_resid_um(&field, fit_pairs);
+            }
+            Err(e) => {
+                return unrejected(format!(
+                    "{} dot(s) read as outliers but the refit without them failed ({e}); nothing \
+                     was excluded and the residuals below are over all {n}",
+                    dropped.len()
+                ));
+            }
+        }
+    }
+
+    if dropped.is_empty() {
+        return RobustFieldFit {
+            field,
+            keep,
+            note: String::new(),
+        };
+    }
+
+    dropped.sort_unstable_by(|&a, &b| final_resid[b].total_cmp(&final_resid[a]));
+    let residuals = dropped
+        .iter()
+        .map(|&i| format!("{:.0} µm", final_resid[i]))
+        .collect::<Vec<_>>()
+        .join(", ");
+    // A dot that is BOTH an outlier and outside the ① lens-calibrated region is
+    // the signature of the metric ruler extrapolating, not of the laser field
+    // curving — different fix, so name it.
+    let extrap = dropped.iter().filter(|&&i| extrapolated_dot[i]).count();
+    let extrap_note = if extrap > 0 {
+        format!(
+            " {extrap} of them also lie OUTSIDE the region the step-1 lens calibration covered, \
+             where the metric ruler extrapolates — that combination points at a ruler artefact \
+             rather than field distortion: print/calibrate a larger paper grid, or shrink the \
+             burn grid."
+        )
+    } else {
+        String::new()
+    };
+    RobustFieldFit {
+        field,
+        keep,
+        note: format!(
+            "{} of {n} dots EXCLUDED from the fit as outliers (residual {residuals}); the RMS/worst \
+             above are over the remaining {}.{extrap_note}",
+            dropped.len(),
+            n - dropped.len()
+        ),
+    }
+}
+
 pub fn fit_laser_field(
     frame: &GrayImage,
     corners_px: [(f64, f64); 4],
@@ -887,7 +1163,7 @@ pub fn fit_laser_field(
     dot_mm: f64,
     kind: DotKind,
     lens: &LensMap,
-    allow_machine_scale: bool,
+    field_scale: FieldScale,
 ) -> Result<FieldCal, String> {
     if grid.n < 4 {
         return Err("laser-field fit needs at least a 4×4 grid".into());
@@ -906,18 +1182,22 @@ pub fn fit_laser_field(
     // extrapolates the bi-cubic unreliably, and that error lands silently in the
     // field fit's residuals/scatter — so surface it. The box is grown 5% of its
     // own span on each side: extrapolation right at the edge is harmless.
-    let extrapolated = lens
-        .calib_px_bounds
-        .map_or(0, |[min_x, min_y, max_x, max_y]| {
+    // Kept per dot, not just counted: an excluded dot that ALSO sits out here is
+    // the signature of ruler extrapolation rather than field distortion.
+    let extrapolated_dot: Vec<bool> = match lens.calib_px_bounds {
+        Some([min_x, min_y, max_x, max_y]) => {
             let mx = (max_x - min_x) * 0.05;
             let my = (max_y - min_y) * 0.05;
             let (lo_x, hi_x) = (min_x - mx, max_x + mx);
             let (lo_y, hi_y) = (min_y - my, max_y + my);
             pairs
                 .iter()
-                .filter(|(fpx, _)| fpx.x < lo_x || fpx.x > hi_x || fpx.y < lo_y || fpx.y > hi_y)
-                .count()
-        });
+                .map(|(fpx, _)| fpx.x < lo_x || fpx.x > hi_x || fpx.y < lo_y || fpx.y > hi_y)
+                .collect()
+        }
+        None => vec![false; pairs.len()],
+    };
+    let extrapolated = extrapolated_dot.iter().filter(|e| **e).count();
     // Detected px → paper-frame mm through the lens ruler. The printed paper
     // only characterizes distortion + metric scale; its pose in the view is
     // arbitrary (it's taped on top). The BURNED GRID anchors the coordinate
@@ -933,21 +1213,23 @@ pub fn fit_laser_field(
         .collect();
     // Scale sanity gate, BEFORE the mirror guard: a large uniform scale mismatch
     // (wrong paper pitch at ①, camera moved since ①, paper out of the burn
-    // plane, machine field size) is a setup error unless the operator has opted
-    // to absorb it in software (`allow_machine_scale`). When absorbed, the field
-    // polynomial's linear terms take it up downstream; `scale` still records it.
+    // plane, machine field size) is a setup error unless the operator has picked
+    // a mode that handles it — `Compensate` absorbs it in the field polynomial's
+    // linear terms, `DistortionOnly` divides it out of the fit targets. `scale`
+    // records it in every mode.
     let sim =
         fit_similarity(&paper_pairs).map_err(|e| format!("burned-grid frame alignment: {e}"))?;
     // sim is measured → commanded, so measured/commanded is its inverse.
     let scale = 1.0 / sim.scale;
-    if !allow_machine_scale && (scale - 1.0).abs() > FIELD_SCALE_FAIL_FRAC {
+    if field_scale == FieldScale::Refuse && (scale - 1.0).abs() > FIELD_SCALE_FAIL_FRAC {
         return Err(format!(
             "{FIELD_SCALE_ERR_MARKER} is off by {:+.1}% — a setup error, not field distortion. \
              Likeliest causes, in order: the pitch entered at step 1 wasn't the paper's MEASURED \
              pitch (or step 3's isn't the commanded one); the camera moved or zoomed since step 1; the \
              printed paper wasn't lying in the burn plane; the machine's field-size setting \
-             (LightBurn/EZCAD). Fix the setup, re-run step 1, then step 3 (or enable \
-             \"compensate machine scale\" to absorb it in software)",
+             (LightBurn/EZCAD). Fix the setup, re-run step 1, then step 3 (or pick \
+             \"compensate machine scale\" to absorb it in software, or \"correct distortion \
+             only\" to keep the work area at 1:1 and fix the curvature alone)",
             (scale - 1.0) * 100.0
         ));
     }
@@ -987,29 +1269,90 @@ pub fn fit_laser_field(
             (Point2::new(mx, my), *cmd)
         })
         .collect();
-    let field = fit_field(&field_pairs).map_err(|e| format!("field fit: {e}"))?;
+    // `DistortionOnly`: strip the uniform scale from the FIELD POLYNOMIAL'S FIT
+    // TARGETS, and nowhere else. It is deliberately NOT taken out of
+    // `paper_to_machine` (that stays `fit_rigid`) because that alignment is also
+    // the camera projection's metric anchor — `camera_px_to_physical` reads true
+    // mm through it, and absorbing a scale factor there would silently rescale
+    // fiducial measurement, placement and the overlay. Removing it here instead
+    // leaves the polynomial learning the non-uniform component alone, so the map
+    // comes out at unit magnification and the whole work area stays addressable.
+    //
+    // The scale is divided out about the COMMANDED LATTICE'S CENTROID, which
+    // `fit_rigid` maps the measured centroid onto exactly — so the centroid is
+    // an exact fixed point and the normalization adds no translation. That
+    // assumes the burned grid is centred on the scan field; the console already
+    // warns when it is well off the configured field centre.
+    let distortion_pairs = (field_scale == FieldScale::DistortionOnly).then(|| {
+        let n = field_pairs.len() as f64;
+        let cx = field_pairs.iter().map(|(_, c)| c.x).sum::<f64>() / n;
+        let cy = field_pairs.iter().map(|(_, c)| c.y).sum::<f64>() / n;
+        field_pairs
+            .iter()
+            .map(|(phys, cmd)| {
+                (
+                    Point2::new(cx + (phys.x - cx) / scale, cy + (phys.y - cy) / scale),
+                    *cmd,
+                )
+            })
+            .collect::<Vec<_>>()
+    });
+    let fit_pairs = distortion_pairs.as_deref().unwrap_or(&field_pairs);
+    let base = fit_field(fit_pairs).map_err(|e| format!("field fit: {e}"))?;
+    // Robust refit: one scuff on the paper must not veto a whole calibration.
+    // Only the FIELD POLYNOMIAL is refit on the survivors. `paper_to_machine`,
+    // `sim` and `scale` are left over all dots on purpose: one outlier perturbs
+    // them by a rigid/uniform-scale amount, and the field polynomial absorbs
+    // constant and linear terms exactly, so the survivors' residuals are
+    // unchanged by it — refitting them would only make the anchor the overlay
+    // and placement share disagree with the dots it was measured from.
+    let is_corner: Vec<bool> = pairs
+        .iter()
+        .map(|(_, cmd)| {
+            grid.corners_mm()
+                .into_iter()
+                .any(|(x, y)| (cmd.x - x).abs() < 1e-6 && (cmd.y - y).abs() < 1e-6)
+        })
+        .collect();
+    let robust = reject_field_outliers(fit_pairs, base, &is_corner, &extrapolated_dot);
+    let field = robust.field;
+    let rejected = robust.keep.iter().filter(|k| !**k).count();
+    let survivor = |i: usize| robust.keep[i];
     // A linear physical-mm → px map for the Place overlay: fit a homography
-    // from each dot's physical position to its detected pixel.
+    // from each dot's physical position to its detected pixel. Over the
+    // survivors too — an excluded dot is a bad measurement wherever it is read.
     let to_px_pairs: Vec<(Point2<f64>, Point2<f64>)> = pairs
         .iter()
         .zip(&field_pairs)
-        .map(|((fpx, _), (phys, _))| (*phys, *fpx))
+        .enumerate()
+        .filter(|(i, _)| survivor(*i))
+        .map(|(_, ((fpx, _), (phys, _)))| (*phys, *fpx))
         .collect();
     let to_px = fit_homography(&to_px_pairs).map_err(|e| format!("overlay fit: {e}"))?;
 
+    // Classified over the survivors as well: a 2 mm outlier reads as scatter and
+    // would have the verdict tell the operator "correction won't help" about a
+    // fit that was just accepted.
     let field_verdict = classify_field_error(
         &field_pairs
             .iter()
-            .map(|(phys, cmd)| (*cmd, Vector2::new(phys.x - cmd.x, phys.y - cmd.y)))
+            .enumerate()
+            .filter(|(i, _)| survivor(*i))
+            .map(|(_, (phys, cmd))| (*cmd, Vector2::new(phys.x - cmd.x, phys.y - cmd.y)))
             .collect::<Vec<_>>(),
     );
 
+    // `physical_mm`/`field_um` report the RAW measurement; `resid_um` reports the
+    // fit, so it is evaluated on the same points the fit saw (identical to
+    // `field_pairs` outside `DistortionOnly`) and always agrees with `rms_um`.
     let dots: Vec<FieldDot> = pairs
         .iter()
         .zip(&field_pairs)
-        .map(|((fpx, cmd), (phys, _))| {
+        .zip(fit_pairs)
+        .enumerate()
+        .map(|(i, (((fpx, cmd), (phys, _)), (fit_phys, _)))| {
             let field_um = ((phys.x - cmd.x).powi(2) + (phys.y - cmd.y).powi(2)).sqrt() * 1000.0;
-            let (gx, gy) = field.precompensate(phys.x, phys.y);
+            let (gx, gy) = field.precompensate(fit_phys.x, fit_phys.y);
             let resid_um = ((gx - cmd.x).powi(2) + (gy - cmd.y).powi(2)).sqrt() * 1000.0;
             FieldDot {
                 px: (fpx.x, fpx.y),
@@ -1017,6 +1360,7 @@ pub fn fit_laser_field(
                 commanded_mm: (cmd.x, cmd.y),
                 field_um,
                 resid_um,
+                rejected: !survivor(i),
             }
         })
         .collect();
@@ -1030,6 +1374,8 @@ pub fn fit_laser_field(
         field_verdict,
         scale,
         extrapolated,
+        rejected,
+        rejection_note: robust.note,
     })
 }
 
@@ -1283,6 +1629,49 @@ mod tests {
         for (a, b) in &pairs {
             let (x, y) = fit.apply((a.x, a.y));
             assert!((x - b.x).abs() < 1e-9 && (y - b.y).abs() < 1e-9);
+        }
+    }
+
+    /// `Similarity2::inverse_apply` is the exact inverse of `apply` for BOTH
+    /// reflection states at a non-unit scale — the fiducial placement carry
+    /// math maps a bed point back through the previous fit with it, so an
+    /// inverse that is only right for `flip_x == false` would silently drift
+    /// the operator's manual offset on the back face.
+    #[test]
+    fn similarity_inverse_round_trips_through_scale_and_reflection() {
+        for flip_x in [false, true] {
+            let sim = Similarity2 {
+                scale: 1.04,
+                rigid: Rigid2 {
+                    cos: (0.42_f64).cos(),
+                    sin: (0.42_f64).sin(),
+                    tx: 30.0,
+                    ty: -11.5,
+                    flip_x,
+                },
+            };
+            for p in [(0.0, 0.0), (17.0, -4.0), (-25.5, 60.25)] {
+                let round = sim.inverse_apply(sim.apply(p));
+                assert!(
+                    (round.0 - p.0).abs() < 1e-9 && (round.1 - p.1).abs() < 1e-9,
+                    "flip_x={flip_x}: {p:?} → {round:?}"
+                );
+                // …and the other way round, so neither direction is privileged.
+                let back = sim.apply(sim.inverse_apply(p));
+                assert!((back.0 - p.0).abs() < 1e-9 && (back.1 - p.1).abs() < 1e-9);
+            }
+            // The scale really is undone, not folded into the rigid part.
+            let far = sim.apply((10.0, 0.0));
+            let near = sim.apply((0.0, 0.0));
+            assert!(
+                (far.0.hypot(far.1 - 0.0) - near.0.hypot(near.1)).abs() > 0.0,
+                "sanity"
+            );
+            assert!(
+                ((far.0 - near.0).hypot(far.1 - near.1) - 10.0 * sim.scale).abs() < 1e-9,
+                "a 10 mm src span maps to 10·scale mm"
+            );
+            assert!((sim.angle_deg() - sim.rigid.angle_deg()).abs() < 1e-12);
         }
     }
 
@@ -1725,8 +2114,16 @@ mod tests {
             cam(px, py)
         });
 
-        let cal = fit_laser_field(&img, corners_px, &grid, dot_mm, DotKind::Dark, &lens, false)
-            .expect("field fit");
+        let cal = fit_laser_field(
+            &img,
+            corners_px,
+            &grid,
+            dot_mm,
+            DotKind::Dark,
+            &lens,
+            FieldScale::Refuse,
+        )
+        .expect("field fit");
         assert_eq!(cal.found, 49, "all dots detected");
         assert!(cal.field.rms_um < 60.0, "field RMS {} µm", cal.field.rms_um);
         field_live_acceptance(&cal, &grid, 100.0, 250.0)
@@ -1779,6 +2176,227 @@ mod tests {
         assert!(cal.field_verdict.ratio >= 2.0);
     }
 
+    /// The operator's real ③ geometry: a 7×7 burned grid (49 dots) with a ~3%
+    /// pincushion field, imaged by a plain 10 px/mm camera through a lens ruler
+    /// fit on the same points. `nudge_mm` displaces individual burns in the
+    /// PHYSICAL frame — that is what a scuffed/spattered dot looks like to the
+    /// fit: detected fine, sitting off the lattice.
+    fn pincushion_setup(
+        nudge_mm: &dyn Fn(f64, f64) -> (f64, f64),
+    ) -> (GrayImage, [(f64, f64); 4], GridSpec, f64, LensMap) {
+        let grid = GridSpec {
+            origin_mm: (0.0, 0.0),
+            pitch_mm: 10.0,
+            n: 7,
+        };
+        let dot_mm = 1.5;
+        let cam = |phx: f64, phy: f64| (10.0 * phx + 50.0, 10.0 * phy + 50.0);
+        let field = |cx: f64, cy: f64| {
+            let (du, dv) = (cx - 30.0, cy - 30.0);
+            let r2 = (du * du + dv * dv) / (30.0 * 30.0);
+            let f = 1.0 + 0.03 * r2;
+            (30.0 + du * f, 30.0 + dv * f)
+        };
+        // Where the burn for commanded (cx,cy) physically ended up.
+        let burned = |cx: f64, cy: f64| {
+            let (px, py) = field(cx, cy);
+            let (dx, dy) = nudge_mm(cx, cy);
+            (px + dx, py + dy)
+        };
+
+        let lens_pairs: Vec<(Point2<f64>, Point2<f64>)> = grid
+            .points()
+            .iter()
+            .map(|&(x, y)| {
+                let (u, v) = cam(x, y);
+                (Point2::new(u, v), Point2::new(x, y))
+            })
+            .collect();
+        let lens = fit_lens(&lens_pairs).expect("lens");
+
+        let centers: Vec<(f64, f64, f64)> = grid
+            .points()
+            .iter()
+            .map(|&(cx, cy)| {
+                let (px, py) = burned(cx, cy);
+                let (u, v) = cam(px, py);
+                (u, v, dot_mm * 10.0)
+            })
+            .collect();
+        let img = GrayImage::from_fn(720, 720, |x, y| {
+            let mut cover = 0.0;
+            for sy in 0..4 {
+                for sx in 0..4 {
+                    let px = x as f64 + (sx as f64 + 0.5) / 4.0 - 0.5;
+                    let py = y as f64 + (sy as f64 + 0.5) / 4.0 - 0.5;
+                    if centers.iter().any(|&(cx, cy, r)| {
+                        ((px - cx).powi(2) + (py - cy).powi(2)).sqrt() < r / 2.0
+                    }) {
+                        cover += 1.0 / 16.0;
+                    }
+                }
+            }
+            image::Luma([(210.0 - 150.0 * cover) as u8])
+        });
+        // The operator clicks the corner dots WHERE THEY ARE, nudge included.
+        let corners_px = grid.corners_mm().map(|(cx, cy)| {
+            let (px, py) = burned(cx, cy);
+            cam(px, py)
+        });
+        (img, corners_px, grid, dot_mm, lens)
+    }
+
+    fn fit_pincushion(
+        setup: &(GrayImage, [(f64, f64); 4], GridSpec, f64, LensMap),
+    ) -> Result<FieldCal, String> {
+        let (img, corners_px, grid, dot_mm, lens) = setup;
+        fit_laser_field(
+            img,
+            *corners_px,
+            grid,
+            *dot_mm,
+            DotKind::Dark,
+            lens,
+            FieldScale::Refuse,
+        )
+    }
+
+    /// The case this was built for: 49 dots, one interior burn ~2 mm off the
+    /// lattice. Including it the fit reads ~300 µm RMS / ~2 mm worst and is
+    /// refused; the outlier is excluded, reported, and the survivors land back
+    /// on the clean grid's residuals — inside the console's 100/250 µm limits.
+    #[test]
+    fn one_stray_dot_is_excluded_and_reported() {
+        let clean = fit_pincushion(&pincushion_setup(&|_, _| (0.0, 0.0))).expect("clean fit");
+        assert_eq!(clean.rejected, 0);
+        assert!(clean.rejection_note.is_empty());
+
+        // (30,30) is the grid's interior centre — not a boundary corner.
+        let strayed = fit_pincushion(&pincushion_setup(&|cx: f64, cy: f64| {
+            if cx == 30.0 && cy == 30.0 {
+                (2.0, 0.0)
+            } else {
+                (0.0, 0.0)
+            }
+        }))
+        .expect("strayed fit");
+
+        assert_eq!(strayed.found, 49, "the stray dot is still DETECTED");
+        assert_eq!(strayed.total, 49);
+        assert_eq!(strayed.rejected, 1, "note: {}", strayed.rejection_note);
+        let stray: Vec<&FieldDot> = strayed.dots.iter().filter(|d| d.rejected).collect();
+        assert_eq!(stray[0].commanded_mm, (30.0, 30.0), "the injected dot");
+        assert!(
+            stray[0].resid_um > 1500.0,
+            "rejected dot still reads its true error: {:.0} µm",
+            stray[0].resid_um
+        );
+        assert!(
+            strayed.rejection_note.contains("1 of 49 dots EXCLUDED"),
+            "note: {}",
+            strayed.rejection_note
+        );
+
+        // The point of the exercise: the survivors' fit matches the clean grid's
+        // and passes the console's default limits, where the all-dots fit didn't.
+        assert!(
+            (strayed.field.rms_um - clean.field.rms_um).abs() < 10.0,
+            "survivor RMS {:.0} µm vs clean {:.0} µm",
+            strayed.field.rms_um,
+            clean.field.rms_um
+        );
+        field_live_acceptance(&strayed, &grid_7x7(), 100.0, 250.0)
+            .expect("one excluded outlier no longer vetoes the calibration");
+
+        // …and the pre-rejection fit really was refused, so the change matters.
+        let worst = strayed.dots.iter().map(|d| d.resid_um).fold(0.0, f64::max);
+        assert!(worst > 250.0, "un-excluded worst {worst:.0} µm");
+    }
+
+    fn grid_7x7() -> GridSpec {
+        GridSpec {
+            origin_mm: (0.0, 0.0),
+            pitch_mm: 10.0,
+            n: 7,
+        }
+    }
+
+    /// Six bad dots out of 49 is not a scuff on the paper, it is a bad capture.
+    /// The cap (4, at 10% of 49) fires: nothing is dropped, the fit still comes
+    /// back so the operator can read it, and the note says the cap is why.
+    #[test]
+    fn too_many_outliers_drop_nothing() {
+        // Six scattered interior dots, all well clear of the boundary corners.
+        let bad = [
+            (10.0, 10.0),
+            (30.0, 10.0),
+            (50.0, 10.0),
+            (10.0, 30.0),
+            (30.0, 30.0),
+            (50.0, 30.0),
+        ];
+        let cal = fit_pincushion(&pincushion_setup(&move |cx: f64, cy: f64| {
+            if bad.contains(&(cx, cy)) {
+                (2.0, 0.0)
+            } else {
+                (0.0, 0.0)
+            }
+        }))
+        .expect("fit still returns");
+        assert_eq!(cal.rejected, 0, "note: {}", cal.rejection_note);
+        assert!(cal.dots.iter().all(|d| !d.rejected));
+        assert!(
+            cal.rejection_note.contains("NOTHING") && cal.rejection_note.contains("10% cap"),
+            "note: {}",
+            cal.rejection_note
+        );
+        // And it is still refused, exactly as it was before rejection existed.
+        assert!(field_live_acceptance(&cal, &grid_7x7(), 100.0, 250.0).is_err());
+    }
+
+    /// A bad boundary corner must never be fitted around — neither by dropping
+    /// the corner nor by dropping the neighbours that hold the polynomial away
+    /// from it. A corner sits at the bi-cubic's maximum leverage, so the second
+    /// route is the real risk: delete two neighbours and the surface bends
+    /// toward the corner until its residual falls back under the limit.
+    ///
+    /// Swept across the whole range where a corner error is big enough to be
+    /// flagged but small enough that the fit might still slip through: nothing
+    /// is ever excluded, the note names the corner, and acceptance always fails.
+    #[test]
+    fn a_corner_outlier_suspends_rejection_and_the_fit_fails() {
+        for step in 8..=16 {
+            let nudge = step as f64 / 10.0;
+            let cal = fit_pincushion(&pincushion_setup(&move |cx: f64, cy: f64| {
+                if cx == 0.0 && cy == 0.0 {
+                    (nudge, 0.0)
+                } else {
+                    (0.0, 0.0)
+                }
+            }))
+            .expect("fit");
+            assert_eq!(
+                cal.rejected, 0,
+                "nudge {nudge} mm excluded dots: {}",
+                cal.rejection_note
+            );
+            assert!(cal.dots.iter().all(|d| !d.rejected));
+            assert!(
+                cal.rejection_note
+                    .contains("boundary corner dots are outliers")
+                    && cal.rejection_note.contains("SUSPENDED"),
+                "nudge {nudge} mm note: {}",
+                cal.rejection_note
+            );
+            // The corner is still PRESENT, so the corner gate is satisfied —
+            // what refuses the fit is the residual gate, with the corner's own
+            // error still in it.
+            let err = field_live_acceptance(&cal, &grid_7x7(), 100.0, 250.0)
+                .expect_err("a bad corner must not be fitted around");
+            assert!(err.contains("limits are 100/250"), "nudge {nudge}: {err}");
+        }
+    }
+
     /// The residual acceptance limits are operator-configurable: a fit sitting
     /// at the rig's measurement floor (RMS 70 µm / worst 180 µm) passes the new
     /// 100/250 defaults but is rejected by the old hardcoded 50/100.
@@ -1803,6 +2421,7 @@ mod tests {
                 commanded_mm: (x, y),
                 field_um: 0.0,
                 resid_um: 0.0,
+                rejected: false,
             })
             .collect();
         let total = dots.len();
@@ -1822,6 +2441,8 @@ mod tests {
             field_verdict: vision::classify_field_error(&[]),
             scale: 1.0,
             extrapolated: 0,
+            rejected: 0,
+            rejection_note: String::new(),
         };
         // The new defaults accept the rig's floor.
         assert!(field_live_acceptance(&cal, &grid, 100.0, 250.0).is_ok());
@@ -1874,8 +2495,16 @@ mod tests {
     #[test]
     fn laser_field_fit_rejects_setup_scale_error() {
         let (img, corners_px, grid, dot_mm, lens) = mis_scaled_ruler_setup(1.35);
-        let err = fit_laser_field(&img, corners_px, &grid, dot_mm, DotKind::Dark, &lens, false)
-            .expect_err("a 35% scale mismatch is a setup error");
+        let err = fit_laser_field(
+            &img,
+            corners_px,
+            &grid,
+            dot_mm,
+            DotKind::Dark,
+            &lens,
+            FieldScale::Refuse,
+        )
+        .expect_err("a 35% scale mismatch is a setup error");
         assert!(
             err.contains(FIELD_SCALE_ERR_MARKER),
             "setup-scale message expected, got: {err}"
@@ -1895,8 +2524,16 @@ mod tests {
     #[test]
     fn laser_field_fit_mild_scale_passes_with_diagnostic() {
         let (img, corners_px, grid, dot_mm, lens) = mis_scaled_ruler_setup(1.015);
-        let cal = fit_laser_field(&img, corners_px, &grid, dot_mm, DotKind::Dark, &lens, false)
-            .expect("a 1.5% scale deviation is fittable");
+        let cal = fit_laser_field(
+            &img,
+            corners_px,
+            &grid,
+            dot_mm,
+            DotKind::Dark,
+            &lens,
+            FieldScale::Refuse,
+        )
+        .expect("a 1.5% scale deviation is fittable");
         assert!(
             (cal.scale - 1.015).abs() < 0.003,
             "measured scale {} ≈ 1.015",
@@ -1904,7 +2541,7 @@ mod tests {
         );
     }
 
-    /// With `allow_machine_scale`, a gross uniform scale (an oversized machine
+    /// With `FieldScale::Compensate`, a gross uniform scale (an oversized machine
     /// field the operator chose to compensate in software) is no longer a hard
     /// setup error: the fit succeeds, records the scale, and the field
     /// polynomial genuinely absorbs it — a physical target maps to a command
@@ -1913,8 +2550,16 @@ mod tests {
     #[test]
     fn laser_field_fit_absorbs_machine_scale_when_allowed() {
         let (img, corners_px, grid, dot_mm, lens) = mis_scaled_ruler_setup(1.35);
-        let cal = fit_laser_field(&img, corners_px, &grid, dot_mm, DotKind::Dark, &lens, true)
-            .expect("a 35% scale is fittable once the operator opts to compensate it");
+        let cal = fit_laser_field(
+            &img,
+            corners_px,
+            &grid,
+            dot_mm,
+            DotKind::Dark,
+            &lens,
+            FieldScale::Compensate,
+        )
+        .expect("a 35% scale is fittable once the operator opts to compensate it");
         assert!(
             (cal.scale - 1.35).abs() < 0.01,
             "measured scale {} ≈ 1.35",
@@ -1934,6 +2579,325 @@ mod tests {
             (ratio * 1.35 - 1.0).abs() < 0.01,
             "command/physical separation ratio {ratio} ≈ 1/1.35"
         );
+    }
+
+    /// The operator's real ③ case: a 7×7 grid burned over commanded 15..75 mm
+    /// of a 0..90 mm field, where the laser puts each dot at
+    /// `centre + scale·(1 + k·r²)·(cmd − centre)` about the field centre
+    /// (45,45) — a known pincushion of strength `k` on top of a known uniform
+    /// `scale`. The camera is an exact metric ruler, so everything the fit sees
+    /// out of true comes from the synthetic field.
+    /// Returns (frame, corners_px, grid, dot_mm, lens).
+    fn scaled_pincushion_setup(
+        scale: f64,
+        k: f64,
+    ) -> (GrayImage, [(f64, f64); 4], GridSpec, f64, LensMap) {
+        let grid = GridSpec {
+            origin_mm: (15.0, 15.0),
+            pitch_mm: 10.0,
+            n: 7,
+        };
+        let dot_mm = 1.5;
+        // Physical mm → px, centred so the shrunken burn stays well inside the
+        // frame: 10 px/mm about physical (45,45) ↦ px (360,360).
+        let cam = |phx: f64, phy: f64| (10.0 * (phx - 45.0) + 360.0, 10.0 * (phy - 45.0) + 360.0);
+        let field = |cx: f64, cy: f64| {
+            let (du, dv) = (cx - 45.0, cy - 45.0);
+            let f = scale * (1.0 + k * (du * du + dv * dv) / (30.0 * 30.0));
+            (45.0 + du * f, 45.0 + dv * f)
+        };
+        // The ① ruler is fit over the region the burn actually occupies, so no
+        // dot reads through an extrapolating lens.
+        let lens_pairs: Vec<(Point2<f64>, Point2<f64>)> = (0..=8)
+            .flat_map(|r| (0..=8).map(move |c| (r, c)))
+            .map(|(r, c)| {
+                let (x, y) = (20.0 + c as f64 * 6.25, 20.0 + r as f64 * 6.25);
+                let (u, v) = cam(x, y);
+                (Point2::new(u, v), Point2::new(x, y))
+            })
+            .collect();
+        let lens = fit_lens(&lens_pairs).expect("lens");
+
+        let centers: Vec<(f64, f64, f64)> = grid
+            .points()
+            .iter()
+            .map(|&(cx, cy)| {
+                let (px, py) = field(cx, cy);
+                let (u, v) = cam(px, py);
+                (u, v, dot_mm * 10.0)
+            })
+            .collect();
+        let img = GrayImage::from_fn(720, 720, |x, y| {
+            let mut cover = 0.0;
+            for sy in 0..4 {
+                for sx in 0..4 {
+                    let px = x as f64 + (sx as f64 + 0.5) / 4.0 - 0.5;
+                    let py = y as f64 + (sy as f64 + 0.5) / 4.0 - 0.5;
+                    if centers.iter().any(|&(cx, cy, r)| {
+                        ((px - cx).powi(2) + (py - cy).powi(2)).sqrt() < r / 2.0
+                    }) {
+                        cover += 1.0 / 16.0;
+                    }
+                }
+            }
+            image::Luma([(210.0 - 150.0 * cover) as u8])
+        });
+        let corners_px = grid.corners_mm().map(|(cx, cy)| {
+            let (px, py) = field(cx, cy);
+            cam(px, py)
+        });
+        (img, corners_px, grid, dot_mm, lens)
+    }
+
+    /// Invert the synthetic field `gain·(1 + k·d²/30²)·d = phys_off` for `d`:
+    /// the commanded offset from the field centre that lands `phys_off` away
+    /// once the fit has divided the measured uniform scale out. `gain` is the
+    /// synthetic scale over the MEASURED one, which is 1 only when there is no
+    /// pincushion — see `laser_field_distortion_only_*` on why they differ.
+    fn field_inverse(phys_off: f64, k: f64, gain: f64) -> f64 {
+        let mut d = phys_off;
+        for _ in 0..64 {
+            d = phys_off / (gain * (1.0 + k * d * d / 900.0));
+        }
+        d
+    }
+
+    /// `DistortionOnly` on a −32.2% machine: the fit succeeds, REPORTS the
+    /// scale, and produces a UNIT-MAGNIFICATION map. The field centre maps to
+    /// itself and a mid-field point's correction is the pincushion alone — a
+    /// fraction of a millimetre, nowhere near the ~47% stretch that absorbing
+    /// the scale would introduce.
+    #[test]
+    fn laser_field_distortion_only_recovers_pincushion_at_unit_magnification() {
+        let (img, corners_px, grid, dot_mm, lens) = scaled_pincushion_setup(0.678, 0.03);
+        let cal = fit_laser_field(
+            &img,
+            corners_px,
+            &grid,
+            dot_mm,
+            DotKind::Dark,
+            &lens,
+            FieldScale::DistortionOnly,
+        )
+        .expect("distortion-only never refuses on scale magnitude");
+        // A least-squares similarity over a pincushioned lattice necessarily
+        // lumps the pincushion's MEAN radial magnification (~+3.7% here) into
+        // the uniform scale — the split between "scale" and "radial term" is
+        // only defined that way. So the reported scale is the synthetic 0.678
+        // times that, not 0.678 exactly, and the fit divides out what it
+        // measured. The pure-scale test below pins the undisturbed case tight.
+        assert!(
+            (cal.scale - 0.678).abs() < 0.03,
+            "measured scale {} ≈ 0.678 is still reported",
+            cal.scale
+        );
+        let centre = cal.field.precompensate(45.0, 45.0);
+        assert!(
+            (centre.0 - 45.0).hypot(centre.1 - 45.0) < 0.05,
+            "field centre maps to itself, got {centre:?}"
+        );
+        // 20 mm out along +x: the correction is the radial term alone.
+        let gain = 0.678 / cal.scale;
+        let want = 45.0 + field_inverse(20.0, 0.03, gain);
+        let mid = cal.field.precompensate(65.0, 45.0);
+        assert!(
+            (mid.0 - want).abs() < 0.1,
+            "mid-field command {} ≈ {want} (radial term only, no scale term)",
+            mid.0
+        );
+        // Magnification over a 40 mm span: 1.0 to within the pincushion's own
+        // few percent — not the 1/0.678 ≈ 1.475 that absorbing it would give.
+        let lo = cal.field.precompensate(25.0, 45.0);
+        let mag = (mid.0 - lo.0) / 40.0;
+        assert!(
+            (mag - 1.0).abs() < 0.05,
+            "magnification {mag} ≈ 1.0 (compensating would give 1.475)"
+        );
+    }
+
+    /// The same burn under `Compensate` keeps behaving as it always has: the
+    /// scale is absorbed into the map, so command space is stretched by
+    /// `1/scale` — this is exactly the work-area shrink `DistortionOnly` avoids.
+    #[test]
+    fn laser_field_compensate_still_absorbs_the_same_scale() {
+        let (img, corners_px, grid, dot_mm, lens) = scaled_pincushion_setup(0.678, 0.03);
+        let cal = fit_laser_field(
+            &img,
+            corners_px,
+            &grid,
+            dot_mm,
+            DotKind::Dark,
+            &lens,
+            FieldScale::Compensate,
+        )
+        .expect("compensate fits a gross scale");
+        assert!(
+            (cal.scale - 0.678).abs() < 0.03,
+            "measured scale {} ≈ 0.678",
+            cal.scale
+        );
+        let lo = cal.field.precompensate(35.0, 45.0);
+        let hi = cal.field.precompensate(55.0, 45.0);
+        let mag = (hi.0 - lo.0) / 20.0;
+        assert!(
+            (mag * 0.678 - 1.0).abs() < 0.02,
+            "magnification {mag} ≈ 1/0.678 — the scale is absorbed"
+        );
+    }
+
+    /// `Refuse` is untouched by the new mode: the same burn is still rejected
+    /// as a setup error before anything is fit.
+    #[test]
+    fn laser_field_refuse_still_rejects_the_same_scale() {
+        let (img, corners_px, grid, dot_mm, lens) = scaled_pincushion_setup(0.678, 0.03);
+        let err = fit_laser_field(
+            &img,
+            corners_px,
+            &grid,
+            dot_mm,
+            DotKind::Dark,
+            &lens,
+            FieldScale::Refuse,
+        )
+        .expect_err("a −32% scale is still a setup error by default");
+        assert!(
+            err.contains(FIELD_SCALE_ERR_MARKER),
+            "setup-scale message expected, got: {err}"
+        );
+    }
+
+    /// The load-bearing one: a PURE uniform scale with no distortion at all
+    /// must come back as a near-identity correction under `DistortionOnly`. If
+    /// the scale were smeared into the polynomial the map would magnify by
+    /// `1/0.678`; if it were divided the wrong way, by `0.678²`. Neither
+    /// survives a ±0.1 mm identity check over the whole grid.
+    #[test]
+    fn laser_field_distortion_only_leaves_a_pure_scale_as_identity() {
+        let (img, corners_px, grid, dot_mm, lens) = scaled_pincushion_setup(0.678, 0.0);
+        let cal = fit_laser_field(
+            &img,
+            corners_px,
+            &grid,
+            dot_mm,
+            DotKind::Dark,
+            &lens,
+            FieldScale::DistortionOnly,
+        )
+        .expect("pure scale is fittable in distortion-only mode");
+        assert!(
+            (cal.scale - 0.678).abs() < 0.005,
+            "measured scale {} ≈ 0.678",
+            cal.scale
+        );
+        for &(x, y) in &grid.points() {
+            let (gx, gy) = cal.field.precompensate(x, y);
+            assert!(
+                (gx - x).hypot(gy - y) < 0.1,
+                "({x},{y}) → ({gx},{gy}) should be identity: nothing to correct"
+            );
+        }
+        // Direction check: 0.678² ≈ 0.46 and 1/0.678 ≈ 1.475 both fail this.
+        let lo = cal.field.precompensate(25.0, 45.0);
+        let hi = cal.field.precompensate(65.0, 45.0);
+        let mag = (hi.0 - lo.0) / 40.0;
+        assert!((mag - 1.0).abs() < 0.01, "magnification {mag} ≈ 1.0");
+    }
+
+    /// `to_commanded` and `to_physical` are separately fit, so the new mode's
+    /// pair must still round-trip through the Newton inversion the projection
+    /// path uses — inside the burned span, and out at the field corners the
+    /// operator will actually address.
+    #[test]
+    fn laser_field_distortion_only_round_trips_commanded_and_physical() {
+        let (img, corners_px, grid, dot_mm, lens) = scaled_pincushion_setup(0.678, 0.03);
+        let cal = fit_laser_field(
+            &img,
+            corners_px,
+            &grid,
+            dot_mm,
+            DotKind::Dark,
+            &lens,
+            FieldScale::DistortionOnly,
+        )
+        .expect("distortion-only fit");
+        for &(x, y) in &[
+            (45.0, 45.0),
+            (25.0, 35.0),
+            (65.0, 70.0),
+            (5.0, 5.0),
+            (85.0, 85.0),
+        ] {
+            let phys = invert_poly(&cal.field.to_commanded, &cal.field.to_physical, (x, y))
+                .unwrap_or_else(|| panic!("({x},{y}) inverts"));
+            let (bx, by) = cal.field.precompensate(phys.0, phys.1);
+            assert!(
+                (bx - x).hypot(by - y) < 1e-6,
+                "({x},{y}) round-trips, got ({bx},{by})"
+            );
+        }
+    }
+
+    /// The whole point of the mode: the map is USED outside the burned grid.
+    /// The grid covers commanded 15..75 mm; sweep the full 0..90 mm work area
+    /// and require the correction to stay finite and strictly monotonic — the
+    /// bi-cubic is extrapolating out there and a fold-over would silently send
+    /// two different physical targets to the same command.
+    #[test]
+    fn laser_field_distortion_only_extrapolates_across_the_work_area() {
+        let (img, corners_px, grid, dot_mm, lens) = scaled_pincushion_setup(0.678, 0.03);
+        let cal = fit_laser_field(
+            &img,
+            corners_px,
+            &grid,
+            dot_mm,
+            DotKind::Dark,
+            &lens,
+            FieldScale::DistortionOnly,
+        )
+        .expect("distortion-only fit");
+        let sweep: Vec<f64> = (0..=90).step_by(2).map(|v| v as f64).collect();
+        for &fixed in &[5.0, 45.0, 85.0] {
+            let (mut prev_x, mut prev_y) = (f64::NEG_INFINITY, f64::NEG_INFINITY);
+            for &v in &sweep {
+                let along_x = cal.field.precompensate(v, fixed);
+                let along_y = cal.field.precompensate(fixed, v);
+                assert!(
+                    along_x.0.is_finite()
+                        && along_x.1.is_finite()
+                        && along_y.0.is_finite()
+                        && along_y.1.is_finite(),
+                    "({v},{fixed}) stays finite"
+                );
+                assert!(
+                    along_x.0 > prev_x,
+                    "x is monotonic across the work area at y={fixed}: {} after {prev_x}",
+                    along_x.0
+                );
+                assert!(
+                    along_y.1 > prev_y,
+                    "y is monotonic across the work area at x={fixed}: {} after {prev_y}",
+                    along_y.1
+                );
+                prev_x = along_x.0;
+                prev_y = along_y.1;
+            }
+        }
+        // Extrapolation must stay a CORRECTION, not run away: 15 mm past the
+        // burned grid the command still tracks the true radial inverse to
+        // within ~1.5 mm. (The correction itself is ~6 mm out at the work-area
+        // corners — that is the synthetic pincushion, not fit divergence.)
+        let gain = 0.678 / cal.scale;
+        for &(x, y) in &[(0.0, 0.0), (90.0, 0.0), (90.0, 90.0), (0.0, 90.0)] {
+            let (du, dv): (f64, f64) = (x - 45.0, y - 45.0);
+            let r = du.hypot(dv);
+            let d = field_inverse(r, 0.03, gain);
+            let (wx, wy) = (45.0 + du / r * d, 45.0 + dv / r * d);
+            let (gx, gy) = cal.field.precompensate(x, y);
+            assert!(
+                (gx - wx).hypot(gy - wy) < 1.5,
+                "corner ({x},{y}) → ({gx},{gy}) tracks the true inverse ({wx},{wy})"
+            );
+        }
     }
 
     /// A machine that MIRRORS X relative to commanded coordinates is now
@@ -1960,7 +2924,7 @@ mod tests {
             dot_mm,
             DotKind::Dark,
             &lens,
-            false,
+            FieldScale::Refuse,
         )
         .expect("a mirrored machine with true corner labels is a reflection the fit absorbs");
         assert!(
@@ -1999,8 +2963,16 @@ mod tests {
         // Swap only LL↔LR (keep UR, UL): NOT a square symmetry, so neither a
         // rotation nor a reflection can align it — a real mislabelling.
         let scrambled = [corners_px[1], corners_px[0], corners_px[2], corners_px[3]];
-        let err = fit_laser_field(&img, scrambled, &grid, dot_mm, DotKind::Dark, &lens, true)
-            .expect_err("a scrambled (non-isometry) corner order is not a calibration");
+        let err = fit_laser_field(
+            &img,
+            scrambled,
+            &grid,
+            dot_mm,
+            DotKind::Dark,
+            &lens,
+            FieldScale::Compensate,
+        )
+        .expect_err("a scrambled (non-isometry) corner order is not a calibration");
         // It fails through detection (the bowtie seed places windows off the
         // dots) rather than silently producing a flipped fit.
         assert!(
@@ -2015,7 +2987,7 @@ mod tests {
     /// reflection cannot align it. All dots lock (a shear is affine, so the
     /// corner seed predicts them), but the similarity residual exceeds one grid
     /// pitch and the guard rejects the fit with the orientation-marker message.
-    /// Run with `allow_machine_scale` so the scale gate is skipped and the
+    /// Run with `FieldScale::Compensate` so the scale gate is skipped and the
     /// correspondence guard is the path exercised.
     #[test]
     fn laser_field_fit_guard_trips_on_a_sheared_correspondence() {
@@ -2070,8 +3042,16 @@ mod tests {
             let (px, py) = shear(cx, cy);
             cam(px, py)
         });
-        let err = fit_laser_field(&img, corners_px, &grid, dot_mm, DotKind::Dark, &lens, true)
-            .expect_err("a shear is not a similarity+reflection — the guard must trip");
+        let err = fit_laser_field(
+            &img,
+            corners_px,
+            &grid,
+            dot_mm,
+            DotKind::Dark,
+            &lens,
+            FieldScale::Compensate,
+        )
+        .expect_err("a shear is not a similarity+reflection — the guard must trip");
         assert!(
             err.contains("orientation markers"),
             "the correspondence guard message is expected, got: {err}"
@@ -2129,8 +3109,16 @@ mod tests {
         });
         let corners_px = grid.corners_mm().map(|(cx, cy)| cam(cx, cy));
 
-        let cal = fit_laser_field(&img, corners_px, &grid, dot_mm, DotKind::Dark, &lens, false)
-            .expect("field fit");
+        let cal = fit_laser_field(
+            &img,
+            corners_px,
+            &grid,
+            dot_mm,
+            DotKind::Dark,
+            &lens,
+            FieldScale::Refuse,
+        )
+        .expect("field fit");
         assert!(
             !matches!(
                 cal.field_verdict.pattern,
@@ -2185,7 +3173,7 @@ mod tests {
             dot_mm,
             DotKind::Dark,
             &inner_lens,
-            false,
+            FieldScale::Refuse,
         )
         .expect("field fit over inner lens");
         assert!(
@@ -2218,7 +3206,7 @@ mod tests {
             dot_mm,
             DotKind::Dark,
             &full_lens,
-            false,
+            FieldScale::Refuse,
         )
         .expect("field fit over full lens");
         assert_eq!(cal.extrapolated, 0, "all dots within the calibrated region");

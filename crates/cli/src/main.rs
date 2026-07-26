@@ -432,9 +432,34 @@ enum Command {
         /// only --w-mm.
         #[arg(long, default_value_t = 0.0)]
         h_mm: f64,
+        /// Hole rendering: "line" traces each hole outline as a vector cut
+        /// (the drill treatment, and the default here — a fiducial hole is
+        /// drilled, not engraved), "fill" ablates each hole as a filled disc.
+        #[arg(long, default_value = "line")]
+        mode: String,
         /// LightBurn device name.
         #[arg(long, default_value = lbrn2::DEFAULT_DEVICE)]
         device: String,
+
+        // --- process recipe (see docs/lbrn2-schema.md) ---
+        /// Max power %.
+        #[arg(long, default_value_t = 20.0)]
+        power_pct: f64,
+        /// Scan speed, mm/s.
+        #[arg(long, default_value_t = 1000.0)]
+        speed_mm_s: f64,
+        /// Frequency, kHz (written to the file in Hz).
+        #[arg(long, default_value_t = 30.0)]
+        frequency_khz: f64,
+        /// MOPA Q-pulse width, ns (a fluence knob; 0 = source default).
+        #[arg(long, default_value_t = 1)]
+        pulse_ns: u32,
+        /// Passes.
+        #[arg(long, default_value_t = 1)]
+        passes: u32,
+        /// Fill line interval, mm (fill mode only).
+        #[arg(long, default_value_t = 0.03)]
+        interval_mm: f64,
 
         /// Laser-field calibration map. When given, every production edge is
         /// densified and pre-warped from desired physical mm to commanded mm
@@ -824,19 +849,35 @@ fn run(cli: &Cli) -> Result<(), Box<dyn std::error::Error>> {
             shape,
             w_mm,
             h_mm,
+            mode,
             device,
+            power_pct,
+            speed_mm_s,
+            frequency_khz,
+            pulse_ns,
+            passes,
+            interval_mm,
             field_map,
             field_seg_mm,
-        } => fid_holes_cmd(
+        } => fid_holes_cmd(FidHolesArgs {
             out,
             layout,
             shape,
-            *w_mm,
-            *h_mm,
+            w_mm: *w_mm,
+            h_mm: *h_mm,
+            mode,
             device,
-            field_map.as_deref(),
-            *field_seg_mm,
-        ),
+            params: AblationParams {
+                power_pct: *power_pct,
+                speed_mm_s: *speed_mm_s,
+                frequency_khz: *frequency_khz,
+                pulse_ns: *pulse_ns,
+                passes: *passes,
+            },
+            interval_mm: *interval_mm,
+            field_map: field_map.as_deref(),
+            field_seg_mm: *field_seg_mm,
+        }),
         Command::Cam {
             list,
             grab,
@@ -1295,59 +1336,70 @@ fn warp_polys(
     })
 }
 
-/// `pcbforge fid-holes` — burn fiducial holes at operator-supplied positions.
-// The arguments mirror the clap variant one-for-one; grouping them into a
-// struct would only duplicate the flag definitions.
-#[allow(clippy::too_many_arguments)]
-fn fid_holes_cmd(
-    out: &std::path::Path,
-    layout: &str,
-    shape: &str,
+struct FidHolesArgs<'a> {
+    out: &'a std::path::Path,
+    layout: &'a str,
+    shape: &'a str,
     w_mm: f64,
     h_mm: f64,
-    device: &str,
-    field_map: Option<&std::path::Path>,
+    mode: &'a str,
+    device: &'a str,
+    params: AblationParams,
+    interval_mm: f64,
+    field_map: Option<&'a std::path::Path>,
     field_seg_mm: f64,
-) -> Result<(), Box<dyn std::error::Error>> {
-    if shape != "circle" && shape != "rect" {
-        return Err(format!("--shape must be \"circle\" or \"rect\", got {shape:?}").into());
+}
+
+/// `pcbforge fid-holes` — emit fiducial holes at operator-supplied positions.
+/// Same drill treatment as `drill-emit`: a Line layer traces each hole outline
+/// by default, and the process recipe comes from the caller rather than a
+/// baked-in one, so the holes burn at the settings the operator drills at.
+fn fid_holes_cmd(a: FidHolesArgs) -> Result<(), Box<dyn std::error::Error>> {
+    if a.shape != "circle" && a.shape != "rect" {
+        return Err(format!("--shape must be \"circle\" or \"rect\", got {:?}", a.shape).into());
     }
+    if a.mode != "fill" && a.mode != "line" {
+        return Err(format!("--mode must be \"fill\" or \"line\", got {:?}", a.mode).into());
+    }
+    let (shape, w_mm) = (a.shape, a.w_mm);
     if w_mm <= 0.0 {
         return Err("--w-mm must be positive".into());
     }
-    if shape == "circle" && h_mm != 0.0 && h_mm != w_mm {
+    if shape == "circle" && a.h_mm != 0.0 && a.h_mm != w_mm {
         return Err(
             "--h-mm is ignored for --shape circle (circles take only --w-mm); \
                      pass 0 or omit it, or match --w-mm"
                 .into(),
         );
     }
-    let resolved_h = if h_mm == 0.0 { w_mm } else { h_mm };
+    let resolved_h = if a.h_mm == 0.0 { w_mm } else { a.h_mm };
     if resolved_h <= 0.0 {
         return Err("--h-mm must be positive".into());
     }
-    if layout.trim().is_empty() {
+    if a.layout.trim().is_empty() {
         return Err("--layout must not be empty".into());
     }
-    let positions = parse_fid_layout(layout)?;
+    let positions = parse_fid_layout(a.layout)?;
 
     let polys = fid_holes_polys(shape, w_mm, resolved_h, &positions);
-    let polys = warp_polys("fid holes", polys, field_map, field_seg_mm)?;
-    let params = AblationParams {
-        power_pct: 20.0,
-        speed_mm_s: 1000.0,
-        frequency_khz: 30.0,
-        pulse_ns: 1,
-        passes: 1,
+    let polys = warp_polys("fid holes", polys, a.field_map, a.field_seg_mm)?;
+    let elems = lbrn2::polys_to_elems(&polys);
+    let layer = if a.mode == "fill" {
+        let mut layer = EmitLayer::fill("FID", a.params, elems);
+        layer.interval_mm = a.interval_mm;
+        layer
+    } else {
+        EmitLayer::line("FID", a.params, elems)
     };
-    let layer = EmitLayer::fill("FID", params, lbrn2::polys_to_elems(&polys));
+    let out = a.out;
     if let Some(dir) = out.parent().filter(|d| !d.as_os_str().is_empty()) {
         std::fs::create_dir_all(dir).ok();
     }
-    lbrn2::write_lbrn2(device, &[layer], out)?;
+    lbrn2::write_lbrn2(a.device, &[layer], out)?;
     eprintln!(
-        "fid holes: {} {shape} hole(s), {w_mm}×{resolved_h} mm",
-        positions.len()
+        "fid holes: {} {shape} hole(s), {w_mm}×{resolved_h} mm -> {} layer",
+        positions.len(),
+        if a.mode == "fill" { "Fill" } else { "Line" }
     );
     // Print the absolute path so it's findable regardless of the working dir.
     let abs = std::path::absolute(out).unwrap_or_else(|_| out.to_path_buf());

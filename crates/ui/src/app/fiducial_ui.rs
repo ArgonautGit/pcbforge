@@ -5,6 +5,84 @@ use super::*;
 /// and silently moving the job would be worse than leaving it.
 const POSE_MAX_RMS_MM: f64 = 0.5;
 
+/// Band the fiducial fit's uniform scale must land in for the placement to be
+/// applied. The fit is a similarity, so it ABSORBS a spacing mismatch instead
+/// of leaving it in the residual — which means [`POSE_MAX_RMS_MM`] no longer
+/// catches it: a self-consistent misdetection at 1.5× now fits with an RMS of
+/// nearly zero and would sail straight through. This band is the only guard
+/// left. A few percent is a plausible machine/calibration scale error; ±10% is
+/// not a real board, it is the wrong holes or a layout that does not describe
+/// this board, and resizing the job by it would be worse than not placing it.
+const POSE_SCALE_MIN: f64 = 0.90;
+const POSE_SCALE_MAX: f64 = 1.10;
+
+/// Below this, a fitted scale is not worth reporting as a resize — 0.1% on a
+/// 40 mm board is 40 µm, inside the detector's own noise.
+pub(super) const POSE_SCALE_QUIET: f64 = 0.001;
+
+/// Bounds for the whole-frame recovery ([`ConsoleApp::locate_fid_markers_globally`]).
+///
+/// The board sits right-side-up, so its POSE is only a few degrees off — but
+/// the gate has to cover perspective as well as pose. The camera looks at the
+/// plate off-axis, which stretches and shears the quad, and a single edge of
+/// the bench frame reads up to 16° of apparent rotation on a board that is
+/// nearly square to the machine. Sized from that, with margin.
+const AUTO_MAX_ROT_DEG: f64 = 20.0;
+/// Candidate budget handed to the O(n²) matcher — generous on purpose (see
+/// `vision::find_fiducial_candidates`: the list is meant to over-admit and let
+/// the arrangement match do the rejecting).
+const AUTO_MAX_CANDIDATES: usize = 96;
+/// Detections below which a Check is a failure worth a whole-frame rescan.
+/// Also `fit_board_pose`'s floor, so fewer than this places nothing anyway.
+const AUTO_RECOVER_BELOW: usize = 3;
+
+/// How close (screen px) a press has to land to an existing ✛ to grab it for a
+/// drag. Sized to the drawn marker — the cross arms reach 9 px and the ring
+/// 11 px — plus a little slack, so anything the operator can see as "on the
+/// marker" grabs it. Bigger would start swallowing presses meant for the
+/// design underneath; smaller would demand pixel-accurate aim at a marker whose
+/// whole point is that it is currently in the wrong place. The same radius the
+/// click-to-place hit tests use, so one ✛ has one grab area for every gesture.
+pub(super) const MARKER_GRAB_PX: f32 = 18.0;
+
+/// The placed design as it appears on this frame: the outline polylines to
+/// stroke, the screen-space bounding box that acts as its drag handle, and
+/// where the placement pivot landed (the centre a Shift-drag rotates about).
+struct PlacedDesign {
+    rings: Vec<Vec<egui::Pos2>>,
+    bbox: egui::Rect,
+    pivot: egui::Pos2,
+}
+
+/// Machine-frame rotation (degrees) for sweeping the pointer from `prev` to
+/// `curr` about `pivot`, all in SCREEN coordinates.
+///
+/// `Placement::affine` builds `[cos, −sin; sin, cos]`, so `rot_deg` is
+/// counter-clockwise in the y-**up** machine frame. Screen rows grow
+/// **downward**, so the view is a mirror of that frame: a sweep that looks
+/// counter-clockwise on screen is clockwise on the bed. `atan2` over raw screen
+/// coordinates therefore measures angles of the opposite sense, and the machine
+/// delta is the NEGATED screen delta — `angle(prev) − angle(curr)`, not the
+/// other way round. (The camera projection is not a pure y-flip, but it is
+/// orientation-reversing everywhere and locally near-conformal, which is all
+/// the sign depends on.)
+pub(super) fn rot_delta_deg(pivot: egui::Pos2, prev: egui::Pos2, curr: egui::Pos2) -> f64 {
+    let angle = |p: egui::Pos2| ((p.y - pivot.y) as f64).atan2((p.x - pivot.x) as f64);
+    wrap_deg((angle(prev) - angle(curr)).to_degrees())
+}
+
+/// Fold an angle into (−180, 180] so a sweep across the seam nudges the job
+/// instead of spinning it a full turn.
+fn wrap_deg(mut deg: f64) -> f64 {
+    while deg > 180.0 {
+        deg -= 360.0;
+    }
+    while deg <= -180.0 {
+        deg += 360.0;
+    }
+    deg
+}
+
 impl ConsoleApp {
     /// Load the fiducial frame into memory + a texture and seed the search
     /// markers from the design layout (so they start near nominal, ready to
@@ -17,11 +95,23 @@ impl ConsoleApp {
                 return;
             }
         };
-        // A file load has no auto-detect, so open the click-in-order marking
-        // round: the operator marks each fiducial, and the final click runs the
-        // check. (Grab/live auto-detect at the seeded positions instead.)
-        if self.set_fid_frame(ctx, img) {
-            self.start_fid_marking();
+        if !self.set_fid_frame(ctx, img) {
+            return;
+        }
+        // With a calibration the markers can be put on the holes outright, so
+        // check immediately. Without one a file load has no way to guess where
+        // the holes image, so open the click-in-order marking round: the
+        // operator marks each fiducial, and the final click runs the check.
+        match self.seed_fid_markers_from_projection() {
+            Ok(()) => {
+                self.fiducials.marking = None;
+                self.detect_fiducials();
+            }
+            Err(e) => {
+                self.start_fid_marking();
+                // After the round's prompt, which rewrites the note.
+                self.fiducials.note.push_str(&format!("  ·  {e}"));
+            }
         }
     }
 
@@ -30,11 +120,22 @@ impl ConsoleApp {
     /// immediately. The one-click camera path for the fiducial check; ● Live
     /// does the same continuously.
     pub fn grab_fid_frame(&mut self, ctx: &Context) {
-        match crate::camera::grab(&self.cam_source()) {
+        match self.grab_shared() {
             Ok(img) => {
                 let img = self.camera.orientation.apply(img);
                 self.set_fid_frame(ctx, img);
-                self.detect_fiducials(ctx);
+                // Put the markers on the holes through the calibration when
+                // there is one; without it, detect at the raw layout seeds as
+                // this path always has.
+                let fallback = self.seed_fid_markers_from_projection().err();
+                if fallback.is_none() {
+                    self.fiducials.marking = None;
+                }
+                self.detect_fiducials();
+                if let Some(e) = fallback {
+                    // Appended after detection, which rewrites the note.
+                    self.fiducials.note.push_str(&format!("  ·  {e}"));
+                }
             }
             Err(e) => self.fiducials.note = format!("camera: {e}"),
         }
@@ -79,6 +180,9 @@ impl ConsoleApp {
     /// Reseed the ✛ set from the layout (the current frame stays) and reopen the
     /// click-in-order marking round — the ↺ reset-markers action.
     pub(super) fn reset_fid_markers(&mut self) {
+        // Deliberately does NOT rebuild a ✕-cleared layout: clear means gone,
+        // or an overgrown click-placed set has no one-step exit again. ⟳ layout
+        // from W×H is the explicit way back.
         self.fiducials.search.clear();
         self.fiducials.found.clear();
         self.sync_fid_markers();
@@ -98,7 +202,15 @@ impl ConsoleApp {
         self.fiducials.measured_ppm = None;
         self.fiducials.homography = None;
         self.fiducials.last_placed = false;
-        self.fiducials.note = "markers cleared — type a layout or ✚ click-to-place new ones".into();
+        // The layout is gone, so its centroid — the origin the carried
+        // placement offset is measured from — means nothing any more.
+        self.fiducials.last_fit = None;
+        // Stale measurements must not be adoptable as a layout they no longer
+        // correspond to.
+        self.fiducials.detected_mm.clear();
+        self.fiducials.note = "markers cleared — ⟳ layout from W×H rebuilds the four corners, or \
+             ✚ click-to-place new ones"
+            .into();
     }
 
     /// Apply one placement click: drop the next search marker (layout order) at
@@ -107,7 +219,7 @@ impl ConsoleApp {
     /// The final marker's click closes the round and runs detection (which
     /// auto-updates the placement). Factored out of the canvas handler so tests
     /// can drive it directly.
-    pub(super) fn fid_mark_click(&mut self, mm: (f64, f64), ctx: &Context) {
+    pub(super) fn fid_mark_click(&mut self, mm: (f64, f64)) {
         // No active round: a plain click implicitly opens one at marker 0.
         let k = self.fiducials.marking.unwrap_or(0);
         // The layout shrank under an active round (a typed edit): cancel rather
@@ -124,10 +236,56 @@ impl ConsoleApp {
         let next = k + 1;
         if next >= n {
             self.fiducials.marking = None;
-            self.detect_fiducials(ctx); // final click → detect + auto-place
+            self.detect_fiducials(); // final click → detect + auto-place
         } else {
             self.fiducials.marking = Some(next);
             self.fiducials.note = format!("click fiducial {} of {n}", next + 1);
+        }
+    }
+
+    /// Whether a canvas click may mark, add or remove a fiducial right now —
+    /// not while a drag has grabbed the design or one of the ✛s. Both
+    /// latches are read through this so the marking, click-to-place and
+    /// right-click-remove paths cannot drift apart.
+    pub(super) fn fid_marking_allowed(&self) -> bool {
+        !self.fiducials.design_drag && self.fiducials.marker_drag.is_none()
+    }
+
+    /// Nudge search marker `i` by `(dx, dy)` mm — one frame of a marker drag.
+    ///
+    /// Moves ONLY `fiducials.search`. The layout is deliberately untouched:
+    /// it is the DESIGN nominal that `fit_board_pose` fits against and that
+    /// `scale_from_design` measures the true px/mm from, so writing a dragged
+    /// position into it would turn a 1 mm correction over a 50 mm baseline into
+    /// a ~2% scale error in everything downstream (LR-17). A search marker says
+    /// "look here"; the layout says "this is where the hole is by design", and
+    /// dragging must only ever change the former.
+    pub(super) fn fid_drag_marker(&mut self, i: usize, (dx, dy): (f64, f64)) {
+        // The layout can shrink mid-drag (a typed edit re-runs `sync_fid_markers`
+        // every frame), and the latched index outlives the marker it named —
+        // same guard, same reason, as `fid_mark_click`'s.
+        let Some(m) = self.fiducials.search.get_mut(i) else {
+            self.fiducials.marker_drag = None;
+            return;
+        };
+        *m = (m.0 + dx, m.1 + dy);
+        if let Some(f) = self.fiducials.found.get_mut(i) {
+            *f = None; // this marker's old detection is stale now
+        }
+    }
+
+    /// End a marker drag: drop the latch and re-check, so the operator sees at
+    /// once whether the nudged marker locks onto its hole.
+    ///
+    /// Once, on RELEASE — never per frame. The detection ladder's third stage is
+    /// a whole-frame candidate scan, far too heavy to run while the pointer
+    /// moves. The ladder tries the operator's markers FIRST and only reaches for
+    /// the projection seed or the rectangle match when they come up short of
+    /// [`AUTO_RECOVER_BELOW`] hits, so a manual placement that finds its holes
+    /// is kept rather than seeded over.
+    pub(super) fn fid_marker_drag_release(&mut self) {
+        if self.fiducials.marker_drag.take().is_some() {
+            self.detect_fiducials();
         }
     }
 
@@ -141,6 +299,13 @@ impl ConsoleApp {
         // Editing the marker set invalidates the "click N of M" ordering, so
         // cancel any active marking round (documented in the checkbox hover).
         self.fiducials.marking = None;
+        // A new point moves the layout centroid, which is the origin the
+        // carried placement offset is measured from — keeping the old fit would
+        // displace the design by the centroid shift on the next Check.
+        self.fiducials.last_fit = None;
+        // Stale measurements must not be adoptable as a layout they no longer
+        // correspond to.
+        self.fiducials.detected_mm.clear();
         self.sync_fid_markers();
         let n = self.fiducials.search.len();
         self.fiducials.note = format!(
@@ -184,15 +349,181 @@ impl ConsoleApp {
         // Editing the marker set invalidates the "click N of M" ordering, so
         // cancel any active marking round (documented in the checkbox hover).
         self.fiducials.marking = None;
+        // Dropping a point moves the layout centroid — same reason
+        // `add_expected_fiducial` drops the fit: the carried offset is measured
+        // from that centroid.
+        self.fiducials.last_fit = None;
+        // Stale measurements must not be adoptable as a layout they no longer
+        // correspond to.
+        self.fiducials.detected_mm.clear();
         // Lengths already match; sync is a no-op reconcile (and re-seeds only if
         // the layout still parses).
         self.sync_fid_markers();
         self.fiducials.note = format!("removed fiducial #{i}  ·  {} left", kept.len());
     }
 
+    /// Drop the carried manual offset: put the design back exactly where a
+    /// fresh, un-nudged Check would put it — on the fiducial-layout centroid,
+    /// at the fitted rotation and scale.
+    ///
+    /// The offset carry ([`update_placement_from_fiducials`]) deliberately
+    /// preserves a drag across re-Checks, which is right when the nudge was
+    /// deliberate and a trap when it was not: an accidental drag becomes
+    /// permanent, because nothing else clears it. `⤵ Load design` re-centres
+    /// only while `auto_pose` is false, and a lock sets it true — so without
+    /// this the only escapes were switching side or restarting the console.
+    ///
+    /// Zeroing the offset is exactly reproducing the `offset = (0,0)` branch of
+    /// the apply, so it is written that way rather than by clearing `last_fit`
+    /// and asking the operator to Check again.
+    ///
+    /// [`update_placement_from_fiducials`]: Self::update_placement_from_fiducials
+    pub(super) fn recentre_on_fiducials(&mut self) {
+        let Some(fit) = self.fiducials.last_fit else {
+            self.fiducials.note =
+                "nothing to recentre against — check fiducials first, so there is a fit to \
+                 centre the design on"
+                    .into();
+            return;
+        };
+        let Ok(layout) = fiducial::parse_layout(&self.fiducials.layout) else {
+            self.fiducials.note = "recentre needs a valid layout".into();
+            return;
+        };
+        let n = layout.len() as f64;
+        let b0 = (
+            layout.iter().map(|p| p.0).sum::<f64>() / n,
+            layout.iter().map(|p| p.1).sum::<f64>() / n,
+        );
+        let before = (self.placement.tx_mm, self.placement.ty_mm);
+        let (tx, ty) = fit.apply(b0);
+        self.placement.tx_mm = tx;
+        self.placement.ty_mm = ty;
+        self.placement.rot_deg = fit.angle_deg();
+        self.placement.scale = fit.scale;
+        // Still an auto pose — this IS the fitted placement, so a later Load
+        // must not recentre over it either.
+        self.placement.auto_pose = true;
+        let moved = (tx - before.0).hypot(ty - before.1);
+        self.fiducials.note = format!(
+            "recentred on the fiducials — dropped a {moved:.2} mm manual offset; design is \
+             back at the layout centroid (rot {:+.2}°, scale {:.4})",
+            self.placement.rot_deg, self.placement.scale
+        );
+    }
+
+    /// Replace the layout with the positions the last Check actually measured,
+    /// making the CURRENT board pose the nominal one.
+    ///
+    /// This is the way out of a layout that never described the real holes.
+    /// `fit_board_pose` fits layout → measured as a rigid transform, so any
+    /// error in the layout's SHAPE (a hand-clicked quadrilateral standing in
+    /// for a rectangle) or in the camera calibration's scale/skew is
+    /// irreducible: no rotation and translation can absorb it, it lands in the
+    /// RMS, and the gate refuses — correctly, since a job placed from that fit
+    /// would burn in the wrong place.
+    ///
+    /// Adopting the measurement makes that residual zero by construction. From
+    /// then on the fit measures only what changed SINCE — which is exactly the
+    /// operator-placement error this whole path exists to compensate for. Teach
+    /// it once with the board where you want it; every later Check moves the job
+    /// by however far the board has drifted.
+    ///
+    /// Deliberately a button, never automatic: silently redefining the nominal
+    /// would turn a genuine misdetection into the new truth.
+    pub(super) fn adopt_measured_layout(&mut self) {
+        // Back-side detections are compared against MIRRORED, beam-offset
+        // expected positions (`expected_points`), so writing them into the
+        // layout — which is the un-mirrored design frame — would bake the flip
+        // in twice. Front only until that inverse is worked out.
+        if self.job.side == Side::Back {
+            self.fiducials.note =
+                "⌖ layout from detection is front-side only (the back's expected \
+                 positions are mirrored and beam-offset)"
+                    .into();
+            return;
+        }
+        let measured = &self.fiducials.detected_mm;
+        if measured.is_empty() || measured.iter().any(Option::is_none) {
+            self.fiducials.note = format!(
+                "⌖ layout from detection needs EVERY fiducial found — have {}/{}. \
+                 Check again first.",
+                measured.iter().filter(|m| m.is_some()).count(),
+                measured.len().max(self.fiducials.search.len())
+            );
+            return;
+        }
+        let pts: Vec<(f64, f64)> = measured.iter().flatten().copied().collect();
+        self.fiducials.layout = fiducial::format_layout(&pts);
+        // The nominal frame just moved, so anything measured against the old one
+        // is void: the carried offset's origin (the layout centroid) has changed,
+        // and the cached pose describes a fit that no longer applies.
+        self.fiducials.last_fit = None;
+        // Stale measurements must not be adoptable as a layout they no longer
+        // correspond to.
+        self.fiducials.detected_mm.clear();
+        self.fiducials.pose = None;
+        self.fiducials.last_placed = false;
+        self.sync_fid_markers();
+        self.fiducials.note = format!(
+            "layout set from the measured holes ({} points) — this board pose is now \
+             nominal. Check again: the fit should be near-identity, and from here a \
+             Check measures only how far the board has moved.",
+            pts.len()
+        );
+    }
+
+    /// The layout string for the current fiducial rectangle, centred in the
+    /// work area. Resolves the effective field centre first, so the Camera
+    /// tab's auto-centre toggle is honoured.
+    pub(super) fn fid_rect_layout(&mut self) -> String {
+        self.sync_auto_field_center();
+        crate::fiducial::format_layout(&crate::fiducial::centered_fid_layout(
+            self.camera.field_cx_mm as f64,
+            self.camera.field_cy_mm as f64,
+            self.fiducials.rect_w_mm,
+            self.fiducials.rect_h_mm,
+        ))
+    }
+
+    /// Rewrite the layout from the rectangle W/H — the response to an edit of
+    /// either span. The ✛ set is cleared before the resync so EVERY marker
+    /// reseeds at the new corners (`sync_fid_markers` only seeds ones it adds,
+    /// which would otherwise leave the crosses sitting at the old rectangle),
+    /// and the stale detections/rows go with them.
+    pub(super) fn apply_fid_rect(&mut self) {
+        self.fiducials.layout = self.fid_rect_layout();
+        self.fiducials.search.clear();
+        self.fiducials.found.clear();
+        self.fiducials.rows.clear();
+        // Everything fitted against the OLD corner positions goes stale with
+        // them — a surviving homography would keep skewing the Place overlay
+        // from a rectangle that no longer exists.
+        self.fiducials.measured_ppm = None;
+        self.fiducials.homography = None;
+        // The rectangle moved the layout centroid, so an offset measured from
+        // the old one would displace the design by the difference.
+        self.fiducials.last_fit = None;
+        // Stale measurements must not be adoptable as a layout they no longer
+        // correspond to.
+        self.fiducials.detected_mm.clear();
+        // Click-placed extras may have made the layout longer than four, so an
+        // in-flight marking index can outlive the marker it named.
+        self.fiducials.marking = None;
+        self.sync_fid_markers();
+    }
+
     /// Resize the marker set to match the design layout, preserving existing
     /// (clicked) positions and seeding any new ones from the layout — so adding
     /// a 4th coordinate makes a 4th ✛ appear without a manual reset.
+    ///
+    /// Deliberately does NOT reseed through the calibrated projection
+    /// ([`seed_fid_markers_from_projection`]): this runs every frame from the
+    /// overlay, so projection-seeding here would drag the operator's markers
+    /// back off their holes as fast as they could place them. Auto-seeding
+    /// belongs to the explicit load / grab / Check actions only.
+    ///
+    /// [`seed_fid_markers_from_projection`]: Self::seed_fid_markers_from_projection
     pub(super) fn sync_fid_markers(&mut self) {
         if fiducial::parse_layout(&self.fiducials.layout).is_err() {
             return;
@@ -210,6 +541,123 @@ impl ConsoleApp {
             .resize(self.fiducials.search.len(), None);
     }
 
+    /// Seed the ✛ set at the layout's PROJECTED pixels instead of its raw mm.
+    ///
+    /// This tab works in the uniform seeded-px/mm frame, which is only ever as
+    /// good as the typed px/mm guess — so the crosses land near the holes only
+    /// by luck, and the operator has to click each one onto its hole before the
+    /// local search can find anything. The calibrated projection already knows
+    /// where a machine-mm point images, and the holes were burned at known
+    /// machine coordinates, so pushing the expected positions through it puts
+    /// every marker inside its own search window and removes the click round.
+    ///
+    /// Returns `Err` with the reason whenever there is no usable projection (or
+    /// it cannot map some point), so the caller can fall back to clicking and
+    /// say why.
+    fn seed_fid_markers_from_projection(&mut self) -> Result<(), String> {
+        let (w, h) = self
+            .fiducials
+            .frame_img
+            .as_ref()
+            .map(|f| f.dimensions())
+            .ok_or("no frame to seed against")?;
+        let projection = self.place_projection(w, h)?;
+        let expected = self.expected_points();
+        if expected.is_empty() {
+            return Err("no expected fiducials to seed".into());
+        }
+        let ppm = self.fiducials.px_per_mm;
+        if ppm <= 0.0 {
+            return Err(format!("seed scale {ppm} px/mm is not positive"));
+        }
+        // Projected px → the tab's uniform frame (x = px/ppm, y measured up
+        // from the bottom row), which is what `check_frame` searches in.
+        let mut seeds = Vec::with_capacity(expected.len());
+        for (i, &p) in expected.iter().enumerate() {
+            let (px, py) = projection.to_px(p).ok_or_else(|| {
+                format!(
+                    "fiducial {} at ({:.1}, {:.1}) mm does not project into this frame",
+                    i + 1,
+                    p.0,
+                    p.1
+                )
+            })?;
+            seeds.push((px / ppm, (f64::from(h) - py) / ppm));
+        }
+        self.fiducials.search = seeds;
+        self.fiducials
+            .found
+            .resize(self.fiducials.search.len(), None);
+        Ok(())
+    }
+
+    /// Locate the fiducials by their RECTANGLE GEOMETRY anywhere in the frame
+    /// and move the ✛ set onto them — the recovery for when the markers are not
+    /// near the real holes at all (bad calibration, board moved, no projection),
+    /// so every local search misses and the operator gets nothing back.
+    ///
+    /// Whole-frame blob scan first, then the layout's own arrangement picks the
+    /// true four out of the blobs. Unmatched layout points keep their existing
+    /// seed rather than being dragged somewhere arbitrary. Returns the operator
+    /// summary — candidate count, how many matched, and the fit RMS — which is
+    /// the primary bench diagnostic when this comes up empty.
+    fn locate_fid_markers_globally(&mut self) -> Result<String, String> {
+        let ppm = self.fiducials.px_per_mm;
+        if ppm <= 0.0 {
+            return Err(format!(
+                "rectangle match: scale {ppm} px/mm is not positive"
+            ));
+        }
+        let layout = fiducial::parse_layout(&self.fiducials.layout)
+            .map_err(|e| format!("rectangle match: layout: {e}"))?;
+        if layout.len() < AUTO_RECOVER_BELOW {
+            return Err(format!(
+                "rectangle match: need ≥{AUTO_RECOVER_BELOW} layout points to match a shape, \
+                 have {}",
+                layout.len()
+            ));
+        }
+        let profile = self.fiducials.profile.to_profile(
+            self.fiducials
+                .shape
+                .to_fid_shape(self.fiducials.diameter_mm, self.fiducials.height_mm),
+        );
+        let frame = self
+            .fiducials
+            .frame_img
+            .as_ref()
+            .ok_or("rectangle match: no frame")?;
+        let h = f64::from(frame.height());
+        let cands = vision::find_fiducial_candidates(frame, &profile, ppm, AUTO_MAX_CANDIDATES);
+        let n_cand = cands.len();
+        let pts: Vec<(f64, f64)> = cands.iter().map(|c| (c.px.x, c.px.y)).collect();
+        let m = fiducial::match_layout_to_candidates(
+            &layout,
+            h,
+            ppm,
+            &pts,
+            AUTO_MAX_ROT_DEG,
+            fiducial::match_tol_px(&layout, ppm),
+        )
+        .ok_or_else(|| format!("rectangle match: {n_cand} candidates, none form the layout"))?;
+
+        // Back into the tab's uniform frame — the exact inverse of the
+        // projection seeding's `(px / ppm, (h − py) / ppm)`, so the two paths
+        // write the same coordinates.
+        self.sync_fid_markers();
+        for (slot, found) in self.fiducials.search.iter_mut().zip(&m.matched_px) {
+            if let &Some((px, py)) = found {
+                *slot = (px / ppm, (h - py) / ppm);
+            }
+        }
+        Ok(format!(
+            "{n_cand} candidates, {}/{}, {:.1} px RMS",
+            m.matched,
+            layout.len(),
+            m.rms_px
+        ))
+    }
+
     /// Detect around the current search markers and record the found positions,
     /// summary rows, and measured scale.
     pub fn render_fiducials(&mut self, ctx: &Context) {
@@ -222,36 +670,39 @@ impl ConsoleApp {
                 return; // grab already detects (or reported the error)
             }
             self.load_fid_frame(ctx);
-        }
-        if self.fiducials.frame_img.is_none() {
+            // The load finished the job: it either seeded through the
+            // calibration and checked, or opened the click round whose last
+            // click checks. Falling through would detect a second time and
+            // bury the round's "click fiducial 1 of N" prompt.
             return;
         }
         if self.fiducials.search.is_empty() {
             self.fiducials.note = "load a frame first".into();
             return;
         }
-        self.detect_fiducials(ctx);
+        // Detection owns the choice of where to look. It tries the operator's
+        // markers first, then the calibrated projection, then the whole-frame
+        // rectangle match, and keeps the first that works.
+        //
+        // Deliberately does NOT re-seed through the calibration up front any
+        // more. That threw away markers the operator had already clicked onto
+        // the holes, and a layout whose coordinates are themselves click-derived
+        // (rather than true machine coordinates) does not project back onto
+        // them — so a Check that used to find all four found none.
+        self.detect_fiducials();
     }
 
     /// Live fiducial tracking: pull frames from the (camera-tab) source and
     /// re-detect each one, so the rings track the holes as the board moves.
     /// Uses `cam_source`, so pick the device/file in the Camera tab.
     pub(super) fn pump_fid_live(&mut self, ctx: &Context) {
+        // Live-off only means this tab stops asking for frames — the capture is
+        // the console's, shared with the Camera and Calibrate tabs, and is
+        // released by the idle rule in `ui()` once no tab wants it.
         if !self.fiducials.live {
-            if self.fiducials.capture.is_some() {
-                self.fiducials.capture = None;
-                self.fiducials.capture_src = None;
-            }
             return;
         }
-        let src = self.cam_source();
-        if self.fiducials.capture.is_none() || self.fiducials.capture_src.as_ref() != Some(&src) {
-            self.fiducials.capture = None;
-            self.fiducials.capture = Some(crate::camera::Capture::start(src.clone()));
-            self.fiducials.capture_src = Some(src);
-        }
-        let latest = self.fiducials.capture.as_ref().and_then(|c| c.latest());
-        if let Some(res) = latest {
+        if let Some(res) = self.capture_latest() {
             match res {
                 Ok(gray) => {
                     let gray = self.camera.orientation.apply(gray);
@@ -265,7 +716,7 @@ impl ConsoleApp {
                     self.fiducials.frame_img = Some(gray);
                     self.sync_fid_markers();
                     if !self.fiducials.search.is_empty() {
-                        self.detect_fiducials(ctx);
+                        self.detect_fiducials();
                     }
                 }
                 Err(e) => {
@@ -278,11 +729,14 @@ impl ConsoleApp {
     }
 
     /// Emit fiducial holes at the expected positions by shelling `pcbforge
-    /// fid-holes`, then BURN them: once the export finishes, the queued
-    /// LightBurn run loads the file and STARTs it (see
-    /// [`pump_verb`](Self::pump_verb)) — no manual load-and-press-play. Uses
-    /// the same layout string the check drives from, so the burned holes land
-    /// exactly where detection looks for them.
+    /// fid-holes`, then LOAD the result in LightBurn without starting it: once
+    /// the export finishes the queued load-only hand-off FORCELOADs the file
+    /// (see [`chain_lightburn_after_verb`](Self::chain_lightburn_after_verb))
+    /// and stops there — START stays with the operator, the same contract the
+    /// drill emit holds. Uses the same layout string the check drives from, so
+    /// the holes land exactly where detection looks for them, and the same
+    /// process recipe the drill emit uses (a Line layer at the Job-tab params)
+    /// — these are drilled holes, not engraved ones.
     pub(super) fn fiducial_generate_holes(&mut self) {
         if let Err(e) = crate::fiducial::parse_layout(&self.fiducials.layout) {
             self.fiducials.note = format!("layout: {e}");
@@ -299,6 +753,9 @@ impl ConsoleApp {
             crate::fiducial::ShapeKind::Circle => 0.0,
             crate::fiducial::ShapeKind::Rect => self.fiducials.height_mm,
         };
+        // The drill recipe, matching `emit_drill_at_placement`: a Line layer
+        // (trace the hole outline, don't scan it in) at the Job-tab process
+        // params over the verb's default power.
         let mut args: Vec<String> = vec![
             "fid-holes".into(),
             "--out".into(),
@@ -311,12 +768,27 @@ impl ConsoleApp {
             format!("{}", self.fiducials.diameter_mm),
             "--h-mm".into(),
             format!("{h_mm}"),
+            "--mode".into(),
+            "line".into(),
+            "--power-pct".into(),
+            "20".into(),
+            "--speed-mm-s".into(),
+            format!("{}", self.job.speed_mm_s),
+            "--frequency-khz".into(),
+            format!("{}", self.job.frequency_khz),
+            "--pulse-ns".into(),
+            format!("{}", self.job.pulse_ns),
+            "--passes".into(),
+            format!("{}", self.job.passes),
+            "--interval-mm".into(),
+            format!("{}", self.job.interval_mm),
         ];
         // Pre-distort with the laser-field map when a usable calibration + map
         // file exist; otherwise burn uncorrected with a warning (mirrors the
         // job emit path).
         let field_path = self.field_map_path();
-        if self.has_usable_field_cal() && field_path.exists() {
+        let use_field = self.has_usable_field_cal() && field_path.exists();
+        if use_field {
             args.push("--field-map".into());
             args.push(field_path.to_string_lossy().into_owned());
         } else {
@@ -328,54 +800,210 @@ impl ConsoleApp {
                 err: true,
             });
         }
+        // Record 4a. The holes are generated from the layout, not the
+        // placement, but the placement snapshot still goes in: "the holes were
+        // cut for THIS layout while the design sat there" is the pairing a
+        // later registration failure has to be read against.
+        let out_path = PathBuf::from(&out);
+        self.diag_export("fid-holes", &args, &out_path, use_field);
         let started = self.run_verb(&args);
-        // Chain the burn only when the export actually launched — a refused
-        // click (a job already running) must not arm the chain against a file
-        // this click never wrote. Resolve to an ABSOLUTE path without
-        // canonicalizing: the file may not exist yet, and \\?\ prefixes upset
-        // LightBurn's FORCELOAD (same rule as the placement export).
+        if started {
+            self.diag_arm_readback("fid-holes", out_path, use_field);
+        }
+        // Queue a LOAD-ONLY hand-off — the file opens in LightBurn once the
+        // export finishes, and START is never sent. Only when the export
+        // actually launched: a refused click (a job already running) must not
+        // arm the chain against a file this click never wrote. Absolute but
+        // NOT canonicalized: the file doesn't exist yet, and \\?\ prefixes
+        // upset LightBurn's FORCELOAD (same rule as the placement export).
         if started {
             match std::path::absolute(std::path::Path::new(&out)) {
                 Ok(abs) => {
-                    self.runtime.pending_lightburn = Some(abs);
+                    self.runtime.pending_lightburn = Some(PendingLightburn {
+                        path: abs,
+                        start: false,
+                    });
                     self.runtime.log.push(LogLine {
-                        text: "queued: load + BURN the holes in LightBurn once the export finishes"
+                        text: "queued: load the holes in LightBurn once the export finishes \
+                               — NOT starting it (press ▶ there to burn)"
                             .into(),
                         err: false,
                     });
+                    self.fiducials.note = format!(
+                        "writing fiducial holes to {out} — see Log for progress. It loads in \
+                         LightBurn but never starts: press play there yourself."
+                    );
                 }
-                Err(e) => self.runtime.log.push(LogLine {
-                    text: format!(
-                        "fid-holes: couldn't resolve an absolute path for the LightBurn run ({e}) \
-                         — the holes file will still be written"
-                    ),
-                    err: true,
-                }),
+                // Nothing queued, so don't promise a load the operator won't get.
+                Err(e) => {
+                    self.runtime.log.push(LogLine {
+                        text: format!(
+                            "fid-holes: couldn't resolve an absolute path for the LightBurn load \
+                             ({e}) — the holes file will still be written"
+                        ),
+                        err: true,
+                    });
+                    self.fiducials.note = format!(
+                        "writing fiducial holes to {out} — see Log for progress; open the file \
+                         in LightBurn yourself."
+                    );
+                }
             }
         }
-        self.fiducials.note =
-            "burning fiducial holes at the expected positions — see Log for progress".into();
+    }
+
+    /// How many fiducials a detection result actually located.
+    fn fid_hits(r: &fiducial::FidResult) -> usize {
+        r.found_px.iter().filter(|f| f.is_some()).count()
+    }
+
+    /// One detection attempt at `seeds`, including the local refine pass.
+    /// Read-only: the caller decides whether this attempt's seeds are the ones
+    /// worth keeping (see [`detect_fiducials`](Self::detect_fiducials)).
+    ///
+    /// The refine pass: a small uniform placement error (a board nudged between
+    /// the burn and the check, or a slightly-off px/mm) moves EVERY hole the
+    /// same way, so the fiducials that were found say where the missed ones
+    /// went — shift the misses by the mean hit displacement and look again.
+    /// Needs ≥2 hits so one bad detection can't drag the misses off on its own,
+    /// and runs at most once; the second pass' result is final whatever it says.
+    ///
+    /// Only the MISSED seeds move, so the hits search unchanged windows and
+    /// cannot regress. The refined seeds stay local: they are a better guess at
+    /// the holes, not the operator's marker set, and writing them back would
+    /// make the ✛ walk on every Check (and every frame under Live). One
+    /// consequence — a refined row's `off` reads detector-vs-refined-seed,
+    /// which is the meaningful number for the retry.
+    fn detect_pass(
+        &self,
+        seeds: &[(f64, f64)],
+        profile: &vision::FiducialProfile,
+        ppm: f64,
+        search_mm: f64,
+    ) -> fiducial::FidResult {
+        let frame = self
+            .fiducials
+            .frame_img
+            .as_ref()
+            .expect("caller checked a frame is loaded");
+        let h = f64::from(frame.height());
+        let r = fiducial::check_frame(frame, seeds, ppm, profile, search_mm);
+
+        let hits = Self::fid_hits(&r);
+        if hits < 2 || hits >= seeds.len() {
+            return r;
+        }
+        let (mut dx, mut dy) = (0.0, 0.0);
+        for (seed, found) in seeds.iter().zip(&r.found_px) {
+            if let &Some((px, py)) = found {
+                dx += px / ppm - seed.0;
+                dy += (h - py) / ppm - seed.1;
+            }
+        }
+        let (dx, dy) = (dx / hits as f64, dy / hits as f64);
+        let refined: Vec<(f64, f64)> = seeds
+            .iter()
+            .zip(&r.found_px)
+            .map(|(&s, found)| {
+                if found.is_none() {
+                    (s.0 + dx, s.1 + dy)
+                } else {
+                    s
+                }
+            })
+            .collect();
+        fiducial::check_frame(frame, &refined, ppm, profile, search_mm)
     }
 
     /// Run detection on the current in-memory frame around the search markers,
     /// updating rows/found/measured/homography. Shared by the static Check and
     /// the live-tracking loop (FLD-11).
-    fn detect_fiducials(&mut self, ctx: &Context) {
-        let Some(frame) = &self.fiducials.frame_img else {
+    fn detect_fiducials(&mut self) {
+        if self.fiducials.frame_img.is_none() {
             return;
-        };
+        }
         let profile = self.fiducials.profile.to_profile(
             self.fiducials
                 .shape
                 .to_fid_shape(self.fiducials.diameter_mm, self.fiducials.height_mm),
         );
-        let r = fiducial::check_frame(
-            frame,
-            &self.fiducials.search,
-            self.fiducials.px_per_mm,
-            &profile,
-            self.fiducials.search_mm,
-        );
+        let ppm = self.fiducials.px_per_mm;
+        let search_mm = self.fiducials.search_mm;
+
+        // TRY IN ORDER, KEEP THE FIRST THAT WORKS. Each source of marker
+        // positions is attempted at most once, best result wins, and the
+        // operator's own markers are the FIRST thing tried — re-seeding
+        // unconditionally breaks the flow where the operator has already
+        // clicked each ✛ onto its hole, because a layout whose coordinates were
+        // themselves click-derived does not project onto the holes.
+        let original = self.fiducials.search.clone();
+        let mut best = self.detect_pass(&original, &profile, ppm, search_mm);
+        let mut best_hits = Self::fid_hits(&best);
+        let mut best_seeds = original.clone();
+        let mut via = "markers".to_string();
+        // Why a stage was skipped or came up short — appended after the tally.
+        let mut why: Vec<String> = Vec::new();
+
+        // Stage 2: the calibrated projection knows where a machine-mm point
+        // images, which beats a stale marker whenever the layout really is in
+        // machine coordinates.
+        if best_hits < AUTO_RECOVER_BELOW {
+            match self.seed_fid_markers_from_projection() {
+                Ok(()) => {
+                    let seeds = self.fiducials.search.clone();
+                    let r = self.detect_pass(&seeds, &profile, ppm, search_mm);
+                    let hits = Self::fid_hits(&r);
+                    if hits > best_hits {
+                        (best, best_hits, best_seeds) = (r, hits, seeds);
+                        via = "projection seed".into();
+                    }
+                }
+                Err(e) => why.push(e),
+            }
+        }
+
+        // Stage 3: give up on knowing where the holes are and find them by
+        // their own geometry — a whole-frame blob scan matched against the
+        // layout's ARRANGEMENT. Written as a third inline attempt (like the
+        // refine pass inside each attempt) rather than by re-entering this
+        // method, so it cannot recurse.
+        //
+        // Skipped under Live: this is a whole-frame scan, far too heavy to run
+        // per streamed frame, and a live feed re-checks continuously anyway.
+        if best_hits < AUTO_RECOVER_BELOW && !self.fiducials.live {
+            // Unmatched layout points keep THEIR seed, so start from the
+            // operator's markers rather than stage 2's projection guesses.
+            self.fiducials.search = original.clone();
+            match self.locate_fid_markers_globally() {
+                Ok(summary) => {
+                    let seeds = self.fiducials.search.clone();
+                    let r = self.detect_pass(&seeds, &profile, ppm, search_mm);
+                    let hits = Self::fid_hits(&r);
+                    if hits > best_hits {
+                        (best, best_seeds) = (r, seeds);
+                        via = format!("rectangle match ({summary})");
+                    } else {
+                        why.push(format!("rectangle match ({summary}) found no more holes"));
+                    }
+                }
+                Err(e) => why.push(e),
+            }
+        }
+
+        // Install the winning stage's markers. When nothing beat the operator's
+        // own, that IS `original` — a failed Check must never park the ✛ set
+        // wherever the last failed attempt happened to leave it.
+        self.fiducials.search = best_seeds;
+        self.fiducials
+            .found
+            .resize(self.fiducials.search.len(), None);
+        if via != "markers" {
+            // The markers moved, so the click-in-order round no longer names
+            // the positions the operator was working through.
+            self.fiducials.marking = None;
+        }
+        let r = best;
+
         let (s, w, m) = r.tally;
         self.fiducials.rows = r.rows;
         self.fiducials.found = r.found_px;
@@ -390,6 +1018,19 @@ impl ConsoleApp {
             None => String::new(),
         };
         self.fiducials.note = format!("{s} strong, {w} weak, {m} missed{scale}");
+        // After the note is rewritten, never before — everything from here down
+        // appends. WHICH stage located the holes is the operator's main
+        // diagnostic: "markers" means their clicks were right, "projection
+        // seed" means the calibration was, "rectangle match" means neither was
+        // and the geometry had to do it. The failed stages' reasons follow, so
+        // "the scan found nothing" reads differently from "the scan found blobs
+        // but none form the layout" — those need opposite fixes.
+        self.fiducials
+            .note
+            .push_str(&format!("  ·  located via {via}"));
+        for reason in &why {
+            self.fiducials.note.push_str(&format!("  ·  {reason}"));
+        }
 
         // Perspective: with ≥4 detected fiducials, fit the design→pixel
         // homography (a tilted camera keystones the flat board). It corrects
@@ -425,15 +1066,15 @@ impl ConsoleApp {
             None
         };
 
-        self.update_placement_from_fiducials(ctx);
+        self.update_placement_from_fiducials();
     }
 
     /// Fit the board's actual pose from the just-detected holes and write it
-    /// into the Place tab (rotation + translation, mirror-aware), so a Check
+    /// into the placement (rotation + translation, mirror-aware), so a Check
     /// re-registers the job without a manual drag. The outcome — success or the
     /// specific reason it was skipped — is appended to the fiducial note; only
     /// an applied pose sets `placement.auto_pose` and caches `fiducials.pose`.
-    fn update_placement_from_fiducials(&mut self, ctx: &Context) {
+    pub(super) fn update_placement_from_fiducials(&mut self) {
         // This detection's placement outcome: reset up front so every early
         // return below leaves it false, and only the successful apply sets it
         // true. The verdict line reads this so it never shows a stale
@@ -445,17 +1086,41 @@ impl ConsoleApp {
         let Some((w, h)) = self.fiducials.frame_img.as_ref().map(|f| f.dimensions()) else {
             return;
         };
-        let Ok(layout) = fiducial::parse_layout(&self.fiducials.layout) else {
-            return; // a bad layout was already surfaced above
+        // Say why. The entry paths that go through `set_fid_frame` do report a
+        // bad layout, but detection can also be reached with markers already in
+        // place and the layout since edited to something unparseable — and then
+        // this returned silently, leaving the verdict line asserting "placement
+        // not updated" with no reason anywhere on screen.
+        let layout = match fiducial::parse_layout(&self.fiducials.layout) {
+            Ok(l) => l,
+            Err(e) => {
+                self.fiducials
+                    .note
+                    .push_str(&format!("  ·  placement not updated — layout: {e}"));
+                // Still opens a `check=N`: a check that never got past its own
+                // layout field is exactly as worth recording as one that did.
+                let layout = self.fiducials.layout.clone();
+                self.diag_check_begin(&layout, (w, h), Err("not reached"), &[]);
+                self.diag_check_outcome(&format!("refused-layout ({e})"));
+                return;
+            }
         };
         // place_projection is the ONLY correct camera-px → machine-mm source
         // here (the design→px homography above would just recover the layout).
+        // Surface the projection's OWN error. It fails for two very different
+        // reasons — nothing calibrated at all, versus a calibration this frame
+        // doesn't match (resolution/crop/orientation) — and a generic "no
+        // calibration" reads as flatly untrue in the second case, which is the
+        // one an operator can actually act on.
         let projection = match self.place_projection(w, h) {
             Ok(p) => p,
-            Err(_) => {
-                self.fiducials
-                    .note
-                    .push_str("  ·  no camera→machine calibration — placement not updated");
+            Err(e) => {
+                self.fiducials.note.push_str(&format!(
+                    "  ·  placement not updated — no camera→machine projection: {e}"
+                ));
+                let layout = self.fiducials.layout.clone();
+                self.diag_check_begin(&layout, (w, h), Err(e.as_str()), &[]);
+                self.diag_check_outcome("refused-projection");
                 return;
             }
         };
@@ -467,18 +1132,57 @@ impl ConsoleApp {
             .iter()
             .map(|&f| f.and_then(|px| projection.from_px(px)))
             .collect();
+        // Record 2a. WHICH projection variant produced these millimetres is
+        // half the answer when the overlay and the export disagree, so it is
+        // logged next to the numbers it produced rather than inferred later.
+        let layout_text = self.fiducials.layout.clone();
+        self.diag_check_begin(&layout_text, (w, h), Ok(&projection), &detected);
+        // Cache before the gates below: a REFUSED fit is exactly when the
+        // operator needs these, because "⌖ layout from detection" is how a
+        // layout that never matched the real holes gets replaced by one that
+        // does.
+        self.fiducials.detected_mm = detected.clone();
         // Back side: the camera sees the drilled holes' EXIT openings, so fit
         // against the exit-magnified nominal positions.
         let exit = self.back_field_params();
-        let pose = match fiducial::fit_board_pose(&layout, &detected, exit.as_ref()) {
-            Ok(pose) => pose,
+        let fiducial::PoseFit {
+            pose,
+            residuals_mm,
+            fit,
+            layout_centroid: b0,
+        } = match fiducial::fit_board_pose(&layout, &detected, exit.as_ref()) {
+            Ok(fit) => fit,
             Err(e) => {
                 self.fiducials
                     .note
                     .push_str(&format!("  ·  placement not updated: {e}"));
+                self.diag_check_outcome(&format!("refused-fit ({e})"));
                 return;
             }
         };
+        // Label each row with its residual from THIS fit — done before the
+        // gates below, because a REJECTED fit is exactly when the operator
+        // needs to see which fiducial is the outlier. The row's own `off` is
+        // detector-vs-marker in the seeded uniform-scale frame and stays small
+        // whenever detection worked, so it cannot answer "why is the RMS big".
+        for (row, residual) in self.fiducials.rows.iter_mut().zip(&residuals_mm) {
+            if let Some(r) = residual {
+                row.text.push_str(&format!("   fit {r:.2} mm"));
+            }
+        }
+        // Record 2b, before the gates: a REFUSED fit is exactly the one whose
+        // numbers need to survive to the log.
+        let centroid = {
+            let hits: Vec<(f64, f64)> = detected.iter().flatten().copied().collect();
+            (!hits.is_empty()).then(|| {
+                let n = hits.len() as f64;
+                (
+                    hits.iter().map(|p| p.0).sum::<f64>() / n,
+                    hits.iter().map(|p| p.1).sum::<f64>() / n,
+                )
+            })
+        };
+        self.diag_check_fit(b0, &pose, centroid);
         // The fit's mirror must match the working face, or the board is on the
         // wrong side (or not flipped): refuse rather than place a mirrored job.
         let flipped_expected = self.job.side == Side::Back;
@@ -488,6 +1192,7 @@ impl ConsoleApp {
             } else {
                 "  ·  detected a mirrored fiducial pattern — is the board flipped? switch side to Back"
             });
+            self.diag_check_outcome("refused-mirror");
             return;
         }
         if pose.rms_mm > POSE_MAX_RMS_MM {
@@ -495,21 +1200,111 @@ impl ConsoleApp {
                 "  ·  fiducial fit RMS {:.2} mm too loose — placement not updated",
                 pose.rms_mm
             ));
+            self.diag_check_outcome("refused-rms");
             return;
         }
-        self.placement.tx_mm = pose.tx_mm;
-        self.placement.ty_mm = pose.ty_mm;
-        self.placement.rot_deg = pose.rot_deg;
+        // Scale gate — see POSE_SCALE_MIN. Applying the fit resizes the burn,
+        // so an implausible scale has to stop the placement even though the
+        // residual looks perfect.
+        if !(POSE_SCALE_MIN..=POSE_SCALE_MAX).contains(&pose.scale) {
+            self.fiducials.note.push_str(&format!(
+                "  ·  fiducial fit scale {:.4} ({:+.1}%) is outside \
+                 {POSE_SCALE_MIN:.2}–{POSE_SCALE_MAX:.2} — wrong holes or wrong \
+                 layout? placement not updated",
+                pose.scale,
+                (pose.scale - 1.0) * 100.0
+            ));
+            self.diag_check_outcome("refused-scale");
+            return;
+        }
+        // Where the design sits RELATIVE TO THE BOARD, in the nominal layout
+        // frame: map the placement the operator is looking at back through the
+        // fit it was written under, and measure it from the layout centroid
+        // `b0` (the point a fresh Check would land the design on). Re-applying
+        // that offset under the NEW fit carries a manual nudge along as the
+        // board moves, instead of every Check throwing it away. Must be read
+        // BEFORE the placement is overwritten below.
+        //
+        // Without a previous fit — the first Check, or a layout edit that made
+        // the old offset meaningless — the offset is zero, i.e. exactly the
+        // "centre the design on the fiducials" behaviour Check has always had.
+        let (offset, rot_offset) = match (&self.fiducials.last_fit, self.placement.auto_pose) {
+            (Some(prev), true) => {
+                let n = prev.inverse_apply((self.placement.tx_mm, self.placement.ty_mm));
+                (
+                    (n.0 - b0.0, n.1 - b0.1),
+                    self.placement.rot_deg - prev.angle_deg(),
+                )
+            }
+            _ => ((0.0, 0.0), 0.0),
+        };
+        let (tx_mm, ty_mm) = fit.apply((b0.0 + offset.0, b0.1 + offset.1));
+        self.placement.tx_mm = tx_mm;
+        self.placement.ty_mm = ty_mm;
+        self.placement.rot_deg = fit.angle_deg() + rot_offset;
+        // No manual scale control exists, so there is nothing to carry: the
+        // fit's scale simply becomes the placement's, resizing the emitted job.
+        self.placement.scale = fit.scale;
         self.placement.auto_pose = true;
         self.fiducials.last_placed = true;
         self.fiducials.pose = Some(pose);
-        self.fiducials.note.push_str(&format!(
-            "  ·  placement set from fiducials (rot {:+.2}°, RMS {:.2} mm)",
-            pose.rot_deg, pose.rms_mm
+        self.fiducials.last_fit = Some(fit);
+        // Record 2c: the placement this check actually wrote, with the manual
+        // nudge it carried across.
+        self.diag_check_outcome(&format!(
+            "applied carried_offset_mm={:.3},{:.3} carried_rot_deg={rot_offset:+.4}",
+            offset.0, offset.1
         ));
-        // Rebuild the Place overlay only if a frame is already loaded there.
-        if self.placement.frame_img.is_some() {
-            self.recompose(ctx);
+        // Only mention a carried offset once it is big enough to be a real
+        // adjustment — sub-10-µm noise from the round trip is not news.
+        let carried = offset.0.hypot(offset.1);
+        // Layout-frame mm, not bed mm — under a fitted scale the two differ by
+        // that factor. It is a "did my nudge survive" indicator, not a metric.
+        let carried = if carried > 0.01 {
+            format!(", carried offset {carried:.2} mm")
+        } else {
+            String::new()
+        };
+        // The resize must never be silent — it changes the burned dimensions,
+        // so it is spelled out in percent next to the scale itself.
+        let resize = if (pose.scale - 1.0).abs() > POSE_SCALE_QUIET {
+            format!(" → job resized {:+.2}%", (pose.scale - 1.0) * 100.0)
+        } else {
+            String::new()
+        };
+        self.fiducials.note.push_str(&format!(
+            "  ·  placement set from fiducials (rot {:+.2}°, scale {:.4}{resize},              RMS {:.2} mm{carried})",
+            pose.rot_deg, pose.scale, pose.rms_mm
+        ));
+        self.ensure_placement_job();
+    }
+
+    /// Make sure the just-locked placement has geometry to draw.
+    ///
+    /// A lock is only worth anything if the operator can see where the job
+    /// landed, and this tab's outline draws nothing until the Gerbers are
+    /// loaded — so a good registration would sit invisible behind a ⤵ Load
+    /// design click. Called only after a fit has actually been APPLIED, so a
+    /// gated-out Check never draws a placement that was refused.
+    ///
+    /// The pose is also meaningless without the job: `pivot` is the design
+    /// point the fit lands on the fiducial centroid, and it stays (0,0) until
+    /// the geometry is loaded — which would put the raw GERBER ORIGIN on the
+    /// fiducials instead of the design's centre. Parsed once (the job is then
+    /// non-empty), so a Live re-lock never re-reads the Gerbers.
+    fn ensure_placement_job(&mut self) {
+        if !self.placement.job.is_empty() {
+            return;
+        }
+        match self.active_job() {
+            Ok((_, _, ablate)) => {
+                self.placement.pivot = crate::place::bbox_center_mm(&ablate);
+                self.placement.job = ablate;
+            }
+            Err(e) => self
+                .fiducials
+                .note
+                .push_str(&format!("  ·  design not drawn: {e}")),
         }
     }
 
@@ -549,15 +1344,36 @@ impl ConsoleApp {
                          Camera tab); set a path to check a saved image instead.",
                     );
                 ui.end_row();
-                let lbl = ui.label("expected (x,y mm; …)");
-                ui.add(egui::TextEdit::singleline(&mut self.fiducials.layout).desired_width(240.0))
-                    .labelled_by(lbl.id)
+                ui.label("fiducial rect W mm");
+                let mut rect_edited = ui
+                    .add(
+                        egui::DragValue::new(&mut self.fiducials.rect_w_mm)
+                            .speed(0.5)
+                            .range(5.0..=500.0),
+                    )
                     .on_hover_text(
-                        "Fiducial positions in board/machine mm (Gerber frame, \
-                         y up). On the un-calibrated uniform scale, bed (0,0) \
-                         is the bottom-left of the camera frame.",
-                    );
+                        "Centre-to-centre x span of the four fiducials. The \
+                         rectangle sits in the middle of the work area (equal \
+                         gaps left/right), so no coordinates are needed.",
+                    )
+                    .changed();
                 ui.end_row();
+                ui.label("fiducial rect H mm");
+                rect_edited |= ui
+                    .add(
+                        egui::DragValue::new(&mut self.fiducials.rect_h_mm)
+                            .speed(0.5)
+                            .range(5.0..=500.0),
+                    )
+                    .on_hover_text(
+                        "Centre-to-centre y span of the four fiducials, centred \
+                         in the work area (equal gaps top/bottom).",
+                    )
+                    .changed();
+                ui.end_row();
+                if rect_edited {
+                    self.apply_fid_rect();
+                }
                 ui.label("px/mm (seed)");
                 ui.add(
                     egui::DragValue::new(&mut self.fiducials.px_per_mm)
@@ -631,7 +1447,10 @@ impl ConsoleApp {
                     );
                 ui.end_row();
             });
-        ui.horizontal(|ui| {
+        // Wrapped: this row has grown to a dozen widgets, and a plain
+        // `horizontal` runs them off the right edge with no scrollbar — the
+        // last buttons simply become unreachable at any sane window width.
+        ui.horizontal_wrapped(|ui| {
             if ui
                 .button("📷 Grab & check")
                 .on_hover_text(
@@ -659,6 +1478,12 @@ impl ConsoleApp {
                 .on_hover_text(
                     "Track fiducials on the live camera feed (source from the Camera tab).",
                 );
+            ui.checkbox(&mut self.fiducials.show_placement, "▦ show placement")
+                .on_hover_text(
+                    "Outline the placed job over this frame, at the Actions-panel pose \
+                     (needs the Job-tab Gerbers and a camera calibration). A fiducial \
+                     lock loads the job automatically.",
+                );
             ui.checkbox(&mut self.fiducials.click_place, "✚ click-to-place")
                 .on_hover_text(
                     "Left-click an empty spot to add an expected fiducial; \
@@ -678,8 +1503,9 @@ impl ConsoleApp {
             if ui
                 .button("✕ clear markers")
                 .on_hover_text(
-                    "Remove ALL expected fiducials — empties the layout field \
-                     above, so nothing reseeds them.",
+                    "Remove ALL expected fiducials — empties the layout, so \
+                     neither the per-frame sync nor ↺ can reseed them. \
+                     ⟳ layout from W×H is the way back.",
                 )
                 .clicked()
             {
@@ -687,13 +1513,57 @@ impl ConsoleApp {
             }
             if ui
                 .add_enabled(
+                    self.fiducials.last_fit.is_some(),
+                    egui::Button::new("⊕ recentre on fiducials"),
+                )
+                .on_hover_text(
+                    "Drop any manual offset and put the design back on the fiducial \
+                     centroid at the fitted rotation and scale. Dragging the design is \
+                     carried across re-Checks on purpose — this is how you undo one.",
+                )
+                .clicked()
+            {
+                self.recentre_on_fiducials();
+            }
+            if ui
+                .add_enabled(
+                    self.fiducials.detected_mm.iter().all(Option::is_some)
+                        && !self.fiducials.detected_mm.is_empty(),
+                    egui::Button::new("⌖ layout from detection"),
+                )
+                .on_hover_text(
+                    "Make the CURRENT board pose nominal: replace the layout with the \
+                     positions just measured, so the fit residual goes to zero and every \
+                     later Check measures only how far the board has moved since. Use \
+                     this when the fit is refused as too loose but all the holes were \
+                     found — it means the layout never described them.",
+                )
+                .clicked()
+            {
+                self.adopt_measured_layout();
+            }
+            if ui
+                .button("⟳ layout from W×H")
+                .on_hover_text(
+                    "Rebuild the layout as the four corners of the fiducial rectangle \
+                     above, centred in the work area — discarding any click-placed \
+                     edits. The same thing editing W or H does, for when the value you \
+                     want is the one already in the field.",
+                )
+                .clicked()
+            {
+                self.apply_fid_rect();
+            }
+            if ui
+                .add_enabled(
                     !self.lightburn_busy(),
-                    egui::Button::new("⚙ Generate + burn holes"),
+                    egui::Button::new("⚙ Generate holes → LightBurn (no burn)"),
                 )
                 .on_hover_text(
                     "Write a .lbrn2 with a hole at each expected position above (the same \
-                     layout the check uses), then drive LightBurn to load and START it. \
-                     LightBurn must be open with the Place-tab device configured.",
+                     layout the check uses), as a Line layer at the Job-tab drill settings, \
+                     then LOAD it in LightBurn (FORCELOAD) without pressing start — you burn \
+                     it from LightBurn yourself.",
                 )
                 .clicked()
             {
@@ -702,7 +1572,9 @@ impl ConsoleApp {
             if let Some(ppm) = self.fiducials.measured_ppm
                 && ui
                     .button(format!("↧ use measured {ppm:.2} px/mm"))
-                    .on_hover_text("Adopt the fiducial-measured scale for this and the Place tab.")
+                    .on_hover_text(
+                        "Adopt the fiducial-measured scale for this tab and the placement.",
+                    )
                     .clicked()
             {
                 self.fiducials.px_per_mm = ppm;
@@ -710,8 +1582,14 @@ impl ConsoleApp {
             }
         });
         ui.label(egui::RichText::new(&self.fiducials.note).weak());
-        ui.weak("⚙ Generate + burn holes writes the .lbrn2 AND runs it in LightBurn at the expected positions above — same layout the check uses.");
+        // The resolved positions, so the derived layout stays inspectable —
+        // and so click-to-place edits (which write the layout directly, not the
+        // W/H above) are visible rather than silent.
+        ui.weak(format!("expected: {}", self.fiducials.layout));
+        ui.weak("⚙ Generate holes writes a .lbrn2 at the expected positions above — same layout the check uses — and loads it in LightBurn, never pressing start.");
         ui.weak("Click each ✛ onto its hole in layout order; the detector searches locally around it. The typed px/mm only seeds the search — registration is anchored to the measured scale.");
+        ui.weak("Drag a ✛ onto its hole to fix one bad marker — the check re-runs when you let go, and only that marker moves (the expected layout is left alone). A ✛ takes the drag first, so Shift+drag ON one moves the marker, not the design.");
+        ui.weak("Drag ON the outlined design — away from any ✛ — to move it; Shift+drag to rotate it about its centre. A drag that starts anywhere else marks fiducials as usual.");
         ui.weak(NAV_HINT);
         ui.separator();
 
@@ -738,15 +1616,15 @@ impl ConsoleApp {
             ui.weak("○ not checked");
         } else if self.fiducials.last_placed {
             // last_placed ⇒ the pose was just written, so it's the fresh fit.
-            let (rms, rot) = self
+            let (rms, rot, scale) = self
                 .fiducials
                 .pose
                 .as_ref()
-                .map_or((0.0, 0.0), |p| (p.rms_mm, p.rot_deg));
+                .map_or((0.0, 0.0, 1.0), |p| (p.rms_mm, p.rot_deg, p.scale));
             ui.colored_label(
                 status_color(true),
                 format!(
-                    "● {s}/{n} fiducials, RMS {rms:.2} mm — placement updated (rot {rot:+.2}°)"
+                    "● {s}/{n} fiducials, RMS {rms:.2} mm — placement updated                      (rot {rot:+.2}°, scale {scale:.4})"
                 ),
             );
         } else {
@@ -756,6 +1634,67 @@ impl ConsoleApp {
                 format!("◐ {s}/{n} fiducials — placement not updated"),
             );
         }
+    }
+
+    /// The placed design projected onto this frame's screen coordinates.
+    ///
+    /// This is the point of a lock: seeing where the job will actually burn
+    /// relative to the holes that were just detected. Vector outlines rather
+    /// than a composited overlay — the fiducial texture is re-uploaded whole on
+    /// every Live frame already, and blending a bench-resolution image on top
+    /// of that would double the per-frame cost for a filled region the operator
+    /// does not need in order to judge alignment.
+    ///
+    /// Design (Gerber mm) → machine mm through the placement affine, then
+    /// machine mm → pixels through the SAME projection the fit used, so the
+    /// outline lands where the export will.
+    fn project_placed_design(
+        &self,
+        xf: &crate::imgview::ImageXform,
+        width: u32,
+        height: u32,
+    ) -> Result<PlacedDesign, String> {
+        let projection = self.place_projection(width, height)?;
+        let a = self.placement().affine();
+        let to_screen = |mm: (f64, f64)| projection.to_px(mm).map(|(px, py)| xf.to_screen(px, py));
+        let mut rings: Vec<Vec<egui::Pos2>> = Vec::new();
+        let mut bbox: Option<egui::Rect> = None;
+        for poly in &self.placement.job {
+            for ring in std::iter::once(&poly.outer).chain(poly.holes.iter()) {
+                let pts: Vec<egui::Pos2> = ring
+                    .iter()
+                    .filter_map(|p| {
+                        let nm = NM_PER_MM as f64;
+                        let (gx, gy) = (p.x as f64 / nm, p.y as f64 / nm);
+                        to_screen((a[0] * gx + a[1] * gy + a[2], a[3] * gx + a[4] * gy + a[5]))
+                    })
+                    .collect();
+                // A ring that partly failed to project would draw a chord
+                // across the gap; skip it rather than lie.
+                if pts.len() != ring.len() || pts.len() < 2 {
+                    continue;
+                }
+                for &p in &pts {
+                    bbox = Some(match bbox {
+                        None => egui::Rect::from_min_max(p, p),
+                        Some(b) => b.union(egui::Rect::from_min_max(p, p)),
+                    });
+                }
+                rings.push(pts);
+            }
+        }
+        let pivot = to_screen((self.placement.tx_mm, self.placement.ty_mm))
+            .ok_or("active camera projection returned a non-finite pivot")?;
+        Ok(PlacedDesign {
+            rings,
+            // The grab handle is the outline's BOUNDING BOX, deliberately
+            // coarser than the outline itself: a point-in-polygon test over
+            // every copper ring, every frame, to decide whether a press starts
+            // a move would cost far more than it buys — and a handle that is
+            // slightly generous is easier to hit than one that is exact.
+            bbox: bbox.unwrap_or_else(|| egui::Rect::from_min_max(pivot, pivot)),
+            pivot,
+        })
     }
 
     /// The frame with clickable search markers (✛) and detected rings drawn on
@@ -784,26 +1723,137 @@ impl ConsoleApp {
             let (ix, iy) = xf.to_native(p);
             (ix / ppm_f, (th - iy) / ppm_f)
         };
+        let (tw, thp) = (tex.size()[0] as u32, tex.size()[1] as u32);
 
-        // Click-to-place (FLD-12): screen positions of the current markers, for
-        // hit-testing add (empty spot) vs. remove (right-click on a ✛).
+        // Screen positions of the ✛ set, for every hit test below (grab a marker
+        // to drag, right-click one to remove, refuse to stack a new one on it).
         // Materialized (not a closure) so the `&self` borrow is released before
-        // the `&mut self` add/remove calls below. Suppressed while navigating.
-        if self.fiducials.click_place && !nav {
-            let marker_px: Vec<(f32, f32)> = self
-                .fiducials
-                .search
-                .iter()
-                .map(|&(x, y)| {
-                    let s = to_screen(x, y);
-                    (s.x, s.y)
-                })
-                .collect();
+        // the `&mut self` calls, and computed once rather than per gesture.
+        let marker_px: Vec<(f32, f32)> = self
+            .fiducials
+            .search
+            .iter()
+            .map(|&(x, y)| {
+                let s = to_screen(x, y);
+                (s.x, s.y)
+            })
+            .collect();
+
+        // Project the design FIRST: its screen-space bounding box is the grab
+        // handle the drag below hit-tests against, and the input handlers all
+        // run before anything is painted.
+        let mut design = (self.fiducials.show_placement && !self.placement.job.is_empty())
+            .then(|| self.project_placed_design(&xf, tw, thp));
+
+        // What a drag grabs, in strict priority order — decided once at
+        // drag_started and latched for the whole gesture, so the pointer
+        // wandering mid-drag neither stops the move nor lets the release drop
+        // a ✛:
+        //   1. Ctrl (pan/zoom) — navigation always wins, nothing is grabbed.
+        //   2. A ✛ within MARKER_GRAB_PX — dragged onto its hole.
+        //   3. The design's bounding box — moved (Shift rotates).
+        //   4. Nothing: the release marks/places fiducials as before.
+        // The marker is tested FIRST on purpose. The design's handle is a coarse
+        // screen-space bbox that almost always contains the markers, so testing
+        // it first would make an existing ✛ ungrabbable whenever the outline is
+        // shown. One consequence, since the marker wins outright: a Shift+drag
+        // that starts on a ✛ drags the marker instead of rotating the design.
+        if resp.drag_started() {
+            let grabbed = resp
+                .interact_pointer_pos()
+                .filter(|_| !nav)
+                .and_then(|p| fiducial::nearest_marker(&marker_px, (p.x, p.y), MARKER_GRAB_PX));
+            let on_design = match &design {
+                Some(Ok(d)) => resp
+                    .interact_pointer_pos()
+                    .is_some_and(|p| d.bbox.contains(p)),
+                _ => false,
+            };
+            self.fiducials.marker_drag = grabbed;
+            self.fiducials.design_drag = on_design && !nav && grabbed.is_none();
+        }
+        // Move the grabbed ✛ with the cursor. The screen delta goes through the
+        // SAME `to_mm` the click handler uses — as the difference of the two
+        // endpoints, so there is one conversion from screen to the tab's uniform
+        // frame, not two. Detection is deliberately NOT re-run here; it runs
+        // once on release (`fid_marker_drag_release`).
+        if let Some(i) = self.fiducials.marker_drag
+            && !nav
+            && resp.dragged()
+            && let Some(pos) = resp.interact_pointer_pos()
+        {
+            let delta = resp.drag_delta();
+            let (x0, y0) = to_mm(pos - delta);
+            let (x1, y1) = to_mm(pos);
+            self.fid_drag_marker(i, (x1 - x0, y1 - y0));
+        }
+        let mut moved = false;
+        if self.fiducials.design_drag
+            && !nav
+            && resp.dragged()
+            && let Some(Ok(d)) = &design
+        {
+            moved = true;
+            let delta = resp.drag_delta();
+            if ui.input(|i| i.modifiers.shift) {
+                // Rotate about the design's own pivot, wherever it landed on
+                // screen. Manual adjustment does NOT clear `auto_pose`: the
+                // next Check carries the nudge across through `last_fit`.
+                if let Some(pos) = resp.interact_pointer_pos() {
+                    let step = rot_delta_deg(d.pivot, pos - delta, pos);
+                    self.placement.rot_deg = wrap_deg(self.placement.rot_deg + step);
+                }
+            } else {
+                // Screen delta → native frame pixels (divide by the display
+                // scale), then applied in PIXEL space (see `drag_place_px`) so
+                // the outline tracks the cursor even under a perspective
+                // homography. Derived from the pivot each frame rather than
+                // accumulated, so the rounding never drifts.
+                let scale = xf.scale.max(1e-3) as f64;
+                if let Err(e) =
+                    self.drag_place_px(tw, thp, delta.x as f64 / scale, delta.y as f64 / scale)
+                {
+                    self.placement.note = format!("placement projection unavailable: {e}");
+                }
+            }
+        }
+        // Re-project after a move so the outline painted below is this frame's
+        // pose, not the one the drag started from — a one-frame lag reads as
+        // the design sticking to the cursor.
+        if moved {
+            design = Some(self.project_placed_design(&xf, tw, thp));
+        }
+        // Record 3. This is the one diagnostic reached from a per-frame path, so
+        // it is guarded three ways: not during a drag (an in-progress gesture is
+        // not a state change — the settled position lands on the frame after the
+        // release), and then inside `diag_overlay` by the placement snapshot and
+        // by an epsilon on the resulting machine-mm box.
+        if !self.fiducials.design_drag {
+            let drawn_center_px = match &design {
+                Some(Ok(d)) => Some(xf.to_native(d.bbox.center())),
+                _ => None,
+            };
+            self.diag_overlay(drawn_center_px, (tw, thp));
+        }
+        // A gesture that grabbed the design OR a marker must not also place
+        // fiducials. Read BEFORE the latches are released, so the release frame
+        // of either drag can't slip a marker through.
+        let marking_allowed = self.fid_marking_allowed();
+        if resp.drag_stopped() {
+            self.fiducials.design_drag = false;
+            // Takes the marker latch and re-checks if one was held.
+            self.fid_marker_drag_release();
+        }
+
+        // Click-to-place (FLD-12): hit-test add (empty spot) vs. remove
+        // (right-click on a ✛). Suppressed while navigating.
+        if self.fiducials.click_place && !nav && marking_allowed {
             // Right-click a marker → remove it, so the set shrinks (fixes the
             // add-only pile-up).
             if resp.secondary_clicked()
                 && let Some(pos) = resp.interact_pointer_pos()
-                && let Some(i) = fiducial::nearest_marker(&marker_px, (pos.x, pos.y), 20.0)
+                && let Some(i) =
+                    fiducial::nearest_marker(&marker_px, (pos.x, pos.y), MARKER_GRAB_PX)
             {
                 self.remove_expected_fiducial(i);
             }
@@ -811,7 +1861,7 @@ impl ConsoleApp {
             // when a marker is under the pointer, so an existing ✛ isn't stacked on).
             else if resp.clicked()
                 && let Some(pos) = resp.interact_pointer_pos()
-                && fiducial::nearest_marker(&marker_px, (pos.x, pos.y), 20.0).is_none()
+                && fiducial::nearest_marker(&marker_px, (pos.x, pos.y), MARKER_GRAB_PX).is_none()
             {
                 let (mx, my) = to_mm(pos);
                 self.add_expected_fiducial(mx, my);
@@ -824,36 +1874,76 @@ impl ConsoleApp {
         // Suppressed while navigating.
         if !self.fiducials.click_place
             && !nav
+            && marking_allowed
             && resp.clicked()
             && let Some(pos) = resp.interact_pointer_pos()
         {
             let mm = to_mm(pos);
-            let ctx = ui.ctx().clone();
-            self.fid_mark_click(mm, &ctx);
+            self.fid_mark_click(mm);
         }
 
         // Paint markers + detected rings.
         let painter = ui.painter_at(rect);
+
+        // The placed job, drawn UNDER the markers so a ✛ is never hidden by it.
+        match design {
+            Some(Ok(ref d)) => {
+                let stroke = egui::Stroke::new(1.0_f32, Color32::from_rgb(0xf0, 0x50, 0x30));
+                for ring in &d.rings {
+                    painter.add(egui::Shape::closed_line(ring.clone(), stroke));
+                }
+            }
+            Some(Err(ref e)) => {
+                painter.text(
+                    rect.left_top() + egui::vec2(6.0, 6.0),
+                    egui::Align2::LEFT_TOP,
+                    format!("placement not drawn: {e}"),
+                    egui::FontId::proportional(12.0),
+                    Color32::from_rgb(0xd0, 0x50, 0x50),
+                );
+            }
+            None => {}
+        }
+
         let cyan = Color32::from_rgb(0x22, 0xcc, 0xdd);
         // While a marking round is active, ghost the markers not yet placed
         // (index ≥ the one being marked) so the next target reads at a glance.
         let ghost = Color32::from_rgba_unmultiplied(0x22, 0xcc, 0xdd, 90);
+        // A grab has to be discoverable, so the ✛ the pointer is close enough to
+        // take — and the one a drag is holding — draw white and heavier. Reuses
+        // the hit test the drag itself runs, so what lights up is exactly what
+        // would be grabbed — and nothing lights up mid design-drag, where the
+        // pointer sits over the widget all the way and a ✛ passing under it
+        // would otherwise read as the thing being moved.
+        let hot = self.fiducials.marker_drag.or_else(|| {
+            (!nav && !self.fiducials.design_drag)
+                .then(|| resp.hover_pos())
+                .flatten()
+                .and_then(|p| fiducial::nearest_marker(&marker_px, (p.x, p.y), MARKER_GRAB_PX))
+        });
         let ring_r = (self.fiducials.diameter_mm as f32 * ppm * 0.5 * xf.scale).max(5.0);
         for (i, &(mx, my)) in self.fiducials.search.iter().enumerate() {
             let c = to_screen(mx, my);
+            let grab = hot == Some(i);
             let mcol = match self.fiducials.marking {
+                _ if grab => Color32::WHITE,
                 Some(k) if i >= k => ghost,
                 _ => cyan,
             };
+            let w = if grab { 2.5_f32 } else { 1.5 };
             painter.line_segment(
                 [egui::pos2(c.x - 9.0, c.y), egui::pos2(c.x + 9.0, c.y)],
-                (1.5, mcol),
+                (w, mcol),
             );
             painter.line_segment(
                 [egui::pos2(c.x, c.y - 9.0), egui::pos2(c.x, c.y + 9.0)],
-                (1.5, mcol),
+                (w, mcol),
             );
-            painter.circle_stroke(c, 11.0, egui::Stroke::new(1.0_f32, mcol));
+            painter.circle_stroke(
+                c,
+                11.0,
+                egui::Stroke::new(if grab { 2.0 } else { 1.0 }, mcol),
+            );
             // 1-based index label next to each ✛ (Calibrate's corner-label style).
             painter.text(
                 egui::pos2(c.x + 12.0, c.y - 12.0),

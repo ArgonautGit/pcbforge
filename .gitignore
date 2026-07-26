@@ -21,6 +21,8 @@ job.lbrn2
 paper-grid.svg
 pcbforge-field-map.txt
 pcbforge.console-settings
+pcbforge.console-log
+pcbforge.console-log.prev
 pcbforge.sqlite
 
 # KiCad per-user local prefs generated next to sample boards
