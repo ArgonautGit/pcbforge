@@ -4,13 +4,17 @@ fn tmp_db() -> PathBuf {
     // Unique per call so each console gets its own settings sidecar
     // (`*.console-settings`) — a shared path would bleed persisted input
     // fields between tests.
+    //
+    // Nested under one per-process parent so a run leaves a single directory
+    // behind instead of one per call. The callers hold only a `PathBuf`, so
+    // there is nowhere to hang a `TempDir` guard without threading one through
+    // every call site; grouping keeps the leak proportional to runs rather
+    // than to tests (this suite alone calls it ~150 times).
     use std::sync::atomic::{AtomicU64, Ordering};
     static N: AtomicU64 = AtomicU64::new(0);
-    let dir = std::env::temp_dir().join(format!(
-        "ui-app-{}-{}",
-        std::process::id(),
-        N.fetch_add(1, Ordering::Relaxed)
-    ));
+    let dir = std::env::temp_dir()
+        .join(format!("ui-app-{}", std::process::id()))
+        .join(N.fetch_add(1, Ordering::Relaxed).to_string());
     std::fs::create_dir_all(&dir).unwrap();
     dir.join("t.sqlite")
 }

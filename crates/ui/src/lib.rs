@@ -20,7 +20,7 @@ mod status;
 // alias it as `camera` so `crate::camera::…` paths keep resolving.
 use capture as camera;
 
-pub use app::{ConsoleApp, LogLine, default_cli_cmd, job_shapes, preview_image, run_capture};
+pub use app::{ConsoleApp, LogLine, default_cli_cmd, job_shapes, preview_image};
 pub use calib::{
     AnchorDot, Calibration, CameraCal, DotKind, FieldCal, FieldDot, GridSpec, LensDot, Rigid2,
     camera_px_to_commanded, camera_px_to_physical, commanded_to_camera_px,
