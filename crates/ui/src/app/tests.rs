@@ -1492,7 +1492,6 @@ field_frame=\n";
             "drill_frequency_khz",
             "drill_out_lbrn2",
             "drill_passes",
-            "drill_power_pct",
             "drill_pulse_ns",
             "drill_speed_mm_s",
             "drill_wobble",
@@ -1576,14 +1575,13 @@ fn job_export_recipe_persists() {
     assert_eq!(fresh.job.passes, 1);
 }
 
-/// The Drill tab's own recipe round-trips through a save + reload, and a blob
-/// with none of the keys keeps the defaults.
+/// The drill settings' own recipe round-trips through a save + reload, and a
+/// blob with none of the keys keeps the defaults.
 #[test]
 fn drill_recipe_persists() {
     let db = tmp_db();
     {
         let mut a = ConsoleApp::new(db.clone(), vec!["true".into()]);
-        a.drill.power_pct = 65.0;
         a.drill.speed_mm_s = 350.0;
         a.drill.frequency_khz = 55.0;
         a.drill.pulse_ns = 12;
@@ -1594,7 +1592,6 @@ fn drill_recipe_persists() {
         a.save_settings_if_changed();
     }
     let b = ConsoleApp::new(db, vec!["true".into()]);
-    assert!((b.drill.power_pct - 65.0).abs() < 1e-9);
     assert!((b.drill.speed_mm_s - 350.0).abs() < 1e-9);
     assert!((b.drill.frequency_khz - 55.0).abs() < 1e-9);
     assert_eq!(b.drill.pulse_ns, 12);
@@ -1603,10 +1600,8 @@ fn drill_recipe_persists() {
     assert!((b.drill.wobble_step_mm - 0.02).abs() < 1e-9);
     assert!((b.drill.wobble_size_mm - 0.1).abs() < 1e-9);
 
-    // A blob with none of the drill keys keeps today's defaults — power stays
-    // at the 20.0 the emit used to hardcode.
+    // A blob with none of the drill keys keeps today's defaults.
     let fresh = ConsoleApp::new(tmp_db(), vec!["true".into()]);
-    assert!((fresh.drill.power_pct - 20.0).abs() < 1e-9);
     assert!((fresh.drill.speed_mm_s - 1000.0).abs() < 1e-9);
     assert!((fresh.drill.frequency_khz - 30.0).abs() < 1e-9);
     assert_eq!(fresh.drill.pulse_ns, 1);
@@ -1616,9 +1611,9 @@ fn drill_recipe_persists() {
 
 /// The drill paths used to persist under the Place tab's `place_drill*` names.
 /// A blob carrying only the legacy keys still restores them, so an operator's
-/// saved drill paths survive the move to the Drill tab.
+/// saved drill paths survive the move to the drill settings.
 #[test]
-fn legacy_place_drill_keys_load_into_the_drill_tab() {
+fn legacy_place_drill_keys_load_into_the_drill_settings() {
     let db = tmp_db();
     let settings = crate::settings::path_for_db(&db);
     std::fs::write(
@@ -2850,9 +2845,11 @@ fn emit_drill_holes_writes_placed_geometry_without_queueing_a_burn() {
     );
 }
 
-/// The Drill tab's recipe is its OWN: the emitted CutSetting carries the drill
-/// power/speed/frequency/pulse/passes, and none of the Job tab's — drilling a
-/// hole outline is a different process from etching copper.
+/// The drill recipe is its OWN: the emitted CutSetting carries the drill
+/// speed/frequency/pulse/passes, and none of the etch settings' — drilling a
+/// hole outline is a different process from etching copper. `maxPower` is
+/// neither one's: the emitter requires the field, but power is not an operator
+/// control here, so it is pinned in code.
 #[test]
 fn emit_drill_holes_uses_the_drill_recipe_not_the_job_recipe() {
     let mut app = ConsoleApp::new(tmp_db(), vec!["true".into()]);
@@ -2867,13 +2864,12 @@ fn emit_drill_holes_uses_the_drill_recipe_not_the_job_recipe() {
     app.drill.files = drl.to_string_lossy().into_owned();
     app.drill.out_lbrn2 = out.to_string_lossy().into_owned();
 
-    // Every value distinct between the two tabs, so nothing matches by luck.
+    // Every value distinct between the two recipes, so nothing matches by luck.
     app.job.speed_mm_s = 2500.0;
     app.job.frequency_khz = 80.0;
     app.job.pulse_ns = 42;
     app.job.passes = 5;
     app.job.interval_mm = 0.05;
-    app.drill.power_pct = 55.0;
     app.drill.speed_mm_s = 400.0;
     app.drill.frequency_khz = 60.0;
     app.drill.pulse_ns = 7;
@@ -2883,7 +2879,8 @@ fn emit_drill_holes_uses_the_drill_recipe_not_the_job_recipe() {
 
     let doc = std::fs::read_to_string(&out).expect("the .lbrn2 was written");
     for expected in [
-        "<maxPower Value=\"55\"/>",
+        // Fixed in code (DRILL_POWER_PCT) — no operator control, either recipe.
+        "<maxPower Value=\"20\"/>",
         "<speed Value=\"400\"/>",
         "<frequency Value=\"60000\"/>",
         "<QPulseWidth Value=\"7\"/>",
@@ -2891,16 +2888,15 @@ fn emit_drill_holes_uses_the_drill_recipe_not_the_job_recipe() {
     ] {
         assert!(doc.contains(expected), "drill recipe missing {expected}");
     }
-    for job_value in [
-        "<maxPower Value=\"20\"/>",
+    for etch_value in [
         "<speed Value=\"2500\"/>",
         "<frequency Value=\"80000\"/>",
         "<QPulseWidth Value=\"42\"/>",
         "<numPasses Value=\"5\"/>",
     ] {
         assert!(
-            !doc.contains(job_value),
-            "the Job tab's {job_value} leaked into the drill export"
+            !doc.contains(etch_value),
+            "the etch settings' {etch_value} leaked into the drill export"
         );
     }
 }

@@ -267,7 +267,6 @@ impl ConsoleApp {
             drill: DrillState {
                 files: String::new(),
                 out_lbrn2: "drill.lbrn2".into(),
-                power_pct: 20.0,
                 speed_mm_s: 1000.0,
                 frequency_khz: 30.0,
                 pulse_ns: 1,
@@ -442,9 +441,8 @@ impl ConsoleApp {
             self.job.wobble_size_mm,
         );
         let drill = format!(
-            "mode=line power={} speed={} freq_khz={} pulse_ns={} passes={} \
+            "mode=line speed={} freq_khz={} pulse_ns={} passes={} \
              wobble={} wobble_step={} wobble_size={} queued_from_gerbers={}",
-            self.drill.power_pct,
             self.drill.speed_mm_s,
             self.drill.frequency_khz,
             self.drill.pulse_ns,

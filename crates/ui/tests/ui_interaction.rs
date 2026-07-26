@@ -323,23 +323,27 @@ fn etch_and_run_in_lightburn_button_is_present_and_guards_without_a_job() {
     );
 }
 
-/// The Drill tab carries the no-burn drill-emit controls: the path fields and
-/// buttons are present and labelled (drivable), "⚙ Drills from KiCad" fills
-/// the drill field with the stable pth/npth paths, and clicking the emit
+/// The Actions panel carries the no-burn drill-emit controls: the path fields
+/// and buttons are present and labelled (drivable), "⚙ Drills from KiCad"
+/// fills the drill field with the stable pth/npth paths, and clicking the emit
 /// button never queues a LightBurn run. Assertions are positive (type a path,
 /// expect the fill): each `console()` gets its own settings sidecar, but the
 /// fill is the behaviour worth pinning either way.
 #[test]
-fn drill_tab_emits_drill_holes_without_a_burn() {
+fn drill_settings_emit_drill_holes_without_a_burn() {
     let mut h = console();
-    // The central panel only builds the selected tab's form, so the drill
-    // widgets exist only once the Drill tab is up.
-    h.get_by_label("⌀ Drill").click();
-    h.run();
+    // The drill block lives in the side panel, so its widgets are up whatever
+    // the central tab shows — no tab click first.
     let s = h.state().debug_summary();
     assert!(
         summary_line(&s, "place:").contains("drill_out=drill.lbrn2"),
         "place line reports the drill output default:\n{s}"
+    );
+    // The collapsing group is labelled and open by default, so the widgets
+    // under it are reachable without a click.
+    assert!(
+        h.query_by_label("⌀ Drill").is_some(),
+        "the drill group header is present in the Actions panel"
     );
     // Labelled inputs for the drill file(s) and output.
     assert!(
@@ -386,16 +390,13 @@ fn drill_tab_emits_drill_holes_without_a_burn() {
     );
 }
 
-/// The Drill tab's recipe is its own set of labelled, drivable widgets — and
-/// editing one moves the `drill:` summary line without touching the Job tab's
-/// `gerbers:` recipe.
+/// The drill recipe is its own set of labelled, drivable widgets in the
+/// Actions panel — and editing one moves the `drill:` summary line without
+/// touching the etch settings' `gerbers:` recipe.
 #[test]
-fn drill_tab_recipe_widgets_are_reachable_by_label() {
+fn drill_settings_recipe_widgets_are_reachable_by_label() {
     let mut h = console();
-    h.get_by_label("⌀ Drill").click();
-    h.run();
     for label in [
-        "drill power %",
         "drill speed mm/s",
         "drill frequency kHz",
         "drill Q-pulse ns",
@@ -404,16 +405,23 @@ fn drill_tab_recipe_widgets_are_reachable_by_label() {
     ] {
         assert!(
             h.query_by_label(label).is_some(),
-            "the Drill tab exposes a labelled {label} widget"
+            "the drill settings expose a labelled {label} widget"
         );
     }
+    // There is deliberately no drill power control: pulse energy is set by the
+    // frequency and Q-pulse width, and the etch settings expose no power
+    // either. The emitter's required maxPower is pinned in code.
+    assert!(
+        h.query_by_label("drill power %").is_none(),
+        "no drill power widget — power is not an operator control here"
+    );
     let s = h.state().debug_summary();
     assert!(
         summary_line(&s, "drill:").contains("mode=line"),
         "the drill line reports the Line layer mode:\n{s}"
     );
     // The drill recipe is independent: toggling its wobble moves the drill
-    // line and leaves the Job tab's recipe untouched.
+    // line and leaves the etch recipe untouched.
     let before = summary_line(&s, "gerbers:").to_string();
     assert!(summary_line(&s, "drill:").contains("wobble=false"));
     h.get_by_label("drill wobble").click();
@@ -426,7 +434,7 @@ fn drill_tab_recipe_widgets_are_reachable_by_label() {
     assert_eq!(
         summary_line(&s, "gerbers:"),
         before,
-        "editing the drill recipe leaves the Job tab's recipe alone"
+        "editing the drill recipe leaves the etch recipe alone"
     );
 }
 

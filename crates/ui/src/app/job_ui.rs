@@ -41,7 +41,8 @@ impl ConsoleApp {
     ///
     /// The drill export is queued behind it (`pending_drills`) rather than
     /// shelled here: only one verb runs at a time, so a second `run_verb` call
-    /// would be refused and leave the Drill tab pointing at files nobody wrote.
+    /// would be refused and leave the drill fields pointing at files nobody
+    /// wrote.
     pub(super) fn gerbers_from_kicad(&mut self) {
         let proj = crate::clean_path(&self.job.kicad_project);
         if proj.trim().is_empty() {
@@ -102,7 +103,17 @@ impl ConsoleApp {
             format!("exporting {copper_layer} + {outline_layer} from KiCad… (see Log)");
     }
 
+    /// The side panel has no scrolling of its own, and the drill + etch recipes
+    /// together are taller than a short window — without this the controls at
+    /// the bottom are simply unreachable.
     pub(super) fn actions_panel(&mut self, ui: &mut egui::Ui) {
+        egui::ScrollArea::vertical()
+            .id_salt("actions-scroll")
+            .auto_shrink([false, false])
+            .show(ui, |ui| self.actions_controls(ui));
+    }
+
+    fn actions_controls(&mut self, ui: &mut egui::Ui) {
         ui.heading("Actions");
         ui.label(egui::RichText::new("These shell the `pcbforge` CLI.").weak());
         ui.separator();
@@ -127,13 +138,24 @@ impl ConsoleApp {
             .on_hover_text(
                 "Run kicad-cli to export copper.gbr + outline.gbr and fill the fields below. \
                  Once that finishes it also exports pth.drl + npth.drl into the same \
-                 directory and fills the Drill tab.",
+                 directory and fills the drill .drl field.",
             )
             .clicked()
         {
             self.gerbers_from_kicad();
         }
 
+        // Drilling and etching are two recipes for one board, so they sit side
+        // by side under the shared KiCad project above. Collapsible (open by
+        // default) so the etch settings are one click away while drilling is
+        // not the job at hand.
+        ui.separator();
+        egui::CollapsingHeader::new("⌀ Drill")
+            .default_open(true)
+            .show(ui, |ui| self.drill_settings(ui));
+        ui.separator();
+
+        ui.label(egui::RichText::new("Etch").strong());
         egui::Grid::new("emit-form")
             .num_columns(2)
             .spacing([8.0, 6.0])
@@ -408,7 +430,6 @@ impl ConsoleApp {
                 CentralTab::Place,
                 "✋ Place on board",
             );
-            ui.selectable_value(&mut self.runtime.tab, CentralTab::Drill, "⌀ Drill");
         });
         ui.separator();
         match self.runtime.tab {
@@ -417,7 +438,6 @@ impl ConsoleApp {
             CentralTab::Calibrate => self.calibrate_view(ui),
             CentralTab::Fiducials => self.fiducial_view(ui),
             CentralTab::Place => self.place_view(ui),
-            CentralTab::Drill => self.drill_view(ui),
         }
     }
 

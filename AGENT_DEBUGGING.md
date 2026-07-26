@@ -64,7 +64,6 @@ Window
   Button label="📷 Camera"
   Button label="🎯 Calibrate"
   Button label="✋ Place on board"
-  Button label="⌀ Drill"
 ```
 
 ## The debugging loop

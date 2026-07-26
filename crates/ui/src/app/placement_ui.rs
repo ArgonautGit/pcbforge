@@ -4,6 +4,13 @@ use super::*;
 /// matches the CLI's `--field-seg-mm` default the etch path inherits.
 const DRILL_FIELD_SEG_MM: f64 = 0.25;
 
+/// The emitter needs a `maxPower` and `AblationParams::validate` rejects 0,
+/// but power is not an operator concept on this machine: pulse energy is set
+/// by the frequency and Q-pulse width. Fixed at the value the drill path has
+/// always emitted (and the CLI's own default), so the only knobs on screen are
+/// the ones that actually change the burn.
+const DRILL_POWER_PCT: f64 = 20.0;
+
 impl ConsoleApp {
     /// Move the placement so its pivot's **pixel** position shifts by
     /// `(dpx, dpy)` frame pixels. Dragging felt wrong under perspective because
@@ -681,10 +688,10 @@ impl ConsoleApp {
 });
             cam::register::transform_shapes(&hole_polys, &affine)
         };
-        // The Drill tab's own recipe — drilling is a different process from
-        // etching copper, so it doesn't borrow the Job tab's numbers.
+        // The drill settings' own recipe — drilling is a different process from
+        // etching copper, so it doesn't borrow the etch numbers.
         let params = pcb_core::AblationParams {
-            power_pct: self.drill.power_pct,
+            power_pct: DRILL_POWER_PCT,
             speed_mm_s: self.drill.speed_mm_s,
             frequency_khz: self.drill.frequency_khz,
             pulse_ns: self.drill.pulse_ns,
@@ -693,10 +700,10 @@ impl ConsoleApp {
         // A hole is TRACED as a vector outline, not scan-filled: `drill_polys`
         // hands us the outline ring of each hole/slot, and LightBurn follows it.
         // So the layer is Line (`type="Cut"`) and the fill interval doesn't
-        // apply — hence no interval control on the Drill tab.
+        // apply — hence no interval control in the drill settings.
         let mut layer =
             cam::lbrn2::EmitLayer::line("DRILL", params, cam::lbrn2::polys_to_elems(&placed));
-        // `line` defaults wobble off; carry the tab's setting through.
+        // `line` defaults wobble off; carry the operator's setting through.
         layer.wobble = self.drill.wobble;
         layer.wobble_step_mm = self.drill.wobble_step_mm;
         layer.wobble_size_mm = self.drill.wobble_size_mm;
@@ -921,7 +928,7 @@ impl ConsoleApp {
 }
 
 /// The `;`-separated PTH+NPTH drill paths `pcbforge drills` writes into
-/// `out_dir`. Shared by the Drill tab's export button and the Gerber
+/// `out_dir`. Shared by the drill settings' export button and the Gerber
 /// completion chain so the two can't drift apart.
 pub(super) fn drill_files_in(out_dir: &std::path::Path) -> String {
     format!(

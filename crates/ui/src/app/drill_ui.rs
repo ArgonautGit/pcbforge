@@ -1,23 +1,23 @@
 use super::*;
 
 impl ConsoleApp {
-    pub(super) fn drill_view(&mut self, ui: &mut egui::Ui) {
+    pub(super) fn drill_settings(&mut self, ui: &mut egui::Ui) {
         egui::Grid::new("drill-paths-form")
             .num_columns(2)
             .spacing([8.0, 6.0])
             .show(ui, |ui| {
                 let drl = ui.label("drill .drl");
-                ui.add(egui::TextEdit::singleline(&mut self.drill.files).desired_width(240.0))
+                ui.add(egui::TextEdit::singleline(&mut self.drill.files).desired_width(180.0))
                     .labelled_by(drl.id)
                     .on_hover_text(
                         "Excellon drill file(s) for \"Emit drill holes\" — KiCad \
                          exports PTH and NPTH holes as two files; list both \
                          separated by ; to get every hole. \"⚙ Drills from \
-                         KiCad\" fills this from the Actions-panel project.",
+                         KiCad\" fills this from the KiCad project above.",
                     );
                 ui.end_row();
                 let drl_out = ui.label("drill out .lbrn2");
-                ui.add(egui::TextEdit::singleline(&mut self.drill.out_lbrn2).desired_width(240.0))
+                ui.add(egui::TextEdit::singleline(&mut self.drill.out_lbrn2).desired_width(180.0))
                     .labelled_by(drl_out.id)
                     .on_hover_text(
                         "Where \"Emit drill holes\" writes the hole-geometry job — \
@@ -32,19 +32,6 @@ impl ConsoleApp {
             .num_columns(2)
             .spacing([8.0, 6.0])
             .show(ui, |ui| {
-                let l = ui.label("drill power %");
-                ui.add(
-                    egui::DragValue::new(&mut self.drill.power_pct)
-                        .speed(1.0)
-                        .range(0.0..=100.0),
-                )
-                .labelled_by(l.id)
-                .on_hover_text(
-                    "Beam power for the hole outlines. AblationParams::validate \
-                     rejects 0 power, so a 0 here refuses the emit rather than \
-                     writing a file that traces every hole with the beam off.",
-                );
-                ui.end_row();
                 let l = ui.label("drill speed mm/s");
                 ui.add(
                     egui::DragValue::new(&mut self.drill.speed_mm_s)
@@ -109,52 +96,50 @@ impl ConsoleApp {
                 ui.end_row();
             });
         ui.separator();
-        ui.horizontal(|ui| {
-            if ui
-                .button("⚙ Drills from KiCad")
-                .on_hover_text(
-                    "Run kicad-cli on the Actions-panel KiCad project to export \
-                     pth.drl + npth.drl (next to the Gerbers) and fill the drill \
-                     .drl field with both.",
-                )
-                .clicked()
-            {
-                self.drills_from_kicad();
-            }
-            // Disabled while a LightBurn run is in flight, like "Etch + run":
-            // the load-only run replaces `lightburn_run`, and stomping a live
-            // burn's progress reporting would be rude.
-            let lb_running = self
-                .runtime
-                .lightburn_run
-                .as_ref()
-                .is_some_and(|r| !r.finished());
-            if ui
-                .add_enabled(
-                    !lb_running,
-                    egui::Button::new("⤓ Emit drill holes → LightBurn (no burn)"),
-                )
-                .on_hover_text(
-                    "Writes ONLY the drill-hole geometry (round holes + slots) from \
-                     the drill .drl file(s) at this placement to the drill out \
-                     .lbrn2, then LOADS the file in LightBurn (FORCELOAD) without \
-                     pressing start — you burn it from LightBurn yourself.",
-                )
-                .clicked()
-            {
-                self.emit_drill_at_placement();
-            }
-            ui.weak("hole pattern at the placed pose — loads in LightBurn, never presses start");
-        });
-        // The emit bakes in the Place tab's pose, which isn't visible from here.
+        if ui
+            .button("⚙ Drills from KiCad")
+            .on_hover_text(
+                "Run kicad-cli on the KiCad project above to export \
+                 pth.drl + npth.drl (next to the Gerbers) and fill the drill \
+                 .drl field with both.",
+            )
+            .clicked()
+        {
+            self.drills_from_kicad();
+        }
+        // Disabled while a LightBurn run is in flight, like "Etch + run": the
+        // load-only run replaces `lightburn_run`, and stomping a live burn's
+        // progress reporting would be rude.
+        let lb_running = self
+            .runtime
+            .lightburn_run
+            .as_ref()
+            .is_some_and(|r| !r.finished());
+        if ui
+            .add_enabled(
+                !lb_running,
+                egui::Button::new("⤓ Emit drill holes → LightBurn (no burn)"),
+            )
+            .on_hover_text(
+                "Writes ONLY the drill-hole geometry (round holes + slots) from \
+                 the drill .drl file(s) at this placement to the drill out \
+                 .lbrn2, then LOADS the file in LightBurn (FORCELOAD) without \
+                 pressing start — you burn it from LightBurn yourself.",
+            )
+            .clicked()
+        {
+            self.emit_drill_at_placement();
+        }
+        // The emit bakes in the current placement, set on the Place tab.
         ui.weak(format!(
-            "emits at the Place-tab pose: ({:.2}, {:.2}) mm, {:.1}°",
+            "emits at the current placement: ({:.2}, {:.2}) mm, {:.1}° — loads in \
+             LightBurn, never presses start",
             self.placement.tx_mm, self.placement.ty_mm, self.placement.rot_deg
         ));
         ui.weak(
             "Emitted as a Line (vector outline) layer: LightBurn traces each hole/slot \
              outline rather than scan-filling it, so there is no fill interval here.",
         );
-        ui.weak("This recipe is independent of the Job tab's — nothing here changes the etch.");
+        ui.weak("This recipe is independent of the Etch settings below — nothing here changes the etch.");
     }
 }

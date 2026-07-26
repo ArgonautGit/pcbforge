@@ -8,7 +8,6 @@ pub(super) enum CentralTab {
     Calibrate,
     Fiducials,
     Place,
-    Drill,
 }
 
 /// Which face of a (possibly double-sided) board the operator is working.
@@ -289,23 +288,24 @@ pub(super) struct PlacementState {
     pub(super) lightburn_device: String,
 }
 
-/// The Drill tab's paths and its own process recipe.
+/// The drill settings' paths and their own process recipe.
 ///
 /// Deliberately separate from [`JobState`]: drilling a hole outline is a
 /// different process from etching copper. The etch fills a region with hatch
 /// lines; the drill traces a vector contour around each hole, so it wants its
-/// own power/speed/frequency/pulse/passes — the settings that make a good
-/// isolation fill are not the settings that punch through FR-4.
+/// own speed/frequency/pulse/passes — the settings that make a good isolation
+/// fill are not the settings that punch through FR-4.
 ///
 /// There is deliberately **no interval field**: a Line layer omits the fill
 /// interval (see `cam::lbrn2::cut_setting_xml`), so a drill interval control
-/// would be dead — it could never reach the emitted file.
+/// would be dead — it could never reach the emitted file. There is no power
+/// field either, for the same reason the etch settings have none: pulse energy
+/// on this source is set by the frequency and Q-pulse width.
 pub(super) struct DrillState {
     /// Excellon drill file path(s), ;-separated.
     pub(super) files: String,
     /// Output .lbrn2 path.
     pub(super) out_lbrn2: String,
-    pub(super) power_pct: f64,
     pub(super) speed_mm_s: f64,
     pub(super) frequency_khz: f64,
     pub(super) pulse_ns: u32,

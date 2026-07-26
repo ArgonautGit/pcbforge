@@ -55,7 +55,6 @@ impl ConsoleApp {
             ("place_px_per_mm", self.placement.px_per_mm.to_string()),
             ("drill_files", self.drill.files.clone()),
             ("drill_out_lbrn2", self.drill.out_lbrn2.clone()),
-            ("drill_power_pct", self.drill.power_pct.to_string()),
             ("drill_speed_mm_s", self.drill.speed_mm_s.to_string()),
             ("drill_frequency_khz", self.drill.frequency_khz.to_string()),
             ("drill_pulse_ns", self.drill.pulse_ns.to_string()),
@@ -374,14 +373,7 @@ impl ConsoleApp {
         {
             self.job.wobble_size_mm = v.clamp(0.0, 2.0);
         }
-        // The Drill tab's own recipe, clamped to its DragValue ranges.
-        if let Some(v) = m
-            .get("drill_power_pct")
-            .and_then(|s| s.trim().parse().ok())
-            .filter(|v: &f64| v.is_finite())
-        {
-            self.drill.power_pct = v.clamp(0.0, 100.0);
-        }
+        // The drill settings' own recipe, clamped to their DragValue ranges.
         if let Some(v) = m
             .get("drill_speed_mm_s")
             .and_then(|s| s.trim().parse().ok())
