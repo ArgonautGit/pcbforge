@@ -53,8 +53,21 @@ impl ConsoleApp {
                 self.placement.lightburn_device.clone(),
             ),
             ("place_px_per_mm", self.placement.px_per_mm.to_string()),
-            ("place_drills", self.placement.drills.clone()),
-            ("place_drill_lbrn2", self.placement.drill_lbrn2.clone()),
+            ("drill_files", self.drill.files.clone()),
+            ("drill_out_lbrn2", self.drill.out_lbrn2.clone()),
+            ("drill_speed_mm_s", self.drill.speed_mm_s.to_string()),
+            ("drill_frequency_khz", self.drill.frequency_khz.to_string()),
+            ("drill_pulse_ns", self.drill.pulse_ns.to_string()),
+            ("drill_passes", self.drill.passes.to_string()),
+            ("drill_wobble", self.drill.wobble.to_string()),
+            (
+                "drill_wobble_step_mm",
+                self.drill.wobble_step_mm.to_string(),
+            ),
+            (
+                "drill_wobble_size_mm",
+                self.drill.wobble_size_mm.to_string(),
+            ),
             ("fid_frame", self.fiducials.frame.clone()),
             ("fid_layout", self.fiducials.layout.clone()),
             ("fid_px_per_mm", self.fiducials.px_per_mm.to_string()),
@@ -278,8 +291,17 @@ impl ConsoleApp {
         str_field(&m, "back_outline", &mut self.job.back_outline);
         str_field(&m, "place_frame", &mut self.placement.frame);
         str_field(&m, "place_lbrn2", &mut self.placement.lbrn2);
-        str_field(&m, "place_drills", &mut self.placement.drills);
-        str_field(&m, "place_drill_lbrn2", &mut self.placement.drill_lbrn2);
+        str_field(&m, "drill_files", &mut self.drill.files);
+        str_field(&m, "drill_out_lbrn2", &mut self.drill.out_lbrn2);
+        // The drill paths used to live on the Place tab under place_drill*
+        // names. Read the legacy keys when the new ones are absent, or every
+        // operator silently loses their saved drill paths on upgrade.
+        if !m.contains_key("drill_files") {
+            str_field(&m, "place_drills", &mut self.drill.files);
+        }
+        if !m.contains_key("drill_out_lbrn2") {
+            str_field(&m, "place_drill_lbrn2", &mut self.drill.out_lbrn2);
+        }
         str_field(
             &m,
             "place_lightburn_device",
@@ -350,6 +372,40 @@ impl ConsoleApp {
             .filter(|v: &f64| v.is_finite())
         {
             self.job.wobble_size_mm = v.clamp(0.0, 2.0);
+        }
+        // The drill settings' own recipe, clamped to their DragValue ranges.
+        if let Some(v) = m
+            .get("drill_speed_mm_s")
+            .and_then(|s| s.trim().parse().ok())
+            .filter(|v: &f64| v.is_finite())
+        {
+            self.drill.speed_mm_s = v.clamp(1.0, 15000.0);
+        }
+        if let Some(v) = m
+            .get("drill_frequency_khz")
+            .and_then(|s| s.trim().parse().ok())
+            .filter(|v: &f64| v.is_finite())
+        {
+            self.drill.frequency_khz = v.clamp(1.0, 4000.0);
+        }
+        u32_field(&m, "drill_pulse_ns", 0, 500, &mut self.drill.pulse_ns);
+        u32_field(&m, "drill_passes", 1, 1000, &mut self.drill.passes);
+        if let Some(v) = m.get("drill_wobble").and_then(|s| s.trim().parse().ok()) {
+            self.drill.wobble = v;
+        }
+        if let Some(v) = m
+            .get("drill_wobble_step_mm")
+            .and_then(|s| s.trim().parse().ok())
+            .filter(|v: &f64| v.is_finite())
+        {
+            self.drill.wobble_step_mm = v.clamp(0.0, 2.0);
+        }
+        if let Some(v) = m
+            .get("drill_wobble_size_mm")
+            .and_then(|s| s.trim().parse().ok())
+            .filter(|v: &f64| v.is_finite())
+        {
+            self.drill.wobble_size_mm = v.clamp(0.0, 2.0);
         }
         f64_field(&m, "thickness_mm", &mut self.job.board_thickness_mm);
         f64_field(&m, "focal_mm", &mut self.job.focal_mm);

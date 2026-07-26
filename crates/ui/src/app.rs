@@ -10,6 +10,7 @@
 mod calibration_ui;
 mod camera_ui;
 mod commands;
+mod drill_ui;
 mod fiducial_ui;
 mod image_ui;
 mod job_ui;
@@ -49,6 +50,7 @@ use commands::{JobShapes, VerbJob};
 pub use commands::{job_shapes, preview_image};
 use job_ui::status_color;
 use lightburn_run::{LightburnRun, spawn_lightburn_load, spawn_lightburn_run};
+use placement_ui::drill_files_in;
 use projection::CameraProjection;
 use state::*;
 
@@ -107,6 +109,7 @@ pub struct ConsoleApp {
     calibration: CalibrationState,
     fiducials: FiducialState,
     placement: PlacementState,
+    drill: DrillState,
     ar: ArState,
     views: ViewState,
 }
@@ -130,6 +133,7 @@ impl ConsoleApp {
                 tab: CentralTab::Job,
                 verb_job: None,
                 pending_lightburn: None,
+                pending_drills: None,
                 lightburn_run: None,
             },
             job: JobState {
@@ -259,8 +263,17 @@ impl ConsoleApp {
                 note: "Load a frame + job, then drag / rotate to place it on the board.".into(),
                 field_correct: false,
                 lightburn_device: cam::lbrn2::DEFAULT_DEVICE.to_string(),
-                drills: String::new(),
-                drill_lbrn2: "drill.lbrn2".into(),
+            },
+            drill: DrillState {
+                files: String::new(),
+                out_lbrn2: "drill.lbrn2".into(),
+                speed_mm_s: 1000.0,
+                frequency_khz: 30.0,
+                pulse_ns: 1,
+                passes: 1,
+                wobble: false,
+                wobble_step_mm: 0.0,
+                wobble_size_mm: 0.0,
             },
             ar: ArState {
                 overlay: false,
@@ -427,6 +440,20 @@ impl ConsoleApp {
             self.job.wobble_step_mm,
             self.job.wobble_size_mm,
         );
+        let drill = format!(
+            "mode=line speed={} freq_khz={} pulse_ns={} passes={} \
+             wobble={} wobble_step={} wobble_size={} queued_from_gerbers={}",
+            self.drill.speed_mm_s,
+            self.drill.frequency_khz,
+            self.drill.pulse_ns,
+            self.drill.passes,
+            self.drill.wobble,
+            self.drill.wobble_step_mm,
+            self.drill.wobble_size_mm,
+            // Armed by "⚙ Gerbers from KiCad" while its export runs; the drill
+            // export fires when that finishes (`chain_drills_after_verb`).
+            self.runtime.pending_drills.is_some(),
+        );
         // ④ auto fiducial-hole layout, resolved against the effective field
         // centre (kept in sync with the auto toggle by `sync_auto_field_center`).
         let fid_layout = fiducial::format_layout(&fiducial::board_fid_layout(
@@ -454,6 +481,7 @@ impl ConsoleApp {
              calib_frame: {calib_frame}\n\
              bed_overlay: show={} field={:.0}mm center=({:.1},{:.1}) auto={}\n\
              place: x={:.2} y={:.2} rot={:.1}° auto_pose={} frame={} lightburn={} device={} drills={} drill_out={} note={:?}\n\
+             drill: {drill}\n\
              calib_paper: n={} pitch={:.2}mm dot={:.2}mm contrast={} out={}\n\
              calib_burn: n={} pitch={:.2}mm dot={:.2}mm contrast={} corners_marked={} edit_anchor_dots={} feedback={} origin=({:.1},{:.1})\n\
              fiducials: {} markers shape={} w={} h={} profile={} search={} out={} marking={}\n\
@@ -487,8 +515,8 @@ impl ConsoleApp {
             },
             self.lightburn_token(),
             self.placement.lightburn_device,
-            base(&self.placement.drills),
-            base(&self.placement.drill_lbrn2),
+            base(&self.drill.files),
+            base(&self.drill.out_lbrn2),
             self.placement.note,
             self.calibration.paper.n,
             self.calibration.paper.pitch_mm,

@@ -4,6 +4,13 @@ use super::*;
 /// matches the CLI's `--field-seg-mm` default the etch path inherits.
 const DRILL_FIELD_SEG_MM: f64 = 0.25;
 
+/// The emitter needs a `maxPower` and `AblationParams::validate` rejects 0,
+/// but power is not an operator concept on this machine: pulse energy is set
+/// by the frequency and Q-pulse width. Fixed at the value the drill path has
+/// always emitted (and the CLI's own default), so the only knobs on screen are
+/// the ones that actually change the burn.
+const DRILL_POWER_PCT: f64 = 20.0;
+
 impl ConsoleApp {
     /// Move the placement so its pivot's **pixel** position shifts by
     /// `(dpx, dpy)` frame pixels. Dragging felt wrong under perspective because
@@ -441,11 +448,11 @@ impl ConsoleApp {
         }
     }
 
-    /// Absolute output path for "Emit drill holes": an absolute `drill_lbrn2`
+    /// Absolute output path for "Emit drill holes": an absolute `out_lbrn2`
     /// as-is, a bare filename next to the (first) drill file — beside the
     /// operator's inputs, like [`Self::resolve_place_output`].
     fn resolve_drill_output(&self, first_drill: &str) -> PathBuf {
-        let raw = PathBuf::from(crate::clean_path(&self.placement.drill_lbrn2));
+        let raw = PathBuf::from(crate::clean_path(&self.drill.out_lbrn2));
         if raw.is_absolute() {
             return raw;
         }
@@ -486,11 +493,7 @@ impl ConsoleApp {
             .parent()
             .map(|p| p.join("pcbforge-gerbers"))
             .unwrap_or_else(|| PathBuf::from("pcbforge-gerbers"));
-        self.placement.drills = format!(
-            "{};{}",
-            out_dir.join("pth.drl").display(),
-            out_dir.join("npth.drl").display()
-        );
+        self.drill.files = drill_files_in(&out_dir);
         self.run_verb(&[
             "drills".into(),
             "--project".into(),
@@ -535,8 +538,8 @@ impl ConsoleApp {
             return;
         }
         let drill_paths: Vec<String> = self
-            .placement
-            .drills
+            .drill
+            .files
             .split(';')
             .map(crate::clean_path)
             .filter(|p| !p.trim().is_empty())
@@ -685,18 +688,25 @@ impl ConsoleApp {
 });
             cam::register::transform_shapes(&hole_polys, &affine)
         };
-        // Same recipe the etch path bakes in: the Job-tab process params over
-        // the register verb's default power.
+        // The drill settings' own recipe — drilling is a different process from
+        // etching copper, so it doesn't borrow the etch numbers.
         let params = pcb_core::AblationParams {
-            power_pct: 20.0,
-            speed_mm_s: self.job.speed_mm_s,
-            frequency_khz: self.job.frequency_khz,
-            pulse_ns: self.job.pulse_ns,
-            passes: self.job.passes,
+            power_pct: DRILL_POWER_PCT,
+            speed_mm_s: self.drill.speed_mm_s,
+            frequency_khz: self.drill.frequency_khz,
+            pulse_ns: self.drill.pulse_ns,
+            passes: self.drill.passes,
         };
+        // A hole is TRACED as a vector outline, not scan-filled: `drill_polys`
+        // hands us the outline ring of each hole/slot, and LightBurn follows it.
+        // So the layer is Line (`type="Cut"`) and the fill interval doesn't
+        // apply — hence no interval control in the drill settings.
         let mut layer =
-            cam::lbrn2::EmitLayer::fill("DRILL", params, cam::lbrn2::polys_to_elems(&placed));
-        layer.interval_mm = self.job.interval_mm;
+            cam::lbrn2::EmitLayer::line("DRILL", params, cam::lbrn2::polys_to_elems(&placed));
+        // `line` defaults wobble off; carry the operator's setting through.
+        layer.wobble = self.drill.wobble;
+        layer.wobble_step_mm = self.drill.wobble_step_mm;
+        layer.wobble_size_mm = self.drill.wobble_size_mm;
         let out_path = self.resolve_drill_output(&drill_paths[0]);
         let out = out_path.to_string_lossy().into_owned();
         if let Err(e) =
@@ -810,29 +820,6 @@ impl ConsoleApp {
                      selects it before loading the file).",
                 );
                 ui.end_row();
-                let drl = ui.label("drill .drl");
-                ui.add(egui::TextEdit::singleline(&mut self.placement.drills).desired_width(240.0))
-                    .labelled_by(drl.id)
-                    .on_hover_text(
-                        "Excellon drill file(s) for \"Emit drill holes\" — KiCad \
-                         exports PTH and NPTH holes as two files; list both \
-                         separated by ; to get every hole. \"⚙ Drills from \
-                         KiCad\" fills this from the Actions-panel project.",
-                    );
-                ui.end_row();
-                let drl_out = ui.label("drill out .lbrn2");
-                ui.add(
-                    egui::TextEdit::singleline(&mut self.placement.drill_lbrn2)
-                        .desired_width(240.0),
-                )
-                .labelled_by(drl_out.id)
-                .on_hover_text(
-                    "Where \"Emit drill holes\" writes the hole-geometry job — \
-                     separate from the etch output so they never overwrite each \
-                     other. A bare filename lands next to the drill file; the log \
-                     prints the full path it wrote.",
-                );
-                ui.end_row();
             });
         ui.horizontal(|ui| {
             if ui
@@ -882,43 +869,6 @@ impl ConsoleApp {
                  physical→commanded. Without one, \"Etch here\" exports the placement \
                  unwarped — field accuracy is then the machine's own correction.",
             );
-        });
-        ui.horizontal(|ui| {
-            if ui
-                .button("⚙ Drills from KiCad")
-                .on_hover_text(
-                    "Run kicad-cli on the Actions-panel KiCad project to export \
-                     pth.drl + npth.drl (next to the Gerbers) and fill the drill \
-                     .drl field with both.",
-                )
-                .clicked()
-            {
-                self.drills_from_kicad();
-            }
-            // Disabled while a LightBurn run is in flight, like "Etch + run":
-            // the load-only run replaces `lightburn_run`, and stomping a live
-            // burn's progress reporting would be rude.
-            let lb_running = self
-                .runtime
-                .lightburn_run
-                .as_ref()
-                .is_some_and(|r| !r.finished());
-            if ui
-                .add_enabled(
-                    !lb_running,
-                    egui::Button::new("⤓ Emit drill holes → LightBurn (no burn)"),
-                )
-                .on_hover_text(
-                    "Writes ONLY the drill-hole geometry (round holes + slots) from \
-                     the drill .drl file(s) at this placement to the drill out \
-                     .lbrn2, then LOADS the file in LightBurn (FORCELOAD) without \
-                     pressing start — you burn it from LightBurn yourself.",
-                )
-                .clicked()
-            {
-                self.emit_drill_at_placement();
-            }
-            ui.weak("hole pattern at the placed pose — loads in LightBurn, never presses start");
         });
         if self.calibration.field.is_some() && !self.calibration.field_accepted {
             ui.colored_label(
@@ -975,4 +925,15 @@ impl ConsoleApp {
             self.recompose(&ctx);
         }
     }
+}
+
+/// The `;`-separated PTH+NPTH drill paths `pcbforge drills` writes into
+/// `out_dir`. Shared by the drill settings' export button and the Gerber
+/// completion chain so the two can't drift apart.
+pub(super) fn drill_files_in(out_dir: &std::path::Path) -> String {
+    format!(
+        "{};{}",
+        out_dir.join("pth.drl").display(),
+        out_dir.join("npth.drl").display()
+    )
 }

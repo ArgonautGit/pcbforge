@@ -1488,6 +1488,15 @@ field_frame=\n";
             "calib_paper_n",
             "calib_paper_out",
             "calib_paper_pitch_mm",
+            "drill_files",
+            "drill_frequency_khz",
+            "drill_out_lbrn2",
+            "drill_passes",
+            "drill_pulse_ns",
+            "drill_speed_mm_s",
+            "drill_wobble",
+            "drill_wobble_size_mm",
+            "drill_wobble_step_mm",
             "fid_board_h_mm",
             "fid_board_w_mm",
             "fid_diameter_mm",
@@ -1506,8 +1515,6 @@ field_frame=\n";
             "job_wobble_size_mm",
             "job_wobble_step_mm",
             "lens_px_bounds",
-            "place_drill_lbrn2",
-            "place_drills",
             "place_lightburn_device",
         ]
     );
@@ -1566,6 +1573,76 @@ fn job_export_recipe_persists() {
     assert_eq!(fresh.job.pulse_ns, 1);
     assert!((fresh.job.interval_mm - 0.03).abs() < 1e-9);
     assert_eq!(fresh.job.passes, 1);
+}
+
+/// The drill settings' own recipe round-trips through a save + reload, and a
+/// blob with none of the keys keeps the defaults.
+#[test]
+fn drill_recipe_persists() {
+    let db = tmp_db();
+    {
+        let mut a = ConsoleApp::new(db.clone(), vec!["true".into()]);
+        a.drill.speed_mm_s = 350.0;
+        a.drill.frequency_khz = 55.0;
+        a.drill.pulse_ns = 12;
+        a.drill.passes = 4;
+        a.drill.wobble = true;
+        a.drill.wobble_step_mm = 0.02;
+        a.drill.wobble_size_mm = 0.1;
+        a.save_settings_if_changed();
+    }
+    let b = ConsoleApp::new(db, vec!["true".into()]);
+    assert!((b.drill.speed_mm_s - 350.0).abs() < 1e-9);
+    assert!((b.drill.frequency_khz - 55.0).abs() < 1e-9);
+    assert_eq!(b.drill.pulse_ns, 12);
+    assert_eq!(b.drill.passes, 4);
+    assert!(b.drill.wobble);
+    assert!((b.drill.wobble_step_mm - 0.02).abs() < 1e-9);
+    assert!((b.drill.wobble_size_mm - 0.1).abs() < 1e-9);
+
+    // A blob with none of the drill keys keeps today's defaults.
+    let fresh = ConsoleApp::new(tmp_db(), vec!["true".into()]);
+    assert!((fresh.drill.speed_mm_s - 1000.0).abs() < 1e-9);
+    assert!((fresh.drill.frequency_khz - 30.0).abs() < 1e-9);
+    assert_eq!(fresh.drill.pulse_ns, 1);
+    assert_eq!(fresh.drill.passes, 1);
+    assert!(!fresh.drill.wobble);
+}
+
+/// The drill paths used to persist under the Place tab's `place_drill*` names.
+/// A blob carrying only the legacy keys still restores them, so an operator's
+/// saved drill paths survive the move to the drill settings.
+#[test]
+fn legacy_place_drill_keys_load_into_the_drill_settings() {
+    let db = tmp_db();
+    let settings = crate::settings::path_for_db(&db);
+    std::fs::write(
+        &settings,
+        "pcbforge console settings v1\n\
+         place_drills=C:/boards/pth.drl;C:/boards/npth.drl\n\
+         place_drill_lbrn2=C:/boards/holes.lbrn2\n",
+    )
+    .unwrap();
+
+    let app = ConsoleApp::new(db, vec!["true".into()]);
+    assert_eq!(app.drill.files, "C:/boards/pth.drl;C:/boards/npth.drl");
+    assert_eq!(app.drill.out_lbrn2, "C:/boards/holes.lbrn2");
+
+    // The new keys win when both are present (the legacy read is a fallback).
+    let db2 = tmp_db();
+    let settings2 = crate::settings::path_for_db(&db2);
+    std::fs::write(
+        &settings2,
+        "pcbforge console settings v1\n\
+         place_drills=C:/old/pth.drl\n\
+         place_drill_lbrn2=C:/old/holes.lbrn2\n\
+         drill_files=C:/new/pth.drl\n\
+         drill_out_lbrn2=C:/new/holes.lbrn2\n",
+    )
+    .unwrap();
+    let app2 = ConsoleApp::new(db2, vec!["true".into()]);
+    assert_eq!(app2.drill.files, "C:/new/pth.drl");
+    assert_eq!(app2.drill.out_lbrn2, "C:/new/holes.lbrn2");
 }
 
 /// The ④ auto fiducial-layout board size + margin round-trip through a save +
@@ -2686,8 +2763,8 @@ fn emit_drill_holes_writes_placed_geometry_without_queueing_a_burn() {
 
     app.placement.job = vec![pcb_core::Poly::default()];
     app.placement.frame_img = Some(image::GrayImage::new(800, 800));
-    app.placement.drills = drl.to_string_lossy().into_owned();
-    app.placement.drill_lbrn2 = out.to_string_lossy().into_owned();
+    app.drill.files = drl.to_string_lossy().into_owned();
+    app.drill.out_lbrn2 = out.to_string_lossy().into_owned();
     app.placement.pivot = (0.0, 0.0);
     app.placement.tx_mm = 100.0;
     app.placement.ty_mm = 50.0;
@@ -2697,6 +2774,14 @@ fn emit_drill_holes_writes_placed_geometry_without_queueing_a_burn() {
 
     let doc = std::fs::read_to_string(&out).expect("the .lbrn2 was written");
     assert!(doc.contains("<name Value=\"DRILL\"/>"));
+    // A hole is TRACED, not scan-filled: the layer must be a Line layer, which
+    // carries no fill interval. (`<name Value="DRILL"/>` alone passes either
+    // way, so it can't catch a regression back to Fill.)
+    assert!(doc.contains("type=\"Cut\""), "the drill layer is Line/Cut");
+    assert!(
+        !doc.contains("interval"),
+        "a Line layer emits no fill interval:\n{doc}"
+    );
     assert_eq!(
         doc.matches("Type=\"Path\"").count(),
         3,
@@ -2760,6 +2845,62 @@ fn emit_drill_holes_writes_placed_geometry_without_queueing_a_burn() {
     );
 }
 
+/// The drill recipe is its OWN: the emitted CutSetting carries the drill
+/// speed/frequency/pulse/passes, and none of the etch settings' — drilling a
+/// hole outline is a different process from etching copper. `maxPower` is
+/// neither one's: the emitter requires the field, but power is not an operator
+/// control here, so it is pinned in code.
+#[test]
+fn emit_drill_holes_uses_the_drill_recipe_not_the_job_recipe() {
+    let mut app = ConsoleApp::new(tmp_db(), vec!["true".into()]);
+    let dir = std::env::temp_dir().join(format!("ui-drill-recipe-{}", std::process::id()));
+    std::fs::create_dir_all(&dir).unwrap();
+    let drl = dir.join("holes.drl");
+    std::fs::write(&drl, DRILL_SAMPLE).unwrap();
+    let out = dir.join("drill-recipe.lbrn2");
+
+    app.placement.job = vec![pcb_core::Poly::default()];
+    app.placement.frame_img = Some(image::GrayImage::new(800, 800));
+    app.drill.files = drl.to_string_lossy().into_owned();
+    app.drill.out_lbrn2 = out.to_string_lossy().into_owned();
+
+    // Every value distinct between the two recipes, so nothing matches by luck.
+    app.job.speed_mm_s = 2500.0;
+    app.job.frequency_khz = 80.0;
+    app.job.pulse_ns = 42;
+    app.job.passes = 5;
+    app.job.interval_mm = 0.05;
+    app.drill.speed_mm_s = 400.0;
+    app.drill.frequency_khz = 60.0;
+    app.drill.pulse_ns = 7;
+    app.drill.passes = 3;
+
+    app.emit_drill_at_placement();
+
+    let doc = std::fs::read_to_string(&out).expect("the .lbrn2 was written");
+    for expected in [
+        // Fixed in code (DRILL_POWER_PCT) — no operator control, either recipe.
+        "<maxPower Value=\"20\"/>",
+        "<speed Value=\"400\"/>",
+        "<frequency Value=\"60000\"/>",
+        "<QPulseWidth Value=\"7\"/>",
+        "<numPasses Value=\"3\"/>",
+    ] {
+        assert!(doc.contains(expected), "drill recipe missing {expected}");
+    }
+    for etch_value in [
+        "<speed Value=\"2500\"/>",
+        "<frequency Value=\"80000\"/>",
+        "<QPulseWidth Value=\"42\"/>",
+        "<numPasses Value=\"5\"/>",
+    ] {
+        assert!(
+            !doc.contains(etch_value),
+            "the etch settings' {etch_value} leaked into the drill export"
+        );
+    }
+}
+
 /// "⚙ Drills from KiCad" mirrors the Gerbers button: deterministic
 /// `pth.drl;npth.drl` paths (next to the Gerbers) fill the drill field
 /// immediately, and the export shells the `drills` verb in the background.
@@ -2776,10 +2917,7 @@ fn drills_from_kicad_fills_the_field_with_stable_paths() {
             .any(|l| l.err && l.text.contains("KiCad project")),
         "missing-project guard logged"
     );
-    assert!(
-        app.placement.drills.is_empty(),
-        "field untouched on refusal"
-    );
+    assert!(app.drill.files.is_empty(), "field untouched on refusal");
 
     // A real (empty) board file: resolve_board only needs it to exist.
     let dir = std::env::temp_dir().join(format!("ui-drills-kicad-{}", std::process::id()));
@@ -2791,7 +2929,7 @@ fn drills_from_kicad_fills_the_field_with_stable_paths() {
     app.drills_from_kicad();
     let gerber_dir = dir.join("pcbforge-gerbers");
     assert_eq!(
-        app.placement.drills,
+        app.drill.files,
         format!(
             "{};{}",
             gerber_dir.join("pth.drl").display(),
@@ -2807,6 +2945,100 @@ fn drills_from_kicad_fills_the_field_with_stable_paths() {
     assert!(
         app.runtime.verb_job.is_some(),
         "the drills verb was shelled"
+    );
+}
+
+/// "⚙ Gerbers from KiCad" chains the drill export off the Gerber verb's
+/// completion. The assertion that matters is that a *second* verb job was
+/// spawned — a filled `drill.files` alone would pass even if the drills verb
+/// never ran, which is exactly the failure this chain exists to avoid.
+#[test]
+fn gerbers_from_kicad_chains_the_drill_export() {
+    let mut app = ConsoleApp::new(tmp_db(), vec!["sh".into(), "-c".into(), "exit 0".into()]);
+    let dir = std::env::temp_dir().join(format!("ui-gerber-drill-chain-{}", std::process::id()));
+    std::fs::create_dir_all(&dir).unwrap();
+    let board = dir.join("demo.kicad_pcb");
+    std::fs::write(&board, "").unwrap();
+    app.job.kicad_project = board.to_string_lossy().into_owned();
+
+    app.gerbers_from_kicad();
+    assert!(app.runtime.verb_job.is_some(), "the gerbers verb spawned");
+    assert!(
+        app.runtime.pending_drills.is_some(),
+        "the drill export is armed"
+    );
+    assert!(
+        app.drill.files.is_empty(),
+        "drill paths are not filled at click time"
+    );
+
+    // Pump until the chain fires. Breaking on `verb_job.is_none()` would never
+    // happen: the chain re-arms the slot inside the same `pump_verb` call.
+    let ctx = Context::default();
+    for _ in 0..500 {
+        app.pump_verb(&ctx);
+        if app.runtime.pending_drills.is_none() {
+            break;
+        }
+        std::thread::sleep(std::time::Duration::from_millis(3));
+    }
+    assert!(app.runtime.pending_drills.is_none(), "chain consumed");
+    assert!(
+        app.runtime.verb_job.is_some(),
+        "a second verb job — the drills export — was spawned"
+    );
+    let gerber_dir = dir.join("pcbforge-gerbers");
+    assert_eq!(
+        app.drill.files,
+        format!(
+            "{};{}",
+            gerber_dir.join("pth.drl").display(),
+            gerber_dir.join("npth.drl").display()
+        ),
+        "the drill paths match the dir the Gerbers went to"
+    );
+}
+
+/// A failed Gerber export skips the chained drill run entirely: no second verb,
+/// and no drill paths persisted for files that were never written.
+#[test]
+fn failed_gerber_export_skips_the_drill_chain() {
+    let mut app = ConsoleApp::new(tmp_db(), vec!["sh".into(), "-c".into(), "exit 3".into()]);
+    let dir = std::env::temp_dir().join(format!("ui-gerber-drill-fail-{}", std::process::id()));
+    std::fs::create_dir_all(&dir).unwrap();
+    let board = dir.join("demo.kicad_pcb");
+    std::fs::write(&board, "").unwrap();
+    app.job.kicad_project = board.to_string_lossy().into_owned();
+
+    app.gerbers_from_kicad();
+    assert!(
+        app.runtime.pending_drills.is_some(),
+        "the drill export is armed"
+    );
+
+    let ctx = Context::default();
+    for _ in 0..500 {
+        app.pump_verb(&ctx);
+        if app.runtime.pending_drills.is_none() {
+            break;
+        }
+        std::thread::sleep(std::time::Duration::from_millis(3));
+    }
+    assert!(app.runtime.pending_drills.is_none(), "chain cleared");
+    assert!(
+        app.runtime.verb_job.is_none(),
+        "no second verb — the drills export was skipped"
+    );
+    assert!(
+        app.drill.files.is_empty(),
+        "no drill paths persisted for files nobody wrote"
+    );
+    assert!(
+        app.runtime
+            .log
+            .iter()
+            .any(|l| l.err && l.text.contains("drills: skipped")),
+        "the skip was logged as an error"
     );
 }
 
