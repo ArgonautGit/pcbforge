@@ -2223,7 +2223,7 @@ job_passes=1\n",
     let old = ConsoleApp::new(db, vec!["true".into()]);
     assert!((old.drill.speed_mm_s - 1000.0).abs() < 1e-9);
     assert!((old.drill.frequency_khz - 30.0).abs() < 1e-9);
-    assert_eq!(old.drill.pulse_ns, 1);
+    assert_eq!(old.drill.pulse_ns, 5);
     assert!((old.drill.interval_mm - 0.05).abs() < 1e-9);
     assert_eq!(old.drill.passes, 2);
     assert!(old.drill.wobble);
@@ -2231,7 +2231,7 @@ job_passes=1\n",
     assert!((old.drill.wobble_size_mm - 0.05).abs() < 1e-9);
     assert!(
         old.debug_summary().contains(
-            "drill: speed=1000 freq_khz=30 pulse_ns=1 interval=0.05 passes=2 wobble=true"
+            "drill: speed=1000 freq_khz=30 pulse_ns=5 interval=0.05 passes=2 wobble=true"
         ),
         "the summary reports the drill recipe: {}",
         old.debug_summary()

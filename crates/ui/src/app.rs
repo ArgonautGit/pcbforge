@@ -289,12 +289,13 @@ impl ConsoleApp {
                 etch_confirm: None,
             },
             // The operator's drill recipe: fast Line passes with a small
-            // wobble, twice over each hole. Frequency and Q-pulse stay at the
-            // source values the drill emit has always used (the etch defaults).
+            // wobble, twice over each hole, at a 5 ns Q-pulse. Frequency stays
+            // at the source value the drill emit has always used (the etch
+            // default).
             drill: DrillState {
                 speed_mm_s: 1000.0,
                 frequency_khz: 30.0,
-                pulse_ns: 1,
+                pulse_ns: 5,
                 interval_mm: 0.05,
                 passes: 2,
                 wobble: true,
