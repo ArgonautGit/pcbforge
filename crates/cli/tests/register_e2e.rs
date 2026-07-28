@@ -119,7 +119,9 @@ fn pincushion_field_map(tag: &str) -> PathBuf {
 
 fn identity_field_map(tag: &str) -> PathBuf {
     use nalgebra::Point2;
-    let coordinates = [-150.0, -50.0, 50.0, 150.0];
+    // Wide enough that the translation tests (which shift the job to x ≈ 200)
+    // stay inside the map's recorded calibrated bounds.
+    let coordinates = [-250.0, -83.0, 83.0, 250.0];
     let pairs: Vec<_> = coordinates
         .iter()
         .flat_map(|&y| {

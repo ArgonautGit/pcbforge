@@ -309,7 +309,9 @@ impl FieldMap {
         };
         let bounds = match self.calib_mm_bounds {
             Some([x0, y0, x1, y1]) => {
-                format!("calib_mm_bounds {x0:.6} {y0:.6} {x1:.6} {y1:.6}\n")
+                // Plain Display is shortest-round-trip for f64, so the parsed
+                // box is bit-identical to the fitted one.
+                format!("calib_mm_bounds {x0} {y0} {x1} {y1}\n")
             }
             None => String::new(),
         };
