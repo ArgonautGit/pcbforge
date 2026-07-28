@@ -1933,6 +1933,7 @@ field_frame=\n";
             "calib_paper_pitch_mm",
             "fid_diameter_mm",
             "fid_height_mm",
+            "fid_live_recover_s",
             "fid_out",
             "fid_profile",
             "fid_rect_h_mm",
@@ -2079,6 +2080,43 @@ fn fid_rect_dimensions_persist() {
     let fresh = ConsoleApp::new(tmp_db(), vec!["true".into()]);
     assert!((fresh.fiducials.rect_w_mm - 50.0).abs() < 1e-9);
     assert!((fresh.fiducials.rect_h_mm - 50.0).abs() < 1e-9);
+}
+
+/// The Live re-acquire interval round-trips, defaults to the operator's 500 ms,
+/// and cannot be pushed out of range by a hand-edited blob — the DragValue
+/// clamps what the console writes, but nothing stops someone typing a value the
+/// ladder would then hand to `Duration::from_secs_f64`.
+#[test]
+fn fid_live_recover_interval_persists_and_clamps() {
+    let db = tmp_db();
+    {
+        let mut a = ConsoleApp::new(db.clone(), vec!["true".into()]);
+        assert!(
+            (a.fiducials.live_recover_s - 0.5).abs() < 1e-9,
+            "a fresh console re-acquires every 500 ms"
+        );
+        a.fiducials.live_recover_s = 0.2;
+        a.save_settings_if_changed();
+    }
+    let b = ConsoleApp::new(db, vec!["true".into()]);
+    assert!((b.fiducials.live_recover_s - 0.2).abs() < 1e-9);
+
+    // Out of range on both sides, planted straight into the settings file.
+    for (written, want) in [("99", 10.0), ("-1", 0.1), ("0", 0.1)] {
+        let db = tmp_db();
+        let settings = crate::settings::path_for_db(&db);
+        std::fs::write(
+            &settings,
+            format!("pcbforge console settings v1\nfid_live_recover_s={written}\n"),
+        )
+        .unwrap();
+        let app = ConsoleApp::new(db, vec!["true".into()]);
+        assert!(
+            (app.fiducials.live_recover_s - want).abs() < 1e-9,
+            "{written} clamps to {want}, got {}",
+            app.fiducials.live_recover_s
+        );
+    }
 }
 
 /// ④ Fiducial holes: the `fid_rect:` summary line reports the rectangle spans
@@ -3584,6 +3622,137 @@ fn a_failed_check_leaves_the_markers_where_the_operator_put_them() {
     assert!(
         app.fiducials.note.contains("rectangle match"),
         "the note says the rescan was tried and why it came up short: {}",
+        app.fiducials.note
+    );
+}
+
+/// The throttle on the ladder's third stage. Under Live the whole-frame scan
+/// costs a visible hitch, so it may fire on a short frame only once per the
+/// operator's re-acquire interval — and backs off four times as far after a run
+/// that found nothing. A manual Check is never throttled.
+///
+/// (The live loop itself — real frames streaming off a device while the board
+/// moves — is not testable headlessly; this pins the decision, not the feed.)
+#[test]
+fn the_rectangle_match_is_throttled_under_live_but_not_under_a_check() {
+    // Built by addition only: an Instant cannot be safely walked backwards.
+    let t0 = std::time::Instant::now();
+    // The windows the ladder stamps, derived the way it derives them, so the
+    // probe times below stay right whatever the default interval becomes.
+    let cooldown = std::time::Duration::from_secs_f64(1.0);
+    let backoff = cooldown * RECOVER_BACKOFF_FACTOR;
+
+    // Enough hits: no stage 3 at all, live or not.
+    assert!(!should_global_recover(true, 3, None, t0));
+    assert!(!should_global_recover(false, 4, None, t0));
+
+    // First short frame under Live scans; a second one inside the window does
+    // not, whichever window the previous run earned.
+    assert!(should_global_recover(true, 1, None, t0));
+    let after_win = Some((t0, cooldown));
+    let after_lose = Some((t0, backoff));
+    assert!(!should_global_recover(true, 1, after_win, t0 + cooldown / 5));
+
+    // The two windows differ: halfway through the backoff a recovered scan is
+    // due again, a failed one is still held off; at the backoff both are due.
+    let mid = t0 + backoff / 2;
+    assert!(should_global_recover(true, 1, after_win, mid));
+    assert!(!should_global_recover(true, 1, after_lose, mid));
+    assert!(should_global_recover(true, 1, after_lose, t0 + backoff));
+    assert!(
+        cooldown < backoff,
+        "a failed recovery must back off further than a successful one"
+    );
+
+    // The configured interval is the one that governs, not a constant: at
+    // 0.2 s the success window is 0.2 s and the failure window 0.8 s.
+    let fast = std::time::Duration::from_secs_f64(0.2);
+    let fast_lose = fast * RECOVER_BACKOFF_FACTOR;
+    assert_eq!(fast_lose, std::time::Duration::from_millis(800));
+    let win = Some((t0, fast));
+    let lose = Some((t0, fast_lose));
+    assert!(!should_global_recover(
+        true,
+        1,
+        win,
+        t0 + std::time::Duration::from_millis(199)
+    ));
+    assert!(should_global_recover(
+        true,
+        1,
+        win,
+        t0 + std::time::Duration::from_millis(200)
+    ));
+    assert!(!should_global_recover(
+        true,
+        1,
+        lose,
+        t0 + std::time::Duration::from_millis(799)
+    ));
+    assert!(should_global_recover(
+        true,
+        1,
+        lose,
+        t0 + std::time::Duration::from_millis(800)
+    ));
+
+    // A manual Check ignores the cooldown entirely — one deliberate press, and
+    // the operator is waiting for the answer.
+    assert!(should_global_recover(false, 1, after_lose, t0));
+    assert!(should_global_recover(false, 0, after_win, t0));
+}
+
+/// The throttle wired into the ladder: under Live a hopeless frame runs the
+/// whole-frame scan once, and the next detection on the same feed reports it as
+/// throttled instead of paying for a second scan.
+#[test]
+fn a_second_short_live_frame_does_not_rescan() {
+    let dir = std::env::temp_dir().join(format!("ui-fidthrottle-{}", std::process::id()));
+    std::fs::create_dir_all(&dir).unwrap();
+    let path = dir.join("bed7.png");
+    let ppm = 10.0;
+    // A blank bed: every stage comes up empty, so every frame is "short".
+    write_hole_frame(&path, ppm, &[]);
+
+    let mut app = ConsoleApp::new(tmp_db(), vec!["true".into()]);
+    app.runtime.tab = CentralTab::Fiducials;
+    app.fiducials.frame = path.to_string_lossy().into();
+    app.fiducials.layout = "15,25; 55,25; 55,60; 15,60".into();
+    app.fiducials.px_per_mm = ppm;
+    app.fiducials.diameter_mm = 1.0;
+    app.fiducials.search_mm = 2.0;
+    let ctx = Context::default();
+    app.load_fid_frame(&ctx);
+    app.fiducials.live = true;
+    // Pin the interval instead of inheriting the operator default: the two
+    // detection passes below run back to back, and a slow (dev, loaded) machine
+    // could otherwise walk past a sub-second window between them and rescan.
+    app.fiducials.live_recover_s = 10.0;
+
+    // Streamed frames driven directly (the pump's path), not through the
+    // Check button — the two are now distinct on purpose.
+    app.detect_fiducials(true);
+    assert!(
+        app.fiducials.note.contains("rectangle match")
+            && !app.fiducials.note.contains("throttled"),
+        "the first short frame under Live still runs the scan: {}",
+        app.fiducials.note
+    );
+    app.detect_fiducials(true);
+    assert!(
+        app.fiducials.note.contains("rectangle match throttled"),
+        "the very next short frame is throttled, not rescanned: {}",
+        app.fiducials.note
+    );
+
+    // A manual Check is not on the feed's budget, so it scans regardless of
+    // how recently the live loop did — WITHOUT Live being switched off first.
+    // A button that sometimes does nothing while the feed runs was the wart
+    // this parameter exists to remove.
+    app.render_fiducials(&ctx);
+    assert!(
+        !app.fiducials.note.contains("throttled"),
+        "a Check ignores the cooldown even while Live is on: {}",
         app.fiducials.note
     );
 }

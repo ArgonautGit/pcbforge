@@ -40,6 +40,8 @@ use crate::status::{self, StatusSnapshot};
 use camera_ui::{CAM_VIEW_MAX, CAMERA_IDLE_RELEASE, downscale_view, should_release_capture};
 #[cfg(test)]
 use commands::spawn_verb;
+#[cfg(test)]
+use fiducial_ui::{RECOVER_BACKOFF_FACTOR, should_global_recover};
 // Blocking: it shells out and waits for the child to exit, which for the
 // default `cargo run -q --bin pcbforge --` is a compile plus a run with the
 // window frozen. The console always uses `spawn_verb`; only tests want the
@@ -240,6 +242,9 @@ impl ConsoleApp {
                 out: "fid-holes.lbrn2".into(),
                 rect_w_mm: 50.0,
                 rect_h_mm: 50.0,
+                // 500 ms: the operator's default cadence for re-acquiring a
+                // board that moved under Live.
+                live_recover_s: 0.5,
                 click_place: false,
                 show_placement: true,
                 detected_mm: Vec::new(),
@@ -258,6 +263,7 @@ impl ConsoleApp {
                 design_drag: false,
                 marker_drag: None,
                 live: false,
+                last_global_recover: None,
             },
             placement: PlacementState {
                 frame: String::new(),
@@ -489,7 +495,7 @@ impl ConsoleApp {
              place: x={:.2} y={:.2} rot={:.1}° scale={:.4} auto_pose={} job_polys={} lightburn={} device={} drills={} drill_out={} note={:?}\n\
              calib_paper: n={} pitch={:.2}mm dot={:.2}mm contrast={} out={}\n\
              calib_burn: n={} pitch={:.2}mm dot={:.2}mm contrast={} corners_marked={} edit_anchor_dots={} feedback={} origin=({:.1},{:.1})\n\
-             fiducials: {} markers shape={} w={} h={} profile={} search={} out={} marking={}\n\
+             fiducials: {} markers shape={} w={} h={} profile={} search={} out={} marking={} live_recover_s={}\n\
              fid_rect: w={} h={} layout={}\n\
              fid_pose: {}\n\
              diag: {} check={} {}\n\
@@ -549,6 +555,7 @@ impl ConsoleApp {
                 Some(k) => k.to_string(),
                 None => "-".to_string(),
             },
+            self.fiducials.live_recover_s,
             self.fiducials.rect_w_mm,
             self.fiducials.rect_h_mm,
             fid_layout,

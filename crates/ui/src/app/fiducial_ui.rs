@@ -1,3 +1,5 @@
+use std::time::{Duration, Instant};
+
 use super::*;
 
 /// Reject an auto-placement whose fiducial fit residual (RMS over the detected
@@ -35,6 +37,51 @@ const AUTO_MAX_CANDIDATES: usize = 96;
 /// Detections below which a Check is a failure worth a whole-frame rescan.
 /// Also `fit_board_pose`'s floor, so fewer than this places nothing anyway.
 const AUTO_RECOVER_BELOW: usize = 3;
+
+/// How much further Live backs off after a whole-frame scan that found NOTHING
+/// than after one that recovered holes. Preserves the 1 s : 4 s ratio the
+/// throttle shipped with, now that the base interval is
+/// [`FiducialState::live_recover_s`] rather than a constant.
+///
+/// [`FiducialState::live_recover_s`]: super::state::FiducialState::live_recover_s
+pub(super) const RECOVER_BACKOFF_FACTOR: u32 = 4;
+
+/// Clamp on the operator's re-acquire interval, in seconds. The floor is what
+/// bounds the damage a very low setting does to the failure backoff (see the
+/// stamp sites in `detect_fiducials`) — and `Duration::from_secs_f64` panics on
+/// a negative or NaN value, so the same bounds are enforced on load.
+pub(super) const LIVE_RECOVER_MIN_S: f64 = 0.1;
+pub(super) const LIVE_RECOVER_MAX_S: f64 = 10.0;
+
+/// Whether the detection ladder should reach for its third stage, the
+/// whole-frame rectangle match. Free-standing so the throttle rule is testable
+/// without a frame, a camera or a running app.
+///
+/// An explicit action ignores the cooldown entirely — even while Live runs: it
+/// is one deliberate press and the operator is waiting for the answer. Only
+/// STREAMED frames are throttled — `last` carries when the scan last ran and
+/// the window that run earned — because the feed would otherwise fire the scan
+/// on every frame that comes up short.
+pub(super) fn should_global_recover(
+    streamed: bool,
+    hits: usize,
+    last: Option<(Instant, Duration)>,
+    now: Instant,
+) -> bool {
+    // Enough holes: the earlier stages did the job, nothing to recover.
+    if hits >= AUTO_RECOVER_BELOW {
+        return false;
+    }
+    // An explicit action (Check, load, grab, a marker drop) always scans:
+    // it is one deliberate press the operator is waiting on — even while the
+    // Live feed happens to be running. Only the feed's own frames are
+    // throttled, or the scan would fire on every frame that comes up short.
+    if !streamed {
+        return true;
+    }
+    // Never run yet — the first short frame under Live scans.
+    last.is_none_or(|(t, cooldown)| now.duration_since(t) >= cooldown)
+}
 
 /// How close (screen px) a press has to land to an existing ✛ to grab it for a
 /// drag. Sized to the drawn marker — the cross arms reach 9 px and the ring
@@ -105,7 +152,7 @@ impl ConsoleApp {
         match self.seed_fid_markers_from_projection() {
             Ok(()) => {
                 self.fiducials.marking = None;
-                self.detect_fiducials();
+                self.detect_fiducials(false);
             }
             Err(e) => {
                 self.start_fid_marking();
@@ -131,7 +178,7 @@ impl ConsoleApp {
                 if fallback.is_none() {
                     self.fiducials.marking = None;
                 }
-                self.detect_fiducials();
+                self.detect_fiducials(false);
                 if let Some(e) = fallback {
                     // Appended after detection, which rewrites the note.
                     self.fiducials.note.push_str(&format!("  ·  {e}"));
@@ -236,7 +283,7 @@ impl ConsoleApp {
         let next = k + 1;
         if next >= n {
             self.fiducials.marking = None;
-            self.detect_fiducials(); // final click → detect + auto-place
+            self.detect_fiducials(false); // final click → detect + auto-place
         } else {
             self.fiducials.marking = Some(next);
             self.fiducials.note = format!("click fiducial {} of {n}", next + 1);
@@ -285,7 +332,7 @@ impl ConsoleApp {
     /// is kept rather than seeded over.
     pub(super) fn fid_marker_drag_release(&mut self) {
         if self.fiducials.marker_drag.take().is_some() {
-            self.detect_fiducials();
+            self.detect_fiducials(false);
         }
     }
 
@@ -689,7 +736,7 @@ impl ConsoleApp {
         // the holes, and a layout whose coordinates are themselves click-derived
         // (rather than true machine coordinates) does not project back onto
         // them — so a Check that used to find all four found none.
-        self.detect_fiducials();
+        self.detect_fiducials(false);
     }
 
     /// Live fiducial tracking: pull frames from the (camera-tab) source and
@@ -716,7 +763,7 @@ impl ConsoleApp {
                     self.fiducials.frame_img = Some(gray);
                     self.sync_fid_markers();
                     if !self.fiducials.search.is_empty() {
-                        self.detect_fiducials();
+                        self.detect_fiducials(true);
                     }
                 }
                 Err(e) => {
@@ -918,7 +965,15 @@ impl ConsoleApp {
     /// Run detection on the current in-memory frame around the search markers,
     /// updating rows/found/measured/homography. Shared by the static Check and
     /// the live-tracking loop (FLD-11).
-    fn detect_fiducials(&mut self) {
+    ///
+    /// `streamed` is true only from the Live pump. The `fiducials.live` flag
+    /// cannot stand in for it: a Check pressed WHILE Live is on is still one
+    /// deliberate press the operator is waiting on, and throttling it (or
+    /// letting its failure suppress the feed's next scans) reads as a button
+    /// that sometimes does nothing. Only the feed's own frames are on the
+    /// feed's budget. `pub(super)` so the throttle test can drive a streamed
+    /// frame directly — every non-test caller is in this file.
+    pub(super) fn detect_fiducials(&mut self, streamed: bool) {
         if self.fiducials.frame_img.is_none() {
             return;
         }
@@ -968,9 +1023,54 @@ impl ConsoleApp {
         // refine pass inside each attempt) rather than by re-entering this
         // method, so it cannot recurse.
         //
-        // Skipped under Live: this is a whole-frame scan, far too heavy to run
-        // per streamed frame, and a live feed re-checks continuously anyway.
-        if best_hits < AUTO_RECOVER_BELOW && !self.fiducials.live {
+        // THROTTLED under Live, not skipped. The operator needs a moved board
+        // re-acquired without touching the console, but the scan runs on the UI
+        // thread and costs one visible hitch — ~180 ms in release, 1.3–4.5 s in
+        // a dev build — so it fires at most once per cooldown rather than on
+        // every short frame. Not threaded on purpose: the frame, the ladder's
+        // state and egui's context would all have to cross the boundary, which
+        // is out of proportion to a sub-200 ms hitch at the operator's cadence.
+        let now = Instant::now();
+        if should_global_recover(
+            streamed,
+            best_hits,
+            self.fiducials.last_global_recover,
+            now,
+        ) {
+            // The operator's re-acquire interval. Re-clamped here rather than
+            // trusted: the DragValue range and the load clamp both hold it, but
+            // `from_secs_f64` PANICS on a negative or NaN, and a live console is
+            // the wrong place to find that out.
+            //
+            // The scan measures 171–190 ms in release on the 2592×1944 bench
+            // frames, against a ~200 ms live iteration (device ~8.7 fps), so at
+            // the 0.5 s default it costs about a third of live time while it is
+            // re-acquiring — the price of following a board that just moved.
+            // Running it per short frame instead would swamp the feed, which is
+            // why it used to be skipped under Live outright.
+            let cooldown = Duration::from_secs_f64(
+                self.fiducials
+                    .live_recover_s
+                    .clamp(LIVE_RECOVER_MIN_S, LIVE_RECOVER_MAX_S),
+            );
+            // The wait a fruitless scan earns instead. A hopeless scene — board
+            // removed, lens cap on, wrong layout — would otherwise burn 180 ms
+            // every interval forever for a result that cannot change. This
+            // backoff is also what keeps a DEV build alive, where the same scan
+            // costs 1.3–4.5 s: one scan per few seconds is a painful feed but
+            // still a moving one, whereas per-frame would wedge the console. (No
+            // build-profile switch — one rule, tuned for the release console the
+            // operator actually runs.) A very low interval weakens that
+            // protection, and LIVE_RECOVER_MIN_S is what bounds it: 0.4 s of
+            // backoff at the floor.
+            let backoff = cooldown * RECOVER_BACKOFF_FACTOR;
+            // Stamp on ATTEMPT, before the outcome is known — including the
+            // cheap Err exits inside `locate_fid_markers_globally` (bad scale,
+            // too few layout points, no frame) that never reach the scan. Those
+            // will not change frame to frame either, so backing off on them is
+            // right; stamping only on success would leave a hopeless scene
+            // scanning every frame, which is exactly what this guards against.
+            self.fiducials.last_global_recover = Some((now, backoff));
             // Unmatched layout points keep THEIR seed, so start from the
             // operator's markers rather than stage 2's projection guesses.
             self.fiducials.search = original.clone();
@@ -982,12 +1082,20 @@ impl ConsoleApp {
                     if hits > best_hits {
                         (best, best_seeds) = (r, seeds);
                         via = format!("rectangle match ({summary})");
+                        // It worked: re-try sooner, so a board that keeps
+                        // drifting is followed rather than sitting out the
+                        // full backoff.
+                        self.fiducials.last_global_recover = Some((now, cooldown));
                     } else {
                         why.push(format!("rectangle match ({summary}) found no more holes"));
                     }
                 }
                 Err(e) => why.push(e),
             }
+        } else if best_hits < AUTO_RECOVER_BELOW {
+            // Suppressed by the cooldown — say so, or a Check pressed during
+            // Live reads as a ladder that silently stopped at stage 2.
+            why.push("rectangle match throttled under Live".into());
         }
 
         // Install the winning stage's markers. When nothing beat the operator's
@@ -1478,6 +1586,20 @@ impl ConsoleApp {
                 .on_hover_text(
                     "Track fiducials on the live camera feed (source from the Camera tab).",
                 );
+            let recover_label = ui.label("re-acquire s");
+            ui.add(
+                egui::DragValue::new(&mut self.fiducials.live_recover_s)
+                    .speed(0.1)
+                    .range(LIVE_RECOVER_MIN_S..=LIVE_RECOVER_MAX_S),
+            )
+            .labelled_by(recover_label.id)
+            .on_hover_text(
+                "How often Live re-runs the whole-frame rectangle match while \
+                 the holes are lost. Each attempt costs a visible hitch of \
+                 ~180 ms, so a shorter interval follows a moving board more \
+                 closely at the price of a slower feed. After a scan that found \
+                 nothing it waits 4× this instead.",
+            );
             ui.checkbox(&mut self.fiducials.show_placement, "▦ show placement")
                 .on_hover_text(
                     "Outline the placed job over this frame, at the Actions-panel pose \

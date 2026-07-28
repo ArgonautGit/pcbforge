@@ -1229,9 +1229,14 @@ mod tests {
 
     /// A low-contrast frame produces a MISS row that names the SNR reason —
     /// a lighting problem surfaced, not a silent bad lock.
+    ///
+    /// The rendered depth dropped from 6 to 0.6 when `vision` moved to a
+    /// matched filter (2026-07-26). Averaging over a dot-sized region cuts
+    /// uniform pixel noise by roughly √(area), so a 6-level dot under ±6 noise
+    /// is now genuinely recoverable and no longer models "too dim to see".
     #[test]
     fn low_contrast_reports_a_miss_with_reason() {
-        let img = frame(200, 200, &[(100.0, 100.0, 10.0)], 6.0, 6.0);
+        let img = frame(200, 200, &[(100.0, 100.0, 10.0)], 0.6, 6.0);
         let r = check_frame(&img, &[(10.0, 10.0)], PPM, &dark(), 2.0);
         assert_eq!(r.tally, (0, 0, 1));
         assert_eq!(r.rows[0].kind, FidKind::Miss);

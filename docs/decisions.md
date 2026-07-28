@@ -3177,3 +3177,264 @@ identifies outlying dots, refits without them, and reports what it excluded.
   plausibly the same vulnerability (the same session saw 74/81 dots there), but
   the ① fit IS the metric ruler everything downstream is measured against, so
   discarding evidence there has a wider blast radius and wants its own decision.
+
+## 2026-07-26 — Fiducial detection on brushed metal: matched filter, response-domain SNR, joint selection
+
+The operator's real surface is brushed, scratched, specular aluminium. Their
+diagnostic log recorded **95 of 168 checks finding fewer than 3 of the 4 holes**.
+`samples/fiducial/brushed-plate-4holes.png` is that frame, now committed as the
+acceptance fixture. Sampled patches on it: a hole reads min 15 / max 173 / mean
+115.1, and nearby "clean" plate reads min 6 / max 176 / mean 115.4. The mark and
+its background are statistically indistinguishable, and the brush scratches carry
+*more* contrast than the fiducials. Every part of the old detector keyed off raw
+pixel statistics, so every part of it failed here.
+
+- **A real disc-matched filter replaces the box mean.** The old "matched filter"
+  was a box mean at `dot_px/4` — a blur, answering "is anything here dark?",
+  which a 120 px scratch answers as loudly as a 2 mm hole. It is now centre mean
+  minus surrounding-annulus mean at the mark's own size: a compact blob of the
+  right size responds strongly, an elongated scratch does not, because the
+  surround contains the scratch too and cancels the centre. Centre and surround
+  are square approximations evaluated from one summed-area table, O(1) per pixel.
+  True discs would need a per-radius kernel and buy nothing — the discriminator
+  is the size and compactness of the support, not its outline.
+- **The centre follows the smaller extent, the surround the larger.** A surround
+  keyed to the smaller extent is filled ~45% by a 2 mm × 1 mm rectangle, which
+  cancels the contrast being measured; that mis-sizing cost 1.4 px of centroid
+  accuracy on the rect fixture. The search window grew to `search_px + surround`
+  to match, so a candidate at the edge of its window still gets an unclipped
+  surround.
+- **SNR is measured on the filter response, not on raw pixels.** This is the
+  point of the change: the response is what discriminates, so the response is
+  what gets a noise floor. On this plate the raw MAD is set by brush texture
+  (σ ≈ 19 grey levels where a hole's own contrast is ~63), and the old
+  `MIN_SNR = 3.5` against it excluded real holes.
+- **The gate is `MIN_RESPONSE_SNR = 3.0`, bracketed by measurement.** In the
+  detector's own windows, seeded 5 px off truth, the four holes read 3.42 / 6.03
+  / 5.38 / 6.03 — and at 3.0 they are the *only* candidates any of those four
+  windows produces. Not one scratch clears the gate. That is the evidence: there
+  is nothing between "every true hole" and "nothing else" to tune against. The
+  floor is the top-left hole at 3.42, weakest because its window straddles a
+  broad dark band that inflates the response MAD. The gate was not raised to
+  chase that margin — it would be fitting one frame's noise and would start
+  missing real holes.
+- **`SCAN_THR_SIGMA` was decoupled from the gate.** It used to be `MIN_SNR * 0.5`,
+  but it applies to raw-pixel σ in the whole-frame scan — a different noise
+  domain. Leaving it derived would have let the response-domain retune silently
+  move the scan's mask. It is now a standalone literal at its existing value, so
+  the scan stays bit-for-bit what the bench-plate arrangement match was tuned to.
+- **Thresholds are keyed to each candidate, not to the window's worst pixel.**
+  The old component threshold was `bg + 0.4·(peak − bg)` where `peak` was the
+  single most extreme pixel in the window — on scratched metal, essentially
+  never the fiducial. Each candidate is now thresholded against its own local
+  median and its own filter response.
+- **Sites are chosen jointly, not independently.** `find_fiducials` now collects
+  the top 5 candidates per site and picks the *combination* maximising summed
+  match quality minus a span-relative penalty on the residual of a similarity
+  fitted from the expected positions to the chosen points. Four independent
+  per-site picks are four chances to lock onto a different scratch; one geometric
+  decision is not, because a scratch has to sit where the layout says a mark
+  should be in order to compete. The public signature is unchanged — `ui` and the
+  CLI both call it.
+- **The fit is inline, not `calib::fit_similarity`.** `calib` depends on
+  `vision`, so calling it from here is a dependency cycle. It is the closed-form
+  2D Umeyama fit, done in *pixel* space rather than mm: the bed map may embed a
+  y-flip, and fitting through it would demand a reflection-aware similarity,
+  whereas expected-px → found-px is near-identity.
+- **Combinations are bounded and the fallback is real.** The product of the
+  per-site candidate counts is accumulated with `checked_mul` (it overflows
+  before any comparison could catch it) and capped at 20 000 — K=5 over 6 sites
+  is 15 625, and 5⁷ is 78 125. Past the cap, selection falls back to
+  consensus-offset: the largest cluster of candidate-minus-expected offsets wins,
+  then each site takes the candidate best reconciling quality with that
+  consensus. Same shape of answer as `calib::square_grid`'s lattice selection,
+  and linear in the candidate count. No real fixture reaches that branch (they
+  are all K=5 over ≤6 sites), so it is covered directly instead: two unit tests
+  on hand-built sites and an eight-site end-to-end case at 5⁸ combinations.
+  Agreement with the consensus is a HARD window there, not a penalty — scoring
+  disagreement continuously let a far-outside candidate accumulate a penalty
+  several times any candidate's score and invert the ranking, so the worst
+  candidate would have won. That was found by testing the branch, not by
+  reading it.
+- **Joint selection never manufactures a miss.** It reorders preferences; it does
+  not veto. A site with no candidate surviving the existing area/shape/aspect/
+  distance gates still returns `NoCandidate` exactly as before, and the geometric
+  term is a soft penalty with no hard reject at any threshold — it has to be,
+  since the truth quad's own worst similarity residual (22.5 px) is about the
+  whole search radius (22.3 px).
+- **Below three sites, geometry is skipped.** A similarity has 4 degrees of
+  freedom, so two point pairs fit it exactly and the residual is identically
+  zero. With fewer than three live sites the per-site ranking is already the
+  whole answer.
+- **Distance became a prior, not the rule.** `min_by(dist)` is gone: candidates
+  rank on match quality minus a penalty on `(dist / search_px)²`. The hard
+  `dist <= search_px` bound stays — that is the search-window contract, not a
+  heuristic.
+- **`find_fiducial_candidates` deliberately does NOT share the new filter.** The
+  code is shared and available, but the whole-frame pass's job is the opposite
+  one: be permissive and hand the caller's arrangement matcher everything that
+  could be a mark. Narrowing it to compact-blob responses would drop marks the
+  arrangement could have vouched for, and its only validation is the bench-plate
+  recovery test, which the change would silently re-tune.
+
+### What this fixture is NOT
+
+**The four holes are the corners of a 40 × 40 mm square on the plate, but they
+are not a square in the image, and the acceptance test does not claim they are.**
+Measured on the ground-truth centres: sides 450.8 / 476.1 / 435.1 / 418.3 px —
+13.8% spread about the 446.3 px nominal — and diagonals 644.3 / 614.9 px, 4.8%
+apart. Bottom longer than top with left longer than right is a coherent
+perspective pattern, not measurement error. `samples/fiducial/README.md` already
+records exactly this for the older bench fixture: "the plate is tilted relative
+to the camera — its diagonals differ by ~9%, so the observed quad is genuinely
+perspective-warped and no similarity fits it." The test therefore asserts
+per-corner distance to the measured centres (the load-bearing check), each side
+within 10% of nominal, side spread under 20%, and diagonals within 8% — and
+explicitly not equal sides, which would be a false claim about this bench.
+
+### Fixtures retuned, and why it is not gate-loosening
+
+Two low-contrast tests rendered a dot at depth 6 over ±6 noise as a stand-in for
+"too dim to see". A matched filter averages over a dot-sized region, cutting
+uniform pixel noise by roughly √(area), so that dot is now genuinely recoverable
+— it locks 1.5 px from truth. The fixtures were re-rendered dimmer (depth 1.5 in
+`vision`, 0.6 in `ui`, where the noise model differs) so they still model absence
+of signal. `dim_low_contrast_burn_is_now_found` asserted `snr < 5.0` against the
+old raw-pixel gate; that comparison is now between two different quantities, so
+the claim moved to where it still holds — the dim burn is found, at its true
+centre, with a healthy score. `SNR_FULL` (the score's saturation point) dropped
+from 10 to 6 for the same reason: response SNR runs lower than raw-pixel SNR for
+the same mark, and keeping 10 would have shown the operator four amber "weak"
+rows for four correct bench locks.
+
+### Known limit, recorded rather than tuned away
+
+A window seeded 22 px up into the broad dark brush band drops the top-left hole
+to SNR 2.31 and the site reports `LowContrast`. That is the safe failure — a miss
+naming the SNR, per the VIS-4 "low contrast is a lighting problem" rule, not a
+confident lock on a scratch — and it is covered by
+`brushed_plate_band_seeded_site_refuses_rather_than_locks_on_texture`. Separately,
+a site seeded on nothing but scratches returns a weak detection (snr 3.11, score
+0.185) rather than an outright miss. It sits under the console's `SCORE_OK` of
+0.25 where all four real holes score 0.34–0.83, so it shows as an amber row. A
+detector-side score floor would have suppressed it, but that would also take away
+the amber rows the operator is meant to see and judge, and a gate placed to
+exclude it would sit inside the 10% margin above the weakest true hole.
+
+## 2026-07-26 — Live re-acquires a moved board: stage 3 throttled, not skipped
+
+The fiducial ladder's third stage — the whole-frame rectangle match — used to be
+skipped outright under ● Live (`best_hits < AUTO_RECOVER_BELOW && !live`). That
+made a moved board unrecoverable without a manual Check, which is exactly the
+moment the operator has their hands on the work and not on the console. Stage 3
+now runs under Live too, gated on a cooldown instead of on `!live`.
+
+### Why it was skipped, in numbers
+
+The scan (`find_fiducial_candidates` plus the arrangement matcher) measures
+171–190 ms in release on the 2592×1944 bench frames, and 1.3–4.5 s in a dev
+build. The live loop's iteration is ~194 ms release (device ~8.7 fps). Running
+the scan on every frame that comes up short therefore roughly HALVES the feed —
+the original reason for the skip, and still a real constraint. Stages 1–2
+(operator markers, projection seed) are cheap and keep running per frame.
+
+### The two windows
+
+`GLOBAL_RECOVER_COOLDOWN` is 1 s, applied after a scan that recovered holes: one
+180 ms scan per second is ~18% of live time, dropping the feed from ~5 to
+~4.2 fps while it re-acquires. That is the price of following a board that just
+moved, and it is paid only while the board is actually lost.
+
+`GLOBAL_RECOVER_BACKOFF` is 4 s, applied after a scan that found nothing — and
+after the cheap early `Err` exits (bad scale, too few layout points, no frame)
+that never reach the scan at all, since none of those change frame to frame. A
+hopeless scene (board removed, lens cap on) must not burn 180 ms every second
+forever; at 4 s it costs ~4.5% of live time. This backoff is also what keeps a
+DEV build usable, where the same scan costs 1.3–4.5 s: one per 4 s is a painful
+feed but a moving one, where per-frame would wedge the console. There is no
+build-profile switch — one rule, tuned for the release console that is what the
+operator actually runs.
+
+The timestamp is stamped on ATTEMPT, before the outcome is known, then shortened
+to the 1 s window if the scan improved things. Stamping only on success would
+leave the hopeless case scanning every frame — the precise failure the backoff
+exists to prevent.
+
+### Consequences accepted
+
+The scan runs on the UI thread, so when it fires it costs one visible hitch
+(~180 ms release). Deliberately not moved to a background thread: the frame, the
+ladder's mutable state and egui's context would all have to cross the boundary,
+which is out of proportion to a sub-200 ms hitch at most once a second.
+
+Streamed frames are the ONLY thing throttled. A manual Check pressed while Live
+is on initially shared the feed's budget (both reached detection with just the
+`live` flag to go on), which made the button sometimes do nothing and let a
+failed Check suppress the feed's next scans — so detection now takes a
+`streamed` parameter set only by the Live pump, and every explicit action
+(Check, load, grab, the final marking click, a marker-drag release) scans
+unconditionally. When the cooldown suppresses a streamed scan, the note carries
+`rectangle match throttled under Live` — consistent with the existing rule that
+the note says which stage located the holes and why the others did not. A successful recovery under Live behaves exactly as it does
+for a Check: the matched markers are installed, detection re-runs from them, and
+the note says `located via rectangle match (…)`. A failed one leaves the
+operator's ✛ set untouched.
+
+The cooldown decision is a free-standing predicate, `should_global_recover`
+(same shape as `should_release_capture`), unit-tested for first-scan, in-window
+suppression, the two differing windows, and a Check ignoring the cooldown
+entirely; a second test drives the real ladder and asserts the second
+consecutive short Live frame reports throttled rather than rescanning. The live
+loop itself — real frames streaming off a device while the board moves — is not
+testable headlessly and is not claimed to be.
+
+## 2026-07-26 — The Live re-acquire cadence is an operator setting, not a constant
+
+The stage-3 throttle shipped with two hard-coded windows: 1 s after a
+whole-frame rectangle match that RECOVERED holes, 4 s after one that found
+nothing. Both numbers were tuned on the bench and neither was reachable from the
+console. The operator wants a board that keeps drifting followed more closely
+than once a second, and asked for 500 ms.
+
+So the pair collapses to one dial: `FiducialState::live_recover_s`, the
+re-acquire interval in seconds, default **0.5**, exposed as a `re-acquire s`
+DragValue beside the ● Live checkbox and persisted as `fid_live_recover_s`. The
+failure window stays a fixed 4× multiple (`RECOVER_BACKOFF_FACTOR`), which
+preserves the shipped 1 s : 4 s ratio rather than inventing a second dial nobody
+asked for — the two windows were never independent, they were one cadence and a
+"this is going nowhere" multiplier.
+
+### Why the interval is clamped, in two places
+
+0.1 ..= 10.0 s, enforced in the DragValue range AND on load in `settings_io`.
+The load clamp is not belt-and-braces: the settings file is plain text an
+operator can edit, and the ladder turns the value into a `Duration` with
+`from_secs_f64`, which PANICS on a negative or NaN. A clamp only in the widget
+would leave a hand-typed `-1` to take the console down on the next lost frame.
+The ladder re-clamps at the stamp site too, for the same reason and at no cost.
+
+The floor is also what bounds the real protection here. The backoff is what
+keeps a hopeless scene — board removed, lens cap on, wrong layout — from burning
+~180 ms every interval forever for a result that cannot change, and what keeps a
+DEV build alive, where the same scan costs 1.3–4.5 s. A very low interval
+weakens that, so 0.1 s is the floor and 0.4 s of backoff is the worst the
+operator can dial in.
+
+### Consequences accepted
+
+At the 0.5 s default the scan costs about a third of live time while it is
+re-acquiring, against ~18% at the old 1 s — a slower feed, deliberately traded
+for following a moving board. That is the operator's call to make, which is the
+point of surfacing it.
+
+`should_global_recover` is untouched: it already read the window out of
+`last_global_recover`'s `(Instant, Duration)` tuple, so making the window
+configurable needed no change to the predicate at all. Its test now derives the
+probe times from the windows instead of naming 2 s and 4 s outright, and asserts
+the configured interval is what governs (0.2 s in → a 0.2 s success window and a
+0.8 s failure window). The ladder-level test pins the interval at 10 s rather
+than inheriting the default, so two back-to-back detection passes on a loaded
+machine cannot walk past a sub-second window and rescan. The value appears in
+`debug_summary()`'s `fiducials:` line, so a headless `state` dump shows it, and
+a headless interaction test drives the field by its label and reads the change
+back out of that line — presence alone would have passed on the caption.

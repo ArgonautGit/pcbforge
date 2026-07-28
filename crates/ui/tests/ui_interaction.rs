@@ -465,6 +465,37 @@ fn the_accessibility_tree_exposes_labeled_widgets() {
     assert!(h.query_by_label("🎯 Calibrate").is_some());
 }
 
+/// The Live re-acquire interval is an operator setting, so it has to be
+/// reachable by name and readable back out of the summary — the same contract
+/// every other drivable field on this tab has.
+#[test]
+fn the_live_reacquire_interval_is_labelled_and_reported() {
+    let mut h = console();
+    h.get_by_label("◎ Fiducial check").click();
+    h.run();
+    assert!(
+        summary_line(&h.state().debug_summary(), "fiducials:").contains("live_recover_s=0.5"),
+        "a fresh console re-acquires every 500 ms:\n{}",
+        h.state().debug_summary()
+    );
+    // Associated with its label, so it is queryable rather than an anonymous
+    // number in a wrapped row of a dozen widgets — and typing into what that
+    // lookup returns has to land in the setting, or the association found the
+    // caption instead of the field.
+    let field = h.get_by_label("re-acquire s");
+    field.focus();
+    field.type_text("2");
+    field.key_press(egui_kittest::kittest::Key::Enter);
+    h.run();
+    assert!(
+        // The field opens for editing pre-filled, so typing EXTENDS the value
+        // (0.5 → 0.52) rather than replacing it — same as the device field.
+        summary_line(&h.state().debug_summary(), "fiducials:").contains("live_recover_s=0.52"),
+        "the re-acquire field is drivable by its label:\n{}",
+        h.state().debug_summary()
+    );
+}
+
 #[test]
 fn fiducial_tab_exposes_its_controls_after_the_panel_split() {
     let mut h = console();

@@ -339,6 +339,13 @@ pub(super) struct FiducialState {
     /// Height of the fiducial rectangle — the y span between hole CENTRES,
     /// centred in the work area (mm).
     pub(super) rect_h_mm: f64,
+    /// How often (seconds) Live re-runs the detection ladder's stage 3 — the
+    /// whole-frame rectangle match — while the holes are lost. The operator's
+    /// dial on the trade between following a board that keeps moving and the
+    /// ~180 ms hitch each attempt costs; a failed attempt waits 4× this. Clamped
+    /// to 0.1..=10.0 both in the DragValue and on load, because the Duration is
+    /// built with `from_secs_f64`, which panics on a negative or NaN value.
+    pub(super) live_recover_s: f64,
     pub(super) click_place: bool,
     /// Draw the placed job over the fiducial frame, so a lock can be judged
     /// against the holes it was fitted to without leaving the tab.
@@ -392,6 +399,13 @@ pub(super) struct FiducialState {
     /// usually contains the markers. A gesture, not a setting: never persisted.
     pub(super) marker_drag: Option<usize>,
     pub(super) live: bool,
+    /// When the detection ladder's stage 3 (the whole-frame rectangle match)
+    /// last RAN under Live, and the cooldown that run earned — short after a
+    /// recovery that found holes, long after one that found nothing. Stage 3 is
+    /// a whole-frame scan on the UI thread, so under a live feed it has to be
+    /// throttled rather than run per short frame; see `should_global_recover`.
+    /// Runtime timing, not a setting: never persisted.
+    pub(super) last_global_recover: Option<(std::time::Instant, std::time::Duration)>,
 }
 
 pub(super) struct PlacementState {

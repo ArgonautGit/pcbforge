@@ -66,6 +66,10 @@ impl ConsoleApp {
             ("fid_out", self.fiducials.out.clone()),
             ("fid_rect_w_mm", self.fiducials.rect_w_mm.to_string()),
             ("fid_rect_h_mm", self.fiducials.rect_h_mm.to_string()),
+            (
+                "fid_live_recover_s",
+                self.fiducials.live_recover_s.to_string(),
+            ),
             ("cam_file", self.camera.file.clone()),
             (
                 "cam_orientation",
@@ -409,6 +413,19 @@ impl ConsoleApp {
             .filter(|v: &f64| v.is_finite())
         {
             self.fiducials.rect_h_mm = v.clamp(5.0, 500.0);
+        }
+        // Live re-acquire cadence, clamped to the DragValue range for the usual
+        // reason and one more: the ladder turns it into a `Duration` with
+        // `from_secs_f64`, which panics on a negative or NaN value.
+        if let Some(v) = m
+            .get("fid_live_recover_s")
+            .and_then(|s| s.trim().parse().ok())
+            .filter(|v: &f64| v.is_finite())
+        {
+            self.fiducials.live_recover_s = v.clamp(
+                super::fiducial_ui::LIVE_RECOVER_MIN_S,
+                super::fiducial_ui::LIVE_RECOVER_MAX_S,
+            );
         }
         if let Some(k) = m
             .get("fid_shape")
