@@ -4503,3 +4503,515 @@ fn the_rectangle_match_follows_the_back_faces_mirrored_geometry() {
         front.fiducials.note
     );
 }
+
+// ---------------------------------------------------------------------------
+// A stray drag re-placed a registered job and "Etch here" burned it without a
+// word. The four gates below are what closes that, and the numbers they pin
+// down are worth a second opinion: a job move needs an explicit arm
+// (`fiducials.move_job`, one-shot); an etch whose placement is more than
+// 0.5 mm / 0.5° from the fiducial pose needs a second click; and the
+// mirror-scale tell measures against the machine's own field scale rather than
+// against 1.0, refusing only within 0.4% of the wrong-face signature.
+// ---------------------------------------------------------------------------
+
+/// An identity `layout → bed` fit, so the fiducial pose is exactly the layout
+/// centroid at 0° and 1.0 — arithmetic a reader can do in their head.
+fn identity_fit() -> calib::Similarity2 {
+    calib::Similarity2 {
+        scale: 1.0,
+        rigid: calib::Rigid2::IDENTITY,
+    }
+}
+
+/// An app with a design placed exactly on the fiducial pose, ready to etch:
+/// a frame to size the export against, copper to register, and a fit to
+/// measure the placement against.
+fn placed_app() -> ConsoleApp {
+    let mut app = ConsoleApp::new(tmp_db(), vec!["true".into()]);
+    app.fiducials.layout = SYM_LAYOUT.into();
+    app.fiducials.last_fit = Some(identity_fit());
+    app.fiducials.frame_img = Some(image::GrayImage::new(800, 800));
+    app.placement.job = vec![pcb_core::Poly::default()];
+    app.placement.auto_pose = true;
+    app.job.emit_copper = "board.gbr".into();
+    let (cx, cy) = SYM_CENTER;
+    app.placement.tx_mm = cx;
+    app.placement.ty_mm = cy;
+    app.placement.rot_deg = 0.0;
+    app
+}
+
+/// Fix 1. The gate that decides whether a press moves the job. Ctrl is
+/// navigation, a ✛ wins over the design's coarse bbox, and — the whole point —
+/// the design does not move unless the operator armed it.
+#[test]
+fn a_design_drag_latches_only_when_move_job_is_armed() {
+    use super::fiducial_ui::design_drag_latches;
+    // Armed, bare press inside the outline: this is the one case that moves.
+    assert!(design_drag_latches(true, false, false, true));
+    // Unarmed — the incident. A press inside the outline (a pan attempt, since
+    // navigation here is Ctrl-only) must grab nothing at all.
+    assert!(!design_drag_latches(true, false, false, false));
+    // Ctrl still wins outright, armed or not.
+    assert!(!design_drag_latches(true, true, false, true));
+    // A ✛ under the cursor beats the design even when armed.
+    assert!(!design_drag_latches(true, false, true, true));
+    // Nowhere near the design: nothing to latch.
+    assert!(!design_drag_latches(false, false, false, true));
+}
+
+/// Fix 1. The arm comes up OFF, is never persisted, and is dropped by every
+/// scene change — a new frame, a side switch, and undoing the offset.
+#[test]
+fn the_move_job_arm_defaults_off_and_is_dropped_on_every_scene_change() {
+    let db = tmp_db();
+    let mut app = ConsoleApp::new(db.clone(), vec!["true".into()]);
+    assert!(!app.fiducials.move_job, "a fresh console is not armed");
+    assert!(app.debug_summary().contains("move_job=false"));
+
+    // A side switch drops it (and any pending etch confirmation with it).
+    app.fiducials.move_job = true;
+    app.placement.etch_confirm = Some(EtchConfirm {
+        dev_mm: 9.0,
+        dev_deg: 0.0,
+        run_after: false,
+    });
+    app.set_side(Side::Back);
+    assert!(!app.fiducials.move_job, "a side switch disarms");
+    assert!(
+        app.placement.etch_confirm.is_none(),
+        "and drops a confirmation quoting the other face's fit"
+    );
+
+    // It is a gesture-level intent, not a setting: a save/reload cycle must not
+    // bring an armed console back.
+    app.fiducials.move_job = true;
+    app.save_settings_if_changed();
+    let reloaded = ConsoleApp::new(db, vec!["true".into()]);
+    assert!(
+        !reloaded.fiducials.move_job,
+        "the arm is never persisted across a restart"
+    );
+}
+
+/// Fix 1 + 3. Undoing an accidental drag puts the design back on the fitted
+/// pose — translation, rotation and scale — zeroes the offset, disarms the
+/// move, and clears any confirmation armed against the offset it just removed.
+#[test]
+fn recentring_zeroes_the_offset_and_disarms_the_move() {
+    let mut app = placed_app();
+    // The bench incident, reproduced: 17.7 mm down-right and +5.13°.
+    app.placement.tx_mm += 12.5;
+    app.placement.ty_mm -= 12.5;
+    app.placement.rot_deg = 5.13;
+    app.placement.scale = 1.02;
+    app.fiducials.move_job = true;
+    app.placement.etch_confirm = Some(EtchConfirm {
+        dev_mm: 17.68,
+        dev_deg: 5.13,
+        run_after: false,
+    });
+
+    let (mm, deg) = app
+        .placement_deviation()
+        .expect("there is a fit to measure");
+    assert!((mm - 17.68).abs() < 0.01, "17.7 mm off the pose: {mm}");
+    assert!((deg - 5.13).abs() < 0.01, "and +5.13°: {deg}");
+    let (ok, text) = app.placement_offset_text();
+    assert!(!ok, "which reads as a problem");
+    assert!(
+        text.contains("17.68 mm") && text.contains("+5.13°") && text.contains("off the fiducial"),
+        "and names both numbers: {text}"
+    );
+
+    app.recentre_on_fiducials();
+    let (mm, deg) = app.placement_deviation().unwrap();
+    assert!(
+        mm < 1e-9 && deg.abs() < 1e-9,
+        "back on the pose: {mm}, {deg}"
+    );
+    assert!(
+        (app.placement.scale - 1.0).abs() < 1e-9,
+        "including the fitted resize: {}",
+        app.placement.scale
+    );
+    assert!(app.placement.auto_pose, "and it is still an auto pose");
+    assert!(!app.fiducials.move_job, "recentring disarms the move");
+    assert!(
+        app.placement.etch_confirm.is_none(),
+        "and voids a confirmation for an offset that no longer exists"
+    );
+    assert!(
+        app.fiducials.note.contains("17.68 mm") && app.fiducials.note.contains("+5.13°"),
+        "the note says what was dropped: {}",
+        app.fiducials.note
+    );
+    let (ok, text) = app.placement_offset_text();
+    assert!(ok && text.contains("on the fiducial pose"), "{text}");
+}
+
+/// Fix 2 + 3. With no fit at all the deviation is not zero, it is undefined —
+/// and both the readout and the etch log say so rather than claiming the job
+/// is on a reference that does not exist.
+#[test]
+fn a_placement_with_no_fit_reports_no_fiducial_reference() {
+    let mut app = placed_app();
+    app.fiducials.last_fit = None;
+    assert!(app.placement_deviation().is_none());
+    let (ok, text) = app.placement_offset_text();
+    assert!(ok, "a manual placement is not an error");
+    assert!(
+        text.contains("manual placement — no fiducial reference"),
+        "{text}"
+    );
+    assert!(app.debug_summary().contains("fid_offset=no_fit"));
+
+    app.emit_at_placement(false);
+    let placed = app
+        .runtime
+        .log
+        .iter()
+        .find(|l| l.text.contains("job placed at"))
+        .expect("the etch logged its placement");
+    assert!(
+        placed
+            .text
+            .contains("manual placement — no fiducial reference"),
+        "the burn record says there was nothing to be off from: {}",
+        placed.text
+    );
+}
+
+/// Fix 2. A placement sitting on the fiducial pose etches on the first click,
+/// exactly as before — and the log line now states the offset even though it
+/// is zero, because "0.00 mm off" is the sentence that was missing.
+#[test]
+fn an_on_pose_etch_emits_on_the_first_click_and_still_logs_the_offset() {
+    let mut app = placed_app();
+    app.emit_at_placement(false);
+    assert!(
+        app.placement.etch_confirm.is_none(),
+        "nothing to confirm at zero offset"
+    );
+    let placed = app
+        .runtime
+        .log
+        .iter()
+        .find(|l| l.text.contains("job placed at"))
+        .expect("it exported");
+    assert!(
+        placed
+            .text
+            .contains("0.00 mm / +0.00° off the fiducial pose"),
+        "the offset is on the burn record unconditionally: {}",
+        placed.text
+    );
+}
+
+/// Fix 2. THE incident. A job dragged 17.7 mm and 5.13° off the pose it was
+/// registered at is not exported on the first click: the click reports both
+/// numbers and arms. The second click on the SAME button burns it.
+#[test]
+fn an_off_pose_etch_reports_the_offset_and_needs_a_second_click() {
+    let mut app = placed_app();
+    app.placement.tx_mm += 12.5;
+    app.placement.ty_mm -= 12.5;
+    app.placement.rot_deg = 5.13;
+
+    app.emit_at_placement(false);
+    assert!(
+        !app.runtime
+            .log
+            .iter()
+            .any(|l| l.text.contains("Etch here →")),
+        "the first click exported nothing"
+    );
+    let warn = app.runtime.log.last().expect("it said why");
+    assert!(warn.err, "and said it as a failure");
+    assert!(
+        warn.text.contains("NOT EXPORTED")
+            && warn.text.contains("17.7 mm")
+            && warn.text.contains("+5.1°")
+            && warn.text.contains("off the fiducial pose"),
+        "naming the offset: {}",
+        warn.text
+    );
+    assert!(
+        warn.text.contains("Click \"▶ Etch here (register)\" again")
+            && warn.text.contains("⊕ recentre on fiducials"),
+        "and both ways forward: {}",
+        warn.text
+    );
+    let confirm = app.placement.etch_confirm.expect("armed");
+    assert!(!confirm.run_after);
+    assert!(app.debug_summary().contains("etch_confirm=pending("));
+
+    // Second click on the same button: it goes.
+    app.emit_at_placement(false);
+    assert!(
+        app.placement.etch_confirm.is_none(),
+        "the confirmation is spent"
+    );
+    let placed = app
+        .runtime
+        .log
+        .iter()
+        .find(|l| l.text.contains("job placed at"))
+        .expect("the second click exported");
+    assert!(
+        placed.text.contains("17.68 mm") && placed.text.contains("+5.13°"),
+        "and the burn record carries the offset it was confirmed at: {}",
+        placed.text
+    );
+}
+
+/// Fix 2. A confirmation authorises ONE offset on ONE button. The other button
+/// cannot spend it — a mis-click on "🔥 Etch + Run" must not start a burn the
+/// operator only armed an export for — and neither can a placement that moved
+/// in between, which re-arms with the numbers actually on screen.
+#[test]
+fn an_etch_confirmation_does_not_transfer_between_buttons_or_survive_a_nudge() {
+    let mut app = placed_app();
+    app.placement.tx_mm += 17.0;
+    app.emit_at_placement(false);
+    assert!(app.placement.etch_confirm.is_some(), "armed for the export");
+
+    // The other button re-arms rather than firing.
+    app.emit_at_placement(true);
+    assert!(
+        !app.runtime
+            .log
+            .iter()
+            .any(|l| l.text.contains("Etch here →")),
+        "🔥 Etch + Run did not inherit ▶ Etch here's confirmation"
+    );
+    assert!(
+        app.placement.etch_confirm.expect("re-armed").run_after,
+        "it armed itself instead"
+    );
+
+    // A nudge between the two clicks invalidates the confirmation: the second
+    // click can only ever confirm the offset the operator was shown.
+    app.placement.tx_mm += 3.0;
+    app.emit_at_placement(true);
+    assert!(
+        !app.runtime
+            .log
+            .iter()
+            .any(|l| l.text.contains("Etch here →")),
+        "a moved placement is a new decision"
+    );
+    let confirm = app
+        .placement
+        .etch_confirm
+        .expect("re-armed with new numbers");
+    assert!(
+        (confirm.dev_mm - 20.0).abs() < 0.01,
+        "quoting the offset as it now is: {}",
+        confirm.dev_mm
+    );
+    // Untouched this time, so it goes.
+    app.emit_at_placement(true);
+    assert!(app.placement.etch_confirm.is_none(), "confirmed and spent");
+    assert!(
+        app.runtime
+            .log
+            .iter()
+            .any(|l| l.text.contains("Etch here →"))
+    );
+}
+
+/// Fix 2. The threshold itself: 0.4 mm and 0.4° are inside the fit tolerance
+/// the lock was accepted with and etch straight through; 0.6 mm alone is
+/// enough to stop.
+#[test]
+fn the_etch_confirmation_threshold_is_half_a_millimetre_and_half_a_degree() {
+    for (dx, rot, wants_confirm) in [
+        (0.4, 0.0, false),
+        (0.0, 0.4, false),
+        (0.6, 0.0, true),
+        (0.0, 0.6, true),
+        (0.0, -0.6, true),
+    ] {
+        let mut app = placed_app();
+        app.placement.tx_mm += dx;
+        app.placement.rot_deg = rot;
+        app.emit_at_placement(false);
+        assert_eq!(
+            app.placement.etch_confirm.is_some(),
+            wants_confirm,
+            "{dx} mm / {rot}° should{} need confirming",
+            if wants_confirm { "" } else { " not" }
+        );
+    }
+}
+
+/// A field calibration carrying a known uniform scale error, for the mirror
+/// tell's baseline. Only `scale` matters here; the rest is the smallest valid
+/// fit that will construct.
+fn field_cal_with_scale(scale: f64) -> calib::FieldCal {
+    use nalgebra::{Matrix3, Point2};
+    let coords = [0.0, 20.0, 40.0, 60.0];
+    let pairs: Vec<_> = coords
+        .iter()
+        .flat_map(|&y| {
+            coords
+                .iter()
+                .map(move |&x| (Point2::new(x, y), Point2::new(x, y)))
+        })
+        .collect();
+    calib::FieldCal {
+        field: vision::fit_field(&pairs).unwrap(),
+        paper_to_machine: calib::Rigid2::IDENTITY,
+        to_px: vision::Homography {
+            matrix: Matrix3::new(10.0, 0.0, 0.0, 0.0, -10.0, 800.0, 0.0, 0.0, 1.0),
+            residuals: vec![],
+            rms: 0.0,
+        },
+        dots: Vec::new(),
+        found: 16,
+        total: 16,
+        field_verdict: vision::classify_field_error(&[]),
+        scale,
+        extrapolated: 0,
+        rejected: 0,
+        rejection_note: String::new(),
+    }
+}
+
+/// Fix 4. The baseline a right-face fit is expected to land at.
+#[test]
+fn the_mirror_tell_baseline_follows_the_field_calibrations_scale() {
+    // No field map: the machine is assumed true, exactly as the tell shipped.
+    let mut app = ConsoleApp::new(tmp_db(), vec!["true".into()]);
+    assert!((app.mirror_scale_baseline() - 1.0).abs() < 1e-12);
+
+    // The operator's machine: 3.58% oversized, error left in the geometry.
+    app.calibration.field = Some(field_cal_with_scale(1.0358));
+    app.calibration.field_scale_used = calib::FieldScale::Refuse;
+    assert!((app.mirror_scale_baseline() - 1.0358).abs() < 1e-12);
+    app.calibration.field_scale_used = calib::FieldScale::DistortionOnly;
+    assert!(
+        (app.mirror_scale_baseline() - 1.0358).abs() < 1e-12,
+        "distortion-only leaves the scale error in the burn too"
+    );
+
+    // Compensated, the holes burn true and the baseline goes back to 1.0.
+    app.calibration.field_scale_used = calib::FieldScale::Compensate;
+    assert!((app.mirror_scale_baseline() - 1.0).abs() < 1e-12);
+
+    // An implausible baseline is not a machine, it is a bad calibration — fall
+    // back rather than build a tell on it.
+    app.calibration.field_scale_used = calib::FieldScale::Refuse;
+    for bad in [0.5, 1.5, f64::NAN, 0.0] {
+        app.calibration.field = Some(field_cal_with_scale(bad));
+        assert!(
+            (app.mirror_scale_baseline() - 1.0).abs() < 1e-12,
+            "baseline {bad} is refused"
+        );
+    }
+}
+
+/// Fix 4, acceptance (a). The regression that blocked the bench: on a machine
+/// whose field is 3.58% oversized, the drilled holes are oversized to match, so
+/// an honest front fit lands at ~1.021 — nowhere near 1.0, and past the
+/// half-way boundary the tell used to draw there. Twelve consecutive Checks
+/// were refused as `refused-mirror-scale`. Against the machine's own baseline
+/// the same fit is unremarkable.
+#[test]
+fn a_legitimate_front_fit_on_an_oversized_field_is_not_refused_as_a_mirror() {
+    let layout = crate::fiducial::parse_layout(SYM_LAYOUT).unwrap();
+    let (cx, cy) = SYM_CENTER;
+    // The logged fit: s = 1.0213, with m = 1.0229 and a field scale of 1.0358.
+    let s = 1.0213;
+    let detected: Vec<(f64, f64)> = layout
+        .iter()
+        .map(|&(x, y)| (cx + s * (x - cx), cy + s * (y - cy)))
+        .collect();
+    let mut app = mirror_gate_app(Side::Front, SYM_LAYOUT, &detected);
+    app.calibration.field = Some(field_cal_with_scale(1.0358));
+    app.calibration.field_scale_used = calib::FieldScale::Refuse;
+    app.update_placement_from_fiducials();
+
+    assert!(
+        app.fiducials.last_placed,
+        "a legitimate front fit must place: {}",
+        app.fiducials.note
+    );
+    let log = std::fs::read_to_string(app.runtime.diag.path()).unwrap();
+    assert!(
+        !log.contains("outcome=refused-mirror-scale"),
+        "and must not be called a wrong-face fit: {log}"
+    );
+}
+
+/// Fix 4, acceptance (b). The hazard still closes on that same machine: a board
+/// genuinely on the wrong face fits at the baseline times the exit
+/// magnification, and that is refused — with the baseline spelled out, since
+/// "not 1.0000" would be a lie here.
+#[test]
+fn a_flipped_board_on_an_oversized_field_is_still_refused() {
+    let layout = crate::fiducial::parse_layout(SYM_LAYOUT).unwrap();
+    let (cx, cy) = SYM_CENTER;
+    let b = 1.0358;
+    let s = b * exit_mag();
+    let detected: Vec<(f64, f64)> = layout
+        .iter()
+        .map(|&(x, y)| (cx + s * (x - cx), cy + s * (y - cy)))
+        .collect();
+    let mut app = mirror_gate_app(Side::Front, SYM_LAYOUT, &detected);
+    app.calibration.field = Some(field_cal_with_scale(b));
+    app.calibration.field_scale_used = calib::FieldScale::Refuse;
+    app.update_placement_from_fiducials();
+
+    assert!(
+        !app.fiducials.last_placed,
+        "a flipped board must not lock as Front: {}",
+        app.fiducials.note
+    );
+    assert!(
+        app.fiducials.note.contains("OTHER face") && app.fiducials.note.contains("1.0358"),
+        "the note names the baseline the fit was judged against: {}",
+        app.fiducials.note
+    );
+    let log = std::fs::read_to_string(app.runtime.diag.path()).unwrap();
+    assert!(
+        log.contains("outcome=refused-mirror-scale") && log.contains("baseline=1.035800"),
+        "and the log records it: {log}"
+    );
+}
+
+/// Fix 4. A fit that is nearer the wrong-face signature but sits on neither is
+/// not evidence of anything — most likely the baseline is wrong. Say so and
+/// keep placing, rather than refusing on a number the console cannot defend.
+#[test]
+fn a_scale_between_the_two_signatures_warns_instead_of_refusing() {
+    let layout = crate::fiducial::parse_layout(SYM_LAYOUT).unwrap();
+    let (cx, cy) = SYM_CENTER;
+    // Well past the midpoint towards m, but ~1.2% clear of it — four times
+    // MIRROR_TELL_MAX_DEV, so outside anything a real flip would produce.
+    let s = exit_mag() + 0.012;
+    let detected: Vec<(f64, f64)> = layout
+        .iter()
+        .map(|&(x, y)| (cx + s * (x - cx), cy + s * (y - cy)))
+        .collect();
+    let mut app = mirror_gate_app(Side::Front, SYM_LAYOUT, &detected);
+    app.update_placement_from_fiducials();
+
+    assert!(
+        app.fiducials.last_placed,
+        "an unprovable suspicion does not block the bench: {}",
+        app.fiducials.note
+    );
+    assert!(
+        app.fiducials.note.contains("too far from either to call")
+            && app.fiducials.note.contains("confirm which face is up"),
+        "but the operator is told what it looks like: {}",
+        app.fiducials.note
+    );
+    let log = std::fs::read_to_string(app.runtime.diag.path()).unwrap();
+    assert!(
+        log.contains("outcome=warned-mirror-scale-ambiguous"),
+        "and it is greppable: {log}"
+    );
+}

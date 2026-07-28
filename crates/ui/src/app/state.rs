@@ -388,11 +388,25 @@ pub(super) struct FiducialState {
     /// being overwritten. `None` (no applied Check yet, or the layout changed
     /// under it) means there is no offset to carry and the design re-centres.
     pub(super) last_fit: Option<calib::Similarity2>,
+    /// The operator has explicitly ARMED "drag the design to move the job".
+    ///
+    /// Without this, any plain drag that started inside the design's screen
+    /// bbox re-placed the job — including a pan attempt, since navigation is
+    /// Ctrl-only (`imgview::is_navigating`). That is how a registered board
+    /// silently acquired a 17.7 mm offset and 5° of rotation between the lock
+    /// and the burn.
+    ///
+    /// One-shot: cleared when the drag it authorised finishes, and on a new
+    /// frame or a side switch, so it can never be left armed across scenes. A
+    /// gesture-level intent, not a setting — never persisted, and it must come
+    /// up OFF after a restart.
+    pub(super) move_job: bool,
     /// Latched on `drag_started` when the pointer went down INSIDE the drawn
-    /// design: for the rest of that drag the gesture moves/rotates the job and
-    /// must not also drop a ✛ or add a click-placed fiducial. A per-frame local
-    /// can't hold it — the overlay function re-runs every frame — and it is a
-    /// gesture, not a setting, so it is never persisted.
+    /// design AND `move_job` was armed: for the rest of that drag the gesture
+    /// moves/rotates the job and must not also drop a ✛ or add a click-placed
+    /// fiducial. A per-frame local can't hold it — the overlay function re-runs
+    /// every frame — and it is a gesture, not a setting, so it is never
+    /// persisted.
     pub(super) design_drag: bool,
     /// Latched on `drag_started` when the pointer went down on an existing ✛:
     /// for the rest of that drag the gesture moves THAT marker (index into
@@ -401,6 +415,10 @@ pub(super) struct FiducialState {
     /// Beats `design_drag` — the design's hit test is a coarse bbox that
     /// usually contains the markers. A gesture, not a setting: never persisted.
     pub(super) marker_drag: Option<usize>,
+    /// What the in-flight canvas gesture grabbed and where it started, kept so
+    /// the `drag_stopped` record can state a delta rather than a position.
+    /// `Some` only between `drag_started` and `drag_stopped`.
+    pub(super) drag_origin: Option<DragOrigin>,
     pub(super) live: bool,
     /// When the detection ladder's stage 3 (the whole-frame rectangle match)
     /// last ran ON THE LIVE FEED, and whether that run recovered any holes.
@@ -414,6 +432,31 @@ pub(super) struct FiducialState {
     /// expires. Manual Checks never stamp this — they are not on the feed's
     /// budget. Runtime timing, not a setting: never persisted.
     pub(super) last_global_recover: Option<(std::time::Instant, bool)>,
+}
+
+/// One canvas gesture on the fiducial frame, as the diagnostic log describes
+/// it. The console recorded no pointer events at all, so attributing a job that
+/// moved between the lock and the burn meant fingerprinting placement affines
+/// after the fact; a started/stopped pair per gesture makes it a grep.
+#[derive(Debug, Clone)]
+pub(super) struct DragOrigin {
+    /// `marker` / `design` / `none` — which of the overlay's grab targets the
+    /// press latched onto, in the priority order `fid_frame_overlay` decides.
+    pub(super) target: &'static str,
+    /// The ✛ index, when `target` is `marker`.
+    pub(super) marker: Option<usize>,
+    /// Modifiers held at press, `+`-joined, or `none`. Ctrl means the gesture
+    /// was navigation and nothing was grabbed — the distinction that took
+    /// forensics to establish.
+    pub(super) modifiers: String,
+    /// Whether "move job" was armed at press. An unarmed press inside the
+    /// design is the pan attempt that used to re-place the job.
+    pub(super) armed: bool,
+    /// Native frame pixels, not screen: comparable across pan/zoom.
+    pub(super) start_px: (f64, f64),
+    /// Placement at press — `(tx_mm, ty_mm, rot_deg)`, so the stop record can
+    /// state what the gesture actually did to the job.
+    pub(super) start_place: (f64, f64, f64),
 }
 
 pub(super) struct PlacementState {
@@ -444,6 +487,26 @@ pub(super) struct PlacementState {
     /// Output `.lbrn2` path for "Emit drill holes" — separate from the etch
     /// output so the two exports never overwrite each other.
     pub(super) drill_lbrn2: String,
+    /// An etch click that was REFUSED because the placement sits far from the
+    /// fiducial-derived pose, holding the deviation it reported and which
+    /// button armed it. The next click on that same button emits; anything
+    /// that moves the placement in between re-arms with the new numbers, so a
+    /// confirmation can only ever confirm what the operator was shown.
+    pub(super) etch_confirm: Option<EtchConfirm>,
+}
+
+/// A pending "click again to etch at this offset" confirmation — see
+/// [`PlacementState::etch_confirm`].
+#[derive(Debug, Clone, Copy, PartialEq)]
+pub(super) struct EtchConfirm {
+    /// How far the placement is from the fiducial pose, bed mm / degrees, as
+    /// the refused click reported them.
+    pub(super) dev_mm: f64,
+    pub(super) dev_deg: f64,
+    /// `true` when the refused click was "🔥 Etch + Run"; the plain "▶ Etch
+    /// here" cannot confirm it, or a mis-click on the other button would start
+    /// a burn the operator never armed.
+    pub(super) run_after: bool,
 }
 
 pub(super) struct ArState {

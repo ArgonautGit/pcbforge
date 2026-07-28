@@ -4,7 +4,56 @@ use super::*;
 /// matches the CLI's `--field-seg-mm` default the etch path inherits.
 const DRILL_FIELD_SEG_MM: f64 = 0.25;
 
+/// How far the placement may sit from the fiducial-derived pose before "Etch
+/// here" stops emitting on the first click and states the numbers instead.
+///
+/// 0.5 mm is not arbitrary: it is [`POSE_MAX_RMS_MM`], the residual above which
+/// the console already refuses to trust a fiducial fit at all. An offset the
+/// registration itself would call a failure has to be deliberate before it is
+/// burned; anything under it is inside the tolerance the lock was accepted
+/// with, and gating there would just teach the operator to click twice.
+///
+/// 0.5° is the rotational match: on a 50 mm board it puts the corners about
+/// 0.44 mm out, the same error at the same scale.
+///
+/// [`POSE_MAX_RMS_MM`]: super::fiducial_ui::POSE_MAX_RMS_MM
+const ETCH_DEVIATION_MAX_MM: f64 = 0.5;
+const ETCH_DEVIATION_MAX_DEG: f64 = 0.5;
+
+/// How far the placement may drift and still count as "the same offset the
+/// operator was shown". Past this the confirmation is re-armed with fresh
+/// numbers, so a second click can only ever confirm what was actually on
+/// screen — a nudge between the two clicks does not ride through on the first
+/// click's authority. Deliberately tight: a re-arm costs one extra click, a
+/// stale confirmation costs a board.
+const ETCH_CONFIRM_EPS_MM: f64 = 0.05;
+const ETCH_CONFIRM_EPS_DEG: f64 = 0.05;
+
 impl ConsoleApp {
+    /// The carried manual offset as the operator should read it, plus whether
+    /// it is small enough to be uninteresting (drives the status colour).
+    ///
+    /// One formatter for both places it appears — beside the ⊕ recentre button
+    /// that undoes it, and beside the x/y/rot fields the etch burns — so the
+    /// two can never quote different numbers for the same state.
+    pub(super) fn placement_offset_text(&self) -> (bool, String) {
+        match self.placement_deviation() {
+            None => (true, "manual placement — no fiducial reference".into()),
+            Some((mm, deg))
+                if mm <= ETCH_DEVIATION_MAX_MM && deg.abs() <= ETCH_DEVIATION_MAX_DEG =>
+            {
+                (
+                    true,
+                    format!("on the fiducial pose ({mm:.2} mm / {deg:+.2}°)"),
+                )
+            }
+            Some((mm, deg)) => (
+                false,
+                format!("⚠ {mm:.2} mm / {deg:+.2}° off the fiducial pose"),
+            ),
+        }
+    }
+
     /// The frame the placement is measured against, in pixels: the fiducial
     /// frame the pose was fitted in, else the last camera grab. Only the
     /// DIMENSIONS matter — they are what `place_projection` validates the lens
@@ -159,6 +208,10 @@ impl ConsoleApp {
         // The other face's fit is not a frame this face's placement can be
         // measured against, so there is no offset to carry into its first Check.
         self.fiducials.last_fit = None;
+        // An arm earned on the other face must not survive into this one, and
+        // an etch confirmation quotes a deviation from a fit that is now gone.
+        self.fiducials.move_job = false;
+        self.placement.etch_confirm = None;
         // The other face's measurements are in a mirrored frame — not a layout
         // this side could adopt.
         self.fiducials.detected_mm.clear();
@@ -303,6 +356,48 @@ impl ConsoleApp {
             });
             return;
         };
+        // Nothing before this point ever compared the placement being burned
+        // with the pose the fiducials fitted. It is the whole incident: a
+        // registered board picked up 17.7 mm and 5° from a stray drag, and
+        // "Etch here" burned that pose as readily as the locked one, saying only
+        // where it had landed — a number that means nothing without the one it
+        // was supposed to land on.
+        let deviation = self.placement_deviation();
+        if let Some((dev_mm, dev_deg)) = deviation
+            && (dev_mm > ETCH_DEVIATION_MAX_MM || dev_deg.abs() > ETCH_DEVIATION_MAX_DEG)
+        {
+            // A confirmation is good only for the button that raised it and for
+            // the offset it quoted; anything else re-arms rather than emits.
+            let confirmed = self.placement.etch_confirm.is_some_and(|c| {
+                c.run_after == run_after
+                    && (c.dev_mm - dev_mm).abs() <= ETCH_CONFIRM_EPS_MM
+                    && (c.dev_deg - dev_deg).abs() <= ETCH_CONFIRM_EPS_DEG
+            });
+            if !confirmed {
+                self.placement.etch_confirm = Some(EtchConfirm {
+                    dev_mm,
+                    dev_deg,
+                    run_after,
+                });
+                let button = if run_after {
+                    "🔥 Etch + Run"
+                } else {
+                    "▶ Etch here (register)"
+                };
+                self.runtime.log.push(LogLine {
+                    text: format!(
+                        "NOT EXPORTED — placement is {dev_mm:.1} mm / {dev_deg:+.1}° off the \
+                         fiducial pose. Click \"{button}\" again to burn it where it now sits, \
+                         or \"⊕ recentre on fiducials\" to put the design back on the holes."
+                    ),
+                    err: true,
+                });
+                return;
+            }
+        }
+        // Either confirmed or never in doubt — and in both cases the next click
+        // starts from a clean slate.
+        self.placement.etch_confirm = None;
         // Field-warp when a valid calibration for THIS frame + the map file
         // exist; otherwise export unwarped with a warning (operator's call).
         let field_path = self.field_map_path();
@@ -369,9 +464,19 @@ impl ConsoleApp {
         // Make the placement + the exact output path explicit in the log — the
         // register output is its own file (not the Job-tab emit), and this is
         // the position it bakes in.
+        //
+        // The offset from the fiducial pose rides on this line UNCONDITIONALLY,
+        // including when it is zero. It used to appear only as a clause in the
+        // Fiducial-check tab's note, on another tab, and only once it was
+        // non-trivial — so the log of the burn itself, the record anyone reads
+        // afterwards, never said whether the job went where the holes put it.
+        let offset_note = match deviation {
+            Some((mm, deg)) => format!(" · {mm:.2} mm / {deg:+.2}° off the fiducial pose"),
+            None => " · manual placement — no fiducial reference".into(),
+        };
         self.runtime.log.push(LogLine {
             text: format!(
-                "Etch here → {out}\n  job placed at ({:.2}, {:.2}) mm, {:.1}°{field_note} — OPEN THIS FILE (not the Job-tab emit output)",
+                "Etch here → {out}\n  job placed at ({:.2}, {:.2}) mm, {:.1}°{offset_note}{field_note} — OPEN THIS FILE (not the Job-tab emit output)",
                 self.placement.tx_mm, self.placement.ty_mm, self.placement.rot_deg
             ),
             err: false,
@@ -1011,6 +1116,21 @@ impl ConsoleApp {
         if off && ui.button("reset scale to 1.000").clicked() {
             self.placement.scale = 1.0;
         }
+        // How far the job has been nudged off the pose the fiducials fitted —
+        // next to the x/y/rot that will be burned, because this is the panel
+        // the operator is looking at when they press Etch. The undo for it is
+        // ⊕ recentre on fiducials, named here so it can be found from the
+        // number rather than only by browsing the other tab's toolbar.
+        let (on_pose, offset_text) = self.placement_offset_text();
+        ui.colored_label(status_color(on_pose), offset_text)
+            .on_hover_text(
+                "Distance and rotation between this placement and the pose the last \
+                 applied fiducial Check put it at. A manual drag is carried across \
+                 later Checks on purpose, so it persists until it is undone: \
+                 \"⊕ recentre on fiducials\" on the Fiducial-check tab drops it. \
+                 Past 0.5 mm / 0.5° an etch click reports the offset and waits for \
+                 a second click.",
+            );
         ui.label(egui::RichText::new(&self.placement.note).weak());
         ui.weak(
             "Uses the Job-tab Gerbers; drag the design on the Fiducial-check tab. \

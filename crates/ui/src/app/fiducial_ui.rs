@@ -5,7 +5,7 @@ use super::*;
 /// Reject an auto-placement whose fiducial fit residual (RMS over the detected
 /// holes) exceeds this — a loose fit means the pairing or the layout is wrong,
 /// and silently moving the job would be worse than leaving it.
-const POSE_MAX_RMS_MM: f64 = 0.5;
+pub(super) const POSE_MAX_RMS_MM: f64 = 0.5;
 
 /// Band the fiducial fit's uniform scale must land in for the placement to be
 /// applied. The fit is a similarity, so it ABSORBS a spacing mismatch instead
@@ -33,6 +33,26 @@ pub(super) const POSE_SCALE_QUIET: f64 = 0.001;
 /// genuine machine-scale error, so the tell is not used and the ambiguity is
 /// only reported.
 const MIRROR_TELL_MIN_M: f64 = 1.005;
+
+/// How close the fitted scale must sit to the wrong-face signature before the
+/// tell is allowed to refuse a placement, in scale units.
+///
+/// Nearest-signature is necessary but not sufficient. The two signatures are
+/// only ~2.3% apart at the reference optics, so "nearer the wrong one" covers
+/// everything past a 1.1% boundary — including scales that are neither, which
+/// is precisely what a wrong baseline produces. A board that really is on the
+/// wrong face lands on its signature to within the fit's own residual (the
+/// swapped correspondence reduces to an exact magnification about the
+/// centroid), so 0.4% is generous for the case being caught while leaving the
+/// ambiguous middle to the warning path.
+const MIRROR_TELL_MAX_DEV: f64 = 0.004;
+
+/// Plausibility band for a field-calibration scale used as the mirror tell's
+/// baseline — the same band the fitted pose scale itself has to land in. A
+/// baseline outside it is not a machine, it is a bad calibration, and a tell
+/// built on it would be worse than the `1.0` assumption it replaces.
+const MIRROR_BASELINE_MIN: f64 = POSE_SCALE_MIN;
+const MIRROR_BASELINE_MAX: f64 = POSE_SCALE_MAX;
 
 /// Bounds for the whole-frame recovery ([`ConsoleApp::locate_fid_markers_globally`]).
 ///
@@ -172,6 +192,46 @@ fn wrap_deg(mut deg: f64) -> f64 {
     deg
 }
 
+/// Whether a press should latch a job MOVE, given what it landed on.
+///
+/// A free function so the rule is testable: the overlay it is called from is a
+/// canvas, and canvas gestures are the one part of this console that cannot be
+/// driven through the accessibility tree.
+///
+/// The precedence it encodes, highest first: navigation (Ctrl) grabs nothing; a
+/// ✛ under the cursor beats the design's coarse bbox; and the design moves only
+/// when the operator armed it.
+pub(super) fn design_drag_latches(
+    on_design: bool,
+    navigating: bool,
+    grabbed_marker: bool,
+    move_job_armed: bool,
+) -> bool {
+    on_design && !navigating && !grabbed_marker && move_job_armed
+}
+
+/// The modifier keys held right now, `+`-joined, for the drag records — `none`
+/// when the gesture is bare. Ctrl/Cmd is the whole difference between a
+/// navigation gesture and one that grabs something, so it has to be on the
+/// record rather than inferred from what the gesture went on to do.
+fn modifier_token(ui: &egui::Ui) -> String {
+    let m = ui.input(|i| i.modifiers);
+    let held: Vec<&str> = [
+        (m.ctrl, "ctrl"),
+        (m.command, "cmd"),
+        (m.shift, "shift"),
+        (m.alt, "alt"),
+    ]
+    .into_iter()
+    .filter_map(|(on, name)| on.then_some(name))
+    .collect();
+    if held.is_empty() {
+        "none".into()
+    } else {
+        held.join("+")
+    }
+}
+
 impl ConsoleApp {
     /// Load the fiducial frame into memory + a texture and seed the search
     /// markers from the design layout (so they start near nominal, ready to
@@ -247,6 +307,11 @@ impl ConsoleApp {
         self.fiducials.frame_tex =
             Some(ctx.load_texture("fid-frame", color, TextureOptions::NEAREST));
         self.fiducials.frame_img = Some(img);
+        // A new frame is a new scene: whatever the arm was for, it was for the
+        // photo that just went away. (The Live path deliberately does NOT
+        // disarm — it replaces the frame every tick, and doing so there would
+        // make the arm unusable under a live feed.)
+        self.fiducials.move_job = false;
         self.fiducials.note =
             "click each ✛ onto its hole in layout order — the last click checks (or 🎯 Check as-is)"
                 .into();
@@ -451,6 +516,77 @@ impl ConsoleApp {
         self.fiducials.note = format!("removed fiducial #{i}  ·  {} left", kept.len());
     }
 
+    /// What a RIGHT-face fiducial fit is expected to land at on this machine —
+    /// the baseline both wrong-face signatures are measured from.
+    ///
+    /// `1.0` is only correct on a machine whose field is the size it claims.
+    /// The ③ laser-field calibration measures exactly that discrepancy
+    /// (`FieldCal::scale`: burned size / commanded size), and the fiducial holes
+    /// were drilled by this machine — so when the error is left in the geometry,
+    /// the holes are that much oversized and every honest fit lands there, not
+    /// at 1.0.
+    ///
+    /// Which makes the scale mode decisive rather than incidental:
+    /// [`Compensate`](calib::FieldScale::Compensate) pre-divides the error out
+    /// of what is emitted, so those holes burn true and the baseline goes back
+    /// to 1.0. `Refuse` and `DistortionOnly` both leave it in.
+    ///
+    /// Acceptance is deliberately NOT required. The scale error is a physical
+    /// property of the machine that the holes carry whether or not the operator
+    /// accepted the fit that measured it; gating on acceptance would restore
+    /// the 1.0 assumption for exactly the operator who has already seen the
+    /// warning and kept working.
+    pub(super) fn mirror_scale_baseline(&self) -> f64 {
+        let Some(field) = self.calibration.field.as_ref() else {
+            return 1.0;
+        };
+        if self.calibration.field_scale_used == calib::FieldScale::Compensate {
+            return 1.0;
+        }
+        if !field.scale.is_finite()
+            || !(MIRROR_BASELINE_MIN..=MIRROR_BASELINE_MAX).contains(&field.scale)
+        {
+            return 1.0;
+        }
+        field.scale
+    }
+
+    /// Where the last applied Check WOULD put the design with no manual offset
+    /// carried — `(tx_mm, ty_mm, rot_deg, scale)` in bed mm. This is the
+    /// "fiducial pose": the reference every manual nudge is measured against.
+    ///
+    /// `None` when there is no fit to measure against (no applied Check yet, a
+    /// side switch, a layout edit) or the layout no longer parses.
+    pub(super) fn fiducial_pose(&self) -> Option<(f64, f64, f64, f64)> {
+        let fit = self.fiducials.last_fit?;
+        let layout = fiducial::parse_layout(&self.fiducials.layout).ok()?;
+        if layout.is_empty() {
+            return None;
+        }
+        let n = layout.len() as f64;
+        let b0 = (
+            layout.iter().map(|p| p.0).sum::<f64>() / n,
+            layout.iter().map(|p| p.1).sum::<f64>() / n,
+        );
+        let (tx, ty) = fit.apply(b0);
+        Some((tx, ty, fit.angle_deg(), fit.scale))
+    }
+
+    /// How far the CURRENT placement sits from the fiducial pose:
+    /// `(translation mm, rotation degrees)`, the rotation wrapped to ±180 so a
+    /// nudge past the wrap point still reads as a small number.
+    ///
+    /// `None` means there is no fiducial reference at all — a purely manual
+    /// placement, which is a different statement from "zero offset" and is
+    /// reported as such rather than as 0.00 mm.
+    pub(super) fn placement_deviation(&self) -> Option<(f64, f64)> {
+        let (tx, ty, rot, _) = self.fiducial_pose()?;
+        Some((
+            (self.placement.tx_mm - tx).hypot(self.placement.ty_mm - ty),
+            wrap_deg(self.placement.rot_deg - rot),
+        ))
+    }
+
     /// Drop the carried manual offset: put the design back exactly where a
     /// fresh, un-nudged Check would put it — on the fiducial-layout centroid,
     /// at the fitted rotation and scale.
@@ -468,35 +604,35 @@ impl ConsoleApp {
     ///
     /// [`update_placement_from_fiducials`]: Self::update_placement_from_fiducials
     pub(super) fn recentre_on_fiducials(&mut self) {
-        let Some(fit) = self.fiducials.last_fit else {
+        if self.fiducials.last_fit.is_none() {
             self.fiducials.note =
                 "nothing to recentre against — check fiducials first, so there is a fit to \
                  centre the design on"
                     .into();
             return;
-        };
-        let Ok(layout) = fiducial::parse_layout(&self.fiducials.layout) else {
+        }
+        let Some((tx, ty, rot, scale)) = self.fiducial_pose() else {
             self.fiducials.note = "recentre needs a valid layout".into();
             return;
         };
-        let n = layout.len() as f64;
-        let b0 = (
-            layout.iter().map(|p| p.0).sum::<f64>() / n,
-            layout.iter().map(|p| p.1).sum::<f64>() / n,
-        );
-        let before = (self.placement.tx_mm, self.placement.ty_mm);
-        let (tx, ty) = fit.apply(b0);
+        let (moved, turned) = self.placement_deviation().unwrap_or((0.0, 0.0));
         self.placement.tx_mm = tx;
         self.placement.ty_mm = ty;
-        self.placement.rot_deg = fit.angle_deg();
-        self.placement.scale = fit.scale;
+        self.placement.rot_deg = rot;
+        self.placement.scale = scale;
         // Still an auto pose — this IS the fitted placement, so a later Load
         // must not recentre over it either.
         self.placement.auto_pose = true;
-        let moved = (tx - before.0).hypot(ty - before.1);
+        // The offset is gone, so a confirmation armed against it describes a
+        // placement that no longer exists — and the next etch click is once
+        // again an ordinary one.
+        self.placement.etch_confirm = None;
+        // Undoing an accidental drag must not leave the tab ready to make
+        // another one.
+        self.fiducials.move_job = false;
         self.fiducials.note = format!(
-            "recentred on the fiducials — dropped a {moved:.2} mm manual offset; design is \
-             back at the layout centroid (rot {:+.2}°, scale {:.4})",
+            "recentred on the fiducials — dropped a {moved:.2} mm / {turned:+.2}° manual offset; \
+             design is back at the layout centroid (rot {:+.2}°, scale {:.4})",
             self.placement.rot_deg, self.placement.scale
         );
     }
@@ -1405,20 +1541,76 @@ impl ConsoleApp {
         // physically flipped, 1/m when Back is selected and it never was.
         // Nearest-signature wins, so a genuine machine-scale error of a few
         // tenths of a percent is still read as a legitimate fit.
+        //
+        // What "right-face lands at 1.0" quietly assumed is a machine whose
+        // field is the size it says it is. It shipped that way and immediately
+        // cost a bench: on a machine 3.58% oversized with the scale error left
+        // uncompensated, the drilled holes come out 3.58% oversized too, so a
+        // perfectly legitimate front fit lands near the FIELD scale, not near
+        // 1.0 — far enough past the half-way boundary that the tell fired on
+        // every honest Check (twelve consecutive `refused-mirror-scale`), and
+        // registration on that machine was simply unavailable. The two
+        // signatures are `b` and `b·m` (or `b/m`), where `b` is what a right-
+        // face fit is expected to land at; the old code was the `b = 1` case.
         let symmetric = fiducial::layout_is_mirror_symmetric(&layout);
         let mag = self.exit_magnification();
+        let base = self.mirror_scale_baseline();
         if symmetric && mag >= MIRROR_TELL_MIN_M {
-            let tell = if flipped_expected { 1.0 / mag } else { mag };
-            if (pose.scale - tell).abs() < (pose.scale - 1.0).abs() {
+            let tell = if flipped_expected {
+                base / mag
+            } else {
+                base * mag
+            };
+            let to_tell = (pose.scale - tell).abs();
+            let to_base = (pose.scale - base).abs();
+            // Nearest-signature ALONE would call anything past the midpoint a
+            // wrong face, including a scale that is nowhere near either — which
+            // is how a bad baseline turns into a refusal the operator cannot
+            // argue with. Requiring the fit to actually sit ON the wrong-face
+            // signature keeps the accusation falsifiable; a genuine flip lands
+            // there within the fit's own noise, since the swapped
+            // correspondence leaves a near-exact magnification behind.
+            if to_tell < to_base && to_tell <= MIRROR_TELL_MAX_DEV {
+                let baseline_note = if (base - 1.0).abs() > POSE_SCALE_QUIET {
+                    format!(
+                        " (a right-face fit on this machine is expected at {base:.4}, from the \
+                         laser-field calibration's measured {:+.2}% scale error)",
+                        (base - 1.0) * 100.0
+                    )
+                } else {
+                    String::new()
+                };
                 self.fiducials.note.push_str(&format!(
-                    "  ·  fiducial fit scale {:.4} matches the OTHER face ({tell:.4}), not 1.0 \
-                     — this layout is mirror-symmetric, so the holes fit either way round and \
-                     the mirror check cannot see it. Check which face is up and which side is \
-                     selected. Placement not updated.",
+                    "  ·  fiducial fit scale {:.4} matches the OTHER face ({tell:.4}), not \
+                     {base:.4}{baseline_note} — this layout is mirror-symmetric, so the holes fit \
+                     either way round and the mirror check cannot see it. Check which face is up \
+                     and which side is selected. Placement not updated.",
                     pose.scale
                 ));
-                self.diag_check_outcome("refused-mirror-scale");
+                self.diag_check_outcome(&format!(
+                    "refused-mirror-scale baseline={base:.6} tell={tell:.6} scale={:.6}",
+                    pose.scale
+                ));
                 return;
+            }
+            if to_tell < to_base {
+                // Leaning towards the wrong-face signature but not sitting on
+                // it: either the board really is flipped AND something else is
+                // off, or the baseline is wrong. Neither is a fact worth
+                // refusing a placement over, so this degrades to the same
+                // warning the no-tell case gets — the operator keeps working
+                // and is told what the fit looks like.
+                self.fiducials.note.push_str(&format!(
+                    "  ·  fiducial fit scale {:.4} sits between a right-face fit ({base:.4}) and \
+                     the OTHER face's signature ({tell:.4}) — too far from either to call, and \
+                     this layout is mirror-symmetric so the mirror check cannot help. Placement \
+                     applied; confirm which face is up.",
+                    pose.scale
+                ));
+                self.diag_check_outcome(&format!(
+                    "warned-mirror-scale-ambiguous baseline={base:.6} tell={tell:.6} scale={:.6}",
+                    pose.scale
+                ));
             }
         } else if symmetric {
             // No usable tell: the two faces really are indistinguishable from
@@ -1726,6 +1918,16 @@ impl ConsoleApp {
                      (needs the Job-tab Gerbers and a camera calibration). A fiducial \
                      lock loads the job automatically.",
                 );
+            // Armed explicitly, never implicitly: an unarmed drag across the
+            // design is a pan attempt, not a re-registration.
+            ui.checkbox(&mut self.fiducials.move_job, "✋ move job (drag)")
+                .on_hover_text(
+                    "Arm dragging the placed job: while this is ticked, a drag that \
+                     starts on the design MOVES it (Shift+drag rotates about its \
+                     pivot). It clears itself as soon as one drag finishes, and on a \
+                     new frame or a side switch — so a stray drag can never re-place \
+                     a registered job. Pan/zoom stays on Ctrl either way.",
+                );
             ui.checkbox(&mut self.fiducials.click_place, "✚ click-to-place")
                 .on_hover_text(
                     "Left-click an empty spot to add an expected fiducial; \
@@ -1753,6 +1955,11 @@ impl ConsoleApp {
             {
                 self.clear_fid_markers();
             }
+            // The offset the button undoes, stated right beside it: the only
+            // place it used to appear was a clause deep in the note line, and
+            // then only while it happened to be the newest thing there.
+            let (on_pose, offset_text) = self.placement_offset_text();
+            ui.colored_label(status_color(on_pose), offset_text);
             if ui
                 .add_enabled(
                     self.fiducials.last_fit.is_some(),
@@ -1760,8 +1967,10 @@ impl ConsoleApp {
                 )
                 .on_hover_text(
                     "Drop any manual offset and put the design back on the fiducial \
-                     centroid at the fitted rotation and scale. Dragging the design is \
-                     carried across re-Checks on purpose — this is how you undo one.",
+                     centroid at the fitted rotation and scale — and disarm ✋ move job. \
+                     Dragging the design is carried across re-Checks on purpose; this is \
+                     how you undo one. Disabled until a Check has produced a fit to \
+                     centre on.",
                 )
                 .clicked()
             {
@@ -1993,13 +2202,23 @@ impl ConsoleApp {
         // a ✛:
         //   1. Ctrl (pan/zoom) — navigation always wins, nothing is grabbed.
         //   2. A ✛ within MARKER_GRAB_PX — dragged onto its hole.
-        //   3. The design's bounding box — moved (Shift rotates).
+        //   3. The design's bounding box, but ONLY while ✋ move job is armed —
+        //      moved (Shift rotates).
         //   4. Nothing: the release marks/places fiducials as before.
         // The marker is tested FIRST on purpose. The design's handle is a coarse
         // screen-space bbox that almost always contains the markers, so testing
         // it first would make an existing ✛ ungrabbable whenever the outline is
         // shown. One consequence, since the marker wins outright: a Shift+drag
         // that starts on a ✛ drags the marker instead of rotating the design.
+        //
+        // Step 3's arming is what closes the incident this gate exists for.
+        // Navigation here is Ctrl-only, so an operator who drags to pan without
+        // holding it lands in the design's bbox — which used to re-place a
+        // registered job silently, and with Shift to rotate it too. Unarmed, a
+        // bare drag now falls through to case 4 and does NOTHING to the job:
+        // deliberately not "pans instead", because pan/zoom on every canvas in
+        // this console is Ctrl, and making one surface pan bare would make the
+        // convention the operator relies on conditional.
         if resp.drag_started() {
             let grabbed = resp
                 .interact_pointer_pos()
@@ -2012,7 +2231,32 @@ impl ConsoleApp {
                 _ => false,
             };
             self.fiducials.marker_drag = grabbed;
-            self.fiducials.design_drag = on_design && !nav && grabbed.is_none();
+            self.fiducials.design_drag =
+                design_drag_latches(on_design, nav, grabbed.is_some(), self.fiducials.move_job);
+            let target = if grabbed.is_some() {
+                "marker"
+            } else if self.fiducials.design_drag {
+                "design"
+            } else {
+                "none"
+            };
+            let origin = DragOrigin {
+                target,
+                marker: grabbed,
+                modifiers: modifier_token(ui),
+                armed: self.fiducials.move_job,
+                start_px: resp
+                    .interact_pointer_pos()
+                    .map(|p| xf.to_native(p))
+                    .unwrap_or((f64::NAN, f64::NAN)),
+                start_place: (
+                    self.placement.tx_mm,
+                    self.placement.ty_mm,
+                    self.placement.rot_deg,
+                ),
+            };
+            self.diag_drag_started(&origin);
+            self.fiducials.drag_origin = Some(origin);
         }
         // Move the grabbed ✛ with the cursor. The screen delta goes through the
         // SAME `to_mm` the click handler uses — as the difference of the two
@@ -2082,9 +2326,21 @@ impl ConsoleApp {
         // of either drag can't slip a marker through.
         let marking_allowed = self.fid_marking_allowed();
         if resp.drag_stopped() {
+            // The arm is one-shot: it authorises THIS gesture and no more, so
+            // it can never be left standing across a re-Check, a new frame or a
+            // walk away from the bench.
+            if self.fiducials.design_drag {
+                self.fiducials.move_job = false;
+            }
             self.fiducials.design_drag = false;
             // Takes the marker latch and re-checks if one was held.
             self.fid_marker_drag_release();
+            // After the release handlers, so the record carries the placement
+            // the gesture finally left behind.
+            if let Some(origin) = self.fiducials.drag_origin.take() {
+                let end_px = resp.interact_pointer_pos().map(|p| xf.to_native(p));
+                self.diag_drag_stopped(&origin, end_px);
+            }
         }
 
         // Click-to-place (FLD-12): hit-test add (empty spot) vs. remove

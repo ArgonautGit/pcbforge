@@ -208,6 +208,68 @@ impl ConsoleApp {
         self.diag(&record);
     }
 
+    /// Record 2d: a canvas gesture on the fiducial frame began.
+    ///
+    /// Two records per completed gesture — this and
+    /// [`diag_drag_stopped`](Self::diag_drag_stopped) — which is why this pair
+    /// does not break the module's no-per-frame rule: a press and a release are
+    /// operator actions, however many frames the drag between them spans.
+    ///
+    /// Carries `check=N` like the rest of the fiducial family: a drag that
+    /// moved the job after check 7 is the thing a reader of check 7 needs to
+    /// see, and without it the only trace was the placement affine itself.
+    pub(super) fn diag_drag_started(&mut self, origin: &DragOrigin) {
+        let seq = self.runtime.diag_check_seq;
+        let record = format!(
+            "fid-drag check={seq} phase=started target={} marker={} modifiers={} move_job_armed={} \
+             start_px={:.1},{:.1} place tx={:.3} ty={:.3} rot_deg={:+.4}",
+            origin.target,
+            match origin.marker {
+                Some(i) => i.to_string(),
+                None => "-".into(),
+            },
+            origin.modifiers,
+            origin.armed,
+            origin.start_px.0,
+            origin.start_px.1,
+            origin.start_place.0,
+            origin.start_place.1,
+            origin.start_place.2,
+        );
+        self.diag(&record);
+    }
+
+    /// Record 2e: the same gesture released, with what it did to the placement.
+    ///
+    /// `place_delta_mm` is zero for every gesture that was not a job move —
+    /// which is the point: a long drag across the design with `target=none`
+    /// (unarmed) reads as an attempted pan that correctly moved nothing.
+    pub(super) fn diag_drag_stopped(&mut self, origin: &DragOrigin, end_px: Option<(f64, f64)>) {
+        let seq = self.runtime.diag_check_seq;
+        let end = end_px.unwrap_or(origin.start_px);
+        let (dx, dy) = (
+            self.placement.tx_mm - origin.start_place.0,
+            self.placement.ty_mm - origin.start_place.1,
+        );
+        let record = format!(
+            "fid-drag check={seq} phase=stopped target={} modifiers={} move_job_armed={} \
+             start_px={:.1},{:.1} end_px={end_x:.1},{end_y:.1} px_delta={:.1},{:.1} \
+             place_delta_mm={dx:.3},{dy:.3} moved_mm={:.3} rot_delta_deg={:+.4}",
+            origin.target,
+            origin.modifiers,
+            origin.armed,
+            origin.start_px.0,
+            origin.start_px.1,
+            end.0 - origin.start_px.0,
+            end.1 - origin.start_px.1,
+            dx.hypot(dy),
+            self.placement.rot_deg - origin.start_place.2,
+            end_x = end.0,
+            end_y = end.1,
+        );
+        self.diag(&record);
+    }
+
     /// Record 3: where the drawn design actually sits, in machine mm.
     ///
     /// Two numbers, because they fail differently. The **affine** bbox is the
