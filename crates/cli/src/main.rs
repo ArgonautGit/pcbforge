@@ -1882,11 +1882,15 @@ fn register_cmd(a: RegisterArgs) -> Result<(), Box<dyn std::error::Error>> {
     }
 
     let fit = vision::fit_affine(&pairs).map_err(|e| e.to_string())?;
-    eprintln!(
-        "register: fit {} fiducials, residual RMS {:.1} µm",
-        pairs.len(),
-        fit.rms * 1000.0
-    );
+    if pairs.len() == 3 {
+        eprintln!("register: exact 3-point fit (no redundancy - residual is not a check)");
+    } else {
+        eprintln!(
+            "register: fit {} fiducials, residual RMS {:.1} µm",
+            pairs.len(),
+            fit.rms * 1000.0
+        );
+    }
     // Fail closed: `NaN > x` is false, so a plain `>` would wave a NaN fit
     // straight through the acceptance gate and into machine coordinates.
     if !fit.rms.is_finite() || fit.rms > a.max_rms_mm {

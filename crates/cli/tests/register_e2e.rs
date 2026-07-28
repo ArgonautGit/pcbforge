@@ -274,10 +274,29 @@ fn frame_detection_path_fits_and_emits() {
     );
     assert!(ok, "frame register succeeds; stderr: {stderr}");
     assert!(
-        stderr.contains("fit 3 fiducials"),
+        stderr.contains("exact 3-point fit"),
         "detected all three: {stderr}"
     );
     assert!(!verts(&doc).is_empty(), "job has geometry");
+}
+
+/// With exactly 3 correspondences the affine fit is exact by construction, so
+/// the RMS line would always read 0.0 — misleading rather than informative.
+/// register should say so instead of printing a fake residual.
+#[test]
+fn three_point_fit_flags_no_redundancy_instead_of_rms() {
+    let (ok, _, stderr) = register(
+        &[
+            "--fiducials",
+            "131,-92=181,-62; 146,-92=196,-62; 131,-81=181,-51",
+        ],
+        "three.lbrn2",
+    );
+    assert!(ok, "three-point register succeeds; stderr: {stderr}");
+    assert!(
+        stderr.contains("exact 3-point fit (no redundancy - residual is not a check)"),
+        "stderr: {stderr}"
+    );
 }
 
 /// The required `--field-map` bakes the laser field pre-distortion into the
