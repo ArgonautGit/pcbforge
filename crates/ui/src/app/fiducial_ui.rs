@@ -784,7 +784,7 @@ impl ConsoleApp {
     /// the apply, so it is written that way rather than by clearing `last_fit`
     /// and asking the operator to Check again.
     ///
-    /// [`update_placement_from_fiducials`]: Self::update_placement_from_fiducials
+    /// [`update_placement_from_fiducials`]: Self::update_placement_from_fiducials_via
     pub(super) fn recentre_on_fiducials(&mut self) {
         if self.fiducials.last_fit.is_none() {
             self.fiducials.note =
@@ -1797,7 +1797,18 @@ impl ConsoleApp {
             None
         };
 
-        self.update_placement_from_fiducials();
+        self.update_placement_from_fiducials_via(&via, &why);
+    }
+
+    /// The same, for detections that were placed directly rather than by the
+    /// ladder — which is only ever a test doing it, hence `cfg(test)`: every
+    /// console path reaches the fit through
+    /// [`detect_fiducials`](Self::detect_fiducials) and has a real stage to
+    /// name. `markers` is the ladder's own starting stage, so that is what a
+    /// hand-placed set is reported as.
+    #[cfg(test)]
+    pub(super) fn update_placement_from_fiducials(&mut self) {
+        self.update_placement_from_fiducials_via("markers", &[]);
     }
 
     /// Fit the board's actual pose from the just-detected holes and write it
@@ -1805,7 +1816,13 @@ impl ConsoleApp {
     /// re-registers the job without a manual drag. The outcome — success or the
     /// specific reason it was skipped — is appended to the fiducial note; only
     /// an applied pose sets `placement.auto_pose` and caches `fiducials.pose`.
-    pub(super) fn update_placement_from_fiducials(&mut self) {
+    ///
+    /// `via` and `declined` are the detection ladder's verdict — which stage
+    /// located the holes, and why the others came up short. They live only in
+    /// [`detect_fiducials`](Self::detect_fiducials)'s locals and reach the
+    /// screen for one check, so record 2a is told them explicitly rather than
+    /// re-deriving them here.
+    pub(super) fn update_placement_from_fiducials_via(&mut self, via: &str, declined: &[String]) {
         // This detection's placement outcome: reset up front so every early
         // return below leaves it false, and only the successful apply sets it
         // true. The verdict line reads this so it never shows a stale
@@ -1831,7 +1848,7 @@ impl ConsoleApp {
                 // Still opens a `check=N`: a check that never got past its own
                 // layout field is exactly as worth recording as one that did.
                 let layout = self.fiducials.layout.clone();
-                self.diag_check_begin(&layout, (w, h), Err("not reached"), &[]);
+                self.diag_check_begin(&layout, (w, h), Err("not reached"), &[], via, &[], &[]);
                 self.diag_check_outcome(&format!("refused-layout ({e})"));
                 return;
             }
@@ -1850,7 +1867,7 @@ impl ConsoleApp {
                     "  ·  placement not updated — no camera→machine projection: {e}"
                 ));
                 let layout = self.fiducials.layout.clone();
-                self.diag_check_begin(&layout, (w, h), Err(e.as_str()), &[]);
+                self.diag_check_begin(&layout, (w, h), Err(e.as_str()), &[], via, &[], &[]);
                 self.diag_check_outcome("refused-projection");
                 return;
             }
@@ -1867,7 +1884,16 @@ impl ConsoleApp {
         // half the answer when the overlay and the export disagree, so it is
         // logged next to the numbers it produced rather than inferred later.
         let layout_text = self.fiducials.layout.clone();
-        self.diag_check_begin(&layout_text, (w, h), Ok(&projection), &detected);
+        let found_px = self.fiducials.found.clone();
+        self.diag_check_begin(
+            &layout_text,
+            (w, h),
+            Ok(&projection),
+            &detected,
+            via,
+            declined,
+            &found_px,
+        );
         // Cache before the gates below: a REFUSED fit is exactly when the
         // operator needs these, because "⌖ layout from detection" is how a
         // layout that never matched the real holes gets replaced by one that

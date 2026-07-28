@@ -366,7 +366,6 @@ impl ConsoleApp {
                 false
             }
         };
-        self.placement.field_correct = use_field;
         // Resolve the output to an ABSOLUTE path so the operator knows exactly
         // which file to open. A bare filename (e.g. "placed.lbrn2") lands next
         // to the copper Gerber — beside their inputs — not in the console's
@@ -713,7 +712,6 @@ impl ConsoleApp {
                 false
             }
         };
-        self.placement.field_correct = use_field;
         // Drill files share the Gerber frame, so the copper job's placement
         // affine positions the holes on the physical board directly.
         let affine = cam::register::Affine2 {
@@ -1108,7 +1106,6 @@ impl ConsoleApp {
             self.emit_drill_at_placement();
         }
         let has_field = self.has_usable_field_cal();
-        self.placement.field_correct = has_field;
         ui.colored_label(
             status_color(has_field),
             if has_field {

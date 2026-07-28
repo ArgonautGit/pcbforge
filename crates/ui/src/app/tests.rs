@@ -306,7 +306,6 @@ fn field_corrected_emit_with_a_missing_map_file_warns_and_emits_unwarped() {
     app.job.emit_copper = "board.gbr".into();
     assert!(!app.field_map_path().exists());
     app.emit_at_placement(false);
-    assert!(!app.placement.field_correct, "field warp is not armed");
     assert!(
         app.runtime
             .log
@@ -333,7 +332,6 @@ fn place_export_always_arms_the_field_warp_when_the_map_exists() {
     std::fs::write(app.field_map_path(), map).unwrap();
 
     app.emit_at_placement(false);
-    assert!(app.placement.field_correct);
     assert!(
         app.runtime
             .log
@@ -2017,7 +2015,6 @@ field_frame=\n";
     // A pre-split blob has one shared parameter set: the paper set is seeded
     // from it, since that's what ① was last fit with.
     assert_eq!(app.calibration.paper, app.calibration.burn);
-    assert!(app.placement.field_correct);
 
     let before = crate::settings::parse(legacy);
     let after = crate::settings::parse(&app.settings_blob());
@@ -2058,6 +2055,7 @@ field_frame=\n";
             "fid_ref_holes",
             "fid_search_mm",
             "fid_shape",
+            "field_plane_mm",
             "job_frequency_khz",
             "job_interval_mm",
             "job_passes",
@@ -2067,6 +2065,7 @@ field_frame=\n";
             "job_wobble_size_mm",
             "job_wobble_step_mm",
             "lens_px_bounds",
+            "mark_height_mm",
             "place_drill_lbrn2",
             "place_drills",
             "place_lightburn_device",
@@ -2075,6 +2074,14 @@ field_frame=\n";
             "scan_center_y_mm",
         ]
     );
+    // place_field_correct is a retired key: unknown keys in an old blob are
+    // tolerated and simply not re-written, rather than migrated.
+    let dropped: Vec<_> = before
+        .keys()
+        .filter(|k| !after.contains_key(*k))
+        .map(|k| k.as_str())
+        .collect();
+    assert_eq!(dropped, vec!["place_field_correct"]);
     assert_eq!(after.get("calib_paper_n"), Some(&"9".to_string()));
     assert_eq!(after.get("calib_paper_pitch_mm"), Some(&"8".to_string()));
     assert_eq!(
@@ -2082,6 +2089,9 @@ field_frame=\n";
         Some(&"bright".to_string())
     );
     for (key, value) in before {
+        if key == "place_field_correct" {
+            continue;
+        }
         assert_eq!(after.get(&key), Some(&value), "setting {key}");
     }
 }
@@ -2668,6 +2678,91 @@ fn lens_calibration_pixel_bounds_round_trip() {
             .is_none(),
         "a missing bounds key restores as None"
     );
+    // And silently: a map that predates the key is not a fault to report.
+    assert!(
+        !c.runtime
+            .log
+            .iter()
+            .any(|l| l.text.contains("lens_px_bounds")),
+        "an absent bounds key says nothing: {:?}",
+        c.runtime.log
+    );
+}
+
+/// A `lens_px_bounds` row that is PRESENT but unusable is a corrupt save, not
+/// a pre-bounds map: it restores as `None` — which silently disables the ③
+/// extrapolation check — so it has to say so in the log.
+#[test]
+fn a_malformed_lens_px_bounds_row_restores_none_and_complains() {
+    use nalgebra::Point2;
+    let coords = [0.0, 20.0, 40.0, 60.0];
+    let pairs: Vec<_> = coords
+        .iter()
+        .flat_map(|&y| {
+            coords.iter().map(move |&x| {
+                (
+                    Point2::new(10.0 * x + 20.0, 800.0 - 10.0 * y),
+                    Point2::new(x, y),
+                )
+            })
+        })
+        .collect();
+    let lens = vision::fit_lens(&pairs).unwrap();
+
+    // Every shape of wrong: a junk token, too few values, a non-finite, and a
+    // box whose corners are the wrong way round.
+    for row in [
+        "0 0 nonsense 700",
+        "0 0 700",
+        "0 0 700 700 700",
+        "0 0 NaN 700",
+        "700 0 20 700",
+        "0 700 700 20",
+    ] {
+        let db = tmp_db();
+        let blob = {
+            let mut a = ConsoleApp::new(db.clone(), vec!["true".into()]);
+            a.calibration.lens = Some(calib::CameraCal {
+                lens: lens.clone(),
+                dots: Vec::new(),
+                found: 16,
+                total: 16,
+            });
+            a.settings_blob()
+        };
+        let corrupted: String = blob
+            .lines()
+            .map(|l| {
+                if l.starts_with("lens_px_bounds=") {
+                    format!("lens_px_bounds={row}\n")
+                } else {
+                    format!("{l}\n")
+                }
+            })
+            .collect();
+        std::fs::write(crate::settings::path_for_db(&db), corrupted).unwrap();
+
+        let app = ConsoleApp::new(db, vec!["true".into()]);
+        assert!(
+            app.calibration
+                .lens
+                .as_ref()
+                .expect("the lens maps still restore")
+                .lens
+                .calib_px_bounds
+                .is_none(),
+            "{row:?} must not restore as bounds"
+        );
+        let complaint = format!(
+            "settings: lens_px_bounds is malformed ({row}) — lens extrapolation \
+             checks are disabled until step 1 is re-fit"
+        );
+        assert!(
+            app.runtime.log.iter().any(|l| l.err && l.text == complaint),
+            "{row:?} must complain, got {:?}",
+            app.runtime.log
+        );
+    }
 }
 
 /// "Etch here" resolves a bare output filename next to the copper Gerber
@@ -4131,7 +4226,10 @@ fn the_diagnostic_log_records_a_check_and_its_overlay_without_flooding() {
         Some((100.0, 600.0)),
         Some((600.0, 600.0)),
     ];
-    app.update_placement_from_fiducials();
+    app.update_placement_from_fiducials_via(
+        "rectangle match (12 candidates, 4/4, 0.4 px RMS)",
+        &["seed scale 0 px/mm is not positive".into()],
+    );
     assert!(app.fiducials.last_placed, "the fit was applied");
 
     let text = std::fs::read_to_string(&log_path).expect("the log file exists");
@@ -4151,6 +4249,24 @@ fn the_diagnostic_log_records_a_check_and_its_overlay_without_flooding() {
     assert!(
         text.contains("layout_centroid_mm=35.000,35.000"),
         "record 2b carries the layout centroid: {text}"
+    );
+    assert!(
+        text.contains("via=\"rectangle match (12 candidates, 4/4, 0.4 px RMS)\""),
+        "record 2a names the ladder stage that found the holes: {text}"
+    );
+    assert!(
+        text.contains("stages_declined=[\"seed scale 0 px/mm is not positive\"]"),
+        "record 2a carries the stages that declined: {text}"
+    );
+    assert!(
+        text.contains("detected_px=[100.0,100.0 600.0,100.0 100.0,600.0 600.0,600.0]"),
+        "record 2a carries the raw camera pixels beside the millimetres: {text}"
+    );
+    // No ① lens fit at all, so there is no calibrated box to be outside of —
+    // which is a different thing from every point being inside one.
+    assert!(
+        text.contains("out_of_lens_bounds=none"),
+        "record 2a says there is no lens box: {text}"
     );
     assert!(text.contains("outcome=applied"), "record 2c: {text}");
 
@@ -4193,6 +4309,53 @@ fn the_diagnostic_log_records_a_check_and_its_overlay_without_flooding() {
         text.contains("overlay check=1"),
         "the overlay is tagged with the check it belongs to: {text}"
     );
+
+    // With a ① lens fit installed the count becomes k/n. The box is grown 5% of
+    // its own span per side first — the same slack the field fit gives its grid
+    // dots — so the 600 px detections sit inside a 580 px box; unexpanded they
+    // would read 3/4. Only the lens is set, so `place_projection` still falls
+    // back to the anchor homography and the detections are unchanged.
+    let coords = [0.0, 20.0, 40.0, 60.0];
+    let lens_pairs: Vec<_> = coords
+        .iter()
+        .flat_map(|&y| {
+            coords.iter().map(move |&x| {
+                (
+                    nalgebra::Point2::new(10.0 * x + 20.0, 800.0 - 10.0 * y),
+                    nalgebra::Point2::new(x, y),
+                )
+            })
+        })
+        .collect();
+    let mut lens = vision::fit_lens(&lens_pairs).unwrap();
+    lens.calib_px_bounds = Some([0.0, 0.0, 580.0, 580.0]);
+    app.calibration.lens = Some(calib::CameraCal {
+        lens,
+        dots: vec![],
+        found: 16,
+        total: 16,
+    });
+    app.update_placement_from_fiducials();
+    let text = std::fs::read_to_string(&log_path).unwrap();
+    assert!(
+        text.contains("out_of_lens_bounds=0/4"),
+        "the box is grown 5% per side before anything is called outside it: {text}"
+    );
+    // Tighten it until the growth cannot save them.
+    if let Some(cal) = app.calibration.lens.as_mut() {
+        cal.lens.calib_px_bounds = Some([0.0, 0.0, 500.0, 500.0]);
+    }
+    app.update_placement_from_fiducials();
+    let text = std::fs::read_to_string(&log_path).unwrap();
+    assert!(
+        text.contains("out_of_lens_bounds=3/4"),
+        "detections the lens fit never covered are counted: {text}"
+    );
+    // The wrapper reports the ladder's own starting stage.
+    assert!(
+        text.contains("via=\"markers\"") && text.contains("stages_declined=[]"),
+        "a re-fit with no ladder context still names a stage: {text}"
+    );
 }
 
 /// A gated-out check still records its fit and names the gate that refused it —
@@ -4203,11 +4366,24 @@ fn the_diagnostic_log_names_the_gate_that_refused_a_check() {
     let log_path = app.runtime.diag.path().to_path_buf();
     app.fiducials.frame_img = Some(image::GrayImage::new(800, 800));
     // No calibration at all, so `place_projection` refuses.
-    app.update_placement_from_fiducials();
+    app.update_placement_from_fiducials_via(
+        "projection seed",
+        &["no frame to seed against".into()],
+    );
     let text = std::fs::read_to_string(&log_path).unwrap();
     assert!(
         text.contains("outcome=refused-projection"),
         "the gate is named: {text}"
+    );
+    // The early return still names the stage that produced the markers; there
+    // is nothing measured yet, so the rest of record 2a is empty.
+    assert!(
+        text.contains("via=\"projection seed\""),
+        "a refused check still names its ladder stage: {text}"
+    );
+    assert!(
+        text.contains("stages_declined=[] detected_px=[] out_of_lens_bounds=none"),
+        "the early return carries no detections: {text}"
     );
     // Record 5: the projection failure also reaches the file as an error line
     // once the frame's log sweep runs.
@@ -5190,4 +5366,252 @@ fn the_burned_reference_holes_survive_a_restart() {
         "and it reports itself as unmeasured: {}",
         c.loop_health_token()
     );
+}
+
+/// A console whose ① lens fit is a synthetic tilted pinhole: the camera hangs
+/// `TILT_HEIGHT_MM` above the calibration plane, its optical axis leaning
+/// toward +y by `atan(0.5)`, so +y is the foreshortened axis and a surface
+/// 1 mm above the plane reads 0.5 mm too far along it. The nadir is placed so
+/// the field centre (35, 35) sits on the optical axis, which keeps the whole
+/// 70 mm field inside an 800×800 frame.
+///
+/// The burned-grid frame is the identity, so paper mm ARE machine mm and every
+/// expected number below is readable without composing a pose.
+const TILT_HEIGHT_MM: f64 = 300.0;
+const TILT_TAN: f64 = 0.5;
+const TILT_NADIR: (f64, f64) = (35.0, 35.0 - TILT_HEIGHT_MM * TILT_TAN);
+/// The pixel the optical axis passes through, which images the field centre.
+const TILT_AXIS_PX: (f64, f64) = (400.0, 400.0);
+
+fn tilted_lens_map() -> vision::LensMap {
+    use nalgebra::Point2;
+    let tilt = TILT_TAN.atan();
+    let (s, c) = tilt.sin_cos();
+    let focal = 2500.0;
+    let pairs: Vec<_> = (0..7)
+        .flat_map(|i| (0..7).map(move |j| (i, j)))
+        .map(|(i, j)| {
+            let x = 70.0 * i as f64 / 6.0;
+            let y = 70.0 * j as f64 / 6.0;
+            let (dx, dy) = (x - TILT_NADIR.0, y - TILT_NADIR.1);
+            let cam_y = c * dy - s * TILT_HEIGHT_MM;
+            let cam_z = s * dy + c * TILT_HEIGHT_MM;
+            (
+                Point2::new(400.0 + focal * dx / cam_z, 400.0 + focal * cam_y / cam_z),
+                Point2::new(x, y),
+            )
+        })
+        .collect();
+    vision::fit_lens(&pairs).unwrap()
+}
+
+/// `nonlinear_app` with its lens swapped for the tilted pinhole above. The ③
+/// field map and its dots are left alone: only the lens feeds the tilt
+/// derivation, and the frame stays the identity either way.
+fn tilted_app() -> ConsoleApp {
+    let mut app = nonlinear_app();
+    app.calibration.lens = Some(calib::CameraCal {
+        lens: tilted_lens_map(),
+        dots: Vec::new(),
+        found: 49,
+        total: 49,
+    });
+    app
+}
+
+#[test]
+fn the_tilt_model_recovers_the_synthetic_camera_geometry() {
+    let app = tilted_app();
+    let tilt = app.camera_tilt().expect("the fit has perspective terms");
+    assert!(
+        (tilt.tilt_rad.tan() - TILT_TAN).abs() < 0.03,
+        "tilt tan {} vs {TILT_TAN}",
+        tilt.tilt_rad.tan()
+    );
+    assert!(
+        (tilt.height_mm - TILT_HEIGHT_MM).abs() < 15.0,
+        "standoff {} mm",
+        tilt.height_mm
+    );
+    // The camera leans toward +y, so depth increases toward +y.
+    assert!(
+        tilt.away_dir.1 > 0.95 && tilt.away_dir.0.abs() < 0.15,
+        "foreshortened axis {:?}",
+        tilt.away_dir
+    );
+    // And it says all of that out loud.
+    let summary = app.debug_summary();
+    assert!(
+        summary.contains("height_comp: active=false") && summary.contains("foreshortened"),
+        "{summary}"
+    );
+}
+
+/// The shipped defaults are the old behaviour, exactly. Not "close enough":
+/// the correction has to be the identity or every existing placement moves.
+#[test]
+fn zero_heights_leave_every_conversion_untouched() {
+    let app = tilted_app();
+    assert_eq!(app.camera.mark_height_mm, 0.0);
+    assert_eq!(app.camera.field_plane_mm, 0.0);
+    let planes = app.plane_shift();
+    assert!(planes.tilt.is_some(), "the tilt model IS available");
+    assert!(!planes.active(), "but with equal planes it moves nothing");
+
+    let projection = app.place_projection(800, 800).unwrap();
+    let lens = &app.calibration.lens.as_ref().unwrap().lens;
+    let frame = app.calibration.field.as_ref().unwrap().paper_to_machine;
+    for px in [(400.0, 400.0), (200.0, 250.0), (610.0, 590.0)] {
+        let got = projection.from_px(px).unwrap();
+        let bare = calib::camera_px_to_physical(lens, &frame, px).unwrap();
+        assert_eq!(got, bare, "uncompensated chain, bit for bit, at {px:?}");
+    }
+}
+
+/// The headline number the operator is buying: a board 1.6 mm above the
+/// calibration plane is imaged ~0.8 mm too far along the foreshortened axis,
+/// so the compensated read pulls back by that much toward the camera.
+#[test]
+fn a_1p6_mm_mark_surface_shifts_the_read_by_0p8_mm_toward_the_camera() {
+    let mut app = tilted_app();
+    let before = app
+        .place_projection(800, 800)
+        .unwrap()
+        .from_px(TILT_AXIS_PX);
+    app.camera.mark_height_mm = 1.6;
+    assert!(
+        app.plane_shift().active(),
+        "1.6 mm over a 0 mm field plane is live"
+    );
+
+    let after = app
+        .place_projection(800, 800)
+        .unwrap()
+        .from_px(TILT_AXIS_PX);
+    let (before, after) = (before.unwrap(), after.unwrap());
+    let shift = (after.0 - before.0, after.1 - before.1);
+    let expected = 1.6 * TILT_TAN;
+    assert!(
+        (shift.1.hypot(shift.0) - expected).abs() < 0.08,
+        "shift {shift:?}, expected ~{expected} mm"
+    );
+    // Along -y: back toward the camera, against the increasing-depth
+    // direction. A sign error here is a 1.6 mm miss the wrong way.
+    assert!(
+        shift.1 < -0.7 && shift.0.abs() < 0.1,
+        "shift {shift:?} must point at -y"
+    );
+    // The console quotes the same number rather than making the operator
+    // difference two placements to find it.
+    let (text, active) = app.height_comp_status();
+    assert!(active, "{text}");
+    assert!(text.contains("at field centre"), "{text}");
+}
+
+/// Only the DIFFERENCE between the two planes moves anything: a mark surface
+/// level with the ③ burn plane is exactly where the frame was anchored.
+#[test]
+fn a_mark_surface_level_with_the_field_plane_needs_no_correction() {
+    let mut app = tilted_app();
+    let before = app
+        .place_projection(800, 800)
+        .unwrap()
+        .from_px(TILT_AXIS_PX)
+        .unwrap();
+    app.camera.mark_height_mm = 1.6;
+    app.camera.field_plane_mm = 1.6;
+    assert!(!app.plane_shift().active());
+    let after = app
+        .place_projection(800, 800)
+        .unwrap()
+        .from_px(TILT_AXIS_PX)
+        .unwrap();
+    assert_eq!(before, after);
+}
+
+/// px → machine → px has to come back to the same pixel with the correction
+/// on, or the overlay and the detections have drifted apart.
+#[test]
+fn the_corrected_projection_round_trips_px_to_machine_and_back() {
+    let mut app = tilted_app();
+    app.camera.mark_height_mm = 1.6;
+    app.camera.field_plane_mm = -0.4;
+    for (label, projection) in [
+        ("physical", app.place_projection(800, 800).unwrap()),
+        (
+            "commanded",
+            app.camera_projection((800, 800)).unwrap().unwrap(),
+        ),
+    ] {
+        for px in [(400.0, 400.0), (200.0, 250.0), (610.0, 590.0)] {
+            let mm = projection.from_px(px).expect(label);
+            let back = projection.to_px(mm).expect(label);
+            assert!(
+                (back.0 - px.0).abs() < 1e-3 && (back.1 - px.1).abs() < 1e-3,
+                "{label}: {px:?} → {mm:?} → {back:?}"
+            );
+        }
+    }
+}
+
+/// Without perspective in the fit there is nothing to derive from, and the
+/// feature says so instead of inventing a tilt. `nonlinear_app`'s lens is a
+/// pure affine, which is exactly that case.
+#[test]
+fn an_untilted_lens_fit_reports_no_tilt_model_and_corrects_nothing() {
+    let mut app = nonlinear_app();
+    app.camera.mark_height_mm = 5.0;
+    assert!(app.camera_tilt().is_none());
+    assert!(!app.plane_shift().active());
+    let (text, active) = app.height_comp_status();
+    assert!(!active);
+    assert_eq!(
+        text,
+        "no tilt model in the lens fit — height compensation inactive"
+    );
+    assert!(app.debug_summary().contains("height_comp: active=false"));
+
+    // And the conversions are untouched despite the 5 mm setting.
+    let projection = app.place_projection(800, 800).unwrap();
+    let lens = &app.calibration.lens.as_ref().unwrap().lens;
+    let frame = app.calibration.field.as_ref().unwrap().paper_to_machine;
+    let px = (300.0, 450.0);
+    assert_eq!(
+        projection.from_px(px).unwrap(),
+        calib::camera_px_to_physical(lens, &frame, px).unwrap()
+    );
+}
+
+#[test]
+fn the_plane_heights_persist_and_are_clamped_on_load() {
+    let db = tmp_db();
+    let mut app = ConsoleApp::new(&db, vec!["true".into()]);
+    app.camera.mark_height_mm = 1.6;
+    app.camera.field_plane_mm = -0.25;
+    std::fs::write(crate::settings::path_for_db(&db), app.settings_blob()).unwrap();
+    let back = ConsoleApp::new(&db, vec!["true".into()]);
+    assert_eq!(back.camera.mark_height_mm, 1.6);
+    assert_eq!(back.camera.field_plane_mm, -0.25);
+
+    // A blob claiming metres is a corrupt blob, not a bench setup.
+    let db = tmp_db();
+    std::fs::write(
+        crate::settings::path_for_db(&db),
+        "pcbforge console settings v1\nmark_height_mm=9000\nfield_plane_mm=-9000\n",
+    )
+    .unwrap();
+    let clamped = ConsoleApp::new(&db, vec!["true".into()]);
+    assert_eq!(clamped.camera.mark_height_mm, 50.0);
+    assert_eq!(clamped.camera.field_plane_mm, -50.0);
+
+    // An absent key keeps the default, which is the uncompensated behaviour.
+    let db = tmp_db();
+    std::fs::write(
+        crate::settings::path_for_db(&db),
+        "pcbforge console settings v1\ncam_show_bed=true\n",
+    )
+    .unwrap();
+    let bare = ConsoleApp::new(&db, vec!["true".into()]);
+    assert_eq!(bare.camera.mark_height_mm, 0.0);
+    assert_eq!(bare.camera.field_plane_mm, 0.0);
 }

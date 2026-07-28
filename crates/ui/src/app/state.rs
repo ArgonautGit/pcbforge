@@ -249,6 +249,18 @@ pub(super) struct CameraState {
     pub(super) field_center_auto: bool,
     pub(super) field_cx_mm: f32,
     pub(super) field_cy_mm: f32,
+    /// Height of the surface being marked above the ① camera-calibration
+    /// plane, mm, positive UPWARD (toward the camera). The camera does not
+    /// look straight down, so a mark surface off the ① plane is imaged with a
+    /// lateral parallax error of roughly `h · tan(tilt)`; see
+    /// `calib::CameraTilt`. `0.0` is the ① plane itself — the uncorrected
+    /// behaviour.
+    pub(super) mark_height_mm: f32,
+    /// Height of the ③ field-grid BURN plane above the same reference, mm,
+    /// same sign convention. The ③ grid was measured through the camera at its
+    /// own height, so the burned-grid frame and the field polynomial are keyed
+    /// on readings at this plane, not at the ① plane.
+    pub(super) field_plane_mm: f32,
 }
 
 /// One grid-parameter set (dots per side, pitch, dot size, contrast). The ①
@@ -491,7 +503,6 @@ pub(super) struct PlacementState {
     pub(super) job: Vec<pcb_core::Poly>,
     pub(super) pivot: (f64, f64),
     pub(super) note: String,
-    pub(super) field_correct: bool,
     /// LightBurn device name for the one-click "Etch + run in LightBurn".
     pub(super) lightburn_device: String,
     /// Excellon drill file path(s) for "Emit drill holes" — `;`-separated

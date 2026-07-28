@@ -30,6 +30,46 @@ fn parse_coeffs(s: &str) -> Option<[f64; 23]> {
 /// the loop measurement with a coordinate that isn't a position.
 const REF_HOLE_MAX_MM: f64 = 10_000.0;
 
+/// Clamp on the two operator-set plane heights (mm above the ① camera
+/// calibration plane, either sign). Nothing this console marks sits further
+/// off that plane, and the compensation is linear in the height — a corrupt
+/// blob must not be able to swing placement by metres.
+pub(super) const PLANE_HEIGHT_MAX_MM: f32 = 50.0;
+
+/// Parse the persisted `lens_px_bounds` row: `min_x min_y max_x max_y`.
+///
+/// Absent or blank is legitimate and silent — a lens map fit before the bounds
+/// were recorded, or restored from such a blob, simply has none. Anything else
+/// present but unusable is a corrupt row and gets a complaint: the previous
+/// `filter_map` dropped unparsable tokens one by one, so `0 0 nonsense 700`
+/// became a three-value list, failed the length check and disabled the ③
+/// extrapolation warnings with nothing said. "No bounds" and "bounds we threw
+/// away" look identical downstream, so they must not look identical here.
+fn parse_px_bounds(raw: Option<&String>, complaints: &mut Vec<String>) -> Option<[f64; 4]> {
+    let raw = raw?.trim();
+    if raw.is_empty() {
+        return None;
+    }
+    let bounds = raw
+        .split_whitespace()
+        .map(str::parse::<f64>)
+        .collect::<Result<Vec<_>, _>>()
+        .ok()
+        .and_then(|v| <[f64; 4]>::try_from(v).ok())
+        // An inverted box is not a box: it would accept nothing and reject
+        // every dot, which reads as a catastrophic fit rather than a bad row.
+        .filter(|[x0, y0, x1, y1]| {
+            [x0, y0, x1, y1].iter().all(|v| v.is_finite()) && x0 <= x1 && y0 <= y1
+        });
+    if bounds.is_none() {
+        complaints.push(format!(
+            "settings: lens_px_bounds is malformed ({raw}) — lens extrapolation \
+             checks are disabled until step 1 is re-fit"
+        ));
+    }
+    bounds
+}
+
 impl ConsoleApp {
     /// The persisted input fields, in a fixed key order.
     pub(super) fn settings_blob(&self) -> String {
@@ -153,10 +193,6 @@ impl ConsoleApp {
                 self.calibration.accept_worst_um.to_string(),
             ),
             ("cam_show_bed", self.camera.show_bed.to_string()),
-            (
-                "place_field_correct",
-                self.placement.field_correct.to_string(),
-            ),
             ("field_mm", self.camera.field_mm.to_string()),
             (
                 "field_center_auto",
@@ -164,6 +200,8 @@ impl ConsoleApp {
             ),
             ("field_cx_mm", self.camera.field_cx_mm.to_string()),
             ("field_cy_mm", self.camera.field_cy_mm.to_string()),
+            ("mark_height_mm", self.camera.mark_height_mm.to_string()),
+            ("field_plane_mm", self.camera.field_plane_mm.to_string()),
             // The calibration matrix (px→mm, row-major) — the operator's grid
             // is taped to the bed and persists, so we keep the fit as a
             // re-anchor seed across restarts (Re-anchor re-locks it).
@@ -308,8 +346,16 @@ impl ConsoleApp {
         ])
     }
 
-    /// Overlay any saved input fields from the settings file onto the defaults.
-    pub(super) fn load_settings(&mut self) {
+    /// Overlay any saved input fields from the settings file onto the defaults,
+    /// returning anything the operator has to be told about a value that was
+    /// present but unusable.
+    ///
+    /// The complaints are returned rather than logged: the sites that find them
+    /// are inside the expressions that build the restored calibration, where
+    /// `self` is already mutably borrowed. `ConsoleApp::new` drains them into
+    /// the log once construction is done.
+    pub(super) fn load_settings(&mut self) -> Vec<String> {
+        let mut complaints: Vec<String> = Vec::new();
         let m = crate::settings::load(&self.runtime.settings_path);
         let str_field =
             |m: &std::collections::BTreeMap<String, String>, k: &str, dst: &mut String| {
@@ -625,6 +671,20 @@ impl ConsoleApp {
             }
         }
         self.sync_auto_field_center();
+        // Height compensation. Read after the bed-overlay block so the legacy
+        // `field_*` migration above sees exactly the key set it was written
+        // for. Absent keys leave the 0.0 defaults, which is the behaviour the
+        // console had before the compensation existed.
+        f32_field(&m, "mark_height_mm", &mut self.camera.mark_height_mm);
+        f32_field(&m, "field_plane_mm", &mut self.camera.field_plane_mm);
+        self.camera.mark_height_mm = self
+            .camera
+            .mark_height_mm
+            .clamp(-PLANE_HEIGHT_MAX_MM, PLANE_HEIGHT_MAX_MM);
+        self.camera.field_plane_mm = self
+            .camera
+            .field_plane_mm
+            .clamp(-PLANE_HEIGHT_MAX_MM, PLANE_HEIGHT_MAX_MM);
         if let Some(v) = m.get("cam_show_bed").and_then(|s| s.trim().parse().ok()) {
             self.camera.show_bed = v;
         }
@@ -656,15 +716,6 @@ impl ConsoleApp {
             .filter(|v: &f64| v.is_finite())
         {
             self.calibration.accept_worst_um = v.clamp(10.0, 1000.0);
-        }
-        // A persisted field-correction preference is only honored once a field
-        // cal exists this session (the placement frame needs it), so this just
-        // restores the operator's intent; calibrate_fit re-enables it on a fit.
-        if let Some(v) = m
-            .get("place_field_correct")
-            .and_then(|s| s.trim().parse().ok())
-        {
-            self.placement.field_correct = v;
         }
         if let Some(o) = m
             .get("cam_orientation")
@@ -743,14 +794,7 @@ impl ConsoleApp {
                     rms_um: stats.next().and_then(|s| s.parse().ok()).unwrap_or(0.0),
                     max_um: stats.next().and_then(|s| s.parse().ok()).unwrap_or(0.0),
                     residuals: Vec::new(),
-                    calib_px_bounds: m.get("lens_px_bounds").and_then(|s| {
-                        let vals: Vec<f64> = s
-                            .split_whitespace()
-                            .filter_map(|t| t.parse().ok())
-                            .filter(|v: &f64| v.is_finite())
-                            .collect();
-                        <[f64; 4]>::try_from(vals).ok()
-                    }),
+                    calib_px_bounds: parse_px_bounds(m.get("lens_px_bounds"), &mut complaints),
                 },
                 dots: Vec::new(),
                 found: stats.next().and_then(|s| s.parse().ok()).unwrap_or(0),
@@ -877,7 +921,7 @@ impl ConsoleApp {
             );
             let Ok(px_to_mm) = vision::Homography::from_matrix(mat) else {
                 self.calibration.note = "ignored an invalid saved calibration matrix".into();
-                return;
+                return complaints;
             };
             self.calibration.anchor = Some(calib::Calibration {
                 px_to_mm,
@@ -895,6 +939,7 @@ impl ConsoleApp {
                 "loaded a saved calibration ({age}) — click ⟳ Re-anchor to re-lock to the taped grid"
             );
         }
+        complaints
     }
 
     /// Persist the input fields if they changed since the last save. Cheap to

@@ -30,6 +30,9 @@ use vision::{
 };
 
 mod square_grid;
+mod tilt;
+
+pub use tilt::{CameraTilt, camera_tilt_from_lens};
 
 /// How the grid dots read against their background. A **printed** reference
 /// grid and a burn that darkens the surface (dark-anodized plate) are
@@ -757,8 +760,33 @@ pub fn commanded_to_camera_px(
     commanded: (f64, f64),
 ) -> Option<(f64, f64)> {
     finite_input(commanded)?;
-    let physical = invert_poly(&field.to_commanded, &field.to_physical, commanded)?;
+    let physical = commanded_to_physical(field, commanded)?;
     physical_to_camera_px(lens, frame, physical)
+}
+
+/// Undo the field pre-distortion: the physical machine millimeters the optics
+/// actually land a commanded coordinate at. Split out of
+/// [`commanded_to_camera_px`] so a caller that needs to insert its own step
+/// between the field map and the camera (the console's height compensation)
+/// does not have to re-implement the numeric inversion.
+pub fn commanded_to_physical(field: &FieldMap, commanded: (f64, f64)) -> Option<(f64, f64)> {
+    finite_input(commanded)?;
+    invert_poly(&field.to_commanded, &field.to_physical, commanded)
+}
+
+/// Camera pixel → the ① lens map's own metric frame ("paper mm"), the first
+/// half of [`camera_px_to_physical`]. The reading is on the plane the ① grid
+/// was imaged at; see [`CameraTilt`] for what that costs at another height.
+pub fn camera_px_to_paper(lens: &LensMap, px: (f64, f64)) -> Option<(f64, f64)> {
+    finite_input(px)?;
+    finite_output(lens.px_to_mm.apply(px.0, px.1))
+}
+
+/// Paper mm → camera pixel: the inverse of [`camera_px_to_paper`], by Newton
+/// inversion of the forward polynomial off the separately fit reverse map.
+pub fn paper_to_camera_px(lens: &LensMap, paper: (f64, f64)) -> Option<(f64, f64)> {
+    finite_input(paper)?;
+    invert_poly(&lens.px_to_mm, &lens.mm_to_px, paper)
 }
 
 /// Camera pixel to desired physical machine millimeters: through the lens map
@@ -766,8 +794,7 @@ pub fn commanded_to_camera_px(
 /// the machine frame. Field-corrected placement uses this direction: the emit
 /// path applies `FieldMap::to_commanded` later, exactly once.
 pub fn camera_px_to_physical(lens: &LensMap, frame: &Rigid2, px: (f64, f64)) -> Option<(f64, f64)> {
-    finite_input(px)?;
-    let paper = finite_output(lens.px_to_mm.apply(px.0, px.1))?;
+    let paper = camera_px_to_paper(lens, px)?;
     finite_output(frame.apply(paper))
 }
 
@@ -782,7 +809,7 @@ pub fn physical_to_camera_px(
 ) -> Option<(f64, f64)> {
     finite_input(physical)?;
     let paper = finite_output(frame.inverse_apply(physical))?;
-    invert_poly(&lens.px_to_mm, &lens.mm_to_px, paper)
+    paper_to_camera_px(lens, paper)
 }
 
 /// Whether every polynomial coefficient needed by the nonlinear camera ↔

@@ -3581,3 +3581,55 @@ the fiducial tab until dismissed or until a healthy loop clears it. It does NOT
 refuse etches: the correspondence is a heuristic and a re-jigged plate must not
 be able to stop the bench. The contract is the banner, the number, the etch log
 line and `debug_summary()`.
+
+## 2026-07-28 — Height-induced camera parallax is modelled, not assumed away
+
+The ① camera-lens calibration is a *plane* measurement: every `px → mm` read is
+where that pixel's view ray crosses the plane the printed paper grid lay on. The
+operator's camera looks at the bed roughly 23° off perpendicular, so a feature
+that actually sits `h` mm above that plane is read at the wrong place — its ray
+keeps going and meets the calibration plane further from the camera, ~0.49 mm
+per mm of height on this rig, almost all of it along the foreshortened axis
+(≈ machine Y). Nothing downstream can see this. The lens fit's residuals are
+perfect; the answer is simply for the wrong surface. A 1.6 mm board sitting on
+the calibration surface is a ~0.8 mm registration error that reads as clean.
+
+**Two heights, both operator-set, both persisted, both defaulting to 0.** `mark
+surface height mm` is where the marked surface sits above the ① plane; `field
+cal plane mm` is where the ③ burned field grid sat. Positive is up, toward the
+camera. Only their DIFFERENCE moves anything: the burned-grid frame and the ③
+field polynomial were built from camera readings of dots at the ③ plane, so
+they are keyed on ①-plane readings *of features at that height*, not on true
+positions. The correction restates a reading from the mark height into the ③
+height's convention and hands that to the frame — one insertion point between
+the lens map and everything downstream, so detections, the overlay and the
+registered burn all move together or not at all. `0/0` is bit-for-bit the
+behaviour the console had before this existed, and a test asserts exactly that.
+
+**The geometry is derived from the lens fit, not typed in.** Sampling
+`px_to_mm` over the region the fit covers and re-fitting a plane homography
+separates two things a tilted pinhole leaves in that map: the perspective row
+`∇w` (fractional depth change per mm, `sin(tilt) / working_distance`, pointing
+away from the camera) and the Jacobian anisotropy at the field centre
+(`σ_min/σ_max = cos(tilt)`). Either alone leaves tilt and distance
+underdetermined; together they give both, and the nadir follows. The correction
+is then a pure radial scaling about the nadir — `h · tan(tilt)` at the field
+centre, per-pixel everywhere else, first order in `h / standoff` — which
+captures the apparent scale change as well as the lateral shift for free.
+
+Asking the operator for the tilt instead was rejected: a protractor against a
+camera housing is not the optical axis, and the number that matters is the one
+the calibration already contains.
+
+**It reports itself rather than being trusted.** `debug_summary()` and the
+camera panel carry the derived tilt, working distance, foreshortened-axis
+bearing (in machine axes) and the correction actually applied at field centre
+for the configured heights, so a wrong derivation is a visible number instead of
+a silently shifted burn. Caveat stated in the code: the polynomial lens map also
+carries genuine barrel/pincushion curvature, and a homography fit to it absorbs
+some of that into `∇w`, so this is a model of the fitted map rather than
+independent metrology of the mount. Where the fit has no usable perspective at
+all — an affine or near-perpendicular map — the feature reports "no tilt model
+in the lens fit" and applies nothing, rather than inventing a small tilt from
+fit noise and moving every placement by it.
+

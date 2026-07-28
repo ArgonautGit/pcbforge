@@ -201,7 +201,6 @@ impl ConsoleApp {
                         // physical frame. Re-fitting the lens invalidates it.
                         self.calibration.field = None;
                         self.calibration.field_accepted = false;
-                        self.placement.field_correct = false;
                     }
                     Err(e) => {
                         // Keep any previous lens calibration — a bad fit
@@ -248,7 +247,6 @@ impl ConsoleApp {
                         self.calibration.lens_frame_signature, signature
                     );
                     self.calibration.field_accepted = false;
-                    self.placement.field_correct = false;
                     return;
                 }
                 match calib::fit_laser_field(
@@ -272,7 +270,6 @@ impl ConsoleApp {
                             self.calibration.accept_worst_um,
                         );
                         self.calibration.field_accepted = acceptance.is_ok();
-                        self.placement.field_correct = false;
                         // classify_field_error assumes the grid is centred on
                         // the scan field: off-axis, genuine curvature reads as
                         // a uniform scale. Warn when the burn is well off the
@@ -321,7 +318,6 @@ impl ConsoleApp {
                                 let path = self.field_map_path();
                                 match std::fs::write(&path, cal.field.serialize()) {
                                     Ok(()) => {
-                                        self.placement.field_correct = true;
                                         // When the operator opted to absorb a
                                         // large machine scale, say so loudly: the
                                         // polynomial makes shapes true, but the
@@ -371,7 +367,6 @@ impl ConsoleApp {
                                     }
                                     Err(e) => {
                                         self.calibration.field_accepted = false;
-                                        self.placement.field_correct = false;
                                         format!(
                                             "field fit met quality limits ({}/{}, RMS/worst {:.0}/{:.0} µm) but saving {} failed: {e}; correction remains disabled",
                                             cal.found,

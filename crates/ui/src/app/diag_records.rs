@@ -28,11 +28,28 @@ fn projection_token(p: &CameraProjection) -> &'static str {
     }
 }
 
+/// How far outside the ① lens fit's pixel box a point may sit before the
+/// record calls it out, as a fraction of the box's own span per side. Same
+/// growth the field fit applies when it flags extrapolated grid dots.
+const LENS_BOUNDS_SLACK: f64 = 0.05;
+
 /// `x,y` pairs (or `-` for a point that has none), mm, in layout order.
 fn fmt_points(pts: &[Option<(f64, f64)>]) -> String {
     pts.iter()
         .map(|p| match p {
             Some((x, y)) => format!("{x:.3},{y:.3}"),
+            None => "-".into(),
+        })
+        .collect::<Vec<_>>()
+        .join(" ")
+}
+
+/// The same, in camera pixels — one decimal, like every other pixel figure in
+/// this file.
+fn fmt_px(pts: &[Option<(f64, f64)>]) -> String {
+    pts.iter()
+        .map(|p| match p {
+            Some((x, y)) => format!("{x:.1},{y:.1}"),
             None => "-".into(),
         })
         .collect::<Vec<_>>()
@@ -135,12 +152,28 @@ impl ConsoleApp {
 
     /// Record 2a: the inputs of one fiducial check. Opens a new `check=N`,
     /// which every record that follows from this check carries.
+    ///
+    /// `via` and `stages_declined` are the detection ladder's own verdict — the
+    /// stage that located the holes and the reasons the others came up short.
+    /// They are on screen for one check only, in the fiducial note, so without
+    /// them a later reader cannot tell a lock earned by the operator's clicks
+    /// from one the whole-frame rectangle scan had to rescue.
+    ///
+    /// `detected_px` is the raw camera side of `detected`: the millimetres are
+    /// the pixels pushed through the projection, so a wrong answer with sane
+    /// pixels is a projection fault and one with wrong pixels is a detection
+    /// fault — and only the pair separates them. `out_of_lens_bounds` counts how
+    /// many of those pixels the ① lens fit never covered, which is the same
+    /// silent extrapolation the field fit already flags for its grid dots.
     pub(super) fn diag_check_begin(
         &mut self,
         layout: &str,
         dims: (u32, u32),
         projection: Result<&CameraProjection, &str>,
         detected: &[Option<(f64, f64)>],
+        via: &str,
+        stages_declined: &[String],
+        detected_px: &[Option<(f64, f64)>],
     ) -> u64 {
         self.runtime.diag_check_seq += 1;
         let seq = self.runtime.diag_check_seq;
@@ -148,12 +181,43 @@ impl ConsoleApp {
             Ok(p) => projection_token(p).to_string(),
             Err(e) => format!("unavailable ({e})"),
         };
+        let declined = stages_declined
+            .iter()
+            .map(|r| format!("\"{r}\""))
+            .collect::<Vec<_>>()
+            .join(" ");
+        // `none` rather than `0/0` when there is nothing to measure against —
+        // the same word `lens_calib_px_bounds` uses in the startup record, and
+        // the distinction matters: "no point is outside" and "there is no box"
+        // are opposite reasons for a clean-looking check.
+        let out_of_bounds = match self
+            .calibration
+            .lens
+            .as_ref()
+            .and_then(|c| c.lens.calib_px_bounds)
+        {
+            Some([min_x, min_y, max_x, max_y]) => {
+                let mx = (max_x - min_x) * LENS_BOUNDS_SLACK;
+                let my = (max_y - min_y) * LENS_BOUNDS_SLACK;
+                let (lo_x, hi_x) = (min_x - mx, max_x + mx);
+                let (lo_y, hi_y) = (min_y - my, max_y + my);
+                let seen: Vec<(f64, f64)> = detected_px.iter().flatten().copied().collect();
+                let out = seen
+                    .iter()
+                    .filter(|(x, y)| *x < lo_x || *x > hi_x || *y < lo_y || *y > hi_y)
+                    .count();
+                format!("{out}/{}", seen.len())
+            }
+            None => "none".into(),
+        };
         let record = format!(
             "fid-check check={seq} layout=\"{layout}\" frame={}x{} projection={projection} \
-             side={:?} detected_machine_mm=[{}]",
+             side={:?} via=\"{via}\" stages_declined=[{declined}] detected_px=[{}] \
+             out_of_lens_bounds={out_of_bounds} detected_machine_mm=[{}]",
             dims.0,
             dims.1,
             self.job.side,
+            fmt_px(detected_px),
             fmt_points(detected)
         );
         self.diag(&record);

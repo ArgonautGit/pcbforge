@@ -53,6 +53,7 @@ pub use commands::{job_shapes, preview_image};
 use job_ui::status_color;
 use lightburn_run::{LightburnRun, spawn_lightburn_load, spawn_lightburn_run};
 use projection::CameraProjection;
+use settings_io::PLANE_HEIGHT_MAX_MM;
 use state::*;
 
 /// Shared hint for image panels that support pan/zoom navigation.
@@ -191,6 +192,8 @@ impl ConsoleApp {
                 field_center_auto: true,
                 field_cx_mm: 35.0,
                 field_cy_mm: 35.0,
+                mark_height_mm: 0.0,
+                field_plane_mm: 0.0,
             },
             calibration: CalibrationState {
                 anchor: None,
@@ -288,7 +291,6 @@ impl ConsoleApp {
                 pivot: (0.0, 0.0),
                 note: "Load the design, then drag it onto the board on the Fiducial-check tab."
                     .into(),
-                field_correct: false,
                 lightburn_device: cam::lbrn2::DEFAULT_DEVICE.to_string(),
                 drills: String::new(),
                 drill_lbrn2: "drill.lbrn2".into(),
@@ -321,11 +323,16 @@ impl ConsoleApp {
                 images: std::collections::HashMap::new(),
             },
         };
-        app.load_settings();
+        let complaints = app.load_settings();
         app.runtime.last_settings = app.settings_blob();
         // After `load_settings`, so the startup record reports the calibration
         // the console actually came up with rather than the empty defaults.
         app.diag_startup();
+        // A saved value that was present but unusable is a fault the operator
+        // has to see; the load path itself has no log access at that point.
+        for text in complaints {
+            app.runtime.log.push(LogLine { text, err: true });
+        }
         app
     }
 
@@ -442,6 +449,12 @@ impl ConsoleApp {
             },
             None => "no-frame",
         };
+        // The derived camera-ray geometry, spelled out: a wrong derivation has
+        // to be readable here rather than only visible as a shifted burn.
+        let height_comp = {
+            let (text, active) = self.height_comp_status();
+            format!("active={active} {text}")
+        };
         let cam = match &self.camera.last {
             Some(g) => format!(
                 "{}×{} (view ×{:.3})",
@@ -552,8 +565,9 @@ impl ConsoleApp {
              back: {back}\n\
              calib_anchor: {calib}\n\
              camera_lens: {lens}\n\
-             laser_field: {field} field_correct={} scale_mode={} limits={:.0}/{:.0}µm\n\
+             laser_field: {field} scale_mode={} limits={:.0}/{:.0}µm\n\
              camera_projection: {projection}\n\
+             height_comp: {height_comp}\n\
              camera_frame: {cam}\n\
              shared_capture: {shared_capture} live_camera={} live_calib={} live_fid={}\n\
              calib_frame: {calib_frame}\n\
@@ -572,7 +586,6 @@ impl ConsoleApp {
             self.runtime.tab,
             self.job.side,
             self.calibration.mode,
-            self.placement.field_correct,
             field_scale_token(self.calibration.field_scale),
             self.calibration.accept_rms_um,
             self.calibration.accept_worst_um,
