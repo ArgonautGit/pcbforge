@@ -495,6 +495,27 @@ pub(super) struct PlacementState {
     pub(super) etch_confirm: Option<EtchConfirm>,
 }
 
+/// The drill emit's own process recipe.
+///
+/// Deliberately separate from [`JobState`]: drilling a hole is a different
+/// process from etching copper. The etch fills a region with hatch lines; the
+/// drill traces the contour of each hole and repeats it, so it wants its own
+/// speed/interval/passes/wobble — the settings that make a good isolation fill
+/// are not the settings that punch through FR-4.
+///
+/// There is no power field, for the same reason the etch settings have none:
+/// pulse energy on this source is set by the frequency and Q-pulse width.
+pub(super) struct DrillState {
+    pub(super) speed_mm_s: f64,
+    pub(super) frequency_khz: f64,
+    pub(super) pulse_ns: u32,
+    pub(super) interval_mm: f64,
+    pub(super) passes: u32,
+    pub(super) wobble: bool,
+    pub(super) wobble_step_mm: f64,
+    pub(super) wobble_size_mm: f64,
+}
+
 /// A pending "click again to etch at this offset" confirmation — see
 /// [`PlacementState::etch_confirm`].
 #[derive(Debug, Clone, Copy, PartialEq)]

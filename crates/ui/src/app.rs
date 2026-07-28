@@ -110,6 +110,7 @@ pub struct ConsoleApp {
     calibration: CalibrationState,
     fiducials: FiducialState,
     placement: PlacementState,
+    drill: DrillState,
     ar: ArState,
     views: ViewState,
 }
@@ -286,6 +287,19 @@ impl ConsoleApp {
                 drills: String::new(),
                 drill_lbrn2: "drill.lbrn2".into(),
                 etch_confirm: None,
+            },
+            // The operator's drill recipe: fast Line passes with a small
+            // wobble, twice over each hole. Frequency and Q-pulse stay at the
+            // source values the drill emit has always used (the etch defaults).
+            drill: DrillState {
+                speed_mm_s: 1000.0,
+                frequency_khz: 30.0,
+                pulse_ns: 1,
+                interval_mm: 0.05,
+                passes: 2,
+                wobble: true,
+                wobble_step_mm: 0.02,
+                wobble_size_mm: 0.05,
             },
             ar: ArState {
                 overlay: false,
@@ -490,6 +504,20 @@ impl ConsoleApp {
                 base(&self.job.back_lbrn2)
             },
         );
+        // The drill emit's own recipe — it shares nothing with the etch numbers
+        // above, so a headless run has to be able to read it back separately.
+        let drill = format!(
+            "speed={} freq_khz={} pulse_ns={} interval={} passes={} wobble={} \
+             wobble_step={} wobble_size={}",
+            self.drill.speed_mm_s,
+            self.drill.frequency_khz,
+            self.drill.pulse_ns,
+            self.drill.interval_mm,
+            self.drill.passes,
+            self.drill.wobble,
+            self.drill.wobble_step_mm,
+            self.drill.wobble_size_mm,
+        );
         // The fiducial rectangle's four positions, resolved against the effective
         // field centre (kept in sync with the auto toggle by `sync_auto_field_center`).
         let fid_layout = fiducial::format_layout(&fiducial::centered_fid_layout(
@@ -532,6 +560,7 @@ impl ConsoleApp {
              calib_frame: {calib_frame}\n\
              bed_overlay: show={} field={:.0}mm center=({:.1},{:.1}) auto={}\n\
              place: x={:.2} y={:.2} rot={:.1}° scale={:.4} auto_pose={} job_polys={} lightburn={} device={} drills={} drill_out={} note={:?}\n\
+             drill: {drill}\n\
              place_intent: move_job={} fid_offset={fid_offset} etch_confirm={etch_confirm} mirror_baseline={:.4}\n\
              calib_paper: n={} pitch={:.2}mm dot={:.2}mm contrast={} out={}\n\
              calib_burn: n={} pitch={:.2}mm dot={:.2}mm contrast={} corners_marked={} edit_anchor_dots={} feedback={} origin=({:.1},{:.1})\n\

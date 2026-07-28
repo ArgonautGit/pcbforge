@@ -4,6 +4,13 @@ use super::*;
 /// matches the CLI's `--field-seg-mm` default the etch path inherits.
 const DRILL_FIELD_SEG_MM: f64 = 0.25;
 
+/// The emitter needs a `maxPower` and `AblationParams::validate` rejects 0, but
+/// power is not an operator concept on this machine: pulse energy is set by the
+/// frequency and Q-pulse width. Fixed at the value the drill path has always
+/// emitted (and the CLI's own default), so the only drill knobs on screen are
+/// the ones that change the burn.
+const DRILL_POWER_PCT: f64 = 20.0;
+
 /// How far the placement may sit from the fiducial-derived pose before "Etch
 /// here" stops emitting on the first click and states the numbers instead.
 ///
@@ -812,18 +819,26 @@ impl ConsoleApp {
 });
             cam::register::transform_shapes(&hole_polys, &affine)
         };
-        // Same recipe the etch path bakes in: the Job-tab process params over
-        // the register verb's default power.
+        // The drill's own recipe over the register verb's default power —
+        // punching a hole is not etching copper, so it doesn't borrow the
+        // Job-tab numbers.
         let params = pcb_core::AblationParams {
-            power_pct: 20.0,
-            speed_mm_s: self.job.speed_mm_s,
-            frequency_khz: self.job.frequency_khz,
-            pulse_ns: self.job.pulse_ns,
-            passes: self.job.passes,
+            power_pct: DRILL_POWER_PCT,
+            speed_mm_s: self.drill.speed_mm_s,
+            frequency_khz: self.drill.frequency_khz,
+            pulse_ns: self.drill.pulse_ns,
+            passes: self.drill.passes,
         };
+        // A hole is TRACED, not scan-filled: `drill_polys` hands over the
+        // outline ring of each hole/slot and LightBurn follows it, so the layer
+        // is Line (`type="Cut"`).
         let mut layer =
-            cam::lbrn2::EmitLayer::fill("DRILL", params, cam::lbrn2::polys_to_elems(&placed));
-        layer.interval_mm = self.job.interval_mm;
+            cam::lbrn2::EmitLayer::line("DRILL", params, cam::lbrn2::polys_to_elems(&placed));
+        layer.interval_mm = self.drill.interval_mm;
+        // `line` defaults wobble off; carry the operator's setting through.
+        layer.wobble = self.drill.wobble;
+        layer.wobble_step_mm = self.drill.wobble_step_mm;
+        layer.wobble_size_mm = self.drill.wobble_size_mm;
         let out_path = self.resolve_drill_output(&drill_paths[0]);
         let out = out_path.to_string_lossy().into_owned();
         // Record 4a. There is no argv — this path writes the file itself rather
@@ -968,6 +983,80 @@ impl ConsoleApp {
                      prints the full path it wrote.",
                 );
                 ui.end_row();
+                let l = ui.label("drill speed mm/s");
+                ui.add(
+                    egui::DragValue::new(&mut self.drill.speed_mm_s)
+                        .speed(10.0)
+                        .range(1.0..=15000.0),
+                )
+                .labelled_by(l.id);
+                ui.end_row();
+                let l = ui.label("drill frequency kHz");
+                ui.add(
+                    egui::DragValue::new(&mut self.drill.frequency_khz)
+                        .speed(1.0)
+                        .range(1.0..=4000.0),
+                )
+                .labelled_by(l.id)
+                .on_hover_text("pulse repetition rate");
+                ui.end_row();
+                let l = ui.label("drill Q-pulse ns");
+                ui.add(
+                    egui::DragValue::new(&mut self.drill.pulse_ns)
+                        .speed(1.0)
+                        .range(0..=500),
+                )
+                .labelled_by(l.id)
+                .on_hover_text("MOPA Q-pulse width; 0 = source default (omits QPulseWidth)");
+                ui.end_row();
+                let l = ui.label("drill interval mm");
+                ui.add(
+                    egui::DragValue::new(&mut self.drill.interval_mm)
+                        .speed(0.001)
+                        .range(0.0..=1.0),
+                )
+                .labelled_by(l.id)
+                .on_hover_text(
+                    "Line spacing written with the drill layer; 0 leaves the \
+                     LightBurn device profile's own value in the file.",
+                );
+                ui.end_row();
+                let l = ui.label("drill passes");
+                ui.add(
+                    egui::DragValue::new(&mut self.drill.passes)
+                        .speed(1.0)
+                        .range(1..=1000),
+                )
+                .labelled_by(l.id)
+                .on_hover_text("times the beam retraces each hole outline");
+                ui.end_row();
+                ui.checkbox(&mut self.drill.wobble, "drill wobble")
+                    .on_hover_text(
+                        "Spiral the beam along the outline to widen the effective \
+                         line. The export writes wobbleEnable explicitly either \
+                         way, so the device profile can't override it.",
+                    );
+                ui.horizontal(|ui| {
+                    if self.drill.wobble {
+                        ui.add(
+                            egui::DragValue::new(&mut self.drill.wobble_step_mm)
+                                .speed(0.005)
+                                .range(0.0..=2.0)
+                                .prefix("step "),
+                        )
+                        .on_hover_text("wobble step along the path, mm (0 = device default)");
+                        ui.add(
+                            egui::DragValue::new(&mut self.drill.wobble_size_mm)
+                                .speed(0.005)
+                                .range(0.0..=2.0)
+                                .prefix("size "),
+                        )
+                        .on_hover_text("wobble diameter, mm (0 = device default)");
+                    } else {
+                        ui.weak("off");
+                    }
+                });
+                ui.end_row();
                 let bed = ui.label("bed frame");
                 ui.add(egui::TextEdit::singleline(&mut self.placement.frame).desired_width(240.0))
                     .labelled_by(bed.id)
@@ -978,6 +1067,10 @@ impl ConsoleApp {
                     );
                 ui.end_row();
             });
+        ui.weak(
+            "The drill recipe is independent of the etch recipe: \"Emit drill holes\" \
+             writes a Line layer that traces each hole/slot outline at these settings.",
+        );
     }
 
     /// The placement action block in the right-hand Actions panel: load the

@@ -2040,6 +2040,14 @@ field_frame=\n";
             "calib_paper_n",
             "calib_paper_out",
             "calib_paper_pitch_mm",
+            "drill_frequency_khz",
+            "drill_interval_mm",
+            "drill_passes",
+            "drill_pulse_ns",
+            "drill_speed_mm_s",
+            "drill_wobble",
+            "drill_wobble_size_mm",
+            "drill_wobble_step_mm",
             "fid_diameter_mm",
             "fid_height_mm",
             "fid_live_recover_s",
@@ -2171,6 +2179,63 @@ fn job_export_recipe_persists() {
     assert_eq!(fresh.job.pulse_ns, 1);
     assert!((fresh.job.interval_mm - 0.03).abs() < 1e-9);
     assert_eq!(fresh.job.passes, 1);
+}
+
+/// The drill's own recipe round-trips through a save + reload, and a settings
+/// file written before the keys existed loads the drill defaults — the values
+/// the machine drills at, not the etch ones it used to borrow.
+#[test]
+fn drill_export_recipe_persists() {
+    let db = tmp_db();
+    {
+        let mut a = ConsoleApp::new(db.clone(), vec!["true".into()]);
+        a.drill.speed_mm_s = 800.0;
+        a.drill.frequency_khz = 60.0;
+        a.drill.pulse_ns = 30;
+        a.drill.interval_mm = 0.02;
+        a.drill.passes = 6;
+        a.drill.wobble = false;
+        a.drill.wobble_step_mm = 0.01;
+        a.drill.wobble_size_mm = 0.03;
+        a.save_settings_if_changed();
+    }
+    let b = ConsoleApp::new(db, vec!["true".into()]);
+    assert!((b.drill.speed_mm_s - 800.0).abs() < 1e-9);
+    assert!((b.drill.frequency_khz - 60.0).abs() < 1e-9);
+    assert_eq!(b.drill.pulse_ns, 30);
+    assert!((b.drill.interval_mm - 0.02).abs() < 1e-9);
+    assert_eq!(b.drill.passes, 6);
+    assert!(!b.drill.wobble);
+    assert!((b.drill.wobble_step_mm - 0.01).abs() < 1e-9);
+    assert!((b.drill.wobble_size_mm - 0.03).abs() < 1e-9);
+
+    // The operator's existing settings file predates every drill_* key: it must
+    // come back with the drill defaults, and never with the etch recipe.
+    let db = tmp_db();
+    std::fs::write(
+        crate::settings::path_for_db(&db),
+        "pcbforge console settings v1\n\
+job_speed_mm_s=2500\n\
+job_interval_mm=0.03\n\
+job_passes=1\n",
+    )
+    .unwrap();
+    let old = ConsoleApp::new(db, vec!["true".into()]);
+    assert!((old.drill.speed_mm_s - 1000.0).abs() < 1e-9);
+    assert!((old.drill.frequency_khz - 30.0).abs() < 1e-9);
+    assert_eq!(old.drill.pulse_ns, 1);
+    assert!((old.drill.interval_mm - 0.05).abs() < 1e-9);
+    assert_eq!(old.drill.passes, 2);
+    assert!(old.drill.wobble);
+    assert!((old.drill.wobble_step_mm - 0.02).abs() < 1e-9);
+    assert!((old.drill.wobble_size_mm - 0.05).abs() < 1e-9);
+    assert!(
+        old.debug_summary().contains(
+            "drill: speed=1000 freq_khz=30 pulse_ns=1 interval=0.05 passes=2 wobble=true"
+        ),
+        "the summary reports the drill recipe: {}",
+        old.debug_summary()
+    );
 }
 
 /// The fiducial rectangle's spans round-trip through a save + reload; a blob
@@ -3395,11 +3460,32 @@ fn emit_drill_holes_writes_placed_geometry_without_queueing_a_burn() {
     app.placement.tx_mm = 100.0;
     app.placement.ty_mm = 50.0;
     app.placement.rot_deg = 0.0;
+    // Distinctive etch numbers: the drill export must ignore them entirely.
+    app.job.speed_mm_s = 4321.0;
+    app.job.interval_mm = 0.011;
+    app.job.passes = 9;
 
     app.emit_drill_at_placement();
 
     let doc = std::fs::read_to_string(&out).expect("the .lbrn2 was written");
     assert!(doc.contains("<name Value=\"DRILL\"/>"));
+    // The drill recipe reaches the file verbatim: a traced (Line) layer at the
+    // drill speed/interval/wobble/passes, NOT the etch numbers.
+    for field in [
+        "type=\"Cut\"",
+        "<speed Value=\"1000\"/>",
+        "<interval Value=\"0.05\"/>",
+        "<wobbleEnable Value=\"1\"/>",
+        "<wobbleStep Value=\"0.02\"/>",
+        "<wobbleSize Value=\"0.05\"/>",
+        "<numPasses Value=\"2\"/>",
+    ] {
+        assert!(doc.contains(field), "drill .lbrn2 must carry {field}");
+    }
+    assert!(
+        !doc.contains("4321") && !doc.contains("0.011"),
+        "the etch recipe must not leak into the drill export"
+    );
     assert_eq!(
         doc.matches("Type=\"Path\"").count(),
         3,

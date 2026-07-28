@@ -3500,3 +3500,29 @@ scenario the strict `PCBFORGE_DOUBLE_SIDED` parse was built to prevent.
 
 Fixed fail-closed: `recover --mark-done` now refuses at any stage that has a
 `next_alt` rather than guessing which branch the operator meant.
+
+## 2026-07-28 — The drill emit gets its own recipe
+
+"Emit drill holes" borrowed the Job tab's etch recipe (speed / frequency /
+Q-pulse / interval / passes) and emitted a **Fill** layer. Etching copper and
+punching through FR-4 are not the same process, and the settings that make a
+good isolation fill are not the settings that drill: the operator's drill
+numbers are 1000 mm/s, Line mode, 0.05 mm interval, wobble 0.02 mm step /
+0.05 mm size, 2 passes.
+
+So the drill emit now carries its own persisted recipe (`drill_*` keys,
+`DrillState`) with those values as defaults, and writes a Line layer — a hole
+is TRACED around its outline, not scan-filled. Power stays fixed at 20%: the
+emitter needs a `maxPower` and `AblationParams::validate` rejects 0, but pulse
+energy on this source is set by frequency and Q-pulse width, so it is not an
+operator knob. Frequency and Q-pulse keep the values the drill path already
+emitted (30 kHz / 1 ns).
+
+`cam::lbrn2` used to write `interval` for Fill layers only. It now writes it
+for a Line layer too when the caller sets one above zero — `EmitLayer::line`
+defaults it to 0, so every other Line layer (isolation, board cut, fiducial
+holes) emits exactly what it did before and the device profile keeps its own
+value there.
+
+The fiducial-hole generator stays on the etch recipe: those holes are burned
+into the jig, not through a board.

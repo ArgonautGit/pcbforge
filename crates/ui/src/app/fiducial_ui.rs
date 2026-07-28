@@ -977,9 +977,9 @@ impl ConsoleApp {
     /// (see [`chain_lightburn_after_verb`](Self::chain_lightburn_after_verb))
     /// and stops there — START stays with the operator, the same contract the
     /// drill emit holds. Uses the same layout string the check drives from, so
-    /// the holes land exactly where detection looks for them, and the same
-    /// process recipe the drill emit uses (a Line layer at the Job-tab params)
-    /// — these are drilled holes, not engraved ones.
+    /// the holes land exactly where detection looks for them, and a Line layer
+    /// like the drill emit's (at the Job-tab params) — these are traced holes,
+    /// not engraved ones.
     pub(super) fn fiducial_generate_holes(&mut self) {
         if let Err(e) = crate::fiducial::parse_layout(&self.fiducials.layout) {
             self.fiducials.note = format!("layout: {e}");
@@ -996,9 +996,11 @@ impl ConsoleApp {
             crate::fiducial::ShapeKind::Circle => 0.0,
             crate::fiducial::ShapeKind::Rect => self.fiducials.height_mm,
         };
-        // The drill recipe, matching `emit_drill_at_placement`: a Line layer
-        // (trace the hole outline, don't scan it in) at the Job-tab process
-        // params over the verb's default power.
+        // A Line layer (trace the hole outline, don't scan it in), like the
+        // drill emit — but at the Job-tab process params over the verb's
+        // default power: these holes are burned into the fiducial jig, not
+        // through a board, so they stay on the etch recipe rather than the
+        // drill one.
         let mut args: Vec<String> = vec![
             "fid-holes".into(),
             "--out".into(),

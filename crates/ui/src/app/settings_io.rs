@@ -57,6 +57,20 @@ impl ConsoleApp {
                 self.placement.lightburn_device.clone(),
             ),
             ("place_px_per_mm", self.placement.px_per_mm.to_string()),
+            ("drill_speed_mm_s", self.drill.speed_mm_s.to_string()),
+            ("drill_frequency_khz", self.drill.frequency_khz.to_string()),
+            ("drill_pulse_ns", self.drill.pulse_ns.to_string()),
+            ("drill_interval_mm", self.drill.interval_mm.to_string()),
+            ("drill_passes", self.drill.passes.to_string()),
+            ("drill_wobble", self.drill.wobble.to_string()),
+            (
+                "drill_wobble_step_mm",
+                self.drill.wobble_step_mm.to_string(),
+            ),
+            (
+                "drill_wobble_size_mm",
+                self.drill.wobble_size_mm.to_string(),
+            ),
             ("place_drills", self.placement.drills.clone()),
             ("place_drill_lbrn2", self.placement.drill_lbrn2.clone()),
             ("fid_frame", self.fiducials.frame.clone()),
@@ -372,6 +386,49 @@ impl ConsoleApp {
             .filter(|v: &f64| v.is_finite())
         {
             self.job.wobble_size_mm = v.clamp(0.0, 2.0);
+        }
+        // The drill emit's own recipe, clamped to its DragValue ranges. A blob
+        // written before these keys existed keeps the drill defaults, which is
+        // what the operator's machine wants anyway.
+        if let Some(v) = m
+            .get("drill_speed_mm_s")
+            .and_then(|s| s.trim().parse().ok())
+            .filter(|v: &f64| v.is_finite())
+        {
+            self.drill.speed_mm_s = v.clamp(1.0, 15000.0);
+        }
+        if let Some(v) = m
+            .get("drill_frequency_khz")
+            .and_then(|s| s.trim().parse().ok())
+            .filter(|v: &f64| v.is_finite())
+        {
+            self.drill.frequency_khz = v.clamp(1.0, 4000.0);
+        }
+        u32_field(&m, "drill_pulse_ns", 0, 500, &mut self.drill.pulse_ns);
+        if let Some(v) = m
+            .get("drill_interval_mm")
+            .and_then(|s| s.trim().parse().ok())
+            .filter(|v: &f64| v.is_finite())
+        {
+            self.drill.interval_mm = v.clamp(0.0, 1.0);
+        }
+        u32_field(&m, "drill_passes", 1, 1000, &mut self.drill.passes);
+        if let Some(v) = m.get("drill_wobble").and_then(|s| s.trim().parse().ok()) {
+            self.drill.wobble = v;
+        }
+        if let Some(v) = m
+            .get("drill_wobble_step_mm")
+            .and_then(|s| s.trim().parse().ok())
+            .filter(|v: &f64| v.is_finite())
+        {
+            self.drill.wobble_step_mm = v.clamp(0.0, 2.0);
+        }
+        if let Some(v) = m
+            .get("drill_wobble_size_mm")
+            .and_then(|s| s.trim().parse().ok())
+            .filter(|v: &f64| v.is_finite())
+        {
+            self.drill.wobble_size_mm = v.clamp(0.0, 2.0);
         }
         // Back-side board thickness / focal offset, clamped to the DragValue
         // ranges (a hand-edited or corrupt blob can't push them out of bounds).
