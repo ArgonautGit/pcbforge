@@ -11,30 +11,20 @@ const DRILL_FIELD_SEG_MM: f64 = 0.25;
 /// the ones that change the burn.
 const DRILL_POWER_PCT: f64 = 20.0;
 
-/// How far the placement may sit from the fiducial-derived pose before "Etch
-/// here" stops emitting on the first click and states the numbers instead.
+/// How far the placement may sit from the fiducial-derived pose before the
+/// offset readout stops calling it "on the pose" and flags it.
 ///
 /// 0.5 mm is not arbitrary: it is [`POSE_MAX_RMS_MM`], the residual above which
 /// the console already refuses to trust a fiducial fit at all. An offset the
-/// registration itself would call a failure has to be deliberate before it is
-/// burned; anything under it is inside the tolerance the lock was accepted
-/// with, and gating there would just teach the operator to click twice.
+/// registration itself would call a failure is worth reading twice; anything
+/// under it is inside the tolerance the lock was accepted with.
 ///
 /// 0.5° is the rotational match: on a 50 mm board it puts the corners about
 /// 0.44 mm out, the same error at the same scale.
 ///
 /// [`POSE_MAX_RMS_MM`]: super::fiducial_ui::POSE_MAX_RMS_MM
-const ETCH_DEVIATION_MAX_MM: f64 = 0.5;
-const ETCH_DEVIATION_MAX_DEG: f64 = 0.5;
-
-/// How far the placement may drift and still count as "the same offset the
-/// operator was shown". Past this the confirmation is re-armed with fresh
-/// numbers, so a second click can only ever confirm what was actually on
-/// screen — a nudge between the two clicks does not ride through on the first
-/// click's authority. Deliberately tight: a re-arm costs one extra click, a
-/// stale confirmation costs a board.
-const ETCH_CONFIRM_EPS_MM: f64 = 0.05;
-const ETCH_CONFIRM_EPS_DEG: f64 = 0.05;
+const OFFSET_TELL_MM: f64 = 0.5;
+const OFFSET_TELL_DEG: f64 = 0.5;
 
 impl ConsoleApp {
     /// The carried manual offset as the operator should read it, plus whether
@@ -46,14 +36,10 @@ impl ConsoleApp {
     pub(super) fn placement_offset_text(&self) -> (bool, String) {
         match self.placement_deviation() {
             None => (true, "manual placement — no fiducial reference".into()),
-            Some((mm, deg))
-                if mm <= ETCH_DEVIATION_MAX_MM && deg.abs() <= ETCH_DEVIATION_MAX_DEG =>
-            {
-                (
-                    true,
-                    format!("on the fiducial pose ({mm:.2} mm / {deg:+.2}°)"),
-                )
-            }
+            Some((mm, deg)) if mm <= OFFSET_TELL_MM && deg.abs() <= OFFSET_TELL_DEG => (
+                true,
+                format!("on the fiducial pose ({mm:.2} mm / {deg:+.2}°)"),
+            ),
             Some((mm, deg)) => (
                 false,
                 format!("⚠ {mm:.2} mm / {deg:+.2}° off the fiducial pose"),
@@ -215,10 +201,6 @@ impl ConsoleApp {
         // The other face's fit is not a frame this face's placement can be
         // measured against, so there is no offset to carry into its first Check.
         self.fiducials.last_fit = None;
-        // An arm earned on the other face must not survive into this one, and
-        // an etch confirmation quotes a deviation from a fit that is now gone.
-        self.fiducials.move_job = false;
-        self.placement.etch_confirm = None;
         // The other face's measurements are in a mirrored frame — not a layout
         // this side could adopt.
         self.fiducials.detected_mm.clear();
@@ -363,48 +345,10 @@ impl ConsoleApp {
             });
             return;
         };
-        // Nothing before this point ever compared the placement being burned
-        // with the pose the fiducials fitted. It is the whole incident: a
-        // registered board picked up 17.7 mm and 5° from a stray drag, and
-        // "Etch here" burned that pose as readily as the locked one, saying only
-        // where it had landed — a number that means nothing without the one it
-        // was supposed to land on.
+        // Measured once, up front: the burn record below names the offset from
+        // the fitted pose, and it has to be the offset that was actually
+        // exported rather than one re-read after the fact.
         let deviation = self.placement_deviation();
-        if let Some((dev_mm, dev_deg)) = deviation
-            && (dev_mm > ETCH_DEVIATION_MAX_MM || dev_deg.abs() > ETCH_DEVIATION_MAX_DEG)
-        {
-            // A confirmation is good only for the button that raised it and for
-            // the offset it quoted; anything else re-arms rather than emits.
-            let confirmed = self.placement.etch_confirm.is_some_and(|c| {
-                c.run_after == run_after
-                    && (c.dev_mm - dev_mm).abs() <= ETCH_CONFIRM_EPS_MM
-                    && (c.dev_deg - dev_deg).abs() <= ETCH_CONFIRM_EPS_DEG
-            });
-            if !confirmed {
-                self.placement.etch_confirm = Some(EtchConfirm {
-                    dev_mm,
-                    dev_deg,
-                    run_after,
-                });
-                let button = if run_after {
-                    "🔥 Etch + Run"
-                } else {
-                    "▶ Etch here (register)"
-                };
-                self.runtime.log.push(LogLine {
-                    text: format!(
-                        "NOT EXPORTED — placement is {dev_mm:.1} mm / {dev_deg:+.1}° off the \
-                         fiducial pose. Click \"{button}\" again to burn it where it now sits, \
-                         or \"⊕ recentre on fiducials\" to put the design back on the holes."
-                    ),
-                    err: true,
-                });
-                return;
-            }
-        }
-        // Either confirmed or never in doubt — and in both cases the next click
-        // starts from a clean slate.
-        self.placement.etch_confirm = None;
         // Field-warp when a valid calibration for THIS frame + the map file
         // exist; otherwise export unwarped with a warning (operator's call).
         let field_path = self.field_map_path();
@@ -1221,8 +1165,7 @@ impl ConsoleApp {
                  applied fiducial Check put it at. A manual drag is carried across \
                  later Checks on purpose, so it persists until it is undone: \
                  \"⊕ recentre on fiducials\" on the Fiducial-check tab drops it. \
-                 Past 0.5 mm / 0.5° an etch click reports the offset and waits for \
-                 a second click.",
+                 Past 0.5 mm / 0.5° it is flagged; the export log names it either way.",
             );
         ui.label(egui::RichText::new(&self.placement.note).weak());
         ui.weak(

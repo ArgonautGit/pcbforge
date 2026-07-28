@@ -4591,13 +4591,11 @@ fn the_rectangle_match_follows_the_back_faces_mirrored_geometry() {
 }
 
 // ---------------------------------------------------------------------------
-// A stray drag re-placed a registered job and "Etch here" burned it without a
-// word. The four gates below are what closes that, and the numbers they pin
-// down are worth a second opinion: a job move needs an explicit arm
-// (`fiducials.move_job`, one-shot); an etch whose placement is more than
-// 0.5 mm / 0.5° from the fiducial pose needs a second click; and the
-// mirror-scale tell measures against the machine's own field scale rather than
-// against 1.0, refusing only within 0.4% of the wrong-face signature.
+// Where the placed job sits relative to the pose the fiducials fitted: the
+// drag rule that moves it, the readout and burn record that name the offset,
+// and the mirror-scale tell, which measures against the machine's own field
+// scale rather than against 1.0 and refuses only within 0.4% of the wrong-face
+// signature.
 // ---------------------------------------------------------------------------
 
 /// An identity `layout → bed` fit, so the fiducial pose is exactly the layout
@@ -4627,76 +4625,32 @@ fn placed_app() -> ConsoleApp {
     app
 }
 
-/// Fix 1. The gate that decides whether a press moves the job. Ctrl is
-/// navigation, a ✛ wins over the design's coarse bbox, and — the whole point —
-/// the design does not move unless the operator armed it.
+/// The gate that decides whether a press moves the job: Ctrl is navigation, a
+/// ✛ wins over the design's coarse bbox, and a bare press inside the outline
+/// moves the design — the operator's ordinary way of placing a job.
 #[test]
-fn a_design_drag_latches_only_when_move_job_is_armed() {
+fn a_bare_press_inside_the_design_latches_a_job_move() {
     use super::fiducial_ui::design_drag_latches;
-    // Armed, bare press inside the outline: this is the one case that moves.
-    assert!(design_drag_latches(true, false, false, true));
-    // Unarmed — the incident. A press inside the outline (a pan attempt, since
-    // navigation here is Ctrl-only) must grab nothing at all.
-    assert!(!design_drag_latches(true, false, false, false));
-    // Ctrl still wins outright, armed or not.
-    assert!(!design_drag_latches(true, true, false, true));
-    // A ✛ under the cursor beats the design even when armed.
-    assert!(!design_drag_latches(true, false, true, true));
+    // A bare press inside the outline moves the job.
+    assert!(design_drag_latches(true, false, false));
+    // Ctrl wins outright: navigation grabs nothing.
+    assert!(!design_drag_latches(true, true, false));
+    // A ✛ under the cursor beats the design's coarse bbox.
+    assert!(!design_drag_latches(true, false, true));
     // Nowhere near the design: nothing to latch.
-    assert!(!design_drag_latches(false, false, false, true));
+    assert!(!design_drag_latches(false, false, false));
 }
 
-/// Fix 1. The arm comes up OFF, is never persisted, and is dropped by every
-/// scene change — a new frame, a side switch, and undoing the offset.
+/// Undoing a drag puts the design back on the fitted pose — translation,
+/// rotation and scale — and zeroes the offset the readout was quoting.
 #[test]
-fn the_move_job_arm_defaults_off_and_is_dropped_on_every_scene_change() {
-    let db = tmp_db();
-    let mut app = ConsoleApp::new(db.clone(), vec!["true".into()]);
-    assert!(!app.fiducials.move_job, "a fresh console is not armed");
-    assert!(app.debug_summary().contains("move_job=false"));
-
-    // A side switch drops it (and any pending etch confirmation with it).
-    app.fiducials.move_job = true;
-    app.placement.etch_confirm = Some(EtchConfirm {
-        dev_mm: 9.0,
-        dev_deg: 0.0,
-        run_after: false,
-    });
-    app.set_side(Side::Back);
-    assert!(!app.fiducials.move_job, "a side switch disarms");
-    assert!(
-        app.placement.etch_confirm.is_none(),
-        "and drops a confirmation quoting the other face's fit"
-    );
-
-    // It is a gesture-level intent, not a setting: a save/reload cycle must not
-    // bring an armed console back.
-    app.fiducials.move_job = true;
-    app.save_settings_if_changed();
-    let reloaded = ConsoleApp::new(db, vec!["true".into()]);
-    assert!(
-        !reloaded.fiducials.move_job,
-        "the arm is never persisted across a restart"
-    );
-}
-
-/// Fix 1 + 3. Undoing an accidental drag puts the design back on the fitted
-/// pose — translation, rotation and scale — zeroes the offset, disarms the
-/// move, and clears any confirmation armed against the offset it just removed.
-#[test]
-fn recentring_zeroes_the_offset_and_disarms_the_move() {
+fn recentring_zeroes_the_offset() {
     let mut app = placed_app();
-    // The bench incident, reproduced: 17.7 mm down-right and +5.13°.
+    // A big manual nudge: 17.7 mm down-right and +5.13°.
     app.placement.tx_mm += 12.5;
     app.placement.ty_mm -= 12.5;
     app.placement.rot_deg = 5.13;
     app.placement.scale = 1.02;
-    app.fiducials.move_job = true;
-    app.placement.etch_confirm = Some(EtchConfirm {
-        dev_mm: 17.68,
-        dev_deg: 5.13,
-        run_after: false,
-    });
 
     let (mm, deg) = app
         .placement_deviation()
@@ -4722,11 +4676,6 @@ fn recentring_zeroes_the_offset_and_disarms_the_move() {
         app.placement.scale
     );
     assert!(app.placement.auto_pose, "and it is still an auto pose");
-    assert!(!app.fiducials.move_job, "recentring disarms the move");
-    assert!(
-        app.placement.etch_confirm.is_none(),
-        "and voids a confirmation for an offset that no longer exists"
-    );
     assert!(
         app.fiducials.note.contains("17.68 mm") && app.fiducials.note.contains("+5.13°"),
         "the note says what was dropped: {}",
@@ -4736,9 +4685,9 @@ fn recentring_zeroes_the_offset_and_disarms_the_move() {
     assert!(ok && text.contains("on the fiducial pose"), "{text}");
 }
 
-/// Fix 2 + 3. With no fit at all the deviation is not zero, it is undefined —
-/// and both the readout and the etch log say so rather than claiming the job
-/// is on a reference that does not exist.
+/// With no fit at all the deviation is not zero, it is undefined — and both the
+/// readout and the etch log say so rather than claiming the job is on a
+/// reference that does not exist.
 #[test]
 fn a_placement_with_no_fit_reports_no_fiducial_reference() {
     let mut app = placed_app();
@@ -4768,17 +4717,13 @@ fn a_placement_with_no_fit_reports_no_fiducial_reference() {
     );
 }
 
-/// Fix 2. A placement sitting on the fiducial pose etches on the first click,
-/// exactly as before — and the log line now states the offset even though it
-/// is zero, because "0.00 mm off" is the sentence that was missing.
+/// A placement sitting on the fiducial pose etches on the click — and the log
+/// line states the offset even though it is zero, because "0.00 mm off" is the
+/// sentence the burn record was missing.
 #[test]
-fn an_on_pose_etch_emits_on_the_first_click_and_still_logs_the_offset() {
+fn an_on_pose_etch_emits_and_logs_the_offset() {
     let mut app = placed_app();
     app.emit_at_placement(false);
-    assert!(
-        app.placement.etch_confirm.is_none(),
-        "nothing to confirm at zero offset"
-    );
     let placed = app
         .runtime
         .log
@@ -4794,142 +4739,36 @@ fn an_on_pose_etch_emits_on_the_first_click_and_still_logs_the_offset() {
     );
 }
 
-/// Fix 2. THE incident. A job dragged 17.7 mm and 5.13° off the pose it was
-/// registered at is not exported on the first click: the click reports both
-/// numbers and arms. The second click on the SAME button burns it.
+/// A job nudged well off the pose it was registered at still etches on the
+/// click — moving the design is the operator's workflow, not an accident — but
+/// the offset is on the readout and on the burn record.
 #[test]
-fn an_off_pose_etch_reports_the_offset_and_needs_a_second_click() {
+fn an_off_pose_etch_emits_and_the_record_names_the_offset() {
     let mut app = placed_app();
     app.placement.tx_mm += 12.5;
     app.placement.ty_mm -= 12.5;
     app.placement.rot_deg = 5.13;
 
-    app.emit_at_placement(false);
-    assert!(
-        !app.runtime
-            .log
-            .iter()
-            .any(|l| l.text.contains("Etch here →")),
-        "the first click exported nothing"
-    );
-    let warn = app.runtime.log.last().expect("it said why");
-    assert!(warn.err, "and said it as a failure");
-    assert!(
-        warn.text.contains("NOT EXPORTED")
-            && warn.text.contains("17.7 mm")
-            && warn.text.contains("+5.1°")
-            && warn.text.contains("off the fiducial pose"),
-        "naming the offset: {}",
-        warn.text
-    );
-    assert!(
-        warn.text.contains("Click \"▶ Etch here (register)\" again")
-            && warn.text.contains("⊕ recentre on fiducials"),
-        "and both ways forward: {}",
-        warn.text
-    );
-    let confirm = app.placement.etch_confirm.expect("armed");
-    assert!(!confirm.run_after);
-    assert!(app.debug_summary().contains("etch_confirm=pending("));
+    let (ok, text) = app.placement_offset_text();
+    assert!(!ok, "the readout flags it: {text}");
 
-    // Second click on the same button: it goes.
     app.emit_at_placement(false);
-    assert!(
-        app.placement.etch_confirm.is_none(),
-        "the confirmation is spent"
-    );
     let placed = app
         .runtime
         .log
         .iter()
         .find(|l| l.text.contains("job placed at"))
-        .expect("the second click exported");
+        .expect("the click exported");
     assert!(
         placed.text.contains("17.68 mm") && placed.text.contains("+5.13°"),
-        "and the burn record carries the offset it was confirmed at: {}",
+        "and the burn record carries the offset it was burned at: {}",
         placed.text
     );
-}
-
-/// Fix 2. A confirmation authorises ONE offset on ONE button. The other button
-/// cannot spend it — a mis-click on "🔥 Etch + Run" must not start a burn the
-/// operator only armed an export for — and neither can a placement that moved
-/// in between, which re-arms with the numbers actually on screen.
-#[test]
-fn an_etch_confirmation_does_not_transfer_between_buttons_or_survive_a_nudge() {
-    let mut app = placed_app();
-    app.placement.tx_mm += 17.0;
-    app.emit_at_placement(false);
-    assert!(app.placement.etch_confirm.is_some(), "armed for the export");
-
-    // The other button re-arms rather than firing.
-    app.emit_at_placement(true);
     assert!(
-        !app.runtime
-            .log
-            .iter()
-            .any(|l| l.text.contains("Etch here →")),
-        "🔥 Etch + Run did not inherit ▶ Etch here's confirmation"
+        app.debug_summary().contains("fid_offset=17.68mm/+5.13deg"),
+        "greppable from a headless run: {}",
+        app.debug_summary()
     );
-    assert!(
-        app.placement.etch_confirm.expect("re-armed").run_after,
-        "it armed itself instead"
-    );
-
-    // A nudge between the two clicks invalidates the confirmation: the second
-    // click can only ever confirm the offset the operator was shown.
-    app.placement.tx_mm += 3.0;
-    app.emit_at_placement(true);
-    assert!(
-        !app.runtime
-            .log
-            .iter()
-            .any(|l| l.text.contains("Etch here →")),
-        "a moved placement is a new decision"
-    );
-    let confirm = app
-        .placement
-        .etch_confirm
-        .expect("re-armed with new numbers");
-    assert!(
-        (confirm.dev_mm - 20.0).abs() < 0.01,
-        "quoting the offset as it now is: {}",
-        confirm.dev_mm
-    );
-    // Untouched this time, so it goes.
-    app.emit_at_placement(true);
-    assert!(app.placement.etch_confirm.is_none(), "confirmed and spent");
-    assert!(
-        app.runtime
-            .log
-            .iter()
-            .any(|l| l.text.contains("Etch here →"))
-    );
-}
-
-/// Fix 2. The threshold itself: 0.4 mm and 0.4° are inside the fit tolerance
-/// the lock was accepted with and etch straight through; 0.6 mm alone is
-/// enough to stop.
-#[test]
-fn the_etch_confirmation_threshold_is_half_a_millimetre_and_half_a_degree() {
-    for (dx, rot, wants_confirm) in [
-        (0.4, 0.0, false),
-        (0.0, 0.4, false),
-        (0.6, 0.0, true),
-        (0.0, 0.6, true),
-        (0.0, -0.6, true),
-    ] {
-        let mut app = placed_app();
-        app.placement.tx_mm += dx;
-        app.placement.rot_deg = rot;
-        app.emit_at_placement(false);
-        assert_eq!(
-            app.placement.etch_confirm.is_some(),
-            wants_confirm,
-            "{dx} mm / {rot}° should{} need confirming",
-            if wants_confirm { "" } else { " not" }
-        );
-    }
 }
 
 /// A field calibration carrying a known uniform scale error, for the mirror

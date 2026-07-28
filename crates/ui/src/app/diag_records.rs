@@ -221,7 +221,7 @@ impl ConsoleApp {
     pub(super) fn diag_drag_started(&mut self, origin: &DragOrigin) {
         let seq = self.runtime.diag_check_seq;
         let record = format!(
-            "fid-drag check={seq} phase=started target={} marker={} modifiers={} move_job_armed={} \
+            "fid-drag check={seq} phase=started target={} marker={} modifiers={} \
              start_px={:.1},{:.1} place tx={:.3} ty={:.3} rot_deg={:+.4}",
             origin.target,
             match origin.marker {
@@ -229,7 +229,6 @@ impl ConsoleApp {
                 None => "-".into(),
             },
             origin.modifiers,
-            origin.armed,
             origin.start_px.0,
             origin.start_px.1,
             origin.start_place.0,
@@ -242,8 +241,8 @@ impl ConsoleApp {
     /// Record 2e: the same gesture released, with what it did to the placement.
     ///
     /// `place_delta_mm` is zero for every gesture that was not a job move —
-    /// which is the point: a long drag across the design with `target=none`
-    /// (unarmed) reads as an attempted pan that correctly moved nothing.
+    /// which is the point: a long drag with `target=none` reads as a gesture
+    /// that correctly moved nothing.
     pub(super) fn diag_drag_stopped(&mut self, origin: &DragOrigin, end_px: Option<(f64, f64)>) {
         let seq = self.runtime.diag_check_seq;
         let end = end_px.unwrap_or(origin.start_px);
@@ -252,12 +251,11 @@ impl ConsoleApp {
             self.placement.ty_mm - origin.start_place.1,
         );
         let record = format!(
-            "fid-drag check={seq} phase=stopped target={} modifiers={} move_job_armed={} \
+            "fid-drag check={seq} phase=stopped target={} modifiers={} \
              start_px={:.1},{:.1} end_px={end_x:.1},{end_y:.1} px_delta={:.1},{:.1} \
              place_delta_mm={dx:.3},{dy:.3} moved_mm={:.3} rot_delta_deg={:+.4}",
             origin.target,
             origin.modifiers,
-            origin.armed,
             origin.start_px.0,
             origin.start_px.1,
             end.0 - origin.start_px.0,

@@ -198,16 +198,11 @@ fn wrap_deg(mut deg: f64) -> f64 {
 /// canvas, and canvas gestures are the one part of this console that cannot be
 /// driven through the accessibility tree.
 ///
-/// The precedence it encodes, highest first: navigation (Ctrl) grabs nothing; a
-/// ✛ under the cursor beats the design's coarse bbox; and the design moves only
-/// when the operator armed it.
-pub(super) fn design_drag_latches(
-    on_design: bool,
-    navigating: bool,
-    grabbed_marker: bool,
-    move_job_armed: bool,
-) -> bool {
-    on_design && !navigating && !grabbed_marker && move_job_armed
+/// The precedence it encodes, highest first: navigation (Ctrl) grabs nothing, a
+/// ✛ under the cursor beats the design's coarse bbox, and anything left that
+/// started inside the outline moves the job.
+pub(super) fn design_drag_latches(on_design: bool, navigating: bool, grabbed_marker: bool) -> bool {
+    on_design && !navigating && !grabbed_marker
 }
 
 /// The modifier keys held right now, `+`-joined, for the drag records — `none`
@@ -307,11 +302,6 @@ impl ConsoleApp {
         self.fiducials.frame_tex =
             Some(ctx.load_texture("fid-frame", color, TextureOptions::NEAREST));
         self.fiducials.frame_img = Some(img);
-        // A new frame is a new scene: whatever the arm was for, it was for the
-        // photo that just went away. (The Live path deliberately does NOT
-        // disarm — it replaces the frame every tick, and doing so there would
-        // make the arm unusable under a live feed.)
-        self.fiducials.move_job = false;
         self.fiducials.note =
             "click each ✛ onto its hole in layout order — the last click checks (or 🎯 Check as-is)"
                 .into();
@@ -623,13 +613,6 @@ impl ConsoleApp {
         // Still an auto pose — this IS the fitted placement, so a later Load
         // must not recentre over it either.
         self.placement.auto_pose = true;
-        // The offset is gone, so a confirmation armed against it describes a
-        // placement that no longer exists — and the next etch click is once
-        // again an ordinary one.
-        self.placement.etch_confirm = None;
-        // Undoing an accidental drag must not leave the tab ready to make
-        // another one.
-        self.fiducials.move_job = false;
         self.fiducials.note = format!(
             "recentred on the fiducials — dropped a {moved:.2} mm / {turned:+.2}° manual offset; \
              design is back at the layout centroid (rot {:+.2}°, scale {:.4})",
@@ -1920,16 +1903,6 @@ impl ConsoleApp {
                      (needs the Job-tab Gerbers and a camera calibration). A fiducial \
                      lock loads the job automatically.",
                 );
-            // Armed explicitly, never implicitly: an unarmed drag across the
-            // design is a pan attempt, not a re-registration.
-            ui.checkbox(&mut self.fiducials.move_job, "✋ move job (drag)")
-                .on_hover_text(
-                    "Arm dragging the placed job: while this is ticked, a drag that \
-                     starts on the design MOVES it (Shift+drag rotates about its \
-                     pivot). It clears itself as soon as one drag finishes, and on a \
-                     new frame or a side switch — so a stray drag can never re-place \
-                     a registered job. Pan/zoom stays on Ctrl either way.",
-                );
             ui.checkbox(&mut self.fiducials.click_place, "✚ click-to-place")
                 .on_hover_text(
                     "Left-click an empty spot to add an expected fiducial; \
@@ -1969,10 +1942,9 @@ impl ConsoleApp {
                 )
                 .on_hover_text(
                     "Drop any manual offset and put the design back on the fiducial \
-                     centroid at the fitted rotation and scale — and disarm ✋ move job. \
-                     Dragging the design is carried across re-Checks on purpose; this is \
-                     how you undo one. Disabled until a Check has produced a fit to \
-                     centre on.",
+                     centroid at the fitted rotation and scale. Dragging the design is \
+                     carried across re-Checks on purpose; this is how you undo one. \
+                     Disabled until a Check has produced a fit to centre on.",
                 )
                 .clicked()
             {
@@ -2204,23 +2176,13 @@ impl ConsoleApp {
         // a ✛:
         //   1. Ctrl (pan/zoom) — navigation always wins, nothing is grabbed.
         //   2. A ✛ within MARKER_GRAB_PX — dragged onto its hole.
-        //   3. The design's bounding box, but ONLY while ✋ move job is armed —
-        //      moved (Shift rotates).
+        //   3. The design's bounding box — moved (Shift rotates).
         //   4. Nothing: the release marks/places fiducials as before.
         // The marker is tested FIRST on purpose. The design's handle is a coarse
         // screen-space bbox that almost always contains the markers, so testing
         // it first would make an existing ✛ ungrabbable whenever the outline is
         // shown. One consequence, since the marker wins outright: a Shift+drag
         // that starts on a ✛ drags the marker instead of rotating the design.
-        //
-        // Step 3's arming is what closes the incident this gate exists for.
-        // Navigation here is Ctrl-only, so an operator who drags to pan without
-        // holding it lands in the design's bbox — which used to re-place a
-        // registered job silently, and with Shift to rotate it too. Unarmed, a
-        // bare drag now falls through to case 4 and does NOTHING to the job:
-        // deliberately not "pans instead", because pan/zoom on every canvas in
-        // this console is Ctrl, and making one surface pan bare would make the
-        // convention the operator relies on conditional.
         if resp.drag_started() {
             let grabbed = resp
                 .interact_pointer_pos()
@@ -2233,8 +2195,7 @@ impl ConsoleApp {
                 _ => false,
             };
             self.fiducials.marker_drag = grabbed;
-            self.fiducials.design_drag =
-                design_drag_latches(on_design, nav, grabbed.is_some(), self.fiducials.move_job);
+            self.fiducials.design_drag = design_drag_latches(on_design, nav, grabbed.is_some());
             let target = if grabbed.is_some() {
                 "marker"
             } else if self.fiducials.design_drag {
@@ -2246,7 +2207,6 @@ impl ConsoleApp {
                 target,
                 marker: grabbed,
                 modifiers: modifier_token(ui),
-                armed: self.fiducials.move_job,
                 start_px: resp
                     .interact_pointer_pos()
                     .map(|p| xf.to_native(p))
@@ -2328,12 +2288,6 @@ impl ConsoleApp {
         // of either drag can't slip a marker through.
         let marking_allowed = self.fid_marking_allowed();
         if resp.drag_stopped() {
-            // The arm is one-shot: it authorises THIS gesture and no more, so
-            // it can never be left standing across a re-Check, a new frame or a
-            // walk away from the bench.
-            if self.fiducials.design_drag {
-                self.fiducials.move_job = false;
-            }
             self.fiducials.design_drag = false;
             // Takes the marker latch and re-checks if one was held.
             self.fid_marker_drag_release();

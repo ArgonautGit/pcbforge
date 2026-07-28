@@ -262,7 +262,6 @@ impl ConsoleApp {
                 homography: None,
                 pose: None,
                 last_fit: None,
-                move_job: false,
                 design_drag: false,
                 marker_drag: None,
                 drag_origin: None,
@@ -286,7 +285,6 @@ impl ConsoleApp {
                 lightburn_device: cam::lbrn2::DEFAULT_DEVICE.to_string(),
                 drills: String::new(),
                 drill_lbrn2: "drill.lbrn2".into(),
-                etch_confirm: None,
             },
             // The operator's drill recipe: fast Line passes with a small
             // wobble, twice over each hole, at a 5 ns Q-pulse. Frequency stays
@@ -528,18 +526,11 @@ impl ConsoleApp {
             self.fiducials.rect_h_mm,
         ));
         // How far the placement has drifted from the pose the last applied
-        // Check put it at — the number "Etch here" gates on, so it has to be
-        // greppable from a headless run too.
+        // Check put it at — the number the offset readout quotes, so it has to
+        // be greppable from a headless run too.
         let fid_offset = match self.placement_deviation() {
             Some((mm, deg)) => format!("{mm:.2}mm/{deg:+.2}deg"),
             None => "no_fit".into(),
-        };
-        let etch_confirm = match &self.placement.etch_confirm {
-            Some(c) => format!(
-                "pending({:.2}mm/{:+.2}deg,run={})",
-                c.dev_mm, c.dev_deg, c.run_after
-            ),
-            None => "none".into(),
         };
         let fid_pose = match &self.fiducials.pose {
             Some(p) => format!(
@@ -562,7 +553,7 @@ impl ConsoleApp {
              bed_overlay: show={} field={:.0}mm center=({:.1},{:.1}) auto={}\n\
              place: x={:.2} y={:.2} rot={:.1}° scale={:.4} auto_pose={} job_polys={} lightburn={} device={} drills={} drill_out={} note={:?}\n\
              drill: {drill}\n\
-             place_intent: move_job={} fid_offset={fid_offset} etch_confirm={etch_confirm} mirror_baseline={:.4}\n\
+             place_intent: fid_offset={fid_offset} mirror_baseline={:.4}\n\
              calib_paper: n={} pitch={:.2}mm dot={:.2}mm contrast={} out={}\n\
              calib_burn: n={} pitch={:.2}mm dot={:.2}mm contrast={} corners_marked={} edit_anchor_dots={} feedback={} origin=({:.1},{:.1})\n\
              fiducials: {} markers shape={} w={} h={} profile={} search={} out={} marking={} live_recover_s={}\n\
@@ -596,7 +587,6 @@ impl ConsoleApp {
             base(&self.placement.drills),
             base(&self.placement.drill_lbrn2),
             self.placement.note,
-            self.fiducials.move_job,
             self.mirror_scale_baseline(),
             self.calibration.paper.n,
             self.calibration.paper.pitch_mm,
