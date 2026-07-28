@@ -502,9 +502,11 @@ fn the_back_gerber_fields_are_drivable_by_label() {
             "outline=outline.gbr",
         ),
     ] {
-        let field = h.get_by_label(label);
-        field.focus();
-        field.type_text(path);
+        h.get_by_label(label).focus();
+        // egui hands over focus on the NEXT frame; typing in the same frame
+        // would land in whichever field held focus before.
+        h.run();
+        h.get_by_label(label).type_text(path);
         h.run();
         assert!(
             summary_line(&h.state().debug_summary(), "back:").contains(token),
@@ -599,6 +601,56 @@ fn the_live_reacquire_interval_is_labelled_and_reported() {
         // (0.5 → 0.52) rather than replacing it — same as the device field.
         summary_line(&h.state().debug_summary(), "fiducials:").contains("live_recover_s=0.52"),
         "the re-acquire field is drivable by its label:\n{}",
+        h.state().debug_summary()
+    );
+}
+
+/// The three compensation heights live on three different tabs — each beside
+/// the thing that fixes it — so the only way to prove all three are wired to
+/// the right state is to drive all three and read the one summary line they
+/// share. A crossed pair here reads on screen as a plausible number and on the
+/// bench as a burn in the wrong place.
+#[test]
+fn the_three_heights_are_labelled_on_their_own_tabs_and_reported_together() {
+    let mut h = console();
+    assert!(
+        summary_line(&h.state().debug_summary(), "height_comp:")
+            .contains("paper=0.00 laser=0.00 surface=0.00 mm"),
+        "a fresh console is uncompensated:\n{}",
+        h.state().debug_summary()
+    );
+    h.get_by_label("🎯 Calibrate").click();
+    h.run();
+    // ① is the mode the console starts in; the paper height sits with it.
+    let field = h.get_by_label("paper grid height mm");
+    field.focus();
+    field.type_text("2");
+    field.key_press(egui_kittest::kittest::Key::Enter);
+    h.run();
+
+    h.get_by_label("3) Laser field (burned grid)").click();
+    h.run();
+    let field = h.get_by_label("laser grid height mm");
+    field.focus();
+    field.type_text("4");
+    field.key_press(egui_kittest::kittest::Key::Enter);
+    h.run();
+
+    h.get_by_label("◎ Fiducial check").click();
+    h.run();
+    let field = h.get_by_label("surface height mm");
+    field.focus();
+    field.type_text("6");
+    field.key_press(egui_kittest::kittest::Key::Enter);
+    h.run();
+
+    // Each drag field opens for editing pre-filled at its current value, "0.0"
+    // at this speed, so a typed digit EXTENDS it: 2 → 0.02. Three different
+    // digits, so a crossed pair cannot read as a pass.
+    assert!(
+        summary_line(&h.state().debug_summary(), "height_comp:")
+            .contains("paper=0.02 laser=0.04 surface=0.06 mm"),
+        "each height lands in its own state:\n{}",
         h.state().debug_summary()
     );
 }

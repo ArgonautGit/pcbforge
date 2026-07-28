@@ -37,18 +37,22 @@ pub(super) enum CameraProjection {
 /// about exactly that:
 ///
 /// * `lens.px_to_mm` reads **on the ① calibration plane** — where the printed
-///   paper grid lay. Height `0` by definition.
+///   paper grid lay. That plane is this struct's zero, whatever height the
+///   operator recorded for the paper.
 /// * `frame` (paper→machine) and `field` (physical→commanded) were both built
-///   from camera readings of the ③ burned grid, which lay at
-///   `field_plane_mm`. They are therefore keyed on ①-plane readings *of
-///   features at that height*, not on true positions.
-/// * The operator marks a surface at `mark_height_mm`.
+///   from camera readings of the ③ burned grid, which lay `field_mm` above the
+///   paper. They are therefore keyed on ①-plane readings *of features at that
+///   height*, not on true positions.
+/// * The operator marks a surface `mark_mm` above the paper.
 ///
 /// So a pixel is read on the ① plane, restated from the mark height into the
 /// ③ height's reading convention, and only then handed to `frame`/`field`.
-/// Heights are positive UPWARD, toward the camera. With both at the shipped
-/// default of `0.0` the restatement is the identity and every conversion is
-/// bit-for-bit what it was before this existed.
+/// Both fields are DIFFERENCES against the ① paper height — the operator
+/// enters three heights above the bed surface and only their differences ever
+/// reach here. Positive is UPWARD, toward the camera. With the shipped
+/// defaults (all three equal, hence `0.0`/`0.0`) the restatement is the
+/// identity and every conversion is bit-for-bit what it was before this
+/// existed.
 #[derive(Debug, Clone, Copy, Default)]
 pub(super) struct PlaneShift {
     /// `None` when the lens fit carries no usable perspective — the feature
@@ -230,20 +234,24 @@ impl ConsoleApp {
         calib::camera_tilt_from_lens(&self.calibration.lens.as_ref()?.lens)
     }
 
-    /// The configured height compensation, with the tilt model resolved.
+    /// The configured height compensation, with the tilt model resolved. The
+    /// operator's three heights are all above the bed surface; the ① paper
+    /// height is what the lens map reads on, so it is the origin everything
+    /// else is stated against here.
     pub(super) fn plane_shift(&self) -> PlaneShift {
+        let paper = self.calibration.paper_height_mm;
         PlaneShift {
             tilt: self.camera_tilt(),
-            mark_mm: self.camera.mark_height_mm as f64,
-            field_mm: self.camera.field_plane_mm as f64,
+            mark_mm: self.fiducials.surface_height_mm - paper,
+            field_mm: self.calibration.laser_height_mm - paper,
         }
     }
 
     /// One line describing the height compensation actually in force, and
-    /// whether it is doing anything. Reported in the camera panel and in
-    /// `debug_summary` so the derived geometry is checkable rather than
-    /// trusted: a tilt or standoff that does not match the bench is visible
-    /// here before it quietly moves a burn.
+    /// whether it is doing anything. Reported beside the surface height on the
+    /// fiducial-check tab and in `debug_summary` so the derived geometry is
+    /// checkable rather than trusted: a tilt or standoff that does not match
+    /// the bench is visible here before it quietly moves a burn.
     pub(super) fn height_comp_status(&self) -> (String, bool) {
         let planes = self.plane_shift();
         let Some(tilt) = planes.tilt else {
@@ -270,7 +278,8 @@ impl ConsoleApp {
         (
             format!(
                 "tilt {:.1}° @ {:.0} mm · foreshortened {bearing:+.0}° ({frame}) · \
-                 mark {:+.2} mm, field plane {:+.2} mm → {:.3} mm at field centre",
+                 vs the ① paper: surface {:+.2} mm, ③ grid {:+.2} mm \
+                 → {:.3} mm at field centre",
                 tilt.tilt_rad.to_degrees(),
                 tilt.working_distance_mm,
                 planes.mark_mm,

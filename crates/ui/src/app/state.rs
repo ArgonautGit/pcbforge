@@ -249,18 +249,6 @@ pub(super) struct CameraState {
     pub(super) field_center_auto: bool,
     pub(super) field_cx_mm: f32,
     pub(super) field_cy_mm: f32,
-    /// Height of the surface being marked above the ① camera-calibration
-    /// plane, mm, positive UPWARD (toward the camera). The camera does not
-    /// look straight down, so a mark surface off the ① plane is imaged with a
-    /// lateral parallax error of roughly `h · tan(tilt)`; see
-    /// `calib::CameraTilt`. `0.0` is the ① plane itself — the uncorrected
-    /// behaviour.
-    pub(super) mark_height_mm: f32,
-    /// Height of the ③ field-grid BURN plane above the same reference, mm,
-    /// same sign convention. The ③ grid was measured through the camera at its
-    /// own height, so the burned-grid frame and the field polynomial are keyed
-    /// on readings at this plane, not at the ① plane.
-    pub(super) field_plane_mm: f32,
 }
 
 /// One grid-parameter set (dots per side, pitch, dot size, contrast). The ①
@@ -282,6 +270,18 @@ pub(super) struct CalibrationState {
     pub(super) paper: GridParams,
     /// ②③ burned grid: the COMMANDED pitch.
     pub(super) burn: GridParams,
+    /// Height the ① printed paper grid lay at, mm above the BED SURFACE,
+    /// positive UPWARD (toward the camera). The camera does not look straight
+    /// down, so a surface off this plane is imaged with a lateral parallax
+    /// error of roughly `h · tan(tilt)`; see `calib::CameraTilt`. Only
+    /// differences between the three heights matter, so a whole-bench zero is
+    /// the uncorrected behaviour.
+    pub(super) paper_height_mm: f64,
+    /// Height the ③ field grid was BURNED at, same reference and sign. The ③
+    /// grid was measured through the camera at its own height, so the
+    /// burned-grid frame and the field polynomial are keyed on readings of
+    /// features at this plane.
+    pub(super) laser_height_mm: f64,
     pub(super) grid_origin_mm: (f64, f64),
     pub(super) grid_out: String,
     /// ① printed-paper grid SVG output path (`paper-grid` verb).
@@ -342,6 +342,13 @@ pub(super) struct FiducialState {
     /// Rectangle height (ignored when `shape == Circle`).
     pub(super) height_mm: f64,
     pub(super) search_mm: f64,
+    /// Height of the surface being checked and marked, mm above the BED
+    /// SURFACE, positive UPWARD — the same reference as the two calibration
+    /// heights. A board resting on the bed is its own thickness; one on a jig
+    /// adds the jig. What the compensation actually uses is this minus the ①
+    /// paper height (how far the marked surface is off the plane the lens
+    /// reads on).
+    pub(super) surface_height_mm: f64,
     pub(super) profile: crate::fiducial::ProfileKind,
     /// Output path for the generated fiducial-holes .lbrn2 (`fid-holes` verb).
     pub(super) out: String,

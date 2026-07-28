@@ -2332,6 +2332,31 @@ impl ConsoleApp {
                     );
                 ui.end_row();
             });
+        // The board's height and what the camera's view angle does about it,
+        // on the tab where the board is actually put under the camera.
+        ui.horizontal(|ui| {
+            let height_label = ui.label("surface height mm");
+            ui.add(
+                egui::DragValue::new(&mut self.fiducials.surface_height_mm)
+                    .speed(0.1)
+                    .range(-PLANE_HEIGHT_MAX_MM..=PLANE_HEIGHT_MAX_MM),
+            )
+            .labelled_by(height_label.id)
+            .on_hover_text(
+                "Height above the bed surface, positive up, of the face being \
+                 checked and marked — a board lying on the bed is its own \
+                 thickness, mm. The camera views the bed off-perpendicular, so a \
+                 face off the step-1 paper plane images too far out along the \
+                 foreshortened axis; this is what pulls it back. Only DIFFERENCES \
+                 between the three heights (this, the step-1 paper grid, the \
+                 step-3 laser grid) affect anything.",
+            );
+            let (text, ok) = self.height_comp_status();
+            ui.colored_label(
+                status_color(ok),
+                format!("{} {text}", if ok { "●" } else { "○" }),
+            );
+        });
         // Wrapped: this row has grown to a dozen widgets, and a plain
         // `horizontal` runs them off the right edge with no scrollbar — the
         // last buttons simply become unreachable at any sane window width.

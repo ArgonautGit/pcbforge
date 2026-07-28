@@ -3633,3 +3633,28 @@ all — an affine or near-perpendicular map — the feature reports "no tilt mod
 in the lens fit" and applies nothing, rather than inventing a small tilt from
 fit noise and moving every placement by it.
 
+### 2026-07-28 addendum — three heights above the bed, each on the tab that knows it
+
+The two relative heights above turned out to be unanswerable at the console.
+"Above the ① calibration plane" asks the operator to remember, weeks later,
+what the paper sheet sat on, and it put both numbers on the Camera tab, which
+is where neither of them is learned. The stored quantities are now three
+ABSOLUTE heights sharing one reference — **the bed surface, positive up** —
+each recorded where the fact exists: `paper grid height mm` beside the ①
+controls on the Calibrate tab, `laser grid height mm` beside the ③ controls,
+and `surface height mm` on the Fiducial-check tab, next to the board it
+describes and to the ●/○ compensation status line (moved off the Camera tab
+with it). Nothing about the model changed: `plane_shift()` differences them
+into exactly the pair `PlaneShift` always took (`mark = surface − paper`,
+`field = laser − paper`), and `calib::tilt` is untouched. Only differences
+matter, so all-equal is still the identity, and all-zero is still the shipped
+default and bit-for-bit the pre-compensation chain.
+
+Keys: `calib_paper_height_mm`, `calib_laser_height_mm`, `fid_surface_height_mm`
+(±50 mm clamp, as before). The hours-old `mark_height_mm` / `field_plane_mm`
+keys are retired with no migration — they never reached a bench, and silently
+reinterpreting a relative height as an absolute one would be the one failure
+this whole entry exists to prevent. `debug_summary()`'s `height_comp:` line now
+quotes the raw trio alongside the derived geometry, because the differences are
+what the projection uses but the trio is what the operator typed.
+

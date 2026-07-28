@@ -491,44 +491,6 @@ impl ConsoleApp {
                     .labelled_by(cy_label.id);
                 }
             });
-            // Height compensation. The camera views the bed off-perpendicular,
-            // so anything imaged off the ① calibration plane is read too far
-            // out along the foreshortened axis. Both heights are measured from
-            // that plane, positive upward; 0/0 is the uncompensated behaviour.
-            ui.horizontal(|ui| {
-                let mark_label = ui.label("mark surface height mm");
-                ui.add(
-                    egui::DragValue::new(&mut self.camera.mark_height_mm)
-                        .speed(0.1)
-                        .range(-PLANE_HEIGHT_MAX_MM..=PLANE_HEIGHT_MAX_MM),
-                )
-                .labelled_by(mark_label.id)
-                .on_hover_text(
-                    "Height of the surface you are marking above the step-1 camera \
-                     calibration plane (where the printed paper grid lay), mm. \
-                     Positive is up, toward the camera — a board on top of the \
-                     calibration surface is positive by its thickness. 0 means the \
-                     mark surface IS the calibration plane.",
-                );
-                let plane_label = ui.label("field cal plane mm");
-                ui.add(
-                    egui::DragValue::new(&mut self.camera.field_plane_mm)
-                        .speed(0.1)
-                        .range(-PLANE_HEIGHT_MAX_MM..=PLANE_HEIGHT_MAX_MM),
-                )
-                .labelled_by(plane_label.id)
-                .on_hover_text(
-                    "Height of the step-3 burned field grid above the same step-1 \
-                     plane, mm. The step-3 grid was measured through the camera at \
-                     its own height, so the machine frame it anchors is on that \
-                     plane; only the DIFFERENCE from the mark surface moves anything.",
-                );
-            });
-            let (text, ok) = self.height_comp_status();
-            ui.colored_label(
-                status_color(ok),
-                format!("{} {text}", if ok { "●" } else { "○" }),
-            );
             if self.camera.show_bed {
                 let (text, ok) = match self.camera.last.as_ref().map(|f| f.dimensions()) {
                     Some(dimensions) => match self.camera_projection(dimensions) {

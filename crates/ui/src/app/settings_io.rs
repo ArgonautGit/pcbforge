@@ -30,11 +30,11 @@ fn parse_coeffs(s: &str) -> Option<[f64; 23]> {
 /// the loop measurement with a coordinate that isn't a position.
 const REF_HOLE_MAX_MM: f64 = 10_000.0;
 
-/// Clamp on the two operator-set plane heights (mm above the ① camera
-/// calibration plane, either sign). Nothing this console marks sits further
-/// off that plane, and the compensation is linear in the height — a corrupt
-/// blob must not be able to swing placement by metres.
-pub(super) const PLANE_HEIGHT_MAX_MM: f32 = 50.0;
+/// Clamp on the three operator-set plane heights (mm above the bed surface,
+/// either sign). Nothing this console calibrates on or marks sits further off
+/// the bed, and the compensation is linear in the height differences — a
+/// corrupt blob must not be able to swing placement by metres.
+pub(super) const PLANE_HEIGHT_MAX_MM: f64 = 50.0;
 
 /// Parse the persisted `lens_px_bounds` row: `min_x min_y max_x max_y`.
 ///
@@ -125,6 +125,10 @@ impl ConsoleApp {
             ("fid_diameter_mm", self.fiducials.diameter_mm.to_string()),
             ("fid_height_mm", self.fiducials.height_mm.to_string()),
             ("fid_search_mm", self.fiducials.search_mm.to_string()),
+            (
+                "fid_surface_height_mm",
+                self.fiducials.surface_height_mm.to_string(),
+            ),
             ("fid_profile", self.fiducials.profile.token().to_string()),
             ("fid_out", self.fiducials.out.clone()),
             ("fid_rect_w_mm", self.fiducials.rect_w_mm.to_string()),
@@ -171,6 +175,16 @@ impl ConsoleApp {
                 dot_kind_token(self.calibration.paper.dot_kind).to_string(),
             ),
             ("calib_paper_out", self.calibration.paper_out.clone()),
+            // The two calibration heights, above the bed surface. They belong
+            // to the fits, not to the camera: a re-fit is what changes them.
+            (
+                "calib_paper_height_mm",
+                self.calibration.paper_height_mm.to_string(),
+            ),
+            (
+                "calib_laser_height_mm",
+                self.calibration.laser_height_mm.to_string(),
+            ),
             (
                 "calib_grid_origin_x",
                 self.calibration.grid_origin_mm.0.to_string(),
@@ -200,8 +214,6 @@ impl ConsoleApp {
             ),
             ("field_cx_mm", self.camera.field_cx_mm.to_string()),
             ("field_cy_mm", self.camera.field_cy_mm.to_string()),
-            ("mark_height_mm", self.camera.mark_height_mm.to_string()),
-            ("field_plane_mm", self.camera.field_plane_mm.to_string()),
             // The calibration matrix (px→mm, row-major) — the operator's grid
             // is taped to the bed and persists, so we keep the fit as a
             // re-anchor seed across restarts (Re-anchor re-locks it).
@@ -671,20 +683,31 @@ impl ConsoleApp {
             }
         }
         self.sync_auto_field_center();
-        // Height compensation. Read after the bed-overlay block so the legacy
-        // `field_*` migration above sees exactly the key set it was written
-        // for. Absent keys leave the 0.0 defaults, which is the behaviour the
-        // console had before the compensation existed.
-        f32_field(&m, "mark_height_mm", &mut self.camera.mark_height_mm);
-        f32_field(&m, "field_plane_mm", &mut self.camera.field_plane_mm);
-        self.camera.mark_height_mm = self
-            .camera
-            .mark_height_mm
-            .clamp(-PLANE_HEIGHT_MAX_MM, PLANE_HEIGHT_MAX_MM);
-        self.camera.field_plane_mm = self
-            .camera
-            .field_plane_mm
-            .clamp(-PLANE_HEIGHT_MAX_MM, PLANE_HEIGHT_MAX_MM);
+        // The three height-compensation heights, all above the bed surface.
+        // Absent keys leave the 0.0 defaults — three equal heights, which is
+        // the behaviour the console had before the compensation existed.
+        for (key, dst) in [
+            (
+                "calib_paper_height_mm",
+                &mut self.calibration.paper_height_mm,
+            ),
+            (
+                "calib_laser_height_mm",
+                &mut self.calibration.laser_height_mm,
+            ),
+            (
+                "fid_surface_height_mm",
+                &mut self.fiducials.surface_height_mm,
+            ),
+        ] {
+            if let Some(v) = m
+                .get(key)
+                .and_then(|s| s.trim().parse().ok())
+                .filter(|v: &f64| v.is_finite())
+            {
+                *dst = v.clamp(-PLANE_HEIGHT_MAX_MM, PLANE_HEIGHT_MAX_MM);
+            }
+        }
         if let Some(v) = m.get("cam_show_bed").and_then(|s| s.trim().parse().ok()) {
             self.camera.show_bed = v;
         }

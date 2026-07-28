@@ -1091,6 +1091,24 @@ impl ConsoleApp {
                         "Where the printable A4 dot-grid SVG is written. Print it at 100%.",
                     );
                     ui.end_row();
+                    // Recorded here, with the fit it describes: the lens map
+                    // reads on whatever plane the sheet lay on, and that is
+                    // only known while the sheet is on the bed.
+                    let height_label = ui.label("paper grid height mm");
+                    ui.add(
+                        egui::DragValue::new(&mut self.calibration.paper_height_mm)
+                            .speed(0.1)
+                            .range(-PLANE_HEIGHT_MAX_MM..=PLANE_HEIGHT_MAX_MM),
+                    )
+                    .labelled_by(height_label.id)
+                    .on_hover_text(
+                        "Height above the bed surface, positive up, that this printed \
+                         paper grid sat at — the sheet plus whatever it lay on, mm. \
+                         The step-1 lens map reads on that plane, so it is what the \
+                         other two heights are measured against; only DIFFERENCES \
+                         between the three heights affect anything.",
+                    );
+                    ui.end_row();
                 }
                 if self.calibration.mode != CalibMode::CameraLens {
                     ui.label("grid out .lbrn2");
@@ -1136,6 +1154,24 @@ impl ConsoleApp {
                     ui.end_row();
                 }
                 if self.calibration.mode == CalibMode::LaserField {
+                    // Same reasoning as the ① paper height: the plane the grid
+                    // was burned at is a fact about this fit.
+                    let height_label = ui.label("laser grid height mm");
+                    ui.add(
+                        egui::DragValue::new(&mut self.calibration.laser_height_mm)
+                            .speed(0.1)
+                            .range(-PLANE_HEIGHT_MAX_MM..=PLANE_HEIGHT_MAX_MM),
+                    )
+                    .labelled_by(height_label.id)
+                    .on_hover_text(
+                        "Height above the bed surface, positive up, that this field \
+                         grid was BURNED at — the plate's top face, mm. The grid was \
+                         measured through the camera at that height, so the machine \
+                         frame and field polynomial it anchors are keyed on readings \
+                         of features there; only DIFFERENCES between the three \
+                         heights affect anything.",
+                    );
+                    ui.end_row();
                     let rms_label = ui.label("accept RMS µm");
                     ui.add(
                         egui::DragValue::new(&mut self.calibration.accept_rms_um)

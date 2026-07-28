@@ -2032,8 +2032,10 @@ field_frame=\n";
             "calib_accept_rms_um",
             "calib_accept_worst_um",
             "calib_field_scale",
+            "calib_laser_height_mm",
             "calib_paper_dot_kind",
             "calib_paper_dot_mm",
+            "calib_paper_height_mm",
             "calib_paper_n",
             "calib_paper_out",
             "calib_paper_pitch_mm",
@@ -2055,7 +2057,7 @@ field_frame=\n";
             "fid_ref_holes",
             "fid_search_mm",
             "fid_shape",
-            "field_plane_mm",
+            "fid_surface_height_mm",
             "job_frequency_khz",
             "job_interval_mm",
             "job_passes",
@@ -2065,7 +2067,6 @@ field_frame=\n";
             "job_wobble_size_mm",
             "job_wobble_step_mm",
             "lens_px_bounds",
-            "mark_height_mm",
             "place_drill_lbrn2",
             "place_drills",
             "place_lightburn_device",
@@ -5176,6 +5177,9 @@ fn the_camera_shift_is_measured_against_the_holes_the_laser_itself_burned() {
         summary.contains("fid_loop: ALARM") && summary.contains("ref_holes=4"),
         "the loop verdict is greppable from a headless run: {summary}"
     );
+    // Error lines reach the diagnostic file via the mirror pass the frame
+    // update runs; there is no frame here, so run it directly.
+    app.diag_mirror_errors();
     let log = std::fs::read_to_string(app.runtime.diag.path()).unwrap();
     assert!(
         log.contains("disagrees with the laser's own fiducial holes"),
@@ -5452,8 +5456,9 @@ fn the_tilt_model_recovers_the_synthetic_camera_geometry() {
 #[test]
 fn zero_heights_leave_every_conversion_untouched() {
     let app = tilted_app();
-    assert_eq!(app.camera.mark_height_mm, 0.0);
-    assert_eq!(app.camera.field_plane_mm, 0.0);
+    assert_eq!(app.calibration.paper_height_mm, 0.0);
+    assert_eq!(app.calibration.laser_height_mm, 0.0);
+    assert_eq!(app.fiducials.surface_height_mm, 0.0);
     let planes = app.plane_shift();
     assert!(planes.tilt.is_some(), "the tilt model IS available");
     assert!(!planes.active(), "but with equal planes it moves nothing");
@@ -5478,10 +5483,10 @@ fn a_1p6_mm_mark_surface_shifts_the_read_by_0p8_mm_toward_the_camera() {
         .place_projection(800, 800)
         .unwrap()
         .from_px(TILT_AXIS_PX);
-    app.camera.mark_height_mm = 1.6;
+    app.fiducials.surface_height_mm = 1.6;
     assert!(
         app.plane_shift().active(),
-        "1.6 mm over a 0 mm field plane is live"
+        "a board 1.6 mm over both calibration planes is live"
     );
 
     let after = app
@@ -5508,8 +5513,8 @@ fn a_1p6_mm_mark_surface_shifts_the_read_by_0p8_mm_toward_the_camera() {
     assert!(text.contains("at field centre"), "{text}");
 }
 
-/// Only the DIFFERENCE between the two planes moves anything: a mark surface
-/// level with the ③ burn plane is exactly where the frame was anchored.
+/// Only DIFFERENCES between the heights move anything: a marked surface level
+/// with the ③ burn plane is exactly where the frame was anchored.
 #[test]
 fn a_mark_surface_level_with_the_field_plane_needs_no_correction() {
     let mut app = tilted_app();
@@ -5518,8 +5523,8 @@ fn a_mark_surface_level_with_the_field_plane_needs_no_correction() {
         .unwrap()
         .from_px(TILT_AXIS_PX)
         .unwrap();
-    app.camera.mark_height_mm = 1.6;
-    app.camera.field_plane_mm = 1.6;
+    app.fiducials.surface_height_mm = 1.6;
+    app.calibration.laser_height_mm = 1.6;
     assert!(!app.plane_shift().active());
     let after = app
         .place_projection(800, 800)
@@ -5534,8 +5539,8 @@ fn a_mark_surface_level_with_the_field_plane_needs_no_correction() {
 #[test]
 fn the_corrected_projection_round_trips_px_to_machine_and_back() {
     let mut app = tilted_app();
-    app.camera.mark_height_mm = 1.6;
-    app.camera.field_plane_mm = -0.4;
+    app.fiducials.surface_height_mm = 1.6;
+    app.calibration.laser_height_mm = -0.4;
     for (label, projection) in [
         ("physical", app.place_projection(800, 800).unwrap()),
         (
@@ -5560,7 +5565,7 @@ fn the_corrected_projection_round_trips_px_to_machine_and_back() {
 #[test]
 fn an_untilted_lens_fit_reports_no_tilt_model_and_corrects_nothing() {
     let mut app = nonlinear_app();
-    app.camera.mark_height_mm = 5.0;
+    app.fiducials.surface_height_mm = 5.0;
     assert!(app.camera_tilt().is_none());
     assert!(!app.plane_shift().active());
     let (text, active) = app.height_comp_status();
@@ -5586,23 +5591,27 @@ fn an_untilted_lens_fit_reports_no_tilt_model_and_corrects_nothing() {
 fn the_plane_heights_persist_and_are_clamped_on_load() {
     let db = tmp_db();
     let mut app = ConsoleApp::new(&db, vec!["true".into()]);
-    app.camera.mark_height_mm = 1.6;
-    app.camera.field_plane_mm = -0.25;
+    app.calibration.paper_height_mm = 2.0;
+    app.calibration.laser_height_mm = -0.25;
+    app.fiducials.surface_height_mm = 1.6;
     std::fs::write(crate::settings::path_for_db(&db), app.settings_blob()).unwrap();
     let back = ConsoleApp::new(&db, vec!["true".into()]);
-    assert_eq!(back.camera.mark_height_mm, 1.6);
-    assert_eq!(back.camera.field_plane_mm, -0.25);
+    assert_eq!(back.calibration.paper_height_mm, 2.0);
+    assert_eq!(back.calibration.laser_height_mm, -0.25);
+    assert_eq!(back.fiducials.surface_height_mm, 1.6);
 
     // A blob claiming metres is a corrupt blob, not a bench setup.
     let db = tmp_db();
     std::fs::write(
         crate::settings::path_for_db(&db),
-        "pcbforge console settings v1\nmark_height_mm=9000\nfield_plane_mm=-9000\n",
+        "pcbforge console settings v1\ncalib_paper_height_mm=9000\n\
+         calib_laser_height_mm=-9000\nfid_surface_height_mm=9000\n",
     )
     .unwrap();
     let clamped = ConsoleApp::new(&db, vec!["true".into()]);
-    assert_eq!(clamped.camera.mark_height_mm, 50.0);
-    assert_eq!(clamped.camera.field_plane_mm, -50.0);
+    assert_eq!(clamped.calibration.paper_height_mm, 50.0);
+    assert_eq!(clamped.calibration.laser_height_mm, -50.0);
+    assert_eq!(clamped.fiducials.surface_height_mm, 50.0);
 
     // An absent key keeps the default, which is the uncompensated behaviour.
     let db = tmp_db();
@@ -5612,6 +5621,43 @@ fn the_plane_heights_persist_and_are_clamped_on_load() {
     )
     .unwrap();
     let bare = ConsoleApp::new(&db, vec!["true".into()]);
-    assert_eq!(bare.camera.mark_height_mm, 0.0);
-    assert_eq!(bare.camera.field_plane_mm, 0.0);
+    assert_eq!(bare.calibration.paper_height_mm, 0.0);
+    assert_eq!(bare.calibration.laser_height_mm, 0.0);
+    assert_eq!(bare.fiducials.surface_height_mm, 0.0);
+}
+
+/// The three heights share ONE reference (the bed surface) and only their
+/// differences reach the projection: a bench where the paper sat 2 mm up, the
+/// field grid was burned at 0.4 mm and the board face is at 3.6 mm is the same
+/// correction as the flat-paper bench with a 1.6 mm board over a −1.6 mm grid.
+/// A reference slip would show up here and nowhere else.
+#[test]
+fn only_the_differences_between_the_three_heights_reach_the_projection() {
+    let relative = {
+        let mut app = tilted_app();
+        app.fiducials.surface_height_mm = 1.6;
+        app.calibration.laser_height_mm = -1.6;
+        app.place_projection(800, 800).unwrap()
+    };
+    let mut app = tilted_app();
+    app.calibration.paper_height_mm = 2.0;
+    app.calibration.laser_height_mm = 0.4;
+    app.fiducials.surface_height_mm = 3.6;
+    let planes = app.plane_shift();
+    assert_eq!((planes.mark_mm, planes.field_mm), (1.6, -1.6));
+
+    let shifted = app.place_projection(800, 800).unwrap();
+    for px in [TILT_AXIS_PX, (200.0, 250.0), (610.0, 590.0)] {
+        assert_eq!(
+            shifted.from_px(px).unwrap(),
+            relative.from_px(px).unwrap(),
+            "the same correction, bit for bit, at {px:?}"
+        );
+    }
+    // And the debug summary quotes the raw trio, not the differences.
+    let summary = app.debug_summary();
+    assert!(
+        summary.contains("height_comp: active=true paper=2.00 laser=0.40 surface=3.60 mm"),
+        "{summary}"
+    );
 }

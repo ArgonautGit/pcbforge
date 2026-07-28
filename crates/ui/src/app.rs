@@ -192,8 +192,6 @@ impl ConsoleApp {
                 field_center_auto: true,
                 field_cx_mm: 35.0,
                 field_cy_mm: 35.0,
-                mark_height_mm: 0.0,
-                field_plane_mm: 0.0,
             },
             calibration: CalibrationState {
                 anchor: None,
@@ -210,6 +208,8 @@ impl ConsoleApp {
                     dot_mm: 0.4,
                     dot_kind: calib::DotKind::Dark,
                 },
+                paper_height_mm: 0.0,
+                laser_height_mm: 0.0,
                 grid_origin_mm: (0.0, 0.0),
                 grid_out: "calib-grid.lbrn2".into(),
                 paper_out: "paper-grid.svg".into(),
@@ -243,6 +243,7 @@ impl ConsoleApp {
                 diameter_mm: 1.0,
                 height_mm: 1.0,
                 search_mm: 2.0,
+                surface_height_mm: 0.0,
                 profile: crate::fiducial::ProfileKind::DarkDot,
                 out: "fid-holes.lbrn2".into(),
                 rect_w_mm: 50.0,
@@ -449,11 +450,18 @@ impl ConsoleApp {
             },
             None => "no-frame",
         };
-        // The derived camera-ray geometry, spelled out: a wrong derivation has
-        // to be readable here rather than only visible as a shifted burn.
+        // The derived camera-ray geometry AND the three heights it is driven
+        // by, spelled out with the tab each is set on: the compensation only
+        // ever uses their differences, so the raw trio has to be readable here
+        // rather than only visible as a shifted burn.
         let height_comp = {
             let (text, active) = self.height_comp_status();
-            format!("active={active} {text}")
+            format!(
+                "active={active} paper={:.2} laser={:.2} surface={:.2} mm · {text}",
+                self.calibration.paper_height_mm,
+                self.calibration.laser_height_mm,
+                self.fiducials.surface_height_mm,
+            )
         };
         let cam = match &self.camera.last {
             Some(g) => format!(
