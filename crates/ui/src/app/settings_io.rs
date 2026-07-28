@@ -44,8 +44,12 @@ impl ConsoleApp {
             ("job_wobble_size_mm", self.job.wobble_size_mm.to_string()),
             ("back_copper", self.job.back_copper.clone()),
             ("back_outline", self.job.back_outline.clone()),
+            ("back_lbrn2", self.job.back_lbrn2.clone()),
             ("thickness_mm", self.job.board_thickness_mm.to_string()),
             ("focal_mm", self.job.focal_mm.to_string()),
+            ("scan_center_auto", self.job.scan_center_auto.to_string()),
+            ("scan_center_x_mm", self.job.scan_center_mm.0.to_string()),
+            ("scan_center_y_mm", self.job.scan_center_mm.1.to_string()),
             ("place_frame", self.placement.frame.clone()),
             ("place_lbrn2", self.placement.lbrn2.clone()),
             (
@@ -293,6 +297,7 @@ impl ConsoleApp {
         str_field(&m, "lbrn2", &mut self.job.emit_lbrn2);
         str_field(&m, "back_copper", &mut self.job.back_copper);
         str_field(&m, "back_outline", &mut self.job.back_outline);
+        str_field(&m, "back_lbrn2", &mut self.job.back_lbrn2);
         str_field(&m, "place_frame", &mut self.placement.frame);
         str_field(&m, "place_lbrn2", &mut self.placement.lbrn2);
         str_field(&m, "place_drills", &mut self.placement.drills);
@@ -368,8 +373,45 @@ impl ConsoleApp {
         {
             self.job.wobble_size_mm = v.clamp(0.0, 2.0);
         }
-        f64_field(&m, "thickness_mm", &mut self.job.board_thickness_mm);
-        f64_field(&m, "focal_mm", &mut self.job.focal_mm);
+        // Back-side board thickness / focal offset, clamped to the DragValue
+        // ranges (a hand-edited or corrupt blob can't push them out of bounds).
+        if let Some(v) = m
+            .get("thickness_mm")
+            .and_then(|s| s.trim().parse().ok())
+            .filter(|v: &f64| v.is_finite())
+        {
+            self.job.board_thickness_mm = v.clamp(0.0, 10.0);
+        }
+        if let Some(v) = m
+            .get("focal_mm")
+            .and_then(|s| s.trim().parse().ok())
+            .filter(|v: &f64| v.is_finite())
+        {
+            self.job.focal_mm = v.clamp(1.0, 1000.0);
+        }
+        if let Some(v) = m
+            .get("scan_center_auto")
+            .and_then(|s| s.trim().parse().ok())
+        {
+            self.job.scan_center_auto = v;
+        }
+        // The scan center is a measured per-rig constant with no DragValue
+        // range of its own; clamp to a sane span so a hand-edited or corrupt
+        // blob can't push it wildly off the bed.
+        if let Some(v) = m
+            .get("scan_center_x_mm")
+            .and_then(|s| s.trim().parse().ok())
+            .filter(|v: &f64| v.is_finite())
+        {
+            self.job.scan_center_mm.0 = v.clamp(-1000.0, 1000.0);
+        }
+        if let Some(v) = m
+            .get("scan_center_y_mm")
+            .and_then(|s| s.trim().parse().ok())
+            .filter(|v: &f64| v.is_finite())
+        {
+            self.job.scan_center_mm.1 = v.clamp(-1000.0, 1000.0);
+        }
         f64_field(&m, "place_px_per_mm", &mut self.placement.px_per_mm);
         f64_field(&m, "fid_px_per_mm", &mut self.fiducials.px_per_mm);
         // Fiducial footprint + search window, clamped to the DragValue ranges

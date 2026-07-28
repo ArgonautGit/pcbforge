@@ -111,6 +111,23 @@ impl ConsoleApp {
         })
     }
 
+    /// The through-hole exit magnification the CURRENT optics imply,
+    /// `1 + thickness/focal` — 1.0 when either is unset.
+    ///
+    /// Read straight off the job fields rather than through
+    /// [`back_field_params`](Self::back_field_params), which is `None` on the
+    /// front: the FRONT needs this number too. It is the tell that separates a
+    /// genuine front fit from a flipped board fitted through a mirror-symmetric
+    /// layout, where the mirror flag alone cannot decide.
+    pub(super) fn exit_magnification(&self) -> f64 {
+        cam::flip::FieldParams {
+            scan_center_mm: (0.0, 0.0),
+            thickness_mm: self.job.board_thickness_mm,
+            focal_mm: self.job.focal_mm,
+        }
+        .exit_magnification()
+    }
+
     /// The expected fiducial positions to display/detect, in bed mm: the raw
     /// design layout on the front, or the mirrored + beam-offset positions on
     /// the back (where the drilled through-holes actually appear when flipped).
@@ -145,6 +162,21 @@ impl ConsoleApp {
         // The other face's measurements are in a mirrored frame — not a layout
         // this side could adopt.
         self.fiducials.detected_mm.clear();
+        // The photo, its texture and the scale measured off it all belong to the
+        // face that was showing. Kept, they put the FRONT board on screen under
+        // a Back selection — and a Check against that stale image is not merely
+        // confusing, it can fit and lock a placement from the wrong face.
+        self.fiducials.frame_img = None;
+        self.fiducials.frame_tex = None;
+        self.fiducials.measured_ppm = None;
+        // …and the note describing that detection goes with it. Back to the
+        // tab's opening instruction rather than blank: a side switch does a lot,
+        // and an empty line reads as nothing having happened.
+        self.fiducials.note = "Load a frame, click each marker onto its hole, then Check.".into();
+        // A side switch is a new scene. The whole-frame scan's Live backoff was
+        // earned against the other face's frame, and up to 40 s of it would
+        // suppress exactly the re-acquisition a flip needs.
+        self.fiducials.last_global_recover = None;
         self.ar.board.clear();
         self.ar.copper.clear();
         self.ar.ablate.clear();

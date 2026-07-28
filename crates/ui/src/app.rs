@@ -158,6 +158,7 @@ impl ConsoleApp {
                 side: Side::Front,
                 back_copper: String::new(),
                 back_outline: String::new(),
+                back_lbrn2: "job-back.lbrn2".into(),
                 board_thickness_mm: 1.6,
                 focal_mm: 70.0,
                 scan_center_auto: true,
@@ -466,6 +467,26 @@ impl ConsoleApp {
             self.job.wobble_step_mm,
             self.job.wobble_size_mm,
         );
+        // The back side's own inputs: they persist across a side switch (only
+        // the per-side caches are dropped), so they report separately.
+        let back = format!(
+            "copper={} outline={} lbrn2={}",
+            if self.job.back_copper.trim().is_empty() {
+                "unset".into()
+            } else {
+                base(&self.job.back_copper)
+            },
+            if self.job.back_outline.trim().is_empty() {
+                "unset".into()
+            } else {
+                base(&self.job.back_outline)
+            },
+            if self.job.back_lbrn2.trim().is_empty() {
+                "unset".into()
+            } else {
+                base(&self.job.back_lbrn2)
+            },
+        );
         // The fiducial rectangle's four positions, resolved against the effective
         // field centre (kept in sync with the auto toggle by `sync_auto_field_center`).
         let fid_layout = fiducial::format_layout(&fiducial::centered_fid_layout(
@@ -484,6 +505,7 @@ impl ConsoleApp {
         format!(
             "tab={:?} side={:?} calib_mode={:?}\n\
              gerbers: {gerbers}\n\
+             back: {back}\n\
              calib_anchor: {calib}\n\
              camera_lens: {lens}\n\
              laser_field: {field} field_correct={} scale_mode={} limits={:.0}/{:.0}µm\n\

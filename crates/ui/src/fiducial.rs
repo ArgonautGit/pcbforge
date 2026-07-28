@@ -324,6 +324,40 @@ pub fn centered_fid_layout(cx: f64, cy: f64, w: f64, h: f64) -> [(f64, f64); 4] 
     [(x0, y0), (x1, y0), (x0, y1), (x1, y1)]
 }
 
+/// How far a mirrored layout point may sit from its partner and still count as
+/// the same point. Layouts are typed or generated coordinates, so a symmetric
+/// one is symmetric to the digit; this only has to absorb the 2-decimal
+/// rounding [`format_layout`] applies when a measured layout is adopted.
+const MIRROR_SYM_TOL_MM: f64 = 0.05;
+
+/// Whether the layout is its own mirror image about the vertical axis through
+/// its centroid — the rectangles the fiducial generator makes all are.
+///
+/// This is the condition under which mirroring the BOARD and permuting the
+/// CORRESPONDENCE produce the same detections: every marker has a partner to
+/// latch onto, so [`fit_board_pose`] returns a clean fit whose `flipped` flag
+/// agrees with whichever face the operator happens to have selected. The flag
+/// is then worthless as a face check and the caller needs a second signal —
+/// see the scale tell in `update_placement_from_fiducials`.
+///
+/// The axis is fixed to vertical-through-the-centroid rather than searched over
+/// all angles: the fit absorbs rotation anyway, and a layout symmetric only
+/// about some oblique axis is not something either the generator or the
+/// rectangle fields can produce.
+pub fn layout_is_mirror_symmetric(layout_mm: &[(f64, f64)]) -> bool {
+    if layout_mm.len() < 3 {
+        return false;
+    }
+    let n = layout_mm.len() as f64;
+    let cx = layout_mm.iter().map(|p| p.0).sum::<f64>() / n;
+    layout_mm.iter().all(|&(x, y)| {
+        let mx = 2.0 * cx - x;
+        layout_mm
+            .iter()
+            .any(|&(qx, qy)| (qx - mx).hypot(qy - y) <= MIRROR_SYM_TOL_MM)
+    })
+}
+
 /// Format points as the `"x,y; x,y; …"` layout string [`parse_layout`] reads,
 /// with 2-decimal coordinates.
 pub fn format_layout(pts: &[(f64, f64)]) -> String {

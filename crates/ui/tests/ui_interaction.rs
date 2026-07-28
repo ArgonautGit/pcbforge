@@ -92,7 +92,7 @@ fn gerbers_from_kicad_fills_the_copper_and_outline_fields() {
 
     let state = h.state().debug_summary();
     assert!(
-        state.contains("copper=copper.gbr") && state.contains("outline=outline.gbr"),
+        state.contains("copper=copper-F_Cu.gbr") && state.contains("outline=outline.gbr"),
         "KiCad button filled the Gerber fields:\n{state}"
     );
 }
@@ -452,6 +452,113 @@ fn wobble_is_opt_in_and_drivable() {
         summary_line(&h.state().debug_summary(), "gerbers:").contains("wobble=false"),
         "checkbox turns wobble back off:\n{}",
         h.state().debug_summary()
+    );
+}
+
+/// The double-sided side selector: a fresh console works the front, and picking
+/// Back both switches the side and reveals the back-only inputs.
+#[test]
+fn the_side_selector_switches_to_the_back_form() {
+    let mut h = console();
+    assert!(
+        h.state().debug_summary().contains("side=Front"),
+        "a fresh console works the front:\n{}",
+        h.state().debug_summary()
+    );
+    // The back inputs only exist on the back, so they are absent to start with.
+    assert!(h.query_by_label("back copper .gbr").is_none());
+
+    h.get_by_label("Back").click();
+    h.run();
+    let s = h.state().debug_summary();
+    assert!(s.contains("side=Back"), "Back selected:\n{s}");
+    for label in ["back copper .gbr", "back outline .gbr", "back out .lbrn2"] {
+        assert!(
+            h.query_by_label(label).is_some(),
+            "the back form must expose `{label}`"
+        );
+    }
+}
+
+/// Each back path field is associated with its caption (labelled_by), so it is
+/// reachable by name rather than being an anonymous box in the form — and what
+/// the lookup returns has to be the field, not the caption, or the typing goes
+/// nowhere.
+#[test]
+fn the_back_gerber_fields_are_drivable_by_label() {
+    let mut h = console();
+    h.get_by_label("Back").click();
+    h.run();
+
+    for (label, path, token) in [
+        (
+            "back copper .gbr",
+            "/boards/demo-B_Cu.gbr",
+            "copper=demo-B_Cu.gbr",
+        ),
+        (
+            "back outline .gbr",
+            "/boards/outline.gbr",
+            "outline=outline.gbr",
+        ),
+    ] {
+        let field = h.get_by_label(label);
+        field.focus();
+        field.type_text(path);
+        h.run();
+        assert!(
+            summary_line(&h.state().debug_summary(), "back:").contains(token),
+            "typing into `{label}` must land in the back state:\n{}",
+            h.state().debug_summary()
+        );
+    }
+}
+
+/// Back → Front → Back through the real selector: the operator's typed paths
+/// belong to the side and survive the round trip, and no per-side cache (fitted
+/// pose, placement scale, loaded job geometry) shows up on the far end. The
+/// clearing itself is pinned by `set_side_resets_per_side_caches` in the lib's
+/// unit tests, which can seed the caches first; this covers the driven path.
+#[test]
+fn switching_sides_keeps_the_back_form_across_the_round_trip() {
+    let mut h = console();
+    h.get_by_label("Back").click();
+    h.run();
+    let field = h.get_by_label("back copper .gbr");
+    field.focus();
+    field.type_text("/boards/demo-B_Cu.gbr");
+    h.run();
+
+    h.get_by_label("Front").click();
+    h.run();
+    assert!(
+        h.state().debug_summary().contains("side=Front"),
+        "switched back to the front:\n{}",
+        h.state().debug_summary()
+    );
+    assert!(
+        h.query_by_label("back copper .gbr").is_none(),
+        "the back form is hidden while working the front"
+    );
+
+    h.get_by_label("Back").click();
+    h.run();
+    let s = h.state().debug_summary();
+    assert!(s.contains("side=Back"), "back again:\n{s}");
+    assert!(
+        summary_line(&s, "back:").contains("copper=demo-B_Cu.gbr"),
+        "the back's own paths survive the round trip:\n{s}"
+    );
+    let place = summary_line(&s, "place:");
+    assert!(
+        place.contains("job_polys=0")
+            && place.contains("auto_pose=false")
+            && place.contains("scale=1.0000"),
+        "the side switch left no placement cache behind:\n{s}"
+    );
+    assert!(
+        summary_line(&s, "fid_pose:").contains("none"),
+        "the other face's fiducial pose must not carry over:\n{s}"
     );
 }
 

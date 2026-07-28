@@ -22,6 +22,18 @@ const POSE_SCALE_MAX: f64 = 1.10;
 /// 40 mm board is 40 µm, inside the detector's own noise.
 pub(super) const POSE_SCALE_QUIET: f64 = 0.001;
 
+/// Smallest exit magnification that can act as a face tell.
+///
+/// On a mirror-symmetric layout the fit's own mirror flag cannot tell the two
+/// faces apart (see `fiducial::layout_is_mirror_symmetric`); what remains is
+/// that a wrong-face fit carries one whole factor of the hole-exit
+/// magnification `m = 1 + thickness/focal`, while a right-face fit lands at 1.0.
+/// At the operator's 1.6 mm board and 70 mm lens that is 2.3% — a clear
+/// separation. Below half a percent it is no longer distinguishable from a
+/// genuine machine-scale error, so the tell is not used and the ambiguity is
+/// only reported.
+const MIRROR_TELL_MIN_M: f64 = 1.005;
+
 /// Bounds for the whole-frame recovery ([`ConsoleApp::locate_fid_markers_globally`]).
 ///
 /// The board sits right-side-up, so its POSE is only a few degrees off — but
@@ -53,20 +65,48 @@ pub(super) const RECOVER_BACKOFF_FACTOR: u32 = 4;
 pub(super) const LIVE_RECOVER_MIN_S: f64 = 0.1;
 pub(super) const LIVE_RECOVER_MAX_S: f64 = 10.0;
 
+/// The wait a stage-3 scan earns: the operator's re-acquire interval after one
+/// that recovered holes, [`RECOVER_BACKOFF_FACTOR`]× that after one that found
+/// nothing.
+///
+/// Derived from `live_recover_s` at COMPARE time rather than snapshotted when
+/// the scan ran, so turning the dial down takes effect on the next frame — the
+/// hover text promises exactly that, and a snapshotted 10 s window would
+/// otherwise ignore the change for another 40 s.
+///
+/// Re-clamped here rather than trusted: the DragValue range and the settings
+/// load clamp both hold it, but `from_secs_f64` PANICS on a negative or NaN,
+/// and a live console is the wrong place to find that out. NaN is handled ahead
+/// of the clamp, which propagates it rather than bounding it.
+pub(super) fn recover_window(live_recover_s: f64, recovered: bool) -> Duration {
+    let secs = if live_recover_s.is_nan() {
+        LIVE_RECOVER_MIN_S
+    } else {
+        live_recover_s.clamp(LIVE_RECOVER_MIN_S, LIVE_RECOVER_MAX_S)
+    };
+    let base = Duration::from_secs_f64(secs);
+    if recovered {
+        base
+    } else {
+        base * RECOVER_BACKOFF_FACTOR
+    }
+}
+
 /// Whether the detection ladder should reach for its third stage, the
 /// whole-frame rectangle match. Free-standing so the throttle rule is testable
 /// without a frame, a camera or a running app.
 ///
 /// An explicit action ignores the cooldown entirely — even while Live runs: it
 /// is one deliberate press and the operator is waiting for the answer. Only
-/// STREAMED frames are throttled — `last` carries when the scan last ran and
-/// the window that run earned — because the feed would otherwise fire the scan
-/// on every frame that comes up short.
+/// STREAMED frames are throttled — `last` carries when the scan last ran on the
+/// feed and whether it recovered anything — because the feed would otherwise
+/// fire the scan on every frame that comes up short.
 pub(super) fn should_global_recover(
     streamed: bool,
     hits: usize,
-    last: Option<(Instant, Duration)>,
+    last: Option<(Instant, bool)>,
     now: Instant,
+    live_recover_s: f64,
 ) -> bool {
     // Enough holes: the earlier stages did the job, nothing to recover.
     if hits >= AUTO_RECOVER_BELOW {
@@ -80,7 +120,9 @@ pub(super) fn should_global_recover(
         return true;
     }
     // Never run yet — the first short frame under Live scans.
-    last.is_none_or(|(t, cooldown)| now.duration_since(t) >= cooldown)
+    last.is_none_or(|(t, recovered)| {
+        now.duration_since(t) >= recover_window(live_recover_s, recovered)
+    })
 }
 
 /// How close (screen px) a press has to land to an existing ✛ to grab it for a
@@ -511,6 +553,10 @@ impl ConsoleApp {
         self.fiducials.detected_mm.clear();
         self.fiducials.pose = None;
         self.fiducials.last_placed = false;
+        // The scan's Live backoff was earned against the OLD layout, which is
+        // exactly the arrangement that was not matching. Adopting a new one
+        // changes what stage 3 looks for, so let the next frame try it.
+        self.fiducials.last_global_recover = None;
         self.sync_fid_markers();
         self.fiducials.note = format!(
             "layout set from the measured holes ({} points) — this board pose is now \
@@ -557,6 +603,10 @@ impl ConsoleApp {
         // Click-placed extras may have made the layout longer than four, so an
         // in-flight marking index can outlive the marker it named.
         self.fiducials.marking = None;
+        // A resized rectangle is a different arrangement for stage 3 to match,
+        // so the backoff the old one earned should not hold off the first scan
+        // against the new one.
+        self.fiducials.last_global_recover = None;
         self.sync_fid_markers();
     }
 
@@ -664,6 +714,16 @@ impl ConsoleApp {
                 layout.len()
             ));
         }
+        // Match against what THIS FACE actually shows, not the raw design
+        // layout. On the back the holes are physically mirrored (and
+        // exit-magnified), while the matcher enumerates proper similarities
+        // only, within ±`AUTO_MAX_ROT_DEG` — so the raw layout can never match
+        // an asymmetric back-face arrangement (recovery dead exactly when the
+        // board has just been flipped), and matches a symmetric one with the
+        // correspondence swapped. `expected_points` is the same source of truth
+        // the projection seeding uses and stays index-aligned with the layout,
+        // so `matched_px` still indexes layout order downstream.
+        let expected = self.expected_points();
         let profile = self.fiducials.profile.to_profile(
             self.fiducials
                 .shape
@@ -679,12 +739,12 @@ impl ConsoleApp {
         let n_cand = cands.len();
         let pts: Vec<(f64, f64)> = cands.iter().map(|c| (c.px.x, c.px.y)).collect();
         let m = fiducial::match_layout_to_candidates(
-            &layout,
+            &expected,
             h,
             ppm,
             &pts,
             AUTO_MAX_ROT_DEG,
-            fiducial::match_tol_px(&layout, ppm),
+            fiducial::match_tol_px(&expected, ppm),
         )
         .ok_or_else(|| format!("rectangle match: {n_cand} candidates, none form the layout"))?;
 
@@ -1036,41 +1096,40 @@ impl ConsoleApp {
             best_hits,
             self.fiducials.last_global_recover,
             now,
+            self.fiducials.live_recover_s,
         ) {
-            // The operator's re-acquire interval. Re-clamped here rather than
-            // trusted: the DragValue range and the load clamp both hold it, but
-            // `from_secs_f64` PANICS on a negative or NaN, and a live console is
-            // the wrong place to find that out.
-            //
             // The scan measures 171–190 ms in release on the 2592×1944 bench
             // frames, against a ~200 ms live iteration (device ~8.7 fps), so at
             // the 0.5 s default it costs about a third of live time while it is
             // re-acquiring — the price of following a board that just moved.
             // Running it per short frame instead would swamp the feed, which is
             // why it used to be skipped under Live outright.
-            let cooldown = Duration::from_secs_f64(
-                self.fiducials
-                    .live_recover_s
-                    .clamp(LIVE_RECOVER_MIN_S, LIVE_RECOVER_MAX_S),
-            );
-            // The wait a fruitless scan earns instead. A hopeless scene — board
-            // removed, lens cap on, wrong layout — would otherwise burn 180 ms
-            // every interval forever for a result that cannot change. This
-            // backoff is also what keeps a DEV build alive, where the same scan
-            // costs 1.3–4.5 s: one scan per few seconds is a painful feed but
-            // still a moving one, whereas per-frame would wedge the console. (No
-            // build-profile switch — one rule, tuned for the release console the
-            // operator actually runs.) A very low interval weakens that
-            // protection, and LIVE_RECOVER_MIN_S is what bounds it: 0.4 s of
-            // backoff at the floor.
-            let backoff = cooldown * RECOVER_BACKOFF_FACTOR;
+            //
+            // A fruitless scan earns `RECOVER_BACKOFF_FACTOR`× that wait
+            // instead. A hopeless scene — board removed, lens cap on, wrong
+            // layout — would otherwise burn 180 ms every interval forever for a
+            // result that cannot change. That backoff is also what keeps a DEV
+            // build alive, where the same scan costs 1.3–4.5 s: one scan per few
+            // seconds is a painful feed but still a moving one, whereas
+            // per-frame would wedge the console. (No build-profile switch — one
+            // rule, tuned for the release console the operator actually runs.) A
+            // very low interval weakens that protection, and LIVE_RECOVER_MIN_S
+            // is what bounds it: 0.4 s of backoff at the floor.
+            //
             // Stamp on ATTEMPT, before the outcome is known — including the
             // cheap Err exits inside `locate_fid_markers_globally` (bad scale,
             // too few layout points, no frame) that never reach the scan. Those
             // will not change frame to frame either, so backing off on them is
             // right; stamping only on success would leave a hopeless scene
             // scanning every frame, which is exactly what this guards against.
-            self.fiducials.last_global_recover = Some((now, backoff));
+            //
+            // ONLY the feed's own frames stamp. A manual Check runs the scan
+            // regardless of the cooldown, and if it also stamped, one press
+            // would silence the feed's next scans for up to the full backoff —
+            // the opposite of what pressing Check means.
+            if streamed {
+                self.fiducials.last_global_recover = Some((now, false));
+            }
             // Unmatched layout points keep THEIR seed, so start from the
             // operator's markers rather than stage 2's projection guesses.
             self.fiducials.search = original.clone();
@@ -1085,7 +1144,9 @@ impl ConsoleApp {
                         // It worked: re-try sooner, so a board that keeps
                         // drifting is followed rather than sitting out the
                         // full backoff.
-                        self.fiducials.last_global_recover = Some((now, cooldown));
+                        if streamed {
+                            self.fiducials.last_global_recover = Some((now, true));
+                        }
                     } else {
                         why.push(format!("rectangle match ({summary}) found no more holes"));
                     }
@@ -1253,6 +1314,22 @@ impl ConsoleApp {
         // Back side: the camera sees the drilled holes' EXIT openings, so fit
         // against the exit-magnified nominal positions.
         let exit = self.back_field_params();
+        // …and that model needs real optics to be a model at all.
+        // `FieldParams::exit_magnification` degrades to 1.0 when the focal
+        // length or the thickness is unset, which does NOT mean "no parallax" —
+        // the holes still exit ~2.3% further out, and with the model flat the
+        // whole of it lands in the fitted scale. That sits comfortably inside
+        // the 0.90–1.10 band, so the back job is emitted 2.3% oversized with
+        // nothing on screen to say so. Fail closed, like every other gate here.
+        if exit.is_some() && self.exit_magnification() <= 1.0 {
+            self.fiducials.note.push_str(
+                "  ·  placement not updated — set the board thickness and the focal length \
+                 on the Job tab before registering the back face: without them the \
+                 hole-exit parallax is fitted as job scale instead",
+            );
+            self.diag_check_outcome("refused-optics");
+            return;
+        }
         let fiducial::PoseFit {
             pose,
             residuals_mm,
@@ -1310,6 +1387,49 @@ impl ConsoleApp {
             ));
             self.diag_check_outcome("refused-rms");
             return;
+        }
+        // The mirror gate above is DEGENERATE on a mirror-symmetric layout —
+        // which the default `10,10; 60,10; 10,60; 60,60` is, and so is every
+        // rectangle the fid-holes generator makes. There, mirroring the BOARD
+        // and permuting the CORRESPONDENCE produce the same detections: each ✛
+        // finds its mirror partner inside the search window, the fit comes back
+        // proper (or improper) to match whichever side is selected, and the
+        // residual is essentially zero. A board on the wrong face then locks
+        // cleanly, which is the worst possible outcome for a double-sided job.
+        //
+        // What the swap cannot hide is the SCALE. The camera images the drilled
+        // holes' EXIT openings, magnified by m = 1 + thickness/focal about the
+        // scan center; the back fit sources already carry that factor, so a
+        // RIGHT-face fit lands at 1.0 on both faces. A wrong-face fit leaves
+        // exactly one factor in: m when Front is selected and the board is
+        // physically flipped, 1/m when Back is selected and it never was.
+        // Nearest-signature wins, so a genuine machine-scale error of a few
+        // tenths of a percent is still read as a legitimate fit.
+        let symmetric = fiducial::layout_is_mirror_symmetric(&layout);
+        let mag = self.exit_magnification();
+        if symmetric && mag >= MIRROR_TELL_MIN_M {
+            let tell = if flipped_expected { 1.0 / mag } else { mag };
+            if (pose.scale - tell).abs() < (pose.scale - 1.0).abs() {
+                self.fiducials.note.push_str(&format!(
+                    "  ·  fiducial fit scale {:.4} matches the OTHER face ({tell:.4}), not 1.0 \
+                     — this layout is mirror-symmetric, so the holes fit either way round and \
+                     the mirror check cannot see it. Check which face is up and which side is \
+                     selected. Placement not updated.",
+                    pose.scale
+                ));
+                self.diag_check_outcome("refused-mirror-scale");
+                return;
+            }
+        } else if symmetric {
+            // No usable tell: the two faces really are indistinguishable from
+            // this frame. Refusing here would block ordinary front work on the
+            // default layout, so say it instead — and note that the back half of
+            // the hazard is already closed, since back registration without
+            // optics is refused outright above.
+            self.fiducials.note.push_str(
+                "  ·  mirror-symmetric layout with no board thickness/focal length — a flipped \
+                 board cannot be told from an unflipped one here; set them on the Job tab",
+            );
         }
         // Scale gate — see POSE_SCALE_MIN. Applying the fit resizes the burn,
         // so an implausible scale has to stop the placement even though the

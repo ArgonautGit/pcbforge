@@ -1796,21 +1796,129 @@ fn scan_center_override_moves_the_parallax_origin() {
 }
 
 /// Switching side clears the per-side caches so nothing from the front
-/// bleeds into the back view.
+/// bleeds into the back view — including the PHOTO. A surviving front frame is
+/// not just a confusing picture: a Check pressed against it detects real holes
+/// and can fit and lock a placement from the wrong face.
 #[test]
 fn set_side_resets_per_side_caches() {
+    let ctx = Context::default();
     let mut app = ConsoleApp::new(tmp_db(), vec!["true".into()]);
     app.fiducials.layout = "10,10; 60,10".into();
     app.sync_fid_markers();
     app.ar.copper = vec![pcb_core::Poly::default()];
     assert!(!app.fiducials.search.is_empty());
+
+    // The front face's frame, its texture, the scale measured off it, the note
+    // describing that detection, and the Live scan's backoff.
+    app.fiducials.frame_img = Some(image::GrayImage::new(64, 64));
+    app.fiducials.frame_tex = Some(ctx.load_texture(
+        "fid-side-test",
+        egui::ColorImage {
+            size: [2, 2],
+            pixels: vec![egui::Color32::BLACK; 4],
+        },
+        egui::TextureOptions::NEAREST,
+    ));
+    app.fiducials.measured_ppm = Some(9.87);
+    app.fiducials.note = "4 strong, 0 weak, 0 missed".into();
+    app.fiducials.last_global_recover = Some((std::time::Instant::now(), false));
+
     app.set_side(Side::Back);
     assert!(
         app.fiducials.search.is_empty(),
         "markers cleared on side switch"
     );
     assert!(app.ar.copper.is_empty(), "AR design cleared on side switch");
+    assert!(
+        app.fiducials.frame_img.is_none() && app.fiducials.frame_tex.is_none(),
+        "the other face's photo is gone"
+    );
+    assert!(
+        app.fiducials.measured_ppm.is_none(),
+        "and the scale measured off it"
+    );
+    assert!(
+        !app.fiducials.note.contains("strong"),
+        "the stale detection note is replaced: {}",
+        app.fiducials.note
+    );
+    assert!(
+        !app.fiducials.note.is_empty(),
+        "…with the tab's instruction, not a blank line"
+    );
+    assert!(
+        app.fiducials.last_global_recover.is_none(),
+        "a side switch is a new scene: the old face's Live backoff must not \
+         suppress the scans a flip needs"
+    );
     assert_eq!(app.job.side, Side::Back);
+}
+
+/// Exporting Front then Back must leave each side pointing at its own copper
+/// Gerber — they used to share one `copper.gbr`, so the back export silently
+/// re-aimed the front job at back copper.
+#[test]
+fn front_then_back_gerber_export_keeps_both_sides() {
+    let mut app = ConsoleApp::new(tmp_db(), vec!["true".into()]);
+    app.job.kicad_project = concat!(
+        env!("CARGO_MANIFEST_DIR"),
+        "/../../samples/kicad/valdemo2.kicad_pcb"
+    )
+    .into();
+    app.gerbers_from_kicad();
+    let front_copper = app.job.emit_copper.clone();
+    let front_outline = app.job.emit_outline.clone();
+    assert!(
+        front_copper.ends_with("copper-F_Cu.gbr"),
+        "front copper path: {front_copper}"
+    );
+
+    app.set_side(Side::Back);
+    app.gerbers_from_kicad();
+    assert!(
+        app.job.back_copper.ends_with("copper-B_Cu.gbr"),
+        "back copper path: {}",
+        app.job.back_copper
+    );
+    assert_eq!(
+        app.job.emit_copper, front_copper,
+        "the back export left the front copper path alone"
+    );
+    assert_ne!(app.job.emit_copper, app.job.back_copper);
+    // Edge.Cuts is side-independent, so both sides share the one outline.
+    assert_eq!(app.job.back_outline, front_outline);
+}
+
+/// Each side emits to its own `.lbrn2`, so a back emit can't overwrite the
+/// front job's output file.
+#[test]
+fn each_side_emits_to_its_own_lbrn2() {
+    let mut app = ConsoleApp::new(tmp_db(), vec!["true".into()]);
+    let front = app.active_lbrn2().to_string();
+    app.set_side(Side::Back);
+    let back = app.active_lbrn2().to_string();
+    assert_eq!(front, app.job.emit_lbrn2);
+    assert_eq!(back, app.job.back_lbrn2);
+    assert_ne!(front, back, "the two sides' outputs are distinct files");
+}
+
+/// A back-side emit mirrors in X, which the CLI refuses without an outline —
+/// the console says so itself instead of letting the operator dig it out of
+/// the CLI's stderr.
+#[test]
+fn back_emit_without_an_outline_is_refused_with_a_reason() {
+    let mut app = ConsoleApp::new(tmp_db(), vec!["true".into()]);
+    app.set_side(Side::Back);
+    app.job.back_copper = "B_Cu.gbr".into();
+    app.job.back_outline.clear();
+    app.emit_clicked();
+    let last = app.runtime.log.last().expect("the refusal was logged");
+    assert!(last.err, "logged as an error");
+    assert!(
+        last.text.contains("back outline"),
+        "names what is missing: {}",
+        last.text
+    );
 }
 
 /// The Job tab lays out with the Back side selected (the back form renders).
@@ -1923,6 +2031,7 @@ field_frame=\n";
     assert_eq!(
         new_keys,
         vec![
+            "back_lbrn2",
             "calib_accept_rms_um",
             "calib_accept_worst_um",
             "calib_field_scale",
@@ -1952,6 +2061,9 @@ field_frame=\n";
             "place_drill_lbrn2",
             "place_drills",
             "place_lightburn_device",
+            "scan_center_auto",
+            "scan_center_x_mm",
+            "scan_center_y_mm",
         ]
     );
     assert_eq!(after.get("calib_paper_n"), Some(&"9".to_string()));
@@ -2117,6 +2229,70 @@ fn fid_live_recover_interval_persists_and_clamps() {
             app.fiducials.live_recover_s
         );
     }
+}
+
+/// The scan-center override round-trips through a save + reload — it's a
+/// measured per-rig constant (the Job tab hover text says so), so it needs to
+/// survive a restart like its `thickness_mm`/`focal_mm` neighbours do. A blob
+/// without the keys keeps the auto-centroid default.
+#[test]
+fn scan_center_persists_and_defaults() {
+    let db = tmp_db();
+    {
+        let mut a = ConsoleApp::new(db.clone(), vec!["true".into()]);
+        a.job.scan_center_auto = false;
+        a.job.scan_center_mm = (12.5, -7.25);
+        a.save_settings_if_changed();
+    }
+    let b = ConsoleApp::new(db, vec!["true".into()]);
+    assert!(!b.job.scan_center_auto, "auto=false persists");
+    assert!((b.job.scan_center_mm.0 - 12.5).abs() < 1e-9);
+    assert!((b.job.scan_center_mm.1 - (-7.25)).abs() < 1e-9);
+
+    // A blob with none of the scan-center keys keeps today's defaults.
+    let fresh = ConsoleApp::new(tmp_db(), vec!["true".into()]);
+    assert!(fresh.job.scan_center_auto, "defaults to the auto centroid");
+    assert!((fresh.job.scan_center_mm.0 - 35.0).abs() < 1e-9);
+    assert!((fresh.job.scan_center_mm.1 - 35.0).abs() < 1e-9);
+}
+
+/// A hand-edited or corrupt blob can't push `thickness_mm`, `focal_mm`, or the
+/// scan-center override out of their sane ranges — clamped on load the same
+/// way the neighbouring fiducial fields are.
+#[test]
+fn thickness_focal_and_scan_center_clamp_on_load() {
+    let db = tmp_db();
+    let settings = crate::settings::path_for_db(&db);
+    std::fs::write(
+        &settings,
+        "pcbforge console settings v1\n\
+thickness_mm=-1.0\n\
+focal_mm=0.5\n\
+scan_center_x_mm=5000\n\
+scan_center_y_mm=-5000\n",
+    )
+    .unwrap();
+    let app = ConsoleApp::new(db, vec!["true".into()]);
+    assert!(
+        (app.job.board_thickness_mm - 0.0).abs() < 1e-9,
+        "thickness clamps to the DragValue floor, got {}",
+        app.job.board_thickness_mm
+    );
+    assert!(
+        (app.job.focal_mm - 1.0).abs() < 1e-9,
+        "focal clamps to the DragValue floor, got {}",
+        app.job.focal_mm
+    );
+    assert!(
+        (app.job.scan_center_mm.0 - 1000.0).abs() < 1e-9,
+        "scan center x clamps to +1000, got {}",
+        app.job.scan_center_mm.0
+    );
+    assert!(
+        (app.job.scan_center_mm.1 - (-1000.0)).abs() < 1e-9,
+        "scan center y clamps to -1000, got {}",
+        app.job.scan_center_mm.1
+    );
 }
 
 /// ④ Fiducial holes: the `fid_rect:` summary line reports the rectangle spans
@@ -3635,30 +3811,47 @@ fn a_failed_check_leaves_the_markers_where_the_operator_put_them() {
 /// moves — is not testable headlessly; this pins the decision, not the feed.)
 #[test]
 fn the_rectangle_match_is_throttled_under_live_but_not_under_a_check() {
+    use super::fiducial_ui::{LIVE_RECOVER_MAX_S, LIVE_RECOVER_MIN_S, recover_window};
+    use std::time::Duration;
     // Built by addition only: an Instant cannot be safely walked backwards.
     let t0 = std::time::Instant::now();
-    // The windows the ladder stamps, derived the way it derives them, so the
-    // probe times below stay right whatever the default interval becomes.
-    let cooldown = std::time::Duration::from_secs_f64(1.0);
-    let backoff = cooldown * RECOVER_BACKOFF_FACTOR;
+    // The dial the probes below are read against, and the two windows it
+    // implies — derived the way the ladder derives them, so the probe times
+    // stay right whatever the default interval becomes.
+    let dial = 1.0;
+    let cooldown = recover_window(dial, true);
+    let backoff = recover_window(dial, false);
+    assert_eq!(backoff, cooldown * RECOVER_BACKOFF_FACTOR);
 
     // Enough hits: no stage 3 at all, live or not.
-    assert!(!should_global_recover(true, 3, None, t0));
-    assert!(!should_global_recover(false, 4, None, t0));
+    assert!(!should_global_recover(true, 3, None, t0, dial));
+    assert!(!should_global_recover(false, 4, None, t0, dial));
 
     // First short frame under Live scans; a second one inside the window does
     // not, whichever window the previous run earned.
-    assert!(should_global_recover(true, 1, None, t0));
-    let after_win = Some((t0, cooldown));
-    let after_lose = Some((t0, backoff));
-    assert!(!should_global_recover(true, 1, after_win, t0 + cooldown / 5));
+    assert!(should_global_recover(true, 1, None, t0, dial));
+    let after_win = Some((t0, true));
+    let after_lose = Some((t0, false));
+    assert!(!should_global_recover(
+        true,
+        1,
+        after_win,
+        t0 + cooldown / 5,
+        dial
+    ));
 
     // The two windows differ: halfway through the backoff a recovered scan is
     // due again, a failed one is still held off; at the backoff both are due.
     let mid = t0 + backoff / 2;
-    assert!(should_global_recover(true, 1, after_win, mid));
-    assert!(!should_global_recover(true, 1, after_lose, mid));
-    assert!(should_global_recover(true, 1, after_lose, t0 + backoff));
+    assert!(should_global_recover(true, 1, after_win, mid, dial));
+    assert!(!should_global_recover(true, 1, after_lose, mid, dial));
+    assert!(should_global_recover(
+        true,
+        1,
+        after_lose,
+        t0 + backoff,
+        dial
+    ));
     assert!(
         cooldown < backoff,
         "a failed recovery must back off further than a successful one"
@@ -3666,40 +3859,69 @@ fn the_rectangle_match_is_throttled_under_live_but_not_under_a_check() {
 
     // The configured interval is the one that governs, not a constant: at
     // 0.2 s the success window is 0.2 s and the failure window 0.8 s.
-    let fast = std::time::Duration::from_secs_f64(0.2);
-    let fast_lose = fast * RECOVER_BACKOFF_FACTOR;
-    assert_eq!(fast_lose, std::time::Duration::from_millis(800));
-    let win = Some((t0, fast));
-    let lose = Some((t0, fast_lose));
+    assert_eq!(recover_window(0.2, false), Duration::from_millis(800));
     assert!(!should_global_recover(
         true,
         1,
-        win,
-        t0 + std::time::Duration::from_millis(199)
+        after_win,
+        t0 + Duration::from_millis(199),
+        0.2
     ));
     assert!(should_global_recover(
         true,
         1,
-        win,
-        t0 + std::time::Duration::from_millis(200)
+        after_win,
+        t0 + Duration::from_millis(200),
+        0.2
     ));
     assert!(!should_global_recover(
         true,
         1,
-        lose,
-        t0 + std::time::Duration::from_millis(799)
+        after_lose,
+        t0 + Duration::from_millis(799),
+        0.2
     ));
     assert!(should_global_recover(
         true,
         1,
-        lose,
-        t0 + std::time::Duration::from_millis(800)
+        after_lose,
+        t0 + Duration::from_millis(800),
+        0.2
     ));
+
+    // …and it is read when the throttle is CHECKED, not snapshotted when the
+    // scan ran. Turning the dial down has to shorten the window ALREADY
+    // running — the hover text promises exactly that, and a scan stamped under
+    // a 10 s interval would otherwise ignore the change for another 40 s.
+    let half = t0 + Duration::from_millis(500);
+    assert!(!should_global_recover(true, 1, after_win, half, 10.0));
+    assert!(
+        should_global_recover(true, 1, after_win, half, 0.2),
+        "lowering the dial applies to the window in flight"
+    );
+    // Raising it lengthens the same window, symmetrically.
+    assert!(should_global_recover(true, 1, after_win, half, 0.2));
+    assert!(!should_global_recover(true, 1, after_win, half, 2.0));
+
+    // Out-of-range dials are bounded rather than trusted: `from_secs_f64`
+    // panics on a negative, and NaN survives `clamp`.
+    assert_eq!(
+        recover_window(-5.0, true),
+        recover_window(LIVE_RECOVER_MIN_S, true)
+    );
+    assert_eq!(
+        recover_window(f64::NAN, true),
+        recover_window(LIVE_RECOVER_MIN_S, true)
+    );
+    assert_eq!(
+        recover_window(1.0e6, true),
+        recover_window(LIVE_RECOVER_MAX_S, true)
+    );
 
     // A manual Check ignores the cooldown entirely — one deliberate press, and
     // the operator is waiting for the answer.
-    assert!(should_global_recover(false, 1, after_lose, t0));
-    assert!(should_global_recover(false, 0, after_win, t0));
+    assert!(should_global_recover(false, 1, after_lose, t0, dial));
+    assert!(should_global_recover(false, 0, after_win, t0, dial));
 }
 
 /// The throttle wired into the ladder: under Live a hopeless frame runs the
@@ -3733,8 +3955,7 @@ fn a_second_short_live_frame_does_not_rescan() {
     // Check button — the two are now distinct on purpose.
     app.detect_fiducials(true);
     assert!(
-        app.fiducials.note.contains("rectangle match")
-            && !app.fiducials.note.contains("throttled"),
+        app.fiducials.note.contains("rectangle match") && !app.fiducials.note.contains("throttled"),
         "the first short frame under Live still runs the scan: {}",
         app.fiducials.note
     );
@@ -3749,10 +3970,45 @@ fn a_second_short_live_frame_does_not_rescan() {
     // how recently the live loop did — WITHOUT Live being switched off first.
     // A button that sometimes does nothing while the feed runs was the wart
     // this parameter exists to remove.
+    let stamp = app.fiducials.last_global_recover;
     app.render_fiducials(&ctx);
     assert!(
         !app.fiducials.note.contains("throttled"),
         "a Check ignores the cooldown even while Live is on: {}",
+        app.fiducials.note
+    );
+    // …and does not SPEND that budget either. Stamping here would let one
+    // press silence the feed's next scans for up to the full backoff — the
+    // opposite of what pressing Check means.
+    assert_eq!(
+        app.fiducials.last_global_recover, stamp,
+        "a manual Check leaves the feed's throttle exactly as the stream left it"
+    );
+
+    // The dial is read when the throttle is checked, not snapshotted when the
+    // scan ran, so turning it down shortens the window already in flight.
+    let stamped = std::time::Instant::now();
+    app.fiducials.last_global_recover = Some((stamped, false));
+    // Just past the 0.4 s the floor implies for a failed scan, and nowhere
+    // near the 40 s the 10 s setting implies. The sleep can only overshoot.
+    std::thread::sleep(std::time::Duration::from_millis(450));
+    app.fiducials.live_recover_s = 10.0;
+    app.detect_fiducials(true);
+    assert!(
+        app.fiducials.note.contains("rectangle match throttled"),
+        "at 10 s the window has not expired: {}",
+        app.fiducials.note
+    );
+    assert_eq!(
+        app.fiducials.last_global_recover,
+        Some((stamped, false)),
+        "a throttled frame does not re-stamp"
+    );
+    app.fiducials.live_recover_s = super::fiducial_ui::LIVE_RECOVER_MIN_S;
+    app.detect_fiducials(true);
+    assert!(
+        !app.fiducials.note.contains("throttled"),
+        "the lowered dial applies to the window already running: {}",
         app.fiducials.note
     );
 }
@@ -3900,4 +4156,350 @@ fn the_error_mirror_survives_the_log_being_trimmed() {
     app.diag_mirror_errors();
     let text = std::fs::read_to_string(app.runtime.diag.path()).unwrap();
     assert!(text.contains("error after the trim"), "mirroring resumes");
+}
+
+/// The default layout, and the exit magnification the default optics imply.
+/// `m` is the factor a wrong-face fit leaves in the scale — the only signal
+/// left once the layout's own mirror symmetry has neutered `pose.flipped`.
+const SYM_LAYOUT: &str = "10,10; 60,10; 10,60; 60,60";
+const SYM_CENTER: (f64, f64) = (35.0, 35.0);
+fn exit_mag() -> f64 {
+    1.0 + 1.6 / 70.0
+}
+
+/// An app wired to fit a pose straight from millimetre "detections": a 10 px/mm
+/// anchor with no y-flip, so a detection at `(x, y)` mm is simply `(10x, 10y)`
+/// px, plus a frame big enough to hold it.
+///
+/// The side is switched BEFORE the frame is installed — `set_side` clears the
+/// previous face's photo, which is the whole point of that clearing.
+fn mirror_gate_app(side: Side, layout: &str, detected_mm: &[(f64, f64)]) -> ConsoleApp {
+    use nalgebra::Matrix3;
+    let mut app = ConsoleApp::new(tmp_db(), vec!["true".into()]);
+    app.fiducials.layout = layout.into();
+    app.set_side(side);
+    app.calibration.anchor = Some(calib::Calibration {
+        px_to_mm: vision::Homography {
+            matrix: Matrix3::new(0.1, 0.0, 0.0, 0.0, 0.1, 0.0, 0.0, 0.0, 1.0),
+            residuals: vec![],
+            rms: 0.0,
+        },
+        rms_um: 0.0,
+        found: 4,
+        total: 4,
+        dots: vec![],
+    });
+    app.fiducials.frame_img = Some(image::GrayImage::new(800, 800));
+    app.fiducials.found = detected_mm
+        .iter()
+        .map(|&(x, y)| Some((x * 10.0, y * 10.0)))
+        .collect();
+    app
+}
+
+/// The default layout is its own mirror image, and every rectangle the
+/// fid-holes generator emits is too — which is precisely when `pose.flipped`
+/// stops being a face check. An L or any chiral arrangement is not.
+#[test]
+fn mirror_symmetry_is_detected_for_the_layouts_that_make_the_flip_gate_blind() {
+    let sym = crate::fiducial::parse_layout(SYM_LAYOUT).unwrap();
+    assert!(
+        crate::fiducial::layout_is_mirror_symmetric(&sym),
+        "the default layout is mirror-symmetric"
+    );
+    // The generator's rectangles, wherever they are centred.
+    let rect = crate::fiducial::centered_fid_layout(35.0, 35.0, 50.0, 30.0);
+    assert!(crate::fiducial::layout_is_mirror_symmetric(&rect));
+    let rect = crate::fiducial::centered_fid_layout(12.5, 88.0, 41.0, 41.0);
+    assert!(crate::fiducial::layout_is_mirror_symmetric(&rect));
+    // A chiral quad is not — there the mirror flag genuinely works.
+    let chiral = crate::fiducial::parse_layout("10,10; 58,10; 14,58; 50,40").unwrap();
+    assert!(!crate::fiducial::layout_is_mirror_symmetric(&chiral));
+    // Two points cannot pin a mirror axis, so they are never called symmetric.
+    let pair = crate::fiducial::parse_layout("10,10; 60,10").unwrap();
+    assert!(!crate::fiducial::layout_is_mirror_symmetric(&pair));
+}
+
+/// THE double-sided hazard. The board has been physically flipped but Front is
+/// still selected. On a mirror-symmetric layout each ✛ latches onto its mirror
+/// PARTNER, so the fit comes back proper (`flipped == false`, matching Front)
+/// with an essentially zero residual — the mirror gate waves it through and a
+/// front job locks onto a back-side board.
+///
+/// What gives it away is the scale: the camera images the holes' EXIT openings,
+/// so the fit carries one whole factor of `m = 1 + thickness/focal` instead of
+/// landing at 1.0. Refuse, and say which face is in doubt.
+#[test]
+fn a_flipped_board_checked_as_front_is_refused_on_a_symmetric_layout() {
+    let m = exit_mag();
+    let (cx, cy) = SYM_CENTER;
+    // The swapped correspondence, reduced: layout point i pairs with the hole
+    // that is its mirror partner, leaving a pure magnification about the
+    // layout centroid.
+    let detected: Vec<(f64, f64)> = crate::fiducial::parse_layout(SYM_LAYOUT)
+        .unwrap()
+        .iter()
+        .map(|&(x, y)| (cx + m * (x - cx), cy + m * (y - cy)))
+        .collect();
+    let mut app = mirror_gate_app(Side::Front, SYM_LAYOUT, &detected);
+    app.update_placement_from_fiducials();
+
+    assert!(
+        !app.fiducials.last_placed,
+        "a flipped board must not lock as Front: {}",
+        app.fiducials.note
+    );
+    assert!(
+        app.fiducials.note.contains("mirror-symmetric")
+            && app.fiducials.note.contains("OTHER face"),
+        "the note names the ambiguity and the suspicion: {}",
+        app.fiducials.note
+    );
+    assert!(
+        !app.placement.auto_pose,
+        "nothing was written into the placement"
+    );
+    let log = std::fs::read_to_string(app.runtime.diag.path()).unwrap();
+    assert!(
+        log.contains("outcome=refused-mirror-scale"),
+        "the gate is named in the log: {log}"
+    );
+}
+
+/// The inverse: Back is selected but the board was never turned over. The fit
+/// sources carry the exit magnification while the detections do not, so the
+/// swapped correspondence produces an improper fit (`flipped == true`, matching
+/// Back) at 1/m. Same tell, other direction.
+#[test]
+fn an_unflipped_board_checked_as_back_is_refused_on_a_symmetric_layout() {
+    let (cx, _) = SYM_CENTER;
+    // The holes as the camera sees them with the board still front-up, read
+    // through the back's mirrored markers: hole i is the mirror partner.
+    let detected: Vec<(f64, f64)> = crate::fiducial::parse_layout(SYM_LAYOUT)
+        .unwrap()
+        .iter()
+        .map(|&(x, y)| (2.0 * cx - x, y))
+        .collect();
+    let mut app = mirror_gate_app(Side::Back, SYM_LAYOUT, &detected);
+    app.update_placement_from_fiducials();
+
+    assert!(
+        !app.fiducials.last_placed,
+        "an unflipped board must not lock as Back: {}",
+        app.fiducials.note
+    );
+    assert!(
+        app.fiducials.note.contains("mirror-symmetric"),
+        "the note names the ambiguity: {}",
+        app.fiducials.note
+    );
+    let log = std::fs::read_to_string(app.runtime.diag.path()).unwrap();
+    assert!(
+        log.contains("outcome=refused-mirror-scale"),
+        "the gate is named in the log: {log}"
+    );
+}
+
+/// …and the tell must not cost the legitimate cases anything. A real front fit
+/// and a real back fit both land at scale 1.0 — the back's sources already
+/// carry the magnification, so it is modelled out rather than fitted — which is
+/// nowhere near either wrong-face signature.
+#[test]
+fn legitimate_front_and_back_fits_still_pass_the_mirror_scale_tell() {
+    let layout = crate::fiducial::parse_layout(SYM_LAYOUT).unwrap();
+
+    // Front, board front-up: the holes are the layout.
+    let mut front = mirror_gate_app(Side::Front, SYM_LAYOUT, &layout);
+    front.update_placement_from_fiducials();
+    assert!(
+        front.fiducials.last_placed,
+        "an honest front fit is applied: {}",
+        front.fiducials.note
+    );
+    let pose = front.fiducials.pose.expect("front pose cached");
+    assert!((pose.scale - 1.0).abs() < 1e-9, "scale {}", pose.scale);
+    assert!(!pose.flipped);
+
+    // Back, board turned over: the camera sees the exit openings, mirrored
+    // about the layout centreline — exactly what `expected_points` predicts.
+    let m = exit_mag();
+    let (cx, cy) = SYM_CENTER;
+    let detected: Vec<(f64, f64)> = layout
+        .iter()
+        .map(|&(x, y)| (2.0 * cx - (cx + m * (x - cx)), cy + m * (y - cy)))
+        .collect();
+    let mut back = mirror_gate_app(Side::Back, SYM_LAYOUT, &detected);
+    back.update_placement_from_fiducials();
+    assert!(
+        back.fiducials.last_placed,
+        "an honest back fit is applied: {}",
+        back.fiducials.note
+    );
+    let pose = back.fiducials.pose.expect("back pose cached");
+    assert!(
+        (pose.scale - 1.0).abs() < 1e-9,
+        "the exit magnification is modelled, not fitted: scale {}",
+        pose.scale
+    );
+    assert!(pose.flipped, "the physical flip is seen");
+}
+
+/// With no optics the magnification collapses to 1.0 and the tell vanishes: the
+/// two faces really are indistinguishable from a symmetric layout. Refusing
+/// here would block ordinary front work on the default layout, so the check
+/// says so instead of guessing — and keeps placing.
+#[test]
+fn a_symmetric_layout_without_optics_warns_instead_of_refusing_on_the_front() {
+    let layout = crate::fiducial::parse_layout(SYM_LAYOUT).unwrap();
+    let mut app = mirror_gate_app(Side::Front, SYM_LAYOUT, &layout);
+    app.job.focal_mm = 0.0;
+    app.job.board_thickness_mm = 0.0;
+    app.update_placement_from_fiducials();
+
+    assert!(
+        app.fiducials.last_placed,
+        "front work is not blocked: {}",
+        app.fiducials.note
+    );
+    assert!(
+        app.fiducials.note.contains("mirror-symmetric") && app.fiducials.note.contains("thickness"),
+        "but the operator is told the mirror check is blind here: {}",
+        app.fiducials.note
+    );
+}
+
+/// Back registration with the optics unset is refused outright. Without them
+/// `exit_magnification` degrades to 1.0, the ~2.3% hole-exit parallax lands in
+/// the FITTED SCALE — inside the 0.90–1.10 band, so nothing else stops it — and
+/// the back job is emitted 2.3% oversized with no warning anywhere.
+#[test]
+fn back_registration_without_board_thickness_or_focal_length_is_refused() {
+    let layout = crate::fiducial::parse_layout(SYM_LAYOUT).unwrap();
+    let (cx, _) = SYM_CENTER;
+    // A perfectly good back-face detection — plain mirror, since with the
+    // optics unset that is all the console can predict.
+    let detected: Vec<(f64, f64)> = layout.iter().map(|&(x, y)| (2.0 * cx - x, y)).collect();
+
+    for (thickness, focal) in [(0.0, 70.0), (1.6, 0.0), (0.0, 0.0)] {
+        let mut app = mirror_gate_app(Side::Back, SYM_LAYOUT, &detected);
+        app.job.board_thickness_mm = thickness;
+        app.job.focal_mm = focal;
+        app.update_placement_from_fiducials();
+        assert!(
+            !app.fiducials.last_placed,
+            "thickness {thickness}, focal {focal}: must not lock: {}",
+            app.fiducials.note
+        );
+        assert!(
+            app.fiducials.note.contains("board thickness")
+                && app.fiducials.note.contains("focal length"),
+            "the note says what to set: {}",
+            app.fiducials.note
+        );
+        let log = std::fs::read_to_string(app.runtime.diag.path()).unwrap();
+        assert!(
+            log.contains("outcome=refused-optics"),
+            "the gate is named in the log: {log}"
+        );
+    }
+
+    // With both set the same detections get past this gate (they are then
+    // refused by the mirror tell instead — the board is not actually flipped).
+    let mut app = mirror_gate_app(Side::Back, SYM_LAYOUT, &detected);
+    app.update_placement_from_fiducials();
+    let log = std::fs::read_to_string(app.runtime.diag.path()).unwrap();
+    assert!(
+        !log.contains("outcome=refused-optics"),
+        "the optics gate is about the OPTICS, not the pose: {log}"
+    );
+}
+
+/// Stage 3, the whole-frame rectangle match, must look for the arrangement THIS
+/// FACE shows. On the back the holes are physically mirrored, and the matcher
+/// enumerates proper similarities only — so matching the raw design layout can
+/// never succeed on a chiral board, leaving recovery dead exactly when the
+/// board has just been flipped.
+///
+/// The layout here is deliberately chiral (its mirror image is not a rotation
+/// of it), so the front/back distinction is the whole difference: the same
+/// frame recovers all four holes in layout order on Back and matches nothing on
+/// Front.
+#[test]
+fn the_rectangle_match_follows_the_back_faces_mirrored_geometry() {
+    let dir = std::env::temp_dir().join(format!("ui-fidback-{}", std::process::id()));
+    std::fs::create_dir_all(&dir).unwrap();
+    let path = dir.join("back-bed.png");
+    let ppm = 10.0;
+    let layout = "10,10; 58,10; 14,58; 50,40";
+
+    // Where the holes really are: the back-expected positions, displaced far
+    // enough (5 mm, against a 2 mm window) that no local search can reach them
+    // and only stage 3 can.
+    let ctx = Context::default();
+    let holes: Vec<(f64, f64)> = {
+        let mut probe = ConsoleApp::new(tmp_db(), vec!["true".into()]);
+        probe.fiducials.layout = layout.into();
+        probe.set_side(Side::Back);
+        probe
+            .expected_points()
+            .iter()
+            .map(|&(x, y)| (x + 5.0, y - 5.0))
+            .collect()
+    };
+    write_hole_frame(&path, ppm, &holes);
+
+    let mut app = ConsoleApp::new(tmp_db(), vec!["true".into()]);
+    app.runtime.tab = CentralTab::Fiducials;
+    app.fiducials.layout = layout.into();
+    // Before the frame — a side switch drops it.
+    app.set_side(Side::Back);
+    app.fiducials.frame = path.to_string_lossy().into();
+    app.fiducials.px_per_mm = ppm;
+    app.fiducials.diameter_mm = 1.0;
+    app.fiducials.search_mm = 2.0;
+    app.load_fid_frame(&ctx);
+    app.render_fiducials(&ctx);
+
+    assert_eq!(
+        app.fiducials.found.iter().filter(|f| f.is_some()).count(),
+        4,
+        "the back face's own arrangement is recovered: {}",
+        app.fiducials.note
+    );
+    assert!(
+        app.fiducials.note.contains("located via rectangle match"),
+        "stage 3 is what did it: {}",
+        app.fiducials.note
+    );
+    // Correspondence, not just a count: marker i must sit on hole i, or every
+    // downstream index (residual rows, the pose fit, ⌖ adopt) is scrambled.
+    for (i, (m, h)) in app.fiducials.search.iter().zip(&holes).enumerate() {
+        assert!(
+            (m.0 - h.0).abs() < 0.5 && (m.1 - h.1).abs() < 0.5,
+            "marker {i} at {m:?} is not on hole {h:?}"
+        );
+    }
+
+    // The same frame on the FRONT: the arrangement is the mirror of what the
+    // front expects, and no proper similarity within ±20° fits it.
+    let mut front = ConsoleApp::new(tmp_db(), vec!["true".into()]);
+    front.runtime.tab = CentralTab::Fiducials;
+    front.fiducials.layout = layout.into();
+    front.fiducials.frame = path.to_string_lossy().into();
+    front.fiducials.px_per_mm = ppm;
+    front.fiducials.diameter_mm = 1.0;
+    front.fiducials.search_mm = 2.0;
+    front.load_fid_frame(&ctx);
+    front.render_fiducials(&ctx);
+    assert_eq!(
+        front.fiducials.found.iter().filter(|f| f.is_some()).count(),
+        0,
+        "a mirrored arrangement is not the front's: {}",
+        front.fiducials.note
+    );
+    assert!(
+        front.fiducials.note.contains("none form the layout"),
+        "and stage 3 says so rather than matching something: {}",
+        front.fiducials.note
+    );
 }

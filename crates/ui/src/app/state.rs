@@ -209,6 +209,9 @@ pub(super) struct JobState {
     pub(super) side: Side,
     pub(super) back_copper: String,
     pub(super) back_outline: String,
+    /// The back side's `.lbrn2` output — its own file, so emitting the back
+    /// leaves the front job intact.
+    pub(super) back_lbrn2: String,
     pub(super) board_thickness_mm: f64,
     pub(super) focal_mm: f64,
     pub(super) scan_center_auto: bool,
@@ -400,12 +403,17 @@ pub(super) struct FiducialState {
     pub(super) marker_drag: Option<usize>,
     pub(super) live: bool,
     /// When the detection ladder's stage 3 (the whole-frame rectangle match)
-    /// last RAN under Live, and the cooldown that run earned — short after a
-    /// recovery that found holes, long after one that found nothing. Stage 3 is
-    /// a whole-frame scan on the UI thread, so under a live feed it has to be
-    /// throttled rather than run per short frame; see `should_global_recover`.
-    /// Runtime timing, not a setting: never persisted.
-    pub(super) last_global_recover: Option<(std::time::Instant, std::time::Duration)>,
+    /// last ran ON THE LIVE FEED, and whether that run recovered any holes.
+    /// Stage 3 is a whole-frame scan on the UI thread, so under a live feed it
+    /// has to be throttled rather than run per short frame; see
+    /// `should_global_recover`.
+    ///
+    /// The OUTCOME is stored, not the window it earned: the window is derived
+    /// from the current `live_recover_s` at compare time, so turning the dial
+    /// down takes effect on the next frame instead of after the snapshotted one
+    /// expires. Manual Checks never stamp this — they are not on the feed's
+    /// budget. Runtime timing, not a setting: never persisted.
+    pub(super) last_global_recover: Option<(std::time::Instant, bool)>,
 }
 
 pub(super) struct PlacementState {
