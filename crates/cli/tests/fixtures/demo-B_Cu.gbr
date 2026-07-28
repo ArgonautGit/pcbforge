@@ -1,0 +1,31 @@
+%TF.GenerationSoftware,KiCad,Pcbnew,(9.0)*%
+%TF.FileFunction,Copper,L2,Bot*%
+%TF.FilePolarity,Positive*%
+%FSLAX46Y46*%
+%MOMM*%
+G04 Hand-authored KiCad-style test fixture: the back copper of the 20 x 15 mm*
+G04 demo board. Plotted in top-view board coordinates, the same frame as*
+G04 demo-F_Cu.gbr — KiCad does not pre-mirror B.Cu; `emit --mirror-x` does.*
+%LPD*%
+G01*
+%ADD10C,0.250000*%
+%ADD11R,1.000000X1.000000*%
+%ADD12C,1.400000*%
+G04 Through-hole pad shared with the front: same board coordinate (2, 2) and*
+G04 the same 1 x 1 mm pad, so its left edge sits at x 1.5 mm on BOTH layers*
+G04 and is the leftmost copper on either. Front/back alignment is measured*
+G04 against this feature.*
+D11*
+X2000000Y2000000D03*
+G04 Back-only via. The back copper stops at x 11.7 / y 8.7, well short of the*
+G04 front's 18.8 / 12.5, so the two sides have deliberately different extents*
+G04 on the right and top edges: a job framed on its own copper bbox instead of*
+G04 the board outline cannot land in the same place on both.*
+D12*
+X11000000Y8000000D03*
+G04 Trace joining the shared pad to the via.*
+D10*
+X2000000Y2000000D02*
+X11000000Y2000000D01*
+X11000000Y8000000D01*
+M02*

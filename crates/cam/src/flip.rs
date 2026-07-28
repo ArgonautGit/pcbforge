@@ -84,18 +84,31 @@ pub struct FieldParams {
 impl FieldParams {
     /// Radial magnification of the exit opening about the scan center.
     /// `1` when thickness is 0 (no drill depth) or focal length is unset.
+    ///
+    /// Fails closed on junk optics rather than propagating it into the
+    /// detection seeds and pose fit downstream: a non-finite focal length is
+    /// treated as unset (same as `focal <= 0`), and a non-finite or negative
+    /// thickness is treated as 0. Both give `1.0` exactly, so a bad parameter
+    /// degrades to "no parallax model" instead of NaN expectations or an
+    /// inverted parallax direction.
     pub fn exit_magnification(&self) -> f64 {
-        if self.focal_mm <= 0.0 {
-            1.0
-        } else {
-            1.0 + self.thickness_mm / self.focal_mm
+        if !self.focal_mm.is_finite() || self.focal_mm <= 0.0 {
+            return 1.0;
         }
+        let thickness = if self.thickness_mm.is_finite() && self.thickness_mm > 0.0 {
+            self.thickness_mm
+        } else {
+            0.0
+        };
+        1.0 + thickness / self.focal_mm
     }
 }
 
 /// Where a through-hole entered at design `(x, y)` mm **exits** the far face,
 /// given the field optics — a radial scale about the scan center. A point on
-/// the axis is unmoved; the shift grows linearly with field radius.
+/// the axis is unmoved; the shift grows linearly with field radius. Finite in,
+/// finite out — see [`FieldParams::exit_magnification`] for how unusable optics
+/// degrade to the identity.
 pub fn entry_to_exit_mm(x: f64, y: f64, field: &FieldParams) -> (f64, f64) {
     let (cx, cy) = field.scan_center_mm;
     let m = field.exit_magnification();
@@ -215,6 +228,45 @@ mod tests {
             focal_mm: 0.0,
         };
         assert_eq!(entry_to_exit_mm(40.0, 20.0, &no_f), (40.0, 20.0));
+    }
+
+    #[test]
+    fn exit_offset_is_identity_for_unusable_optics() {
+        let center = (5.0, 5.0);
+        // A non-finite focal length is "unset", like focal <= 0.
+        for focal in [f64::NAN, f64::INFINITY, f64::NEG_INFINITY, -70.0] {
+            let field = FieldParams {
+                scan_center_mm: center,
+                thickness_mm: 1.6,
+                focal_mm: focal,
+            };
+            assert_eq!(field.exit_magnification(), 1.0, "focal {focal}");
+            assert_eq!(entry_to_exit_mm(40.0, 20.0, &field), (40.0, 20.0));
+        }
+        // A non-finite or negative thickness is "no drill depth" — never an
+        // inverted parallax direction (m < 1) or NaN expectations.
+        for thickness in [f64::NAN, f64::INFINITY, f64::NEG_INFINITY, -1.6] {
+            let field = FieldParams {
+                scan_center_mm: center,
+                thickness_mm: thickness,
+                focal_mm: 70.0,
+            };
+            assert_eq!(field.exit_magnification(), 1.0, "thickness {thickness}");
+            assert_eq!(entry_to_exit_mm(40.0, 20.0, &field), (40.0, 20.0));
+        }
+    }
+
+    #[test]
+    fn back_expected_is_finite_for_unusable_optics() {
+        let axis = MirrorAxis::VerticalX { x_mm: 0.0 };
+        let field = FieldParams {
+            scan_center_mm: (0.0, 0.0),
+            thickness_mm: f64::NAN,
+            focal_mm: f64::NAN,
+        };
+        let (bx, by) = back_expected_fiducial_mm(35.0, 12.0, &axis, &field);
+        assert!(bx.is_finite() && by.is_finite(), "({bx}, {by})");
+        assert_eq!((bx, by), (-35.0, 12.0));
     }
 
     #[test]

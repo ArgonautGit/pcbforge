@@ -247,7 +247,10 @@ enum Command {
 
         /// Mirror the design in X for the back side of a double-sided board
         /// (KiCad exports B.Cu in top-view coords; flipping the board
-        /// left-right needs the design mirrored to match). Winding is preserved.
+        /// left-right needs the design mirrored to match). Winding is
+        /// preserved. Requires --outline: the outline is what puts front and
+        /// back in the same frame — without it each side is framed on its own
+        /// copper extents and the two jobs will not align.
         #[arg(long)]
         mirror_x: bool,
 
@@ -542,13 +545,15 @@ enum Command {
     },
     /// Export the copper + outline Gerbers a job needs from a KiCad project,
     /// via kicad-cli. Point it at a `.kicad_pcb` (or a project directory with
-    /// one) and it writes `copper.gbr` + `outline.gbr` into `--out`.
+    /// one) and it writes `copper-<layer>.gbr` + `outline.gbr` into `--out`.
     Gerbers {
         /// KiCad board (`.kicad_pcb`) or a project directory containing one.
         #[arg(long)]
         project: PathBuf,
 
-        /// Output directory for `copper.gbr` + `outline.gbr`.
+        /// Output directory for `copper-<layer>.gbr` + `outline.gbr` — the
+        /// copper name carries its layer, so a front and a back export can
+        /// share one directory.
         #[arg(long, default_value = ".")]
         out: PathBuf,
 
@@ -1728,6 +1733,18 @@ fn build_job(
 /// FlatCAM-replacement inversion (like `noncopper`) piped straight into a
 /// press-play LightBurn file.
 fn emit_cmd(a: EmitArgs) -> Result<(), Box<dyn std::error::Error>> {
+    // Fail closed before reading anything: without an outline the board region
+    // is the copper's own bbox, so front and back are cornered on *different*
+    // extents (min x of F.Cu vs max x of B.Cu) and the two jobs silently land
+    // in unrelated frames. The outline is what gives both sides one frame.
+    if a.mirror_x && a.outline.is_none() {
+        return Err(
+            "emit: --mirror-x requires --outline — without a board outline the \
+                    front and back jobs are framed on their own copper extents and will \
+                    not align on the flipped board"
+                .into(),
+        );
+    }
     let job = build_job(
         a.copper,
         a.outline,

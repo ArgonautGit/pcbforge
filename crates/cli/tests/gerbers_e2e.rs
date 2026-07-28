@@ -48,7 +48,9 @@ fn gerbers_exports_copper_and_outline_from_a_project() {
         stdout.contains("copper:") && stdout.contains("outline:"),
         "prints the two Gerber paths:\n{stdout}"
     );
-    let copper = out.join("copper.gbr");
+    // The copper name carries its layer (default F.Cu), so a later back-side
+    // export into the same directory lands beside it rather than on it.
+    let copper = out.join("copper-F_Cu.gbr");
     let outline = out.join("outline.gbr");
     assert!(
         copper.is_file() && outline.is_file(),
@@ -88,5 +90,5 @@ fn gerbers_accepts_a_project_directory() {
         }
         panic!("gerbers on a dir failed: {err}");
     }
-    assert!(out.join("copper.gbr").is_file());
+    assert!(out.join("copper-F_Cu.gbr").is_file());
 }
