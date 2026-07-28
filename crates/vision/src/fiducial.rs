@@ -194,6 +194,22 @@ pub struct Confidence {
     /// matched-filter peak, px. Large values flag an asymmetric or
     /// corrupted blob.
     pub centroid_peak_gap_px: f64,
+    /// How far this mark sits from where the rest of the set says it should
+    /// be, px: its residual under the least-squares similarity fitted across
+    /// every site that locked (see [`find_fiducials`]). The other components
+    /// say the mark *looks* right; this says it *sits* right, and it is the
+    /// only one that can catch a plausible-looking scratch at every site.
+    ///
+    /// `None` when there is no arrangement to measure: fewer than three sites
+    /// locked, or their expected positions are collinear (see
+    /// [`MIN_LAYOUT_ASPECT`]) — reported as "not assessed" rather than as a
+    /// flattering zero.
+    ///
+    /// Deliberately NOT folded into `score`. `score` is one site's verdict on
+    /// its own evidence and is calibrated against the console's weak-detection
+    /// threshold; this is a property of the SET, and a caller gating on
+    /// geometric coherence should test it separately.
+    pub arrangement_px: Option<f64>,
     /// Combined `[0, 1]` score.
     pub score: f64,
 }
@@ -275,10 +291,49 @@ const TOP_K: usize = 5;
 /// hard `dist <= search_px` bound stays: that is the search-window contract.
 const DIST_PENALTY: f64 = 0.5;
 /// Weight of the arrangement residual in a combination's score, applied to the
-/// sum of `(residual / span)²` over the sites. Span-relative, like the `ui`
-/// layout matcher's tolerance, because the observed quad is perspective-warped
-/// and absolute pixel tolerances do not transfer between framings.
-const RESID_PENALTY: f64 = 8.0;
+/// sum of `(residual / search_px)²` over the sites.
+///
+/// Normalized by the SEARCH WINDOW, not by the layout's span (which is what it
+/// was until 2026-07-28). Span-relative made the term arithmetically incapable
+/// of the job the module header claims for it: candidates are hard-bounded to
+/// `search_px` of their seed, so the whole penalty was bounded by
+/// `RESID_PENALTY·n·(search_px/span)²` — about 0.1 on the brushed plate, where
+/// span is 315 px and the window 22 px — against per-site quality gaps of
+/// 0.15–0.6. It could not overturn any real quality difference, and it got
+/// *weaker* as the layout grew, which is backwards. Setting it to zero changed
+/// no test. Against the window the term is comparable to a quality gap by
+/// construction: one site displaced a full window from where the others say it
+/// should be costs ≈0.5 (a 4-DOF similarity over four sites absorbs about half
+/// of a lone outlier), which is the middle of that band.
+///
+/// 1.0 is set by that construction and not by a test boundary — the brushed
+/// fixture still locks all four holes at 8.0, so there is no failure to bisect
+/// against. What bounds the value instead is a property worth writing down:
+/// residual is measured expected→found, so INCOHERENT SEED ERROR lands in it
+/// undiminished. In `brushed_plate_locks_all_four_with_large_seed_error` the
+/// four seeds are scattered ~20 px in unrelated directions and the correct pick
+/// already scores Σ(r/search_px)² = 2.43, five times what a full-window outlier
+/// contributes. Raising the weight scales that floor along with the signal and
+/// buys nothing but a larger arbitrary number multiplying seed noise. The term
+/// discriminates only to the extent the seeds are coherent — which on the bench,
+/// where the error is a board offset the similarity absorbs, they are.
+const RESID_PENALTY: f64 = 1.0;
+/// Minimum principal-spread aspect (`√(λmin/λmax)` of the expected positions'
+/// second-moment matrix) before the arrangement is allowed a vote. Same gate,
+/// same value, as `lens`' `MIN_ASPECT`, and second-moment rather than
+/// bounding-box for the same reason: it catches a diagonal line, which a box
+/// does not.
+///
+/// [`similarity_residuals`]' own `nrm <= 1e-12` bail cannot catch this — `nrm`
+/// is Σ|a|² measured *along* the line, which is large for a collinear layout.
+/// Three collinear sites leave a 4-DOF similarity only two constraints on six
+/// coordinates, and every equally-spaced collinear triple, anywhere in the
+/// frame at any scale, fits at exactly zero residual. A term a decoy set can
+/// zero out is worse than none, so a 1-D layout gets no arrangement vote and no
+/// reported residual; selection falls back to the per-site ranking, which is
+/// already the answer for fewer than three sites. `fit_affine` and
+/// `fit_homography` refuse the same inputs outright.
+const MIN_LAYOUT_ASPECT: f64 = 0.15;
 /// Cap on `∏ Kᵢ` for exhaustive combination search. K=5 over 6 sites is 15625;
 /// beyond that the product explodes (5^7 = 78125), so past this bound the
 /// selector falls back to consensus-offset selection, which is linear in the
@@ -553,6 +608,12 @@ pub fn find_fiducial_candidates(
 /// picks the winners. Four independent per-site coin-flips could each be won by
 /// a different scratch; one geometric decision cannot, because a scratch has to
 /// sit where the fiducial layout says a mark should be in order to compete.
+///
+/// Selection reorders preferences, it does not veto: a geometrically incoherent
+/// set still comes back as detections. What it comes back with is
+/// [`Confidence::arrangement_px`] — how far each mark sits from where the rest
+/// of the set puts it — so a caller can refuse the set on coherence instead of
+/// having to infer it from per-site quality, which cannot see it.
 pub fn find_fiducials(
     frame: &GrayImage,
     expected_mm: &[Point2<f64>],
@@ -565,11 +626,13 @@ pub fn find_fiducials(
         .map(|&e| scan_site(frame, e, search_mm, profile, bed))
         .collect();
     let picks = select_jointly(&scans);
+    let resid = arrangement_residuals(&scans, &picks);
     scans
         .iter()
         .zip(picks)
-        .map(|(scan, pick)| match (scan, pick) {
-            (Ok(site), Some(i)) => Ok(site.finish(i, bed)),
+        .zip(resid)
+        .map(|((scan, pick), r)| match (scan, pick) {
+            (Ok(site), Some(i)) => Ok(site.finish(i, bed, r)),
             // A site that scanned but offered nothing the gates accepted is a
             // NoCandidate exactly as before. Joint selection never manufactures
             // a miss of its own: it reorders preferences, it does not veto.
@@ -616,7 +679,7 @@ struct SiteScan {
 }
 
 impl SiteScan {
-    fn finish(&self, i: usize, bed: &BedMap) -> Fiducial {
+    fn finish(&self, i: usize, bed: &BedMap, arrangement_px: Option<f64>) -> Fiducial {
         let c = self.cands[i];
         Fiducial {
             expected_mm: self.expected_mm,
@@ -627,6 +690,7 @@ impl SiteScan {
                 circularity: c.shape_fill,
                 ring_contrast: c.ring_contrast,
                 centroid_peak_gap_px: c.gap,
+                arrangement_px,
                 score: c.score,
             },
         }
@@ -669,21 +733,23 @@ fn select_jointly(scans: &[Result<SiteScan, Miss>]) -> Vec<Option<usize>> {
     }
     let site = |i: usize| scans[i].as_ref().expect("live sites scanned Ok");
 
-    // Arrangement scale: RMS radius of the expected positions about their
-    // centroid. Residuals are measured against this so the tolerance follows
-    // the layout's own size rather than a pixel count that only suits one
-    // framing.
-    let n = live.len() as f64;
-    let cx = live.iter().map(|&i| site(i).expected_px.x).sum::<f64>() / n;
-    let cy = live.iter().map(|&i| site(i).expected_px.y).sum::<f64>() / n;
-    let span = (live
+    // A layout with no two-dimensional extent constrains a similarity so weakly
+    // that a decoy set can fit it at zero residual (see MIN_LAYOUT_ASPECT), so
+    // it gets no vote at all rather than a vote that can be gamed.
+    let expected: Vec<(f64, f64)> = live
         .iter()
-        .map(|&i| (site(i).expected_px.x - cx).powi(2) + (site(i).expected_px.y - cy).powi(2))
-        .sum::<f64>()
-        / n)
-        .sqrt();
-    // Written out rather than negated so the NaN case reads explicitly.
-    if !span.is_finite() || span <= 1e-6 {
+        .map(|&i| (site(i).expected_px.x, site(i).expected_px.y))
+        .collect();
+    if !layout_is_two_dimensional(&expected) {
+        return picks;
+    }
+    // Residuals are normalized per site by that site's own search window: the
+    // window is the only scale on which "this candidate does not fit the
+    // layout" means the same thing across framings, and it is the scale the
+    // candidates are bounded on. Written out rather than negated so the NaN
+    // case reads explicitly.
+    let scale: Vec<f64> = live.iter().map(|&i| site(i).search_px).collect();
+    if !scale.iter().all(|s| s.is_finite() && *s > 1e-6) {
         return picks;
     }
 
@@ -725,7 +791,8 @@ fn select_jointly(scans: &[Result<SiteScan, Miss>]) -> Vec<Option<usize>> {
         // near-identity, so a proper similarity is all that is needed.
         let penalty: f64 = similarity_residuals(&src, &dst)
             .iter()
-            .map(|r| (r / span).powi(2))
+            .zip(&scale)
+            .map(|(r, s)| (r / s).powi(2))
             .sum();
         let value = quality - RESID_PENALTY * penalty;
         if best.as_ref().is_none_or(|(b, _)| value > *b) {
@@ -815,6 +882,70 @@ fn consensus_pick(scans: &[Result<SiteScan, Miss>], live: &[usize], picks: &mut 
             picks[i] = Some(idx);
         }
     }
+}
+
+/// Whether a set of expected positions constrains a similarity in two
+/// dimensions. The eigenvalues of the second-moment matrix are the principal
+/// spreads, so `√(λmin/λmax)` is the layout's aspect and a line of sites reads
+/// ~0 at any angle — see [`MIN_LAYOUT_ASPECT`] for why a collinear layout has
+/// to be refused rather than merely down-weighted.
+fn layout_is_two_dimensional(pts: &[(f64, f64)]) -> bool {
+    let n = pts.len() as f64;
+    if pts.len() < 3 {
+        return false;
+    }
+    let cx = pts.iter().map(|p| p.0).sum::<f64>() / n;
+    let cy = pts.iter().map(|p| p.1).sum::<f64>() / n;
+    let (mut cxx, mut cxy, mut cyy) = (0.0, 0.0, 0.0);
+    for p in pts {
+        let (dx, dy) = (p.0 - cx, p.1 - cy);
+        cxx += dx * dx;
+        cxy += dx * dy;
+        cyy += dy * dy;
+    }
+    let (cxx, cxy, cyy) = (cxx / n, cxy / n, cyy / n);
+    let tr = cxx + cyy;
+    let disc = ((cxx - cyy).powi(2) + 4.0 * cxy * cxy).max(0.0).sqrt();
+    let lam_max = ((tr + disc) / 2.0).max(0.0);
+    let lam_min = ((tr - disc) / 2.0).max(0.0);
+    lam_max.is_finite() && lam_max > 1e-12 && (lam_min / lam_max).sqrt() >= MIN_LAYOUT_ASPECT
+}
+
+/// Arrangement residual of the FINAL picks, per site, px — what
+/// [`Confidence::arrangement_px`] reports.
+///
+/// Measured once on the chosen set rather than inside the combination loop, so
+/// the consensus fallback reports the same number the exhaustive branch does,
+/// and so the number a caller sees is the arrangement it actually got back.
+/// `None` everywhere when there is no arrangement to measure.
+fn arrangement_residuals(
+    scans: &[Result<SiteScan, Miss>],
+    picks: &[Option<usize>],
+) -> Vec<Option<f64>> {
+    let mut out = vec![None; picks.len()];
+    let live: Vec<usize> = picks
+        .iter()
+        .enumerate()
+        .filter_map(|(i, p)| p.map(|_| i))
+        .collect();
+    if live.len() < 3 {
+        return out;
+    }
+    let mut src = Vec::with_capacity(live.len());
+    let mut dst = Vec::with_capacity(live.len());
+    for &i in &live {
+        let Ok(s) = &scans[i] else { return out };
+        let c = s.cands[picks[i].expect("live sites have a pick")];
+        src.push((s.expected_px.x, s.expected_px.y));
+        dst.push((c.px.x, c.px.y));
+    }
+    if !layout_is_two_dimensional(&src) {
+        return out;
+    }
+    for (&i, r) in live.iter().zip(similarity_residuals(&src, &dst)) {
+        out[i] = Some(r);
+    }
+    out
 }
 
 /// Per-point residuals of the least-squares similarity (rotation + uniform
@@ -1174,9 +1305,10 @@ fn response_peaks(
     peaks.sort_by(|a, b| b.1.total_cmp(&a.1));
     let mut out: Vec<((usize, usize), f64)> = Vec::new();
     for p in peaks {
-        if out.iter().any(|q| {
-            (q.0.0 as f64 - p.0.0 as f64).hypot(q.0.1 as f64 - p.0.1 as f64) < dot_px
-        }) {
+        if out
+            .iter()
+            .any(|q| (q.0.0 as f64 - p.0.0 as f64).hypot(q.0.1 as f64 - p.0.1 as f64) < dot_px)
+        {
             continue;
         }
         out.push(p);
@@ -1198,7 +1330,11 @@ fn local_median(win: &Window, x: usize, y: usize, k: usize) -> f64 {
     for yy in y0..y1 {
         buf.extend_from_slice(&win.v[yy * win.w + x0..yy * win.w + x1]);
     }
-    if buf.is_empty() { 0.0 } else { median_mut(&mut buf) }
+    if buf.is_empty() {
+        0.0
+    } else {
+        median_mut(&mut buf)
+    }
 }
 
 /// The masked component at `(x, y)`, or — when the response peak lands on a
@@ -1795,6 +1931,98 @@ mod tests {
         })
     }
 
+    /// A decoy that beats the true mark on its own merits still loses, because
+    /// it does not sit where the other three sites say it should. This is the
+    /// claim the module header makes ("a scratch must also sit where the layout
+    /// says") and until 2026-07-28 nothing tested it — with the residual
+    /// normalized by the layout's span the arrangement term was ~0.01 here and
+    /// the decoy won.
+    ///
+    /// Everything except coherence is held equal on purpose. Both candidates at
+    /// site 0 sit exactly 24 px from the seed, so `DIST_PENALTY` charges them
+    /// identically and cannot be what decides; the decoy simply points the wrong
+    /// way. The true marks share one (+24, 0) offset, which a similarity absorbs
+    /// exactly — residual 0. The decoy's (0, +24) leaves residuals
+    /// 16.97/12/12/0 px, Σ(r/30)² = 0.64, against a quality gap of 0.40. So the
+    /// true set wins 0.52 to 0.28, and with `RESID_PENALTY` zeroed it loses
+    /// 0.52 to 0.92.
+    #[test]
+    fn a_better_looking_decoy_loses_to_the_arrangement() {
+        let seeds = [
+            (100.0, 100.0),
+            (300.0, 100.0),
+            (100.0, 300.0),
+            (300.0, 300.0),
+        ];
+        let sites: Vec<Result<SiteScan, Miss>> = seeds
+            .iter()
+            .enumerate()
+            .map(|(i, &e)| {
+                let truth = ((e.0 + 24.0, e.1), 0.45);
+                if i == 0 {
+                    scan_with(e, &[((e.0, e.1 + 24.0), 0.85), truth])
+                } else {
+                    scan_with(e, &[truth])
+                }
+            })
+            .collect();
+
+        let picks = select_jointly(&sites);
+        assert_eq!(
+            picks[0],
+            Some(1),
+            "site 0 took the higher-quality decoy: the arrangement term did not bite"
+        );
+
+        // And the residual of what was chosen reaches the caller.
+        let resid = arrangement_residuals(&sites, &picks);
+        for (i, r) in resid.iter().enumerate() {
+            let r = r.unwrap_or_else(|| panic!("site {i} reported no arrangement residual"));
+            assert!(r < 1e-9, "site {i} residual {r:.3} px on a coherent set");
+        }
+    }
+
+    /// Three sites in a row: the arrangement declines to vote rather than
+    /// voting on nothing. A collinear layout leaves a 4-DOF similarity only two
+    /// constraints, and the decoy set here fits it at zero residual — the term
+    /// would be free, so the guard withholds it and the per-site ranking (which
+    /// prefers the decoy) stands. Same geometry as
+    /// `a_better_looking_decoy_loses_to_the_arrangement` otherwise, where the
+    /// fourth site breaks the line and the decoy duly loses.
+    #[test]
+    fn collinear_layout_makes_no_arrangement_claim() {
+        let seeds = [(100.0, 100.0), (300.0, 100.0), (500.0, 100.0)];
+        let sites: Vec<Result<SiteScan, Miss>> = seeds
+            .iter()
+            .enumerate()
+            .map(|(i, &e)| {
+                let truth = ((e.0 + 24.0, e.1), 0.45);
+                if i == 0 {
+                    scan_with(e, &[((e.0, e.1 + 24.0), 0.85), truth])
+                } else {
+                    scan_with(e, &[truth])
+                }
+            })
+            .collect();
+
+        assert!(
+            !layout_is_two_dimensional(&seeds),
+            "a row of three sites must not read as a 2-D layout"
+        );
+        let picks = select_jointly(&sites);
+        assert_eq!(
+            picks[0],
+            Some(0),
+            "a collinear layout voted anyway — its residual is not a real constraint"
+        );
+        assert!(
+            arrangement_residuals(&sites, &picks)
+                .iter()
+                .all(Option::is_none),
+            "a collinear layout must report no residual rather than a flattering 0.0"
+        );
+    }
+
     /// The consensus fallback finds the coherent offset and takes it, even
     /// where the decoy at a site outscores the true mark on its own merits.
     /// Every site here is offset by (+6, −5); the decoys sit on a 28 px circle
@@ -1803,7 +2031,10 @@ mod tests {
     fn consensus_fallback_follows_the_shared_offset() {
         let sites: Vec<Result<SiteScan, Miss>> = (0..8)
             .map(|i| {
-                let e = (100.0 + 200.0 * (i % 4) as f64, 100.0 + 200.0 * (i / 4) as f64);
+                let e = (
+                    100.0 + 200.0 * (i % 4) as f64,
+                    100.0 + 200.0 * (i / 4) as f64,
+                );
                 scan_with(
                     e,
                     &[
@@ -2005,15 +2236,18 @@ mod tests {
     /// equal sides, which would be a false claim about this fixture.
     #[test]
     fn brushed_plate_quad_is_geometrically_coherent() {
-        let p = brushed_locks_all_four(&[(5.0, -3.0), (-4.0, 4.0), (3.0, 5.0), (-5.0, -2.0)], "geom");
+        let p = brushed_locks_all_four(
+            &[(5.0, -3.0), (-4.0, 4.0), (3.0, 5.0), (-5.0, -2.0)],
+            "geom",
+        );
         let d = |a: Point2<f64>, b: Point2<f64>| (a.x - b.x).hypot(a.y - b.y);
         let sides = [d(p[0], p[1]), d(p[2], p[3]), d(p[0], p[2]), d(p[1], p[3])];
         let diags = [d(p[0], p[3]), d(p[1], p[2])];
         let nominal = 40.0 * BRUSHED_PPM;
 
-        let (lo, hi) = sides.iter().fold((f64::MAX, 0.0f64), |(l, h), &s| {
-            (l.min(s), h.max(s))
-        });
+        let (lo, hi) = sides
+            .iter()
+            .fold((f64::MAX, 0.0f64), |(l, h), &s| (l.min(s), h.max(s)));
         assert!(
             hi / lo < 1.20,
             "sides {sides:?} spread beyond the plate's known perspective warp"
@@ -2025,7 +2259,11 @@ mod tests {
             );
         }
         let dl = diags[0].max(diags[1]) / diags[0].min(diags[1]);
-        assert!(dl < 1.08, "diagonals {diags:?} differ by {:.1}%", (dl - 1.0) * 100.0);
+        assert!(
+            dl < 1.08,
+            "diagonals {diags:?} differ by {:.1}%",
+            (dl - 1.0) * 100.0
+        );
     }
 
     /// A window centred on the long dark brush band above the top-left hole
