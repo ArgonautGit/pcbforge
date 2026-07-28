@@ -228,6 +228,39 @@ fn double_sided_board_branches_through_the_bottom_flow() {
     );
 }
 
+/// LR-04: `recover --mark-done` on a branching stage (one with `next_alt`)
+/// must not guess which branch the operator meant. Advancing unconditionally
+/// to `next` would silently skip the bottom side of a double-sided board.
+#[test]
+fn mark_done_refuses_a_branching_stage() {
+    let path = temp_db_path("mark-done-branch");
+    let pallet = FixedPalletSource(5005);
+    let ds = FlipMode::DoubleSided;
+
+    // Walk to the flip stage: fiducials -> bulk_top -> iso_check -> flip.
+    let mut board_id = 0;
+    for _ in 0..3 {
+        board_id = invoke_with(&path, &pallet, ds).board_id();
+    }
+
+    let db = Db::open(&path).unwrap();
+    let graph = StageGraph::load().unwrap();
+    let id = {
+        let mut board = db.get_board(board_id).unwrap().expect("board exists");
+        assert_eq!(board.stage, "flip");
+        // Simulate an interrupted attempt at the branching stage.
+        board.stage_phase = "needs_attention".into();
+        db.update_board(&board).unwrap();
+        board.id
+    };
+
+    assert!(engine::recover_board(&db, &graph, id, RecoveryAction::MarkDone).is_err());
+
+    let board = db.get_board(id).unwrap().unwrap();
+    assert_eq!(board.stage, "flip", "mark-done must not choose a branch");
+    assert_eq!(board.stage_phase, "needs_attention");
+}
+
 #[test]
 fn distinct_pallets_get_distinct_boards() {
     let path = temp_db_path("two-pallets");

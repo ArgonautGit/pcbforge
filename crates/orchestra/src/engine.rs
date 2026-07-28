@@ -829,6 +829,13 @@ pub fn recover_board(
                 "recovery_retry"
             }
             RecoveryAction::MarkDone => {
+                if def.next_alt.is_some() {
+                    return Err(EngineError::Config(format!(
+                        "stage `{}` branches (has `next_alt`); mark-done cannot choose \
+                         which branch to take, resolve the stage itself",
+                        board.stage
+                    )));
+                }
                 let next = def.next.clone().ok_or_else(|| {
                     EngineError::Config(format!("stage `{}` is already terminal", board.stage))
                 })?;
