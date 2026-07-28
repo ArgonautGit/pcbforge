@@ -1450,8 +1450,9 @@ existing ING-6 kicad-cli invoker.
 - `ingest::kicad_cli::export_job_gerbers(board, out_dir, copper_layer,
   outline_layer)`: exports the conductor + outline on separate calls (so the
   layer→file mapping is unambiguous) and moves each plotted file to a stable
-  name — `copper.gbr` / `outline.gbr`. `resolve_board` accepts a `.kicad_pcb`
-  *or* a project directory containing exactly one board.
+  name — `copper.gbr` / `outline.gbr` (renamed to `copper-<layer>.gbr` on
+  2026-07-28, see that day's entries; outline unchanged). `resolve_board`
+  accepts a `.kicad_pcb` *or* a project directory containing exactly one board.
 - CLI `pcbforge gerbers --project <.kicad_pcb|dir> --out <dir>
   [--copper-layer F.Cu] [--outline-layer Edge.Cuts]`: prints `board/copper/
   outline` paths for a script or the console to pick up. Verified end-to-end:
@@ -1474,13 +1475,15 @@ runner:
 
 - `gerbers_from_kicad` now resolves the board (cheap, for the output dir),
   pre-fills the copper/outline fields with the deterministic output paths
-  (`<board dir>/pcbforge-gerbers/{copper,outline}.gbr`), and shells
-  `pcbforge gerbers …` via `run_verb` (thread + channel, non-blocking). The
-  files appear when the job finishes; its progress/errors stream to the Log.
-  Back side passes `--copper-layer B.Cu`.
+  (`<board dir>/pcbforge-gerbers/{copper,outline}.gbr`, renamed to
+  `copper-<layer>.gbr` on 2026-07-28, see that day's entries; outline
+  unchanged), and shells `pcbforge gerbers …` via `run_verb` (thread + channel,
+  non-blocking). The files appear when the job finishes; its progress/errors
+  stream to the Log. Back side passes `--copper-layer B.Cu`.
 - The UI interaction test is now deterministic (no kicad-cli needed): the fields
-  are pre-set synchronously, so it asserts `copper=copper.gbr` immediately. The
-  actual export is covered by the CLI `gerbers_e2e` tests.
+  are pre-set synchronously, so it asserts `copper=copper.gbr` immediately
+  (that assertion has since followed the 2026-07-28 rename). The actual export
+  is covered by the CLI `gerbers_e2e` tests.
 - `debug_driver` gained a `PCBFORGE_CLI` env override so it can drive *real*
   verbs (e.g. `PCBFORGE_CLI=./target/debug/pcbforge`) instead of the `true`
   no-op. Confirmed the button pre-fills the fields instantly (non-blocking) and
@@ -3438,3 +3441,62 @@ machine cannot walk past a sub-second window and rescan. The value appears in
 `debug_summary()`'s `fiducials:` line, so a headless `state` dump shows it, and
 a headless interaction test drives the field by its label and reads the change
 back out of that line — presence alone would have passed on the caption.
+
+## 2026-07-28 — LR-03 blocker list
+
+LR-03 (back-side "Etch here" refused until `register` gains `--mirror-x`,
+IMP-05) is not just a missing flag. Everything below is a dead path only
+because the mirror is refused; each becomes a live burn-geometry hazard the
+day `register --mirror-x` ships. Recorded so closing LR-03 does not happen
+without closing these too.
+
+- The mirror gate (`pose.flipped` vs the selected side) is degenerate for
+  mirror-symmetric fiducial layouts — including the default 4-corner
+  rectangle — where a physical flip is indistinguishable from a correspondence
+  swap and fits as a pure ~1.023 scale that passes the 0.90–1.10
+  `POSE_SCALE_MIN`/`MAX` gate. (Being fixed on this branch.)
+- Stage-3 whole-frame recovery matches the raw layout under proper rotations
+  ≤20° only — reflection-blind, so it fails outright on the back for
+  asymmetric layouts and silently succeeds with swapped correspondences for
+  symmetric ones. (Being fixed on this branch.)
+- Unset focal length/board thickness silently absorbs the ~2.3% exit parallax
+  (`entry_to_exit_mm`) into `pose.scale`, inside the 0.90–1.10 gate — an
+  oversized back job that reads as a clean fit. (Being fixed on this branch.)
+- `emit --mirror-x` without `--outline` corners each side on its own copper
+  bounding box, so front and back land in unrelated frames. (Being fixed on
+  this branch: mirror-x now requires `--outline`.)
+- LR-15 (back-side AR overlay double-mirror) was deferred as "display-only" —
+  that deferral is conditional on LR-03 staying closed. It is not independently
+  safe.
+- `exit_to_entry_mm` (the inverse of the parallax model) does not exist, so
+  adopting a measured back-side layout as the new nominal stays front-only
+  until it does.
+
+## 2026-07-28 — Scan-center frame convention
+
+`scan_center_mm` is a DESIGN-frame point; `scan_center_auto` is the
+fiducial-layout centroid in that same frame. `cam::flip` already documents the
+field as design-frame, but the console's hover text implied a measured machine
+quantity, and the two must not drift apart.
+
+The fit itself does not care: a wrong scan center is a constant offset in
+source space that the similarity fit's translation term absorbs, so it never
+shows up as residual. Downstream uses are not so forgiving — the parallax
+model (`entry_to_exit_mm`) is applied about this point, so a design-frame
+value fed a machine-frame number silently mis-shifts every back-side fiducial
+expectation by the difference. One convention is recorded: design frame. The
+console setting is persisted as of this branch. VIS-3 (field-center
+calibration) will supply a measured value mapped into the design frame at that
+point — not a second, competing frame.
+
+## 2026-07-28 — Recovery cannot choose a branch
+
+`recover --mark-done` followed `next` unconditionally at every stage,
+including one with a `next_alt`. At `flip`, that meant MarkDone jumped a
+double-sided board straight to `done`, skipping
+`fiducials_bottom`/`bulk_bottom`/`iso_check_bottom` — recreating, through the
+recovery door, exactly the LR-04 "silently skip the bottom side" scrap
+scenario the strict `PCBFORGE_DOUBLE_SIDED` parse was built to prevent.
+
+Fixed fail-closed: `recover --mark-done` now refuses at any stage that has a
+`next_alt` rather than guessing which branch the operator meant.
