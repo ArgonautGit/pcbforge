@@ -250,6 +250,13 @@ impl ConsoleApp {
                 click_place: false,
                 show_placement: true,
                 detected_mm: Vec::new(),
+                checked_layout: Vec::new(),
+                ref_holes: Vec::new(),
+                loop_health: None,
+                loop_note: "no fiducial holes have been burned from this console yet".into(),
+                loop_alarm: None,
+                adopt_confirm: None,
+                adopt_warn: None,
                 note: "Load a frame, click each marker onto its hole, then Check.".into(),
                 rows: Vec::new(),
                 measured_ppm: None,
@@ -559,6 +566,7 @@ impl ConsoleApp {
              fiducials: {} markers shape={} w={} h={} profile={} search={} out={} marking={} live_recover_s={}\n\
              fid_rect: w={} h={} layout={}\n\
              fid_pose: {}\n\
+             fid_loop: {} ref_holes={} adopt_confirm={} adopt_warn={}\n\
              diag: {} check={} {}\n\
              settings: {}",
             self.runtime.tab,
@@ -622,6 +630,13 @@ impl ConsoleApp {
             self.fiducials.rect_h_mm,
             fid_layout,
             fid_pose,
+            self.loop_health_token(),
+            self.fiducials.ref_holes.len(),
+            match self.fiducials.adopt_confirm {
+                Some(s) => format!("{s:.4}"),
+                None => "-".into(),
+            },
+            self.fiducials.adopt_warn.is_some(),
             self.runtime.diag.path().display(),
             self.runtime.diag_check_seq,
             if self.runtime.diag.failed() {

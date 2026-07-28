@@ -14,9 +14,29 @@
 //! 3. Render the overlay PNG: confirmed holes ringed green, the current
 //!    target crosshaired red, remaining holes dim — the operator's map.
 //!
-//! The frame is the registered camera view at a uniform `px_per_mm`
-//! (pre-VIS-3, same contract as the fiducial check); hole coordinates are the
-//! drill file's mm coordinates in that frame.
+//! **Which frame these numbers live in.** The only mapping this verb has is a
+//! uniform `px_per_mm` with the y axis flipped: raw (still lens-distorted)
+//! pixels divided by a number the operator typed, with no bed anchor under it.
+//! That is the CAMERA PLANE, not the machine frame — the console draws the same
+//! distinction, where the anchorless homography fallback is "a viewing aid only,
+//! labelled approximate" and export refuses until the lens and field
+//! calibrations are accepted (`ui::app::projection`).
+//!
+//! So the guide reports only what survives the missing calibration:
+//!
+//! - Hole positions are printed as **drill-file mm** — the coordinates in the
+//!   file the operator handed over. They are never labelled machine
+//!   coordinates, because nothing here can know where the machine origin is.
+//! - The confirmation number is a **displacement** between the detected hole
+//!   and the search position it was sought at, measured in the camera plane and
+//!   converted at `px_per_mm`. A displacement is what a change of frame leaves
+//!   intact (up to the scale error in the typed `px_per_mm`), so it is a
+//!   meaningful "did the drill land where the map says", whereas subtracting a
+//!   drill-file coordinate from a camera-plane one is a frame collision that
+//!   only reads as zero when the board happens to sit at its design
+//!   coordinates.
+//! - The overlay is the operator's real instrument: it is drawn in the frame
+//!   the detection happened in, so it needs no calibration to be true.
 
 use std::path::Path;
 
@@ -136,8 +156,17 @@ impl GuideState {
 }
 
 /// Look for the drilled hole at `target` in `frame` and gate it: the detected
-/// dark-hole center must sit within `tol_um` of the target. Returns the
-/// offset in µm, or why the hole is not confirmed.
+/// dark-hole center must sit within `tol_um` of where the hole was sought.
+/// Returns that displacement in µm, or why the hole is not confirmed.
+///
+/// The displacement is measured **in pixels**, between the detection and the
+/// search position the target maps to, and only then divided by `px_per_mm`.
+/// Both ends are then in one frame — the camera plane — which is what makes the
+/// number mean anything: `found_mm` is camera-plane mm (raw px ÷ typed
+/// `px_per_mm`, no lens undistortion and no bed anchor), so differencing it
+/// against a drill-file coordinate would mix two frames. See the module docs.
+/// A wrong `px_per_mm` still scales this reading, so the gate is only as tight
+/// as that number is right.
 pub fn check_hole(
     frame: &GrayImage,
     target: &HoleTarget,
@@ -153,19 +182,19 @@ pub fn check_hole(
             diameter_mm: target.d_mm,
         },
     };
-    let expected = [Point2::new(target.x_mm, target.y_mm)];
+    let target_pt = Point2::new(target.x_mm, target.y_mm);
+    let expected = [target_pt];
     let res = find_fiducials(frame, &expected, search_mm, &profile, &bed);
     match &res[0] {
         Ok(f) => {
-            let off_um = ((f.found_mm.x - target.x_mm).powi(2)
-                + (f.found_mm.y - target.y_mm).powi(2))
-            .sqrt()
-                * 1000.0;
+            let sought_px = bed.mm_to_px(target_pt);
+            let off_um = (f.found_px - sought_px).norm() / px_per_mm * 1000.0;
             if off_um <= tol_um {
                 Ok(off_um)
             } else {
                 Err(format!(
-                    "hole found {off_um:.0} µm off target (tolerance {tol_um:.0} µm) — re-check before advancing"
+                    "hole found {off_um:.0} µm from the mapped position (tolerance \
+                     {tol_um:.0} µm) — re-check before advancing"
                 ))
             }
         }
@@ -321,6 +350,14 @@ pub fn step(
     };
 
     let mut out = Vec::new();
+    // Say which frame every number below lives in, up front. With only a typed
+    // px/mm there is no bed anchor and no lens map, so nothing here is a machine
+    // coordinate and the guide must not let the operator read one.
+    out.push(format!(
+        "frame: camera plane at {px_per_mm:.2} px/mm (uniform fallback — no lens or \
+         bed calibration); positions below are DRILL-FILE mm and offsets are \
+         camera-plane displacements, NOT machine coordinates"
+    ));
 
     // Confirm the pending hole on the frame before advancing (only once the
     // guide has started — the first invocation just presents the first target).
@@ -331,7 +368,7 @@ pub fn step(
         // the centroid L/2 off target) can't hard-lock the flow (LR-08).
         if skip {
             out.push(format!(
-                "skipped hole #{} at ({:.3}, {:.3}) mm — NOT confirmed",
+                "skipped hole #{} at ({:.3}, {:.3}) drill-file mm — NOT confirmed",
                 state.pending + 1,
                 t.x_mm,
                 t.y_mm
@@ -339,7 +376,7 @@ pub fn step(
             state.pending += 1;
         } else if accept {
             out.push(format!(
-                "force-accepted hole #{} at ({:.3}, {:.3}) mm — confirmation gate overridden",
+                "force-accepted hole #{} at ({:.3}, {:.3}) drill-file mm — gate overridden",
                 state.pending + 1,
                 t.x_mm,
                 t.y_mm
@@ -355,7 +392,7 @@ pub fn step(
                 format!("{e} — rerun with --accept to force-confirm this hole or --skip to pass it")
             })?;
             out.push(format!(
-                "confirmed hole #{} at ({:.3}, {:.3}) mm — {off:.0} µm off target",
+                "confirmed hole #{} at ({:.3}, {:.3}) drill-file mm — {off:.0} µm from the mapped position",
                 state.pending + 1,
                 t.x_mm,
                 t.y_mm
@@ -390,7 +427,7 @@ pub fn step(
             out.push(format!("fit the {:.2} mm bit", t.d_mm));
         }
         out.push(format!(
-            "drill hole #{}/{}: ({:.3}, {:.3}) mm, bit {:.2} mm — then rerun with a fresh frame",
+            "drill hole #{}/{}: ({:.3}, {:.3}) drill-file mm, bit {:.2} mm — find it on the overlay, then rerun with a fresh frame",
             state.pending + 1,
             holes.len(),
             t.x_mm,
@@ -507,11 +544,43 @@ mod tests {
         // Hole 0.4 mm off target: found but out of tolerance.
         let img2 = frame(200, 200, &[(104.0, 100.0, 10.0)]);
         let err = check_hole(&img2, &t, PPM, 150.0, 1.0).unwrap_err();
-        assert!(err.contains("µm off target"), "{err}");
+        assert!(err.contains("µm from the mapped position"), "{err}");
 
         // No hole at all.
         let img3 = frame(200, 200, &[]);
         assert!(check_hole(&img3, &t, PPM, 150.0, 1.0).is_err());
+    }
+
+    /// The confirmation number is a DISPLACEMENT in the camera plane, so it is
+    /// unchanged by where that plane's origin happens to sit. Imaging the same
+    /// drilled hole in a frame whose whole content is shifted, with the target
+    /// shifted the same way, must read the same offset — the old
+    /// `found_mm − design_mm` form could not, because it subtracted a
+    /// drill-file coordinate from a camera-plane one and so measured the frame
+    /// origin as well as the drill error.
+    #[test]
+    fn check_hole_offset_is_a_camera_plane_displacement() {
+        // 0.05 mm (0.5 px) of real drill error at two different frame origins.
+        let a = frame(200, 200, &[(100.5, 100.0, 10.0)]);
+        let ta = HoleTarget {
+            x_mm: 10.0,
+            y_mm: 10.0,
+            d_mm: 1.0,
+        };
+        // Same hole, same error, imaged 3 mm further along x and y; the target
+        // travels with it (the operator re-seeds, or the board moved on the bed).
+        let b = frame(200, 200, &[(130.5, 70.0, 10.0)]);
+        let tb = HoleTarget {
+            x_mm: 13.0,
+            y_mm: 13.0,
+            d_mm: 1.0,
+        };
+        let off_a = check_hole(&a, &ta, PPM, 150.0, 1.0).expect("confirmed");
+        let off_b = check_hole(&b, &tb, PPM, 150.0, 1.0).expect("confirmed");
+        assert!(
+            (off_a - off_b).abs() < 5.0,
+            "the same drill error reads the same in any frame: {off_a} vs {off_b} µm"
+        );
     }
 
     #[test]

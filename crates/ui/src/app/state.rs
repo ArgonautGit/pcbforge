@@ -357,6 +357,36 @@ pub(super) struct FiducialState {
     /// aligned with the layout. This is the frame `fit_board_pose` fits in, so
     /// it is what "⌖ layout from detection" writes back as the new nominal.
     pub(super) detected_mm: Vec<Option<(f64, f64)>>,
+    /// The nominal layout the most recent Check fitted against, parsed. Kept
+    /// because a layout that has SINCE been replaced by the positions that
+    /// Check measured can only be recognised as an adoption by comparing it
+    /// with the one it replaced (see `check_hand_adopted_layout`).
+    pub(super) checked_layout: Vec<(f64, f64)>,
+    /// The COMMANDED positions of the last fiducial-hole burn this console
+    /// emitted, machine mm. The laser cut these holes where it was told to, so
+    /// a later detection of them measures the camera↔laser loop and nothing
+    /// else — the board cannot un-drill. Persisted (`fid_ref_holes`): the plate
+    /// outlives the session that burned it.
+    pub(super) ref_holes: Vec<(f64, f64)>,
+    /// The most recent camera↔laser loop measurement, or `None` when the last
+    /// Check could not match the reference holes (`loop_note` says why).
+    pub(super) loop_health: Option<super::fiducial_ui::LoopHealth>,
+    /// Why the loop could not be measured, for the readout. Empty while
+    /// `loop_health` is `Some`.
+    pub(super) loop_note: String,
+    /// A loop measurement past the alarm band, LATCHED: it stays on the tab
+    /// until the operator dismisses it or a healthy measurement clears it. The
+    /// scale warning this replaces was a one-line note that scrolled away while
+    /// it fired on seven consecutive checks.
+    pub(super) loop_alarm: Option<super::fiducial_ui::LoopHealth>,
+    /// A refused "⌖ layout from detection", holding the size change that
+    /// refused it so the deliberate second action can name the number it is
+    /// overriding. Cleared by anything that changes what would be adopted.
+    pub(super) adopt_confirm: Option<f64>,
+    /// A layout that looks like the detections were adopted into it by hand,
+    /// latched with the size change it hides. Cleared by rebuilding the layout
+    /// from the rectangle.
+    pub(super) adopt_warn: Option<String>,
     pub(super) note: String,
     pub(super) rows: Vec<FidRow>,
     pub(super) measured_ppm: Option<f64>,

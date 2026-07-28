@@ -1459,6 +1459,7 @@ mod tests {
             to_physical: affine_poly([1.02, 0.0, 1.0], [0.0, 0.98, -2.0]),
             rms_um: 0.0,
             max_um: 0.0,
+            calib_mm_bounds: None,
         };
         (lens, field)
     }

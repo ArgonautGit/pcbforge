@@ -425,9 +425,15 @@ impl ConsoleApp {
             Some((mm, deg)) => format!(" · {mm:.2} mm / {deg:+.2}° off the fiducial pose"),
             None => " · manual placement — no fiducial reference".into(),
         };
+        // How far the camera→machine map was from the laser's own fiducial
+        // holes when this file was written. The burn is placed THROUGH that
+        // map, so it is the one number that says whether the position above
+        // means anything — and the incident that added it was diagnosed from
+        // this log, after the fact, without it.
+        let loop_note = format!(" · camera↔laser loop {}", self.loop_health_token());
         self.runtime.log.push(LogLine {
             text: format!(
-                "Etch here → {out}\n  job placed at ({:.2}, {:.2}) mm, {:.1}°{offset_note}{field_note} — OPEN THIS FILE (not the Job-tab emit output)",
+                "Etch here → {out}\n  job placed at ({:.2}, {:.2}) mm, {:.1}°{offset_note}{loop_note}{field_note} — OPEN THIS FILE (not the Job-tab emit output)",
                 self.placement.tx_mm, self.placement.ty_mm, self.placement.rot_deg
             ),
             err: false,
@@ -737,6 +743,7 @@ impl ConsoleApp {
                 &hole_polys,
                 &affine,
                 DRILL_FIELD_SEG_MM,
+                field.calib_mm_bounds,
                 |x, y| field.precompensate(x, y),
             ) {
                 Ok(warped) => warped,

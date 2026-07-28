@@ -279,6 +279,16 @@ pub struct FieldMap {
     pub rms_um: f64,
     /// Worst single-dot residual, µm.
     pub max_um: f64,
+    /// Axis-aligned PHYSICAL-mm bounds of the dots this fit covered:
+    /// `[min_x, min_y, max_x, max_y]`. Outside it the bi-cubic is pure
+    /// extrapolation — on a field fit over dots spanning 15–75 mm the `uv²`
+    /// term alone reaches ±3.5 mm out at the 90 mm declared field edge, which
+    /// is a beam move the operator never asked for. `cam::register`'s field
+    /// warp refuses geometry that lands outside it (plus a small margin), so
+    /// this is a gate, not a diagnostic. `None` for maps that predate the
+    /// bounds line or were hand-constructed — those cannot be gated and warp
+    /// as before.
+    pub calib_mm_bounds: Option<[f64; 4]>,
 }
 
 impl FieldMap {
@@ -297,8 +307,14 @@ impl FieldMap {
                 .collect::<Vec<_>>()
                 .join(" ")
         };
+        let bounds = match self.calib_mm_bounds {
+            Some([x0, y0, x1, y1]) => {
+                format!("calib_mm_bounds {x0:.6} {y0:.6} {x1:.6} {y1:.6}\n")
+            }
+            None => String::new(),
+        };
         format!(
-            "pcbforge-field 1\nto_commanded {}\nto_physical {}\nrms_um {:.6}\nmax_um {:.6}\n",
+            "pcbforge-field 1\nto_commanded {}\nto_physical {}\nrms_um {:.6}\nmax_um {:.6}\n{bounds}",
             row(self.to_commanded.to_coeffs()),
             row(self.to_physical.to_coeffs()),
             self.rms_um,
@@ -311,6 +327,7 @@ impl FieldMap {
         let mut to_commanded = None;
         let mut to_physical = None;
         let (mut rms_um, mut max_um) = (0.0_f64, 0.0_f64);
+        let mut calib_mm_bounds = None;
         let coeffs = |rest: &str| -> Result<[f64; 23], String> {
             let nums: Vec<f64> = rest
                 .split_whitespace()
@@ -349,6 +366,23 @@ impl FieldMap {
                 }
                 "rms_um" => rms_um = rest.trim().parse().map_err(|_| "bad rms_um")?,
                 "max_um" => max_um = rest.trim().parse().map_err(|_| "bad max_um")?,
+                // Every token must parse: a bounds line the reader half-understood
+                // would gate the warp against a box nobody fit.
+                "calib_mm_bounds" => {
+                    let vals: Vec<f64> = rest
+                        .split_whitespace()
+                        .map(|s| s.parse::<f64>().map_err(|_| "bad calib_mm_bounds"))
+                        .collect::<Result<_, _>>()?;
+                    let b: [f64; 4] = vals
+                        .try_into()
+                        .map_err(|_| "calib_mm_bounds expects 4 values (x0 y0 x1 y1)")?;
+                    if !b.iter().all(|v| v.is_finite()) || b[0] > b[2] || b[1] > b[3] {
+                        return Err(
+                            "calib_mm_bounds must be finite and ordered (x0 ≤ x1, y0 ≤ y1)".into(),
+                        );
+                    }
+                    calib_mm_bounds = Some(b);
+                }
                 _ => {}
             }
         }
@@ -363,6 +397,7 @@ impl FieldMap {
             to_physical: to_physical.ok_or("missing to_physical")?,
             rms_um,
             max_um,
+            calib_mm_bounds,
         })
     }
 }
@@ -376,6 +411,16 @@ pub fn fit_field(pairs: &[(Point2<f64>, Point2<f64>)]) -> Result<FieldMap, Strin
     let cmd: Vec<(f64, f64)> = pairs.iter().map(|(_, c)| (c.x, c.y)).collect();
     let to_commanded = Poly2::fit(&phys, &cmd)?;
     let to_physical = Poly2::fit(&cmd, &phys)?;
+    // Physical extent the fit actually covered — the region the pre-distortion
+    // is a measurement over rather than an extrapolation.
+    let (mut min_x, mut min_y) = (f64::INFINITY, f64::INFINITY);
+    let (mut max_x, mut max_y) = (f64::NEG_INFINITY, f64::NEG_INFINITY);
+    for &(x, y) in &phys {
+        min_x = min_x.min(x);
+        min_y = min_y.min(y);
+        max_x = max_x.max(x);
+        max_y = max_y.max(y);
+    }
     let mut sumsq = 0.0;
     let mut max = 0.0_f64;
     for (p, c) in pairs {
@@ -389,6 +434,7 @@ pub fn fit_field(pairs: &[(Point2<f64>, Point2<f64>)]) -> Result<FieldMap, Strin
         to_physical,
         rms_um: (sumsq / pairs.len() as f64).sqrt(),
         max_um: max,
+        calib_mm_bounds: Some([min_x, min_y, max_x, max_y]),
     })
 }
 
@@ -1143,6 +1189,67 @@ mod tests {
             "round-trip precompensation: ({a},{b}) vs ({c},{d})"
         );
         assert!((restored.rms_um - field.rms_um).abs() < 1e-3);
+        assert_eq!(
+            restored.calib_mm_bounds, field.calib_mm_bounds,
+            "the fitted region survives the file"
+        );
+    }
+
+    /// The fitted region is the physical span of the dots — the thing the
+    /// downstream warp gate needs, and the reason a 15–75 mm fit must not be
+    /// trusted out at a 90 mm field edge.
+    #[test]
+    fn field_fit_records_the_physical_span_it_covered() {
+        let pairs: Vec<(Point2<f64>, Point2<f64>)> = (0..5)
+            .flat_map(|r| {
+                (0..5).map(move |c| {
+                    let phys = (15.0 + c as f64 * 15.0, 15.0 + r as f64 * 15.0);
+                    (Point2::new(phys.0, phys.1), Point2::new(phys.0, phys.1))
+                })
+            })
+            .collect();
+        let field = fit_field(&pairs).unwrap();
+        assert_eq!(field.calib_mm_bounds, Some([15.0, 15.0, 75.0, 75.0]));
+    }
+
+    #[test]
+    fn field_map_without_bounds_parses_and_a_malformed_one_is_refused() {
+        let pairs: Vec<(Point2<f64>, Point2<f64>)> = (0..5)
+            .flat_map(|r| {
+                (0..5).map(move |c| {
+                    let p = Point2::new(c as f64 * 10.0, r as f64 * 10.0);
+                    (p, p)
+                })
+            })
+            .collect();
+        let text = fit_field(&pairs).unwrap().serialize();
+
+        // A file written before the bounds line existed still loads — it just
+        // cannot be gated.
+        let legacy: String = text
+            .lines()
+            .filter(|l| !l.starts_with("calib_mm_bounds "))
+            .map(|l| format!("{l}\n"))
+            .collect();
+        assert_eq!(
+            FieldMap::parse(&legacy)
+                .expect("legacy map loads")
+                .calib_mm_bounds,
+            None
+        );
+
+        // A bounds line that is not four ordered finite numbers is refused
+        // outright: silently dropping a token would gate the warp against a box
+        // nobody fit.
+        for bad in [
+            "calib_mm_bounds 0 0 10",
+            "calib_mm_bounds 0 0 x 10",
+            "calib_mm_bounds 0 0 nan 10",
+            "calib_mm_bounds 10 0 0 10",
+        ] {
+            let poisoned = legacy.replace("rms_um", &format!("{bad}\nrms_um"));
+            assert!(FieldMap::parse(&poisoned).is_err(), "must refuse {bad:?}");
+        }
     }
 
     #[test]

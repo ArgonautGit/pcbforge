@@ -89,6 +89,17 @@ pub enum WarpError {
         /// The transformed vertex, mm.
         out_mm: (f64, f64),
     },
+    /// The vertex landed outside the region the field map was fit over, where
+    /// the pre-distortion polynomial is extrapolating rather than measuring.
+    /// Refused for the same reason the others are: an extrapolated correction
+    /// is a beam move nobody measured, and it grows without bound away from the
+    /// fitted dots.
+    OutsideFieldCalibration {
+        /// The physical vertex the map was asked to evaluate, mm.
+        src_mm: (f64, f64),
+        /// The fitted region, `[x0, y0, x1, y1]` physical mm.
+        calib_mm: [f64; 4],
+    },
 }
 
 impl std::fmt::Display for WarpError {
@@ -107,11 +118,42 @@ impl std::fmt::Display for WarpError {
                  envelope",
                 src_mm.0, src_mm.1, out_mm.0, out_mm.1
             ),
+            Self::OutsideFieldCalibration { src_mm, calib_mm } => write!(
+                f,
+                "the vertex at ({:.3}, {:.3}) mm lies outside the field map's \
+                 calibrated region ({:.3}..{:.3}, {:.3}..{:.3}) mm (+{:.0}% \
+                 margin) — the field correction is not measured there; place the \
+                 job inside the calibrated box or re-run the laser-field \
+                 calibration over the area you need",
+                src_mm.0,
+                src_mm.1,
+                calib_mm[0],
+                calib_mm[2],
+                calib_mm[1],
+                calib_mm[3],
+                FIELD_BOUNDS_MARGIN_FRAC * 100.0
+            ),
         }
     }
 }
 
 impl std::error::Error for WarpError {}
+
+/// How far outside the field map's fitted box a vertex may sit and still be
+/// warped, as a fraction of the box's own span on each side. Same 5% the lens
+/// map's extrapolation check uses, for the same reason: right at the edge the
+/// polynomial is still interpolating between the outermost dots in one axis, so
+/// a hairline overhang is not extrapolation worth refusing a job over.
+const FIELD_BOUNDS_MARGIN_FRAC: f64 = 0.05;
+
+/// Whether `p` (physical mm) sits inside `calib_mm` grown by
+/// [`FIELD_BOUNDS_MARGIN_FRAC`] of its own span on each side.
+fn within_field_bounds(p: (f64, f64), calib_mm: [f64; 4]) -> bool {
+    let [x0, y0, x1, y1] = calib_mm;
+    let mx = (x1 - x0) * FIELD_BOUNDS_MARGIN_FRAC;
+    let my = (y1 - y0) * FIELD_BOUNDS_MARGIN_FRAC;
+    p.0 >= x0 - mx && p.0 <= x1 + mx && p.1 >= y0 - my && p.1 <= y1 + my
+}
 
 /// Round a transformed millimeter coordinate onto the nm lattice, refusing
 /// anything the `i64` cast would saturate. Checked in **mm, before** scaling by
@@ -160,18 +202,29 @@ pub fn transform_shapes(shapes: &[Poly], a: &Affine2) -> Vec<Poly> {
 /// would bow. `warp` takes `(x_mm, y_mm)` physical and returns `(x_mm, y_mm)`
 /// commanded.
 ///
+/// `calib_mm` is the region `warp` was FIT over, `[x0, y0, x1, y1]` physical mm
+/// (`vision::FieldMap::calib_mm_bounds`). Every point handed to `warp` —
+/// including the subdivision points — must land inside it (plus
+/// [`FIELD_BOUNDS_MARGIN_FRAC`]) or the whole job is refused: outside the fitted
+/// dots the pre-distortion is an extrapolating cubic, which on a real bench map
+/// reaches millimetres of "correction" in the uncalibrated outer ring. `None`
+/// means the map does not know what it was fit over (a pre-bounds file), and the
+/// warp proceeds ungated as it always did.
+///
 /// # Errors
 ///
 /// - [`WarpError::NonFinite`] if the affine or `warp` yields NaN/∞ for a vertex.
 /// - [`WarpError::OutOfEnvelope`] if a transformed vertex leaves the sanity
 ///   envelope.
+/// - [`WarpError::OutsideFieldCalibration`] if a vertex leaves `calib_mm`.
 ///
-/// Either refuses the whole job. Clamping would be worse: it would silently move
-/// a vertex the operator believes the calibration placed.
+/// Any of them refuses the whole job. Clamping would be worse: it would silently
+/// move a vertex the operator believes the calibration placed.
 pub fn transform_shapes_field<F>(
     shapes: &[Poly],
     a: &Affine2,
     max_seg_mm: f64,
+    calib_mm: Option<[f64; 4]>,
     warp: F,
 ) -> Result<Vec<Poly>, WarpError>
 where
@@ -184,6 +237,16 @@ where
     };
     let warp_pt = |p: P| -> Result<P, WarpError> {
         let src = (nm_to_mm(p.x), nm_to_mm(p.y));
+        // Gate BEFORE evaluating: an extrapolated value can be perfectly finite
+        // and well inside the envelope, so nothing downstream would catch it.
+        if let Some(calib_mm) = calib_mm
+            && !within_field_bounds(src, calib_mm)
+        {
+            return Err(WarpError::OutsideFieldCalibration {
+                src_mm: src,
+                calib_mm,
+            });
+        }
         checked_nm(src, warp(src.0, src.1))
     };
     // Densify a closed ring in the physical frame, then warp every point.
@@ -330,7 +393,7 @@ mod tests {
     #[test]
     fn field_warp_subdivides_edges_and_warps_interior_points() {
         // 10 mm segments over a 100 mm edge → 10 interior points per edge.
-        let out = transform_shapes_field(&[big_sq()], &Affine2::identity(), 10.0, pincushion)
+        let out = transform_shapes_field(&[big_sq()], &Affine2::identity(), 10.0, None, pincushion)
             .expect("finite warp");
         let ring = &out[0].outer;
         // 4 corners + 10 interior each = 44 points (subdivision happened).
@@ -361,8 +424,9 @@ mod tests {
     #[test]
     fn field_warp_identity_keeps_edges_straight() {
         // Identity warp: subdivided points stay collinear on the original edge.
-        let out = transform_shapes_field(&[big_sq()], &Affine2::identity(), 10.0, |x, y| (x, y))
-            .expect("finite warp");
+        let out =
+            transform_shapes_field(&[big_sq()], &Affine2::identity(), 10.0, None, |x, y| (x, y))
+                .expect("finite warp");
         let ring = &out[0].outer;
         assert_eq!(ring.len(), 44);
         // Every bottom-edge interior point (indices 1..=10) has y = 0.
@@ -384,7 +448,7 @@ mod tests {
             outer: big_sq().outer,
             holes: vec![hole],
         };
-        let out = transform_shapes_field(&[poly], &Affine2::identity(), 10.0, pincushion)
+        let out = transform_shapes_field(&[poly], &Affine2::identity(), 10.0, None, pincushion)
             .expect("finite warp");
         assert_eq!(out[0].holes.len(), 1, "hole survives the warp");
         assert!(out[0].holes[0].len() > 4, "hole edges densified too");
@@ -394,12 +458,12 @@ mod tests {
     fn non_finite_warp_result_refuses_the_job() {
         // NaN would cast to 0 nm — the machine origin — and the beam would draw
         // a line across the board to reach it.
-        let out = transform_shapes_field(&[big_sq()], &Affine2::identity(), 10.0, |x, y| {
+        let out = transform_shapes_field(&[big_sq()], &Affine2::identity(), 10.0, None, |x, y| {
             if x > 50.0 { (f64::NAN, y) } else { (x, y) }
         });
         assert!(matches!(out, Err(WarpError::NonFinite { .. })), "{out:?}");
 
-        let inf = transform_shapes_field(&[big_sq()], &Affine2::identity(), 10.0, |x, y| {
+        let inf = transform_shapes_field(&[big_sq()], &Affine2::identity(), 10.0, None, |x, y| {
             if y > 50.0 { (x, f64::INFINITY) } else { (x, y) }
         });
         assert!(matches!(inf, Err(WarpError::NonFinite { .. })), "{inf:?}");
@@ -409,7 +473,7 @@ mod tests {
     fn finite_but_absurd_warp_result_refuses_the_job() {
         // 1e300 mm is finite, so a finiteness-only guard would pass it — and the
         // nm cast saturates it to i64::MAX all the same.
-        let out = transform_shapes_field(&[big_sq()], &Affine2::identity(), 10.0, |x, y| {
+        let out = transform_shapes_field(&[big_sq()], &Affine2::identity(), 10.0, None, |x, y| {
             if x > 50.0 { (1e300, y) } else { (x, y) }
         });
         match out {
@@ -423,18 +487,126 @@ mod tests {
         let a = Affine2 {
             m: [1.0, 0.0, f64::NAN, 0.0, 1.0, 0.0],
         };
-        let out = transform_shapes_field(&[big_sq()], &a, 10.0, |x, y| (x, y));
+        let out = transform_shapes_field(&[big_sq()], &a, 10.0, None, |x, y| (x, y));
         assert!(matches!(out, Err(WarpError::NonFinite { .. })), "{out:?}");
     }
 
     #[test]
     fn warp_error_message_names_the_offending_vertex() {
-        let err = transform_shapes_field(&[big_sq()], &Affine2::identity(), 10.0, |_, _| {
+        let err = transform_shapes_field(&[big_sq()], &Affine2::identity(), 10.0, None, |_, _| {
             (f64::NAN, 0.0)
         })
         .unwrap_err();
         let text = err.to_string();
         assert!(text.contains("non-finite"), "{text}");
         assert!(text.contains("0.000, 0.000"), "{text}");
+    }
+
+    /// The bench case: a field fit over dots spanning 15–75 mm. A job that lives
+    /// inside that box warps exactly as it did before the gate existed.
+    #[test]
+    fn field_bounds_pass_geometry_inside_the_calibrated_box() {
+        let bounds = Some([15.0, 15.0, 75.0, 75.0]);
+        let job = Poly {
+            outer: vec![
+                P::new(20 * MM, 20 * MM),
+                P::new(70 * MM, 20 * MM),
+                P::new(70 * MM, 70 * MM),
+                P::new(20 * MM, 70 * MM),
+            ],
+            holes: vec![],
+        };
+        let gated = transform_shapes_field(
+            std::slice::from_ref(&job),
+            &Affine2::identity(),
+            10.0,
+            bounds,
+            pincushion,
+        )
+        .expect("job inside the calibrated box still warps");
+        let ungated =
+            transform_shapes_field(&[job], &Affine2::identity(), 10.0, None, pincushion).unwrap();
+        assert_eq!(gated, ungated, "the gate changes no geometry it admits");
+    }
+
+    /// Just outside: within the 5% margin the polynomial is still effectively
+    /// interpolating, so a hairline overhang is admitted rather than refused.
+    #[test]
+    fn field_bounds_admit_the_margin_and_refuse_beyond_it() {
+        // 60 mm span → 3 mm margin each side, so 77.9 is in and 78.1 is out.
+        let bounds = Some([15.0, 15.0, 75.0, 75.0]);
+        let at = |x_mm: f64| Poly {
+            outer: vec![
+                P::new((x_mm * MM as f64) as i64, 40 * MM),
+                P::new((x_mm * MM as f64) as i64 + MM, 40 * MM),
+                P::new((x_mm * MM as f64) as i64 + MM, 41 * MM),
+            ],
+            holes: vec![],
+        };
+        assert!(
+            transform_shapes_field(&[at(76.0)], &Affine2::identity(), 10.0, bounds, pincushion)
+                .is_ok(),
+            "inside the margin"
+        );
+        let err =
+            transform_shapes_field(&[at(79.0)], &Affine2::identity(), 10.0, bounds, pincushion)
+                .unwrap_err();
+        match err {
+            WarpError::OutsideFieldCalibration { src_mm, calib_mm } => {
+                assert_eq!(calib_mm, [15.0, 15.0, 75.0, 75.0]);
+                assert!(src_mm.0 >= 79.0, "{src_mm:?}");
+            }
+            other => panic!("{other:?}"),
+        }
+        let text = err.to_string();
+        assert!(
+            text.contains("15.000..75.000"),
+            "names the calibrated box: {text}"
+        );
+        assert!(
+            text.contains("79.000"),
+            "names the offending vertex: {text}"
+        );
+    }
+
+    /// The subdivision points are gated too: an edge whose ENDS sit inside the
+    /// box can still cross the uncalibrated ring on its way, and every point in
+    /// between is warped.
+    #[test]
+    fn field_bounds_gate_the_subdivision_points_not_only_the_vertices() {
+        // A tall thin triangle straddling y: ends at y=20 and y=70 (inside),
+        // but the edge runs out to x=200 in between.
+        let bounds = Some([15.0, 15.0, 75.0, 75.0]);
+        let poly = Poly {
+            outer: vec![
+                P::new(20 * MM, 20 * MM),
+                P::new(200 * MM, 45 * MM),
+                P::new(20 * MM, 70 * MM),
+            ],
+            holes: vec![],
+        };
+        let err = transform_shapes_field(&[poly], &Affine2::identity(), 1.0, bounds, pincushion)
+            .unwrap_err();
+        assert!(
+            matches!(err, WarpError::OutsideFieldCalibration { .. }),
+            "{err:?}"
+        );
+    }
+
+    /// A map that does not know what it was fit over cannot be gated — it warps
+    /// as it always did rather than refusing every job.
+    #[test]
+    fn field_map_without_bounds_is_ungated() {
+        let far = Poly {
+            outer: vec![
+                P::new(500 * MM, 500 * MM),
+                P::new(501 * MM, 500 * MM),
+                P::new(501 * MM, 501 * MM),
+            ],
+            holes: vec![],
+        };
+        assert!(
+            transform_shapes_field(&[far], &Affine2::identity(), 10.0, None, pincushion).is_ok()
+        );
     }
 }

@@ -1318,13 +1318,17 @@ fn warp_polys(
             let field = load_field_map(path)?;
             validate_field_segment(field_seg_mm)?;
             eprintln!(
-                "{tag}: field warp on (fit RMS {:.1} µm, worst {:.1} µm), edges ≤{:.2} mm",
-                field.rms_um, field.max_um, field_seg_mm
+                "{tag}: field warp on (fit RMS {:.1} µm, worst {:.1} µm), edges ≤{:.2} mm{}",
+                field.rms_um,
+                field.max_um,
+                field_seg_mm,
+                field_bounds_note(&field)
             );
             cam::register::transform_shapes_field(
                 &polys,
                 &cam::register::Affine2::identity(),
                 field_seg_mm,
+                field.calib_mm_bounds,
                 |x, y| field.precompensate(x, y),
             )
             .map_err(|e| format!("{tag}: field warp refused — {e}"))?
@@ -1659,6 +1663,21 @@ struct BuiltJob {
     shapes: Vec<pcb_core::Poly>,
 }
 
+/// The region a field map was fit over, for the "field warp on" log line. Says
+/// so explicitly when the map carries no bounds: that map cannot be gated, and
+/// the operator should know the outer field is being extrapolated on trust.
+fn field_bounds_note(field: &vision::FieldMap) -> String {
+    match field.calib_mm_bounds {
+        Some([x0, y0, x1, y1]) => format!(
+            ", calibrated over ({x0:.1}..{x1:.1}, {y0:.1}..{y1:.1}) mm — geometry \
+             outside it is refused"
+        ),
+        None => ", calibrated region UNKNOWN (map predates the bounds line) — \
+                 geometry outside the fitted dots cannot be refused"
+            .to_string(),
+    }
+}
+
 fn load_field_map(path: &std::path::Path) -> Result<vision::FieldMap, Box<dyn std::error::Error>> {
     let field = vision::FieldMap::parse(&std::fs::read_to_string(path)?)
         .map_err(|e| format!("field map {}: {e}", path.display()))?;
@@ -1787,13 +1806,17 @@ fn emit_cmd(a: EmitArgs) -> Result<(), Box<dyn std::error::Error>> {
             let field = load_field_map(path)?;
             validate_field_segment(a.field_seg_mm)?;
             eprintln!(
-                "emit: field warp on (fit RMS {:.1} µm, worst {:.1} µm), edges ≤{:.2} mm",
-                field.rms_um, field.max_um, a.field_seg_mm
+                "emit: field warp on (fit RMS {:.1} µm, worst {:.1} µm), edges ≤{:.2} mm{}",
+                field.rms_um,
+                field.max_um,
+                a.field_seg_mm,
+                field_bounds_note(&field)
             );
             cam::register::transform_shapes_field(
                 &shapes,
                 &cam::register::Affine2::identity(),
                 a.field_seg_mm,
+                field.calib_mm_bounds,
                 |x, y| field.precompensate(x, y),
             )
             .map_err(|e| format!("emit: field warp refused — {e}"))?
@@ -1940,14 +1963,18 @@ fn register_cmd(a: RegisterArgs) -> Result<(), Box<dyn std::error::Error>> {
             let field = load_field_map(path)?;
             validate_field_segment(a.field_seg_mm)?;
             eprintln!(
-                "register: field warp on (fit RMS {:.1} µm, worst {:.1} µm), edges ≤{:.2} mm",
-                field.rms_um, field.max_um, a.field_seg_mm
+                "register: field warp on (fit RMS {:.1} µm, worst {:.1} µm), edges ≤{:.2} mm{}",
+                field.rms_um,
+                field.max_um,
+                a.field_seg_mm,
+                field_bounds_note(&field)
             );
             (
                 cam::register::transform_shapes_field(
                     &job.shapes,
                     &affine,
                     a.field_seg_mm,
+                    field.calib_mm_bounds,
                     |x, y| field.precompensate(x, y),
                 )
                 .map_err(|e| format!("register: field warp refused — {e}"))?,
@@ -2676,10 +2703,20 @@ mod tests {
             .collect();
         let dir = std::env::temp_dir().join(format!("pcbforge-extrap-{}", std::process::id()));
         std::fs::create_dir_all(&dir).unwrap();
+        let text = vision::fit_field(&pairs).unwrap().serialize();
+        // A map that does not record what it was fit over — the pre-bounds file
+        // format — is the only way to reach the envelope check at all now: with
+        // bounds the job is refused before the polynomial is ever evaluated.
+        let legacy: String = text
+            .lines()
+            .filter(|l| !l.starts_with("calib_mm_bounds "))
+            .map(|l| format!("{l}\n"))
+            .collect();
         let path = dir.join("cubic-field.txt");
-        std::fs::write(&path, vision::fit_field(&pairs).unwrap().serialize()).unwrap();
+        std::fs::write(&path, &legacy).unwrap();
         // Loads fine: finite coefficients, usable normalization.
-        assert!(load_field_map(&path).is_ok());
+        let loaded = load_field_map(&path).expect("legacy map without bounds still loads");
+        assert!(loaded.calib_mm_bounds.is_none(), "no bounds to gate on");
 
         let polys = fid_holes_polys("rect", 2.0, 3.0, &[(5000.0, 5000.0)]);
         let err = warp_polys("fid holes", polys, Some(path.as_path()), 0.25)
@@ -2687,6 +2724,43 @@ mod tests {
             .to_string();
         assert!(err.starts_with("fid holes: field warp refused"), "{err}");
         assert!(err.contains("sanity envelope"), "{err}");
+    }
+
+    /// The same map WITH its fitted region refuses earlier and says why: the
+    /// polynomial is not a measurement out there, so it is never evaluated.
+    #[test]
+    fn warp_polys_refuses_geometry_outside_the_fitted_region() {
+        use nalgebra::Point2;
+        let pairs: Vec<_> = (0..5)
+            .flat_map(|row| {
+                (0..5).map(move |col| {
+                    let (x, y) = (col as f64 * 5.0, row as f64 * 5.0);
+                    (Point2::new(x, y), Point2::new(x + 1.0, y))
+                })
+            })
+            .collect();
+        let field = vision::fit_field(&pairs).expect("fits");
+        assert_eq!(
+            field.calib_mm_bounds,
+            Some([0.0, 0.0, 20.0, 20.0]),
+            "the fit records the span it covered"
+        );
+        let dir = std::env::temp_dir().join(format!("pcbforge-bounds-{}", std::process::id()));
+        std::fs::create_dir_all(&dir).unwrap();
+        let path = dir.join("bounded-field.txt");
+        std::fs::write(&path, field.serialize()).unwrap();
+
+        // Inside the fitted box: warps, as the operator's real job does.
+        let inside = fid_holes_polys("rect", 2.0, 3.0, &[(10.0, 10.0)]);
+        assert!(warp_polys("fid holes", inside, Some(path.as_path()), 0.25).is_ok());
+
+        // Outside it: refused, naming the offending vertex and the box.
+        let outside = fid_holes_polys("rect", 2.0, 3.0, &[(60.0, 10.0)]);
+        let err = warp_polys("fid holes", outside, Some(path.as_path()), 0.25)
+            .expect_err("geometry outside the fitted region must refuse the job")
+            .to_string();
+        assert!(err.contains("calibrated region"), "{err}");
+        assert!(err.contains("0.000..20.000"), "names the box: {err}");
     }
 
     #[test]

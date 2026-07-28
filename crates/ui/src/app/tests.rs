@@ -2055,6 +2055,7 @@ field_frame=\n";
             "fid_profile",
             "fid_rect_h_mm",
             "fid_rect_w_mm",
+            "fid_ref_holes",
             "fid_search_mm",
             "fid_shape",
             "job_frequency_khz",
@@ -4938,5 +4939,255 @@ fn a_scale_between_the_two_signatures_warns_instead_of_refusing() {
     assert!(
         log.contains("outcome=warned-mirror-scale-ambiguous"),
         "and it is greppable: {log}"
+    );
+}
+
+/// The incident these two guards were built from, reconstructed from the bench
+/// log. The console commanded a 40 mm fiducial square at (25,25)..(65,65) and
+/// burned it; the camera was then physically moved. Every later Check read those
+/// same holes as a 42.4×42.9 mm quad rotated 8.5° — 1.065× and 8.5° of pure
+/// camera↔laser map error, ~9 mm of burn error at the corners.
+///
+/// Nothing in the fiducial fit could say so: a board is allowed to sit anywhere,
+/// so rotation proves nothing, and the scale went out as one line of note text.
+/// The holes are the fixed point — the laser cut them where it was told to, and
+/// they cannot move afterwards.
+const INCIDENT_HOLES: &str = "25,25; 65,25; 25,65; 65,65";
+const INCIDENT_DETECTED: [(f64, f64); 4] = [
+    (33.244, 23.124),
+    (75.208, 28.914),
+    (26.872, 65.540),
+    (68.247, 71.639),
+];
+
+#[test]
+fn the_camera_shift_is_measured_against_the_holes_the_laser_itself_burned() {
+    let mut app = mirror_gate_app(Side::Front, INCIDENT_HOLES, &INCIDENT_DETECTED);
+    app.fiducials.ref_holes = crate::fiducial::parse_layout(INCIDENT_HOLES).unwrap();
+    app.update_placement_from_fiducials();
+
+    let health = app
+        .fiducials
+        .loop_health
+        .expect("the burned holes were matched");
+    assert!(
+        (health.scale - 1.0647).abs() < 0.001,
+        "the map reads the laser's own 40 mm square 6.5% too big: {health:?}"
+    );
+    assert!(
+        (health.rot_deg - 8.52).abs() < 0.05,
+        "…and 8.5° turned: {health:?}"
+    );
+    assert_eq!(health.used, 4, "all four holes matched");
+    assert!(
+        health.rms_mm < 1.0,
+        "the detections really are that burned pattern, seen through a bad map: {health:?}"
+    );
+    assert!(
+        app.fiducials.loop_alarm.is_some(),
+        "and it latches — the warning it replaces scrolled away seven checks running"
+    );
+    // The check itself only WARNED, exactly as it did on the bench: a
+    // mirror-symmetric layout with the fitted scale between the two face
+    // signatures. That is the hole this guard fills.
+    assert!(
+        app.fiducials.note.contains("too far from either to call"),
+        "the pre-existing tells still only warn: {}",
+        app.fiducials.note
+    );
+    let summary = app.debug_summary();
+    assert!(
+        summary.contains("fid_loop: ALARM") && summary.contains("ref_holes=4"),
+        "the loop verdict is greppable from a headless run: {summary}"
+    );
+    let log = std::fs::read_to_string(app.runtime.diag.path()).unwrap();
+    assert!(
+        log.contains("disagrees with the laser's own fiducial holes"),
+        "and it reaches the diagnostic log: {log}"
+    );
+}
+
+/// The other half of the incident: the operator answered the refused fits by
+/// re-typing the layout to the DETECTED positions. From then on every Check
+/// compared the measurement to itself — scale 1.000, all gates green, the whole
+/// 6.5% still in the burn. Adopting a measurement that is a different SIZE from
+/// the layout it replaces is refused, with the number named.
+#[test]
+fn adopting_a_resized_measurement_as_the_layout_is_refused() {
+    let mut app = mirror_gate_app(Side::Front, INCIDENT_HOLES, &INCIDENT_DETECTED);
+    app.fiducials.ref_holes = crate::fiducial::parse_layout(INCIDENT_HOLES).unwrap();
+    app.update_placement_from_fiducials();
+    app.adopt_measured_layout();
+
+    assert_eq!(
+        app.fiducials.layout, INCIDENT_HOLES,
+        "the nominal layout is left exactly as it was"
+    );
+    assert!(
+        app.fiducials.note.contains("REFUSED") && app.fiducials.note.contains("+6.47%"),
+        "the refusal names the size change: {}",
+        app.fiducials.note
+    );
+    assert!(
+        app.fiducials.note.contains("camera→machine map")
+            && app.fiducials.note.contains("① Camera lens"),
+        "…and points at the calibration, not at the layout: {}",
+        app.fiducials.note
+    );
+    let confirm = app.fiducials.adopt_confirm.expect("the escape is armed");
+    assert!((confirm - 1.0647).abs() < 0.001, "with the scale on it");
+
+    // The escape exists — a re-jigged plate really does re-site the holes — but
+    // it is a second, differently-labelled press, and it says so in the log.
+    app.adopt_measured_layout_confirmed();
+    assert_eq!(
+        app.fiducials.layout,
+        crate::fiducial::format_layout(&INCIDENT_DETECTED),
+        "the deliberate second action does adopt"
+    );
+    assert!(app.fiducials.adopt_confirm.is_none(), "and disarms");
+    assert!(
+        app.runtime
+            .log
+            .iter()
+            .any(|l| l.err && l.text.contains("over a +6.47% size change")),
+        "the override is on the record"
+    );
+}
+
+/// Adoption cannot be gated where it is typed rather than pressed, so the
+/// console watches for the RESULT: a layout that is the last detections, and a
+/// different size from the layout those detections were measured against.
+///
+/// The same test pins why the loop check exists at all — after the adoption the
+/// fiducial fit reads a clean 1.000 while the map is still 6.5% out, and only
+/// the burned holes still say so.
+#[test]
+fn a_layout_typed_to_the_detections_is_recognised_as_an_adoption() {
+    let mut app = mirror_gate_app(Side::Front, INCIDENT_HOLES, &INCIDENT_DETECTED);
+    app.fiducials.ref_holes = crate::fiducial::parse_layout(INCIDENT_HOLES).unwrap();
+    app.update_placement_from_fiducials();
+    assert!(
+        app.fiducials.adopt_warn.is_none(),
+        "nothing to warn about yet"
+    );
+
+    // What typing the measured coordinates into the layout does.
+    app.fiducials.layout = crate::fiducial::format_layout(&INCIDENT_DETECTED);
+    app.update_placement_from_fiducials();
+
+    let warn = app
+        .fiducials
+        .adopt_warn
+        .clone()
+        .expect("the adoption is recognised");
+    assert!(
+        // +6.49 rather than the fit's +6.47: a typed layout carries the two
+        // decimals `format_layout` writes, and that is what is being judged.
+        warn.contains("+6.49%") && warn.contains("compares the measurement to itself"),
+        "the warning names the size change and what it costs: {warn}"
+    );
+    let fit_scale = app.fiducials.pose.expect("the check applied").scale;
+    assert!(
+        (fit_scale - 1.0).abs() < 0.001,
+        "the fit is now identity — this is the laundering: {fit_scale}"
+    );
+    let health = app.fiducials.loop_health.expect("the holes still match");
+    assert!(
+        (health.scale - 1.0647).abs() < 0.001,
+        "but the laser's own holes are unmoved by a layout edit: {health:?}"
+    );
+    assert!(app.fiducials.loop_alarm.is_some(), "so the banner stays");
+
+    // Rebuilding a nominal layout from the rectangle is the way out.
+    app.apply_fid_rect();
+    assert!(app.fiducials.adopt_warn.is_none(), "and the warning clears");
+}
+
+/// A healthy loop clears the latch — the banner is a verdict on the machine
+/// now, not a permanent scar.
+#[test]
+fn a_healthy_loop_clears_a_latched_alarm() {
+    let holes = crate::fiducial::parse_layout(SYM_LAYOUT).unwrap();
+    let mut app = mirror_gate_app(Side::Front, SYM_LAYOUT, &holes);
+    app.fiducials.ref_holes = holes.clone();
+    app.fiducials.loop_alarm = Some(super::fiducial_ui::LoopHealth {
+        scale: 1.0647,
+        rot_deg: 8.52,
+        rms_mm: 0.44,
+        used: 4,
+    });
+    app.update_placement_from_fiducials();
+
+    let health = app.fiducials.loop_health.expect("matched");
+    assert!(health.healthy(), "an exact loop is green: {health:?}");
+    assert!(app.fiducials.loop_alarm.is_none(), "which clears the latch");
+    assert!(
+        app.loop_health_token().starts_with("ok "),
+        "and the etch log line says so: {}",
+        app.loop_health_token()
+    );
+}
+
+/// The correspondence is a heuristic, so it has to fail closed: detections that
+/// are not the burned pattern must produce "no reference holes matched", never a
+/// number. A number here would be read as a verdict on the machine.
+#[test]
+fn detections_that_are_not_the_burned_pattern_decline_to_measure_the_loop() {
+    let holes = crate::fiducial::parse_layout(INCIDENT_HOLES).unwrap();
+    // Three corners of the burned square plus one hole 25 mm away from the
+    // fourth — no similarity carries the pattern onto that.
+    let elsewhere = [(25.0, 25.0), (65.0, 25.0), (25.0, 65.0), (90.0, 90.0)];
+    let why = super::fiducial_ui::measure_loop(&holes, &elsewhere)
+        .expect_err("a different plate is not a measurement");
+    assert!(
+        why.starts_with("no reference holes matched"),
+        "and it says which: {why}"
+    );
+
+    // Nothing burned from this console at all is its own answer.
+    let why = super::fiducial_ui::measure_loop(&[], &elsewhere).expect_err("no reference");
+    assert!(why.contains("no fiducial holes have been burned"), "{why}");
+
+    // The plate may sit anywhere: a pure translation is not loop error.
+    let moved: Vec<(f64, f64)> = holes.iter().map(|&(x, y)| (x + 12.0, y - 7.0)).collect();
+    let health = super::fiducial_ui::measure_loop(&holes, &moved).expect("still the same plate");
+    assert!(
+        health.healthy(),
+        "a re-placed plate reads green: {health:?}"
+    );
+}
+
+/// The reference holes outlive the session that burned them — the plate is
+/// still bolted to the bed after a restart.
+#[test]
+fn the_burned_reference_holes_survive_a_restart() {
+    let db = tmp_db();
+    {
+        let mut a = ConsoleApp::new(&db, vec!["true".into()]);
+        a.fiducials.ref_holes = crate::fiducial::parse_layout(INCIDENT_HOLES).unwrap();
+        a.save_settings_if_changed();
+    }
+    let b = ConsoleApp::new(&db, vec!["true".into()]);
+    assert_eq!(
+        b.fiducials.ref_holes,
+        crate::fiducial::parse_layout(INCIDENT_HOLES).unwrap(),
+        "the commanded hole positions are restored"
+    );
+
+    // A corrupt blob leaves the check unarmed rather than measuring the machine
+    // against nonsense.
+    let db = tmp_db();
+    std::fs::write(
+        crate::settings::path_for_db(&db),
+        "pcbforge console settings v1\nfid_ref_holes=25,25; 65,nan\n",
+    )
+    .unwrap();
+    let c = ConsoleApp::new(&db, vec!["true".into()]);
+    assert!(c.fiducials.ref_holes.is_empty(), "unparseable is unarmed");
+    assert!(
+        c.loop_health_token() == "unmeasured",
+        "and it reports itself as unmeasured: {}",
+        c.loop_health_token()
     );
 }

@@ -603,6 +603,35 @@ fn the_live_reacquire_interval_is_labelled_and_reported() {
     );
 }
 
+/// The camera↔laser loop readout sits at the TOP of the fiducial tab, above the
+/// form — the signal it replaces was a clause in a note line under a button row
+/// and went unread through seven consecutive checks. On a console that has
+/// never burned holes it says so rather than reading as a pass.
+#[test]
+fn the_camera_laser_loop_readout_is_on_the_fiducial_tab() {
+    let mut h = console();
+    h.get_by_label("◎ Fiducial check").click();
+    h.run();
+    assert!(
+        h.query_by_label_contains("camera↔laser loop").is_some(),
+        "the loop readout is drawn on the tab"
+    );
+    assert!(
+        h.query_by_label_contains("no fiducial holes have been burned")
+            .is_some(),
+        "and an unarmed loop says why it has no number"
+    );
+    assert!(
+        summary_line(&h.state().debug_summary(), "fid_loop:").contains("unmeasured ref_holes=0"),
+        "a headless run can read the same verdict:\n{}",
+        h.state().debug_summary()
+    );
+    // No alarm to dismiss and nothing to confirm adopting on a fresh console:
+    // both actions appear only once there is something to act on.
+    assert!(h.query_by_label("✕ dismiss map alarm").is_none());
+    assert!(h.query_by_label_contains("adopt anyway").is_none());
+}
+
 #[test]
 fn fiducial_tab_exposes_its_controls_after_the_panel_split() {
     let mut h = console();

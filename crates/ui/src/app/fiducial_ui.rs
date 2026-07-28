@@ -1,5 +1,7 @@
 use std::time::{Duration, Instant};
 
+use nalgebra::Point2;
+
 use super::*;
 
 /// Reject an auto-placement whose fiducial fit residual (RMS over the detected
@@ -53,6 +55,190 @@ const MIRROR_TELL_MAX_DEV: f64 = 0.004;
 /// built on it would be worse than the `1.0` assumption it replaces.
 const MIRROR_BASELINE_MIN: f64 = POSE_SCALE_MIN;
 const MIRROR_BASELINE_MAX: f64 = POSE_SCALE_MAX;
+
+/// Largest size change "⌖ layout from detection" adopts without a second,
+/// deliberate confirmation.
+///
+/// The layout and the detections are the SAME PHYSICAL HOLES: the layout says
+/// where they were commanded, the detections say where the camera reads them.
+/// A rigid board cannot change size between those two statements, so a size
+/// difference is the camera→machine map and nothing else — and writing it into
+/// the nominal layout does not fix it, it hides it: every later Check then
+/// compares the measurement to itself and reports scale 1.000 with the whole
+/// error still in the burn. 2% is far outside any measurement noise this
+/// detector produces (0.1% on a 40 mm square is 40 µm) and far inside the
+/// smallest map error worth acting on, so the false-positive rate is
+/// essentially the detector's own — the standard this console's gates are held
+/// to since the wrong-face tell refused a legitimate 1.021 front fit.
+pub(super) const ADOPT_MAX_SCALE_DEV: f64 = 0.02;
+
+/// How close a layout has to sit to the last Check's detections before it is
+/// read as having ADOPTED them. Only has to absorb `format_layout`'s 2-decimal
+/// rounding plus a hand-rounded coordinate; a layout that genuinely describes
+/// different holes is never this close to a measurement.
+pub(super) const ADOPT_MATCH_MAX_MM: f64 = 0.2;
+
+/// Green band for the camera↔laser loop: at or inside these the map still
+/// agrees with the holes the laser itself burned. 1% of a 40 mm hole square is
+/// 0.4 mm and 0.5° is 0.35 mm at its corners — both above what a fiducial
+/// detection through an honest map produces, so a healthy rig sits green.
+pub(super) const LOOP_OK_SCALE_DEV: f64 = 0.01;
+pub(super) const LOOP_OK_ROT_DEG: f64 = 0.5;
+
+/// Alarm band: past either of these the readout latches into a banner. 2% /
+/// 1° on a 40 mm square is ~0.8 mm / 0.7 mm of burn error at the corners —
+/// past anything registration can absorb, and double the green band so the
+/// amber middle carries the "watch it" cases instead of the banner.
+pub(super) const LOOP_ALARM_SCALE_DEV: f64 = 0.02;
+pub(super) const LOOP_ALARM_ROT_DEG: f64 = 1.0;
+
+/// How far a detection may sit from its reference hole, AFTER the best-fit
+/// similarity, and still be that hole. The similarity already absorbs where the
+/// plate sits and how the loop is wrong, so what is left is pattern shape: a
+/// different plate, or holes re-burned in a different arrangement, does not fit
+/// this closely. Generous enough (a few mm) that a real detection on the real
+/// plate never falls out.
+pub(super) const LOOP_MATCH_MAX_MM: f64 = 3.0;
+
+/// The camera↔laser loop, measured: the similarity carrying the COMMANDED
+/// positions of the last fiducial-hole burn onto the positions a later Check
+/// detected for those same holes.
+///
+/// This is the one closed loop on the bench where the physical truth is known.
+/// The laser cut the holes where it was told to; the holes cannot move, resize
+/// or rotate afterwards. So any scale or rotation between commanded and
+/// detected is pure camera↔laser map error — unlike a fiducial fit against a
+/// nominal layout, where a board that simply sits crooked produces the same
+/// numbers.
+#[derive(Debug, Clone, Copy, PartialEq)]
+pub(super) struct LoopHealth {
+    /// Detected spacing / commanded spacing. 1.065 means the map reads the
+    /// laser's own 40 mm hole square as 42.6 mm.
+    pub(super) scale: f64,
+    /// Commanded → detected rotation, degrees.
+    pub(super) rot_deg: f64,
+    /// Residual of the fit — how well the detections are the burned pattern at
+    /// all, as opposed to a different set of holes.
+    pub(super) rms_mm: f64,
+    /// How many reference holes were matched.
+    pub(super) used: usize,
+}
+
+impl LoopHealth {
+    /// Inside the green band: the map and the laser agree.
+    pub(super) fn healthy(&self) -> bool {
+        (self.scale - 1.0).abs() <= LOOP_OK_SCALE_DEV && self.rot_deg.abs() <= LOOP_OK_ROT_DEG
+    }
+
+    /// Past the alarm band — worth latching a banner over.
+    pub(super) fn alarming(&self) -> bool {
+        (self.scale - 1.0).abs() > LOOP_ALARM_SCALE_DEV || self.rot_deg.abs() > LOOP_ALARM_ROT_DEG
+    }
+
+    /// Machine-greppable form for the log line and `debug_summary`.
+    pub(super) fn token(&self) -> String {
+        format!(
+            "{:+.2}%/{:+.2}deg rms={:.2}mm holes={}",
+            (self.scale - 1.0) * 100.0,
+            self.rot_deg,
+            self.rms_mm,
+            self.used
+        )
+    }
+}
+
+/// Best-fit similarity scale carrying `from` onto `to`, index-paired. `None`
+/// when the two do not describe the same point set (different lengths, too few
+/// points) or the fit is degenerate.
+pub(super) fn layout_adoption_scale(from: &[(f64, f64)], to: &[(f64, f64)]) -> Option<f64> {
+    if from.len() != to.len() || from.len() < 2 {
+        return None;
+    }
+    let pairs: Vec<(Point2<f64>, Point2<f64>)> = from
+        .iter()
+        .zip(to)
+        .map(|(a, b)| (Point2::new(a.0, a.1), Point2::new(b.0, b.1)))
+        .collect();
+    calib::fit_similarity(&pairs).ok().map(|f| f.scale)
+}
+
+/// Measure the camera↔laser loop from the commanded hole positions and one
+/// Check's detections (both machine mm).
+///
+/// The correspondence is nearest-neighbour, then VERIFIED: the fitted pattern
+/// has to land on the detections to within [`LOOP_MATCH_MAX_MM`], every
+/// reference hole has to claim its own detection, and a mirrored fit is not the
+/// burned plate at all. Anything else declines — a re-jigged plate or holes
+/// burned somewhere else must produce "no reference holes matched", never a
+/// number, because the number would be read as a verdict on the machine.
+///
+/// Translation is deliberately not examined: the plate may sit anywhere.
+pub(super) fn measure_loop(
+    ref_holes: &[(f64, f64)],
+    detected_mm: &[(f64, f64)],
+) -> Result<LoopHealth, String> {
+    if ref_holes.len() < 3 {
+        return Err("no fiducial holes have been burned from this console yet".into());
+    }
+    if detected_mm.len() < ref_holes.len() {
+        return Err(format!(
+            "no reference holes matched — {} detections for {} burned holes",
+            detected_mm.len(),
+            ref_holes.len()
+        ));
+    }
+    let mut claimed: Vec<usize> = Vec::new();
+    let mut pairs: Vec<(Point2<f64>, Point2<f64>)> = Vec::new();
+    for &(rx, ry) in ref_holes {
+        let Some((k, _)) = detected_mm
+            .iter()
+            .enumerate()
+            .map(|(k, d)| (k, (d.0 - rx).hypot(d.1 - ry)))
+            .min_by(|a, b| a.1.total_cmp(&b.1))
+        else {
+            return Err("no reference holes matched".into());
+        };
+        if claimed.contains(&k) {
+            return Err(
+                "no reference holes matched — two burned holes claim the same detection".into(),
+            );
+        }
+        claimed.push(k);
+        pairs.push((
+            Point2::new(rx, ry),
+            Point2::new(detected_mm[k].0, detected_mm[k].1),
+        ));
+    }
+    let fit =
+        calib::fit_similarity(&pairs).map_err(|e| format!("no reference holes matched ({e})"))?;
+    // A mirrored fit means these are not the burned holes seen through a wrong
+    // map — they are the other face, or another plate. Not this measurement's
+    // business either way.
+    if fit.rigid.flip_x {
+        return Err("no reference holes matched — the detections mirror the burned pattern".into());
+    }
+    let residuals: Vec<f64> = pairs
+        .iter()
+        .map(|(a, b)| {
+            let (x, y) = fit.apply((a.x, a.y));
+            (x - b.x).hypot(y - b.y)
+        })
+        .collect();
+    let worst = residuals.iter().copied().fold(0.0, f64::max);
+    if worst > LOOP_MATCH_MAX_MM {
+        return Err(format!(
+            "no reference holes matched — the detections are {worst:.1} mm off the burned \
+             pattern's shape (a different plate, or the holes were re-burned elsewhere)"
+        ));
+    }
+    let rms_mm = (residuals.iter().map(|r| r * r).sum::<f64>() / residuals.len() as f64).sqrt();
+    Ok(LoopHealth {
+        scale: fit.scale,
+        rot_deg: fit.angle_deg(),
+        rms_mm,
+        used: pairs.len(),
+    })
+}
 
 /// Bounds for the whole-frame recovery ([`ConsoleApp::locate_fid_markers_globally`]).
 ///
@@ -350,8 +536,10 @@ impl ConsoleApp {
         // placement offset is measured from — means nothing any more.
         self.fiducials.last_fit = None;
         // Stale measurements must not be adoptable as a layout they no longer
-        // correspond to.
+        // correspond to — including through the size gate's confirmation, which
+        // was armed against numbers that no longer exist.
         self.fiducials.detected_mm.clear();
+        self.fiducials.adopt_confirm = None;
         self.fiducials.note = "markers cleared — ⟳ layout from W×H rebuilds the four corners, or \
              ✚ click-to-place new ones"
             .into();
@@ -448,8 +636,10 @@ impl ConsoleApp {
         // displace the design by the centroid shift on the next Check.
         self.fiducials.last_fit = None;
         // Stale measurements must not be adoptable as a layout they no longer
-        // correspond to.
+        // correspond to — including through the size gate's confirmation, which
+        // was armed against numbers that no longer exist.
         self.fiducials.detected_mm.clear();
+        self.fiducials.adopt_confirm = None;
         self.sync_fid_markers();
         let n = self.fiducials.search.len();
         self.fiducials.note = format!(
@@ -498,8 +688,10 @@ impl ConsoleApp {
         // from that centroid.
         self.fiducials.last_fit = None;
         // Stale measurements must not be adoptable as a layout they no longer
-        // correspond to.
+        // correspond to — including through the size gate's confirmation, which
+        // was armed against numbers that no longer exist.
         self.fiducials.detected_mm.clear();
+        self.fiducials.adopt_confirm = None;
         // Lengths already match; sync is a no-op reconcile (and re-seeds only if
         // the layout still parses).
         self.sync_fid_markers();
@@ -639,7 +831,32 @@ impl ConsoleApp {
     ///
     /// Deliberately a button, never automatic: silently redefining the nominal
     /// would turn a genuine misdetection into the new truth.
+    ///
+    /// And deliberately REFUSED when the measurement is a different SIZE from
+    /// the layout it would replace — see [`ADOPT_MAX_SCALE_DEV`]. That case is
+    /// not a layout that never described the holes; it is a camera→machine map
+    /// that no longer describes the machine, and adopting it launders the error
+    /// into the nominal. [`adopt_measured_layout_confirmed`] is the way past it.
+    ///
+    /// [`adopt_measured_layout_confirmed`]: Self::adopt_measured_layout_confirmed
     pub(super) fn adopt_measured_layout(&mut self) {
+        self.adopt_measured_layout_inner(false);
+    }
+
+    /// Adopt the measurement DESPITE a size change the default path refuses —
+    /// the deliberate second action, armed only by that refusal and labelled
+    /// with the number it overrides.
+    ///
+    /// It exists because the refusal is not always right: re-jigging the plate
+    /// or re-burning the holes at a different spacing genuinely re-sites them,
+    /// and then the measurement is the truth. It is a separate press with the
+    /// percentage on its face, so the choice is on the record rather than in a
+    /// silence.
+    pub(super) fn adopt_measured_layout_confirmed(&mut self) {
+        self.adopt_measured_layout_inner(true);
+    }
+
+    fn adopt_measured_layout_inner(&mut self, force: bool) {
         // Back-side detections are compared against MIRRORED, beam-offset
         // expected positions (`expected_points`), so writing them into the
         // layout — which is the un-mirrored design frame — would bake the flip
@@ -662,14 +879,71 @@ impl ConsoleApp {
             return;
         }
         let pts: Vec<(f64, f64)> = measured.iter().flatten().copied().collect();
+        // The size gate. The layout and the measurement are the same physical
+        // holes, so the only thing between them that a board can legitimately do
+        // is move and turn — both of which the fit absorbs and neither of which
+        // is examined here. A SIZE change is the map.
+        let nominal = fiducial::parse_layout(&self.fiducials.layout).unwrap_or_default();
+        let scale = layout_adoption_scale(&nominal, &pts);
+        if let Some(scale) = scale
+            && (scale - 1.0).abs() > ADOPT_MAX_SCALE_DEV
+            && !force
+        {
+            self.fiducials.adopt_confirm = Some(scale);
+            self.fiducials.note = format!(
+                "⌖ layout from detection REFUSED — the measured holes are {:+.2}% ({scale:.4}×) \
+                 the size of the layout they were checked against. A rigid board cannot change \
+                 size, so that is the camera→machine map, not the layout: adopting it would hide \
+                 the map error instead of fixing it — every later Check would compare the \
+                 measurement to itself and read scale 1.000 with the whole error still in the \
+                 burn. Recalibrate ① Camera lens and ③ Laser field. If the holes really were \
+                 re-burned at a different size, press ⌖ adopt anyway ({scale:.4}×).",
+                (scale - 1.0) * 100.0
+            );
+            self.runtime.log.push(LogLine {
+                text: format!(
+                    "fiducials: refused to adopt the detected positions as the layout — they are \
+                     {:+.2}% the size of the nominal layout, which is a camera→machine map error, \
+                     not a board that changed size",
+                    (scale - 1.0) * 100.0
+                ),
+                err: true,
+            });
+            return;
+        }
+        // Forcing past the gate is a decision about the machine, so it goes in
+        // the log where a later registration failure will be read from.
+        let forced = match scale.filter(|s| force && (s - 1.0).abs() > ADOPT_MAX_SCALE_DEV) {
+            Some(scale) => {
+                self.runtime.log.push(LogLine {
+                    text: format!(
+                        "fiducials: adopted the detected positions as the layout over a {:+.2}% \
+                         size change — if the holes were not re-burned, this hides a camera→machine \
+                         map error rather than fixing it",
+                        (scale - 1.0) * 100.0
+                    ),
+                    err: true,
+                });
+                format!(
+                    " Adopted over a {:+.2}% size change: if those holes were not re-burned, the \
+                     map error is now nominal and invisible.",
+                    (scale - 1.0) * 100.0
+                )
+            }
+            None => String::new(),
+        };
+        self.fiducials.adopt_confirm = None;
+        self.fiducials.adopt_warn = None;
         self.fiducials.layout = fiducial::format_layout(&pts);
         // The nominal frame just moved, so anything measured against the old one
         // is void: the carried offset's origin (the layout centroid) has changed,
         // and the cached pose describes a fit that no longer applies.
         self.fiducials.last_fit = None;
         // Stale measurements must not be adoptable as a layout they no longer
-        // correspond to.
+        // correspond to — including through the size gate's confirmation, which
+        // was armed against numbers that no longer exist.
         self.fiducials.detected_mm.clear();
+        self.fiducials.adopt_confirm = None;
         self.fiducials.pose = None;
         self.fiducials.last_placed = false;
         // The scan's Live backoff was earned against the OLD layout, which is
@@ -680,9 +954,155 @@ impl ConsoleApp {
         self.fiducials.note = format!(
             "layout set from the measured holes ({} points) — this board pose is now \
              nominal. Check again: the fit should be near-identity, and from here a \
-             Check measures only how far the board has moved.",
+             Check measures only how far the board has moved.{forced}",
             pts.len()
         );
+    }
+
+    /// Latch a warning when the layout being checked looks like the PREVIOUS
+    /// check's detections written back into it by hand.
+    ///
+    /// The adopt button can be gated; typing coordinates cannot, and the effect
+    /// is identical — a nominal layout that IS the measurement, after which
+    /// every fit compares the measurement to itself and reports scale 1.000
+    /// however wrong the map is. So the console watches for the result instead
+    /// of the action: a layout that matches the last detections to within
+    /// [`ADOPT_MATCH_MAX_MM`] and differs in SIZE from the layout that check ran
+    /// against is an adoption, whoever performed it.
+    ///
+    /// Must run before the check restamps `detected_mm` / `checked_layout`.
+    fn check_hand_adopted_layout(&mut self, layout: &[(f64, f64)]) {
+        let previous: Vec<(f64, f64)> = self
+            .fiducials
+            .detected_mm
+            .iter()
+            .flatten()
+            .copied()
+            .collect();
+        if previous.is_empty()
+            || previous.len() != self.fiducials.detected_mm.len()
+            || previous.len() != layout.len()
+        {
+            return;
+        }
+        if !layout
+            .iter()
+            .zip(&previous)
+            .all(|(a, b)| (a.0 - b.0).hypot(a.1 - b.1) <= ADOPT_MATCH_MAX_MM)
+        {
+            return;
+        }
+        let Some(scale) = layout_adoption_scale(&self.fiducials.checked_layout, layout) else {
+            return;
+        };
+        if (scale - 1.0).abs() <= ADOPT_MAX_SCALE_DEV {
+            return;
+        }
+        self.fiducials.adopt_warn = Some(format!(
+            "⚠ this layout matches the previous check's detections to within \
+             {ADOPT_MATCH_MAX_MM} mm — the measured positions look adopted into it, and they are \
+             {:+.2}% ({scale:.4}×) the size of the layout that check ran against. A rigid board \
+             cannot change size, so from here every Check compares the measurement to itself and \
+             reads ~1.000 however wrong the camera→machine map is. Recalibrate ① Camera lens and \
+             ③ Laser field; ⟳ layout from W×H puts a nominal layout back.",
+            (scale - 1.0) * 100.0
+        ));
+        self.runtime.log.push(LogLine {
+            text: format!(
+                "fiducials: the layout being checked matches the previous detections and is \
+                 {:+.2}% the size of the layout they were measured against — a camera→machine map \
+                 error is being carried as the nominal layout",
+                (scale - 1.0) * 100.0
+            ),
+            err: true,
+        });
+    }
+
+    /// Re-measure the camera↔laser loop against the holes this console last
+    /// burned, and latch the verdict.
+    ///
+    /// Runs on every Check that produced detections — the reference holes are
+    /// the laser's own work, so no operator action arms this. A healthy
+    /// measurement clears a latched alarm; the amber middle neither latches nor
+    /// clears, so a rig hovering at the boundary keeps the last verdict.
+    ///
+    /// Never refuses anything. The correspondence is a heuristic, and a
+    /// mismatched one (a re-jigged plate, a different board in front of the
+    /// camera) would otherwise block work over a number the console cannot
+    /// stand behind — so the contract is the banner and the number.
+    fn update_loop_health(&mut self, detected: &[Option<(f64, f64)>]) {
+        let hits: Vec<(f64, f64)> = detected.iter().flatten().copied().collect();
+        match measure_loop(&self.fiducials.ref_holes, &hits) {
+            Ok(health) => {
+                self.fiducials.loop_health = Some(health);
+                self.fiducials.loop_note.clear();
+                if health.alarming() {
+                    self.fiducials.loop_alarm = Some(health);
+                    self.runtime.log.push(LogLine {
+                        text: format!(
+                            "fiducials: the camera→machine map disagrees with the laser's own \
+                             fiducial holes by {} — recalibrate ① Camera lens and ③ Laser field \
+                             before burning",
+                            health.token()
+                        ),
+                        err: true,
+                    });
+                } else if health.healthy() {
+                    self.fiducials.loop_alarm = None;
+                }
+            }
+            Err(why) => {
+                self.fiducials.loop_health = None;
+                self.fiducials.loop_note = why;
+            }
+        }
+    }
+
+    /// The loop-health readout: `(healthy, text)`. `healthy` drives the colour,
+    /// so an unmeasured loop reads as not-green rather than as a pass.
+    pub(super) fn loop_health_line(&self) -> (bool, String) {
+        match &self.fiducials.loop_health {
+            Some(h) if h.healthy() => (
+                true,
+                format!(
+                    "● camera↔laser loop: the map matches the laser's own holes to {:+.2}% / \
+                     {:+.2}° (RMS {:.2} mm over {} holes)",
+                    (h.scale - 1.0) * 100.0,
+                    h.rot_deg,
+                    h.rms_mm,
+                    h.used
+                ),
+            ),
+            Some(h) => (
+                false,
+                format!(
+                    "◐ camera↔laser loop: the map is {:+.2}% / {:+.2}° off the laser's own holes \
+                     (RMS {:.2} mm over {} holes) — green is within {:.0}% / {:.1}°",
+                    (h.scale - 1.0) * 100.0,
+                    h.rot_deg,
+                    h.rms_mm,
+                    h.used,
+                    LOOP_OK_SCALE_DEV * 100.0,
+                    LOOP_OK_ROT_DEG
+                ),
+            ),
+            None => (
+                false,
+                format!("○ camera↔laser loop: {}", self.fiducials.loop_note),
+            ),
+        }
+    }
+
+    /// Loop health for a log line or `debug_summary` — the same numbers the
+    /// readout quotes, in one greppable token.
+    pub(super) fn loop_health_token(&self) -> String {
+        match (&self.fiducials.loop_health, &self.fiducials.loop_alarm) {
+            (Some(h), Some(_)) => format!("ALARM {}", h.token()),
+            (Some(h), None) if h.healthy() => format!("ok {}", h.token()),
+            (Some(h), None) => format!("watch {}", h.token()),
+            (None, Some(a)) => format!("unmeasured (latched ALARM {})", a.token()),
+            (None, None) => "unmeasured".into(),
+        }
     }
 
     /// The layout string for the current fiducial rectangle, centred in the
@@ -705,6 +1125,12 @@ impl ConsoleApp {
     /// and the stale detections/rows go with them.
     pub(super) fn apply_fid_rect(&mut self) {
         self.fiducials.layout = self.fid_rect_layout();
+        // A layout rebuilt from the rectangle is nominal by construction, so
+        // both adoption states are answered: the pending confirmation has
+        // nothing left to adopt, and the hand-adoption warning's subject is
+        // gone.
+        self.fiducials.adopt_confirm = None;
+        self.fiducials.adopt_warn = None;
         self.fiducials.search.clear();
         self.fiducials.found.clear();
         self.fiducials.rows.clear();
@@ -717,8 +1143,10 @@ impl ConsoleApp {
         // the old one would displace the design by the difference.
         self.fiducials.last_fit = None;
         // Stale measurements must not be adoptable as a layout they no longer
-        // correspond to.
+        // correspond to — including through the size gate's confirmation, which
+        // was armed against numbers that no longer exist.
         self.fiducials.detected_mm.clear();
+        self.fiducials.adopt_confirm = None;
         // Click-placed extras may have made the layout longer than four, so an
         // in-flight marking index can outlive the marker it named.
         self.fiducials.marking = None;
@@ -1037,6 +1465,19 @@ impl ConsoleApp {
         let started = self.run_verb(&args);
         if started {
             self.diag_arm_readback("fid-holes", out_path, use_field);
+            // These positions are what the laser is being TOLD to cut, which is
+            // the whole value of them: a later Check that finds these holes
+            // measures the camera↔laser loop and nothing else (see
+            // `measure_loop`). Recorded only once the export actually launched,
+            // so a refused click can't retire the plate that is still on the
+            // bed. Not gated on the burn happening — the operator presses play
+            // in LightBurn, and a reference that goes stale is caught by the
+            // correspondence test, whereas a missing one measures nothing.
+            self.fiducials.ref_holes =
+                crate::fiducial::parse_layout(&self.fiducials.layout).unwrap_or_default();
+            self.fiducials.loop_health = None;
+            self.fiducials.loop_note =
+                "holes emitted — burn them, then Check to measure the loop".into();
         }
         // Queue a LOAD-ONLY hand-off — the file opens in LightBurn once the
         // export finishes, and START is never sent. Only when the export
@@ -1431,7 +1872,19 @@ impl ConsoleApp {
         // operator needs these, because "⌖ layout from detection" is how a
         // layout that never matched the real holes gets replaced by one that
         // does.
+        // The hand-adoption tell reads the PREVIOUS check's detections and the
+        // layout they were measured against, so it runs before either is
+        // restamped below.
+        self.check_hand_adopted_layout(&layout);
         self.fiducials.detected_mm = detected.clone();
+        self.fiducials.checked_layout = layout.clone();
+        // A fresh measurement invalidates the size the pending confirmation was
+        // armed with; re-pressing ⌖ re-arms it against these numbers.
+        self.fiducials.adopt_confirm = None;
+        // The closed loop, measured before any gate: the camera↔laser map's
+        // disagreement with the laser's own holes is worth knowing precisely
+        // when the fit is being refused.
+        self.update_loop_health(&detected);
         // Back side: the camera sees the drilled holes' EXIT openings, so fit
         // against the exit-magnified nominal positions.
         let exit = self.back_field_params();
@@ -1737,6 +2190,7 @@ impl ConsoleApp {
     /// the per-fiducial summary rows. Lives in its own resizable/scrollable
     /// panel so it can't crowd out the image (see `fiducial_view`).
     fn fiducial_controls(&mut self, ui: &mut egui::Ui) {
+        self.loop_health_banner(ui);
         egui::Grid::new("fid-form")
             .num_columns(2)
             .spacing([8.0, 6.0])
@@ -1967,6 +2421,23 @@ impl ConsoleApp {
             {
                 self.adopt_measured_layout();
             }
+            // The escape from the size gate: a SECOND, differently-labelled
+            // press carrying the number it overrides, and only after the first
+            // one refused. A jig change does legitimately re-site the holes —
+            // but the default answer to a board that changed size is no.
+            if let Some(scale) = self.fiducials.adopt_confirm
+                && ui
+                    .button(format!("⌖ adopt anyway ({scale:.4}×)"))
+                    .on_hover_text(
+                        "Adopt the measured positions even though they are a different SIZE \
+                         from the layout. Correct only if the holes really were re-burned or \
+                         re-jigged at that spacing — otherwise this writes a camera→machine map \
+                         error into the nominal layout, where no later Check can see it.",
+                    )
+                    .clicked()
+            {
+                self.adopt_measured_layout_confirmed();
+            }
             if ui
                 .button("⟳ layout from W×H")
                 .on_hover_text(
@@ -2027,6 +2498,58 @@ impl ConsoleApp {
             };
             ui.colored_label(color, &row.text);
         }
+    }
+
+    /// The camera↔laser loop-health block at the top of the tab: the latched
+    /// alarm banner (when there is one), the hand-adoption warning, and the
+    /// one-line readout.
+    ///
+    /// Above the form on purpose. The signal this replaces was a clause in the
+    /// note line under a button row — it fired on seven consecutive checks
+    /// during the incident that produced this guard and was never read once.
+    fn loop_health_banner(&mut self, ui: &mut egui::Ui) {
+        if let Some(alarm) = self.fiducials.loop_alarm {
+            egui::Frame::none()
+                .fill(Color32::from_rgb(0x50, 0x14, 0x14))
+                .inner_margin(8.0)
+                .show(ui, |ui| {
+                    ui.label(
+                        egui::RichText::new(format!(
+                            "⚠ THE CAMERA→MACHINE MAP DISAGREES WITH THE LASER'S OWN HOLES by \
+                             {:+.2}% / {:+.2}° — recalibrate ① Camera lens and ③ Laser field \
+                             before burning. This console commanded those fiducial holes and the \
+                             board cannot un-drill, so the error is in the map, not on the bench. \
+                             Do NOT adopt the detected positions as the layout: that hides this \
+                             number, it does not fix it.",
+                            (alarm.scale - 1.0) * 100.0,
+                            alarm.rot_deg
+                        ))
+                        .strong()
+                        .color(Color32::from_rgb(0xff, 0xc0, 0xc0)),
+                    );
+                    if ui
+                        .button("✕ dismiss map alarm")
+                        .on_hover_text(
+                            "Hide the banner until the next Check. A Check that measures the \
+                             loop back inside the green band clears it for good; one that is \
+                             still out brings it straight back.",
+                        )
+                        .clicked()
+                    {
+                        self.fiducials.loop_alarm = None;
+                    }
+                });
+        }
+        if let Some(warn) = self.fiducials.adopt_warn.clone() {
+            ui.colored_label(status_color(false), warn);
+        }
+        let (ok, text) = self.loop_health_line();
+        ui.colored_label(status_color(ok), text).on_hover_text(
+            "Measured from the fiducial holes this console emitted: their COMMANDED positions \
+                 against the positions a Check detects for them. Scale and rotation between those \
+                 two are pure camera↔laser error — a board that merely sits crooked cannot \
+                 produce them.",
+        );
     }
 
     /// One colored status line (Calibrate-style) summarizing the last check and

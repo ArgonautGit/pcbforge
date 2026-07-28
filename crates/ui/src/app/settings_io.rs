@@ -25,6 +25,11 @@ fn parse_coeffs(s: &str) -> Option<[f64; 23]> {
     arr.iter().all(|v| v.is_finite()).then_some(arr)
 }
 
+/// Bound on a restored reference-hole coordinate. Any bed this console drives
+/// is a fraction of this; the check is only here so a corrupt blob cannot seed
+/// the loop measurement with a coordinate that isn't a position.
+const REF_HOLE_MAX_MM: f64 = 10_000.0;
+
 impl ConsoleApp {
     /// The persisted input fields, in a fixed key order.
     pub(super) fn settings_blob(&self) -> String {
@@ -83,6 +88,13 @@ impl ConsoleApp {
             ("fid_profile", self.fiducials.profile.token().to_string()),
             ("fid_out", self.fiducials.out.clone()),
             ("fid_rect_w_mm", self.fiducials.rect_w_mm.to_string()),
+            // The commanded positions of the last fiducial-hole burn, as a
+            // layout string. The plate stays on the bed across a restart, and
+            // it is the only reference the camera↔laser loop check has.
+            (
+                "fid_ref_holes",
+                crate::fiducial::format_layout(&self.fiducials.ref_holes),
+            ),
             ("fid_rect_h_mm", self.fiducials.rect_h_mm.to_string()),
             (
                 "fid_live_recover_s",
@@ -512,6 +524,27 @@ impl ConsoleApp {
             .filter(|v: &f64| v.is_finite())
         {
             self.fiducials.rect_h_mm = v.clamp(5.0, 500.0);
+        }
+        // The reference fiducial holes, restored only if they still read as a
+        // hole pattern: finite coordinates on the bed, and enough of them for
+        // `measure_loop` to fit anything. A blob that fails any of that leaves
+        // the loop check unarmed (it then says so) rather than measuring the
+        // machine against nonsense.
+        if let Some(pts) = m
+            .get("fid_ref_holes")
+            .and_then(|s| crate::fiducial::parse_layout(s).ok())
+            .filter(|pts| {
+                pts.len() >= 3
+                    && pts.len() <= 64
+                    && pts.iter().all(|p| {
+                        p.0.is_finite()
+                            && p.1.is_finite()
+                            && p.0.abs() <= REF_HOLE_MAX_MM
+                            && p.1.abs() <= REF_HOLE_MAX_MM
+                    })
+            })
+        {
+            self.fiducials.ref_holes = pts;
         }
         // Live re-acquire cadence, clamped to the DragValue range for the usual
         // reason and one more: the ladder turns it into a `Duration` with

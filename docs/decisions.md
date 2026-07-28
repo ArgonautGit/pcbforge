@@ -3526,3 +3526,58 @@ value there.
 
 The fiducial-hole generator stays on the etch recipe: those holes are burned
 into the jig, not through a board.
+
+## 2026-07-28 — The camera moved and the closed loop said nothing
+
+A bench incident: the camera was physically shifted after calibration, leaving
+the camera→machine map 1.065× and 8.5° wrong — ~9 mm of burn error at the
+corners of a 40 mm board. It was diagnosed only afterwards, from the
+diagnostic log, and only because the console happens to burn its own fiducial
+holes: it commanded a 40.00 mm hole square, and later Checks read those same
+holes back as 42.4×42.9 mm rotated 8.5°.
+
+That is a closed loop with a known fixed point. The laser cut the holes where
+it was told to and a drilled board cannot un-drill, resize or rotate itself, so
+commanded-vs-detected is camera↔laser error and nothing else. A fiducial fit
+against a nominal layout cannot make the same claim: a board is allowed to sit
+anywhere, so its rotation and translation prove nothing, and its scale can
+always be argued to be the board.
+
+Two console behaviours let the error through:
+
+1. **Layout adoption laundered it.** Faced with fits that would not settle, the
+   operator re-typed the fiducial layout to the DETECTED positions (in this
+   incident, and once before). From then on every Check compared the
+   measurement to itself: scale 1.000, rotation 0.017°, every gate green, the
+   full error still in every burn.
+2. **The one signal that fired scrolled away.** The mirror-scale ambiguity
+   warning (`warned-mirror-scale-ambiguous`) fired on seven consecutive checks
+   as a single line of note text under a button row.
+
+Two guards, both in the console:
+
+**Adoption refuses a size change.** The nominal layout and the detections are
+the same physical holes, so between them a board may move and turn — the fit
+absorbs both and neither is examined — but it cannot change SIZE. Past 2%,
+"⌖ layout from detection" refuses and names the number, pointing at the camera
+lens and laser field calibrations rather than at the layout. The threshold is
+chosen for a near-zero false-positive rate: 0.1% on a 40 mm square is 40 µm,
+and this console has already cost a bench once by refusing a legitimate 1.021
+front fit on an assumed baseline. A jig change does legitimately re-site holes,
+so the escape exists — but as a second, differently-labelled press carrying the
+percentage on its face and a line in the log, never as a silence. Typing
+coordinates cannot be gated the same way, so the console watches for the
+result instead: a layout that matches the last detections to within 0.2 mm and
+is a different size from the layout they were measured against latches a
+warning, whoever performed the adoption.
+
+**The loop is measured automatically.** The commanded positions of the last
+fid-holes burn are persisted (`fid_ref_holes`); every later Check whose
+detections match that pattern (nearest-neighbour, then verified against the
+fitted similarity — a mismatch declines with "no reference holes matched"
+rather than reporting garbage) yields a scale and rotation that are pure loop
+error. Green at ≤1% / ≤0.5°; past 2% / 1° a latched banner sits at the top of
+the fiducial tab until dismissed or until a healthy loop clears it. It does NOT
+refuse etches: the correspondence is a heuristic and a re-jigged plate must not
+be able to stop the bench. The contract is the banner, the number, the etch log
+line and `debug_summary()`.
