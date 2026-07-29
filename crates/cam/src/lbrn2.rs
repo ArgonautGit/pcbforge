@@ -52,7 +52,10 @@ pub struct EmitLayer {
     pub name: String,
     pub mode: LayerMode,
     pub params: AblationParams,
-    /// Fill line interval, mm (emitted for `Fill`).
+    /// Line interval, mm. Always emitted for `Fill` (the hatch spacing); for
+    /// `Line` only when set above zero — a traced contour has no hatch, but the
+    /// layer setting still reaches the machine (the drill recipe sets it), and
+    /// omitting it leaves the device profile's value in charge.
     pub interval_mm: f64,
     /// Fill scan angle, deg (emitted when non-zero).
     pub angle_deg: f64,
@@ -106,7 +109,9 @@ impl EmitLayer {
             name: name.into(),
             mode: LayerMode::Line,
             params,
-            interval_mm: 0.03,
+            // No hatch on a traced contour: 0 keeps `interval` out of the file
+            // unless the caller asks for one.
+            interval_mm: 0.0,
             angle_deg: 0.0,
             fill_angle_step_deg: 0.0,
             cross_hatch: false,
@@ -400,6 +405,11 @@ fn cut_setting_xml(index: u32, layer: &EmitLayer) -> String {
         if layer.fill_angle_step_deg != 0.0 {
             field("anglePerPass", num(layer.fill_angle_step_deg));
         }
+    } else if layer.interval_mm > 0.0 {
+        // A Line layer has no hatch, so the interval is only written when the
+        // caller set one explicitly (the drill recipe does); absent, the
+        // device profile keeps its own.
+        field("interval", num(layer.interval_mm));
     }
     if p.passes > 1 {
         field("numPasses", p.passes.to_string());
@@ -576,7 +586,24 @@ mod tests {
         let layer = EmitLayer::line("C00", base_params(), Vec::new());
         let xml = cut_setting_xml(0, &layer);
         assert!(xml.contains("type=\"Cut\""), "Line => Cut");
-        assert!(!xml.contains("interval"), "Line omits fill interval");
+        assert!(
+            !xml.contains("interval"),
+            "Line omits the interval unless one is set"
+        );
+    }
+
+    #[test]
+    fn line_mode_emits_an_explicitly_set_interval() {
+        // The drill recipe traces hole outlines at its own interval; the value
+        // has to reach the file, and only when the caller set it.
+        let mut layer = EmitLayer::line("DRILL", base_params(), Vec::new());
+        layer.interval_mm = 0.05;
+        let xml = cut_setting_xml(0, &layer);
+        assert!(xml.contains("<interval Value=\"0.05\"/>"), "{xml}");
+        assert!(
+            !xml.contains("crossHatch"),
+            "still no hatch on a Line layer"
+        );
     }
 
     #[test]

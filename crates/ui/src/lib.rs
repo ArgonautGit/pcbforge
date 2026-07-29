@@ -13,6 +13,7 @@
 //! from the GUI and invisible to the CLI.
 
 mod app;
+mod diag;
 mod fiducial;
 mod imgview;
 mod place;

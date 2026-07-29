@@ -100,6 +100,21 @@ fn offer(slot: &Slot, frame: Result<GrayImage, String>) {
     *slot.lock().unwrap() = Some(frame);
 }
 
+/// Whether the slot still holds a frame nobody has taken. Since
+/// [`Capture::latest`] *consumes* the slot, an occupied slot means no consumer
+/// is polling — the signal the device loop throttles on.
+#[cfg(any(feature = "camera", test))]
+fn slot_occupied(slot: &Slot) -> bool {
+    slot.lock().unwrap().is_some()
+}
+
+/// How long the device loop naps when the previous frame is still unread.
+/// Short enough to be invisible to a live consumer (well under the 109–125 ms
+/// the device actually delivers frames in), long enough that an idle shared
+/// capture costs a wakeup rather than a core.
+#[cfg(feature = "camera")]
+const IDLE_NAP: Duration = Duration::from_millis(15);
+
 fn capture_loop(source: Source, slot: Slot, stop: Arc<AtomicBool>) {
     #[cfg(feature = "camera")]
     if let Source::Device(index) = source {
@@ -189,6 +204,21 @@ fn device_loop(index: u32, slot: &Slot, stop: &Arc<AtomicBool>) {
         }
     };
     while !stop.load(Ordering::Relaxed) {
+        // Don't decode a fresh 5 MP frame on top of one nobody read. The
+        // console keeps this capture open across one-shot grabs (so the next
+        // grab skips the ~2.1 s device init), and without this the thread would
+        // decode continuously and burn a core the whole time it idles.
+        //
+        // This never throttles a real live feed: a live pump polls once per UI
+        // frame (~16 ms, it calls `request_repaint`) while the device delivers
+        // at 109–125 ms/frame, so the consumer drains the slot ~7× faster than
+        // it fills and the slot is empty at nearly every check. Even the
+        // calibration pump — which re-anchors per frame and so polls slower —
+        // only ever pays one extra `IDLE_NAP` of latency, not a stall.
+        if slot_occupied(slot) {
+            thread::sleep(IDLE_NAP);
+            continue;
+        }
         let frame = frame_to_gray(&mut cam);
         let slow = frame.is_err();
         offer(slot, frame);
@@ -305,6 +335,18 @@ mod tests {
         offer(&slot, Ok(GrayImage::from_pixel(2, 2, image::Luma([2]))));
         let got = slot.lock().unwrap().take().unwrap().unwrap();
         assert_eq!(got.get_pixel(0, 0).0[0], 2, "newest frame wins");
+    }
+
+    #[test]
+    fn slot_occupancy_tracks_unread_frames() {
+        // The device loop's throttle predicate, exercised without a camera:
+        // occupied means the last frame went unread, so there is no consumer.
+        let slot: Slot = Arc::new(Mutex::new(None));
+        assert!(!slot_occupied(&slot), "empty slot = a consumer drained it");
+        offer(&slot, Ok(GrayImage::from_pixel(2, 2, image::Luma([5]))));
+        assert!(slot_occupied(&slot), "unread frame = nobody is polling");
+        let _ = slot.lock().unwrap().take(); // what `latest()` does
+        assert!(!slot_occupied(&slot), "taking the frame frees the slot");
     }
 
     #[test]

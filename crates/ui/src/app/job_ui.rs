@@ -35,10 +35,12 @@ impl ConsoleApp {
     /// Export the copper + outline Gerbers from the KiCad project by shelling
     /// `pcbforge gerbers` in the **background** (the export can take a second or
     /// two — the window must not freeze). The output paths are deterministic
-    /// (`<board dir>/pcbforge-gerbers/{copper,outline}.gbr`), so the fields are
-    /// filled immediately; the files appear when the background job finishes,
-    /// whose progress/errors stream to the Log.
-    fn gerbers_from_kicad(&mut self) {
+    /// (`<board dir>/pcbforge-gerbers/copper-<layer>.gbr` + `outline.gbr`), so
+    /// the fields are filled immediately; the files appear when the background
+    /// job finishes, whose progress/errors stream to the Log. The copper name
+    /// carries the layer, so exporting Front then Back fills both sides'
+    /// fields with files that coexist.
+    pub(super) fn gerbers_from_kicad(&mut self) {
         let proj = crate::clean_path(&self.job.kicad_project);
         if proj.trim().is_empty() {
             self.runtime.log.push(LogLine {
@@ -66,8 +68,14 @@ impl ConsoleApp {
             .parent()
             .map(|p| p.join("pcbforge-gerbers"))
             .unwrap_or_else(|| PathBuf::from("pcbforge-gerbers"));
-        let copper = out_dir.join("copper.gbr").display().to_string();
-        let outline = out_dir.join("outline.gbr").display().to_string();
+        let copper = out_dir
+            .join(ingest::kicad_cli::copper_gerber_name(copper_layer))
+            .display()
+            .to_string();
+        let outline = out_dir
+            .join(ingest::kicad_cli::OUTLINE_GERBER_NAME)
+            .display()
+            .to_string();
         match self.job.side {
             Side::Front => {
                 self.job.emit_copper = copper;
@@ -97,7 +105,17 @@ impl ConsoleApp {
         ui.heading("Actions");
         ui.label(egui::RichText::new("These shell the `pcbforge` CLI.").weak());
         ui.separator();
+        // Scrollable: the emit recipe, the back-side block and the placement
+        // controls together are taller than the panel on a normal window, and
+        // an unreachable “🔥 Etch + Run” is worse than a scrollbar (the same fix
+        // the Calibrate and Fiducial tabs already carry).
+        egui::ScrollArea::vertical()
+            .id_salt("actions-scroll")
+            .auto_shrink([false, false])
+            .show(ui, |ui| self.actions_body(ui));
+    }
 
+    fn actions_body(&mut self, ui: &mut egui::Ui) {
         egui::Grid::new("kicad-form")
             .num_columns(2)
             .spacing([8.0, 6.0])
@@ -116,7 +134,8 @@ impl ConsoleApp {
         if ui
             .button("⚙ Gerbers from KiCad")
             .on_hover_text(
-                "Run kicad-cli to export copper.gbr + outline.gbr and fill the fields below.",
+                "Run kicad-cli to export copper-<layer>.gbr + outline.gbr for the \
+                 selected side and fill that side's fields below.",
             )
             .clicked()
         {
@@ -135,8 +154,9 @@ impl ConsoleApp {
                 ui.add(egui::TextEdit::singleline(&mut self.job.emit_outline).desired_width(180.0))
                     .labelled_by(l.id);
                 ui.end_row();
-                ui.label("out .lbrn2");
-                ui.add(egui::TextEdit::singleline(&mut self.job.emit_lbrn2).desired_width(180.0));
+                let l = ui.label("out .lbrn2");
+                ui.add(egui::TextEdit::singleline(&mut self.job.emit_lbrn2).desired_width(180.0))
+                    .labelled_by(l.id);
                 ui.end_row();
                 ui.label("offset mm");
                 ui.add(
@@ -215,7 +235,7 @@ impl ConsoleApp {
                 });
                 ui.end_row();
             });
-        ui.weak("Recipe (speed / Q-pulse / interval / passes / wobble) applies to both this Emit and Place's “Etch here”.");
+        ui.weak("Recipe (speed / Q-pulse / interval / passes / wobble) applies to both this Emit and “Etch here”.");
 
         // Double-sided (ORC-6): side selector + back-side inputs.
         ui.separator();
@@ -231,14 +251,26 @@ impl ConsoleApp {
                 .num_columns(2)
                 .spacing([8.0, 6.0])
                 .show(ui, |ui| {
-                    ui.label("back copper .gbr");
+                    let l = ui.label("back copper .gbr");
                     ui.add(
                         egui::TextEdit::singleline(&mut self.job.back_copper).desired_width(180.0),
-                    );
+                    )
+                    .labelled_by(l.id);
                     ui.end_row();
-                    ui.label("back outline .gbr");
+                    let l = ui.label("back outline .gbr");
                     ui.add(
                         egui::TextEdit::singleline(&mut self.job.back_outline).desired_width(180.0),
+                    )
+                    .labelled_by(l.id);
+                    ui.end_row();
+                    let l = ui.label("back out .lbrn2");
+                    ui.add(
+                        egui::TextEdit::singleline(&mut self.job.back_lbrn2).desired_width(180.0),
+                    )
+                    .labelled_by(l.id)
+                    .on_hover_text(
+                        "Separate from the front output so emitting the back \
+                         doesn't overwrite the front job.",
                     );
                     ui.end_row();
                     ui.label("thickness mm");
@@ -299,6 +331,11 @@ impl ConsoleApp {
         ui.weak(
             "With an accepted step 1 (Camera lens) + step 3 (Laser field) map the export field-warps every edge; without one it emits unwarped (warned in the log).",
         );
+
+        ui.separator();
+        self.placement_actions(ui);
+
+        ui.separator();
         if ui.button("⏭ Next stage (bring-up)").clicked() {
             self.run_verb(&["next".into(), "--bringup-stubs".into()]);
         }
@@ -306,7 +343,7 @@ impl ConsoleApp {
         ui.weak("Live camera → the “📷 Camera” tab.");
     }
 
-    /// The wobble recipe args shared by Emit and Place's "Etch here" (empty
+    /// The wobble recipe args shared by Emit and "Etch here" (empty
     /// when wobble is off — the CLI default already writes wobbleEnable=0).
     pub(super) fn wobble_args(&self) -> Vec<String> {
         if !self.job.wobble {
@@ -319,6 +356,15 @@ impl ConsoleApp {
             "--wobble-size-mm".into(),
             format!("{}", self.job.wobble_size_mm),
         ]
+    }
+
+    /// The `.lbrn2` the current side emits to — one file per side, so a back
+    /// emit never lands on top of the front job.
+    pub(super) fn active_lbrn2(&self) -> &str {
+        match self.job.side {
+            Side::Front => &self.job.emit_lbrn2,
+            Side::Back => &self.job.back_lbrn2,
+        }
     }
 
     pub(super) fn emit_clicked(&mut self) {
@@ -335,12 +381,25 @@ impl ConsoleApp {
             });
             return;
         }
+        // The back side mirrors in X, and `emit --mirror-x` refuses without an
+        // outline: the two sides would otherwise be framed on their own copper
+        // extents and never line up on the flipped board. Say so here rather
+        // than letting the operator read it out of the CLI's stderr.
+        if self.job.side == Side::Back && outline.is_empty() {
+            self.runtime.log.push(LogLine {
+                text: "emit: the back side needs a back outline Gerber — it frames \
+                       the mirrored job so both sides align on the flipped board"
+                    .into(),
+                err: true,
+            });
+            return;
+        }
         let mut args: Vec<String> = vec![
             "emit".into(),
             "--copper".into(),
             copper,
             "--lbrn2".into(),
-            crate::clean_path(&self.job.emit_lbrn2),
+            crate::clean_path(self.active_lbrn2()),
             "--offset-mm".into(),
             format!("{}", self.job.offset_mm),
             "--speed-mm-s".into(),
@@ -392,11 +451,6 @@ impl ConsoleApp {
                 CentralTab::Fiducials,
                 "◎ Fiducial check",
             );
-            ui.selectable_value(
-                &mut self.runtime.tab,
-                CentralTab::Place,
-                "✋ Place on board",
-            );
         });
         ui.separator();
         match self.runtime.tab {
@@ -404,11 +458,14 @@ impl ConsoleApp {
             CentralTab::Camera => self.camera_view(ui),
             CentralTab::Calibrate => self.calibrate_view(ui),
             CentralTab::Fiducials => self.fiducial_view(ui),
-            CentralTab::Place => self.place_view(ui),
         }
     }
 
     pub(super) fn job_view(&mut self, ui: &mut egui::Ui) {
+        // The job's output destinations live here, beside the Gerbers that feed
+        // them, now that the Place tab that used to hold them is gone.
+        self.placement_paths_form(ui);
+        ui.separator();
         ui.label(egui::RichText::new(&self.job.preview_note).weak());
         if let Some(tex) = self.job.preview_tex.clone() {
             self.show_image(ui, "preview", &tex);

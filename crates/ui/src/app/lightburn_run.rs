@@ -156,13 +156,19 @@ impl ConsoleApp {
     }
 
     /// The place-section token for `debug_summary`: `idle` (nothing queued or
-    /// running), `pending` (queued behind the export verb), or the active/last
-    /// run's [`token`](LightburnRun::token).
+    /// running), `pending` (a load+START queued behind the export verb),
+    /// `pending-load` (a load-only hand-off queued — it can never press START),
+    /// or the active/last run's [`token`](LightburnRun::token). The two pending
+    /// states are distinct because whether a queued hand-off can fire the laser
+    /// is the one thing a headless `state` dump must not have to guess.
     pub(super) fn lightburn_token(&self) -> String {
         match &self.runtime.lightburn_run {
             Some(run) => run.token(),
-            None if self.runtime.pending_lightburn.is_some() => "pending".into(),
-            None => "idle".into(),
+            None => match &self.runtime.pending_lightburn {
+                Some(p) if p.start => "pending".into(),
+                Some(_) => "pending-load".into(),
+                None => "idle".into(),
+            },
         }
     }
 }

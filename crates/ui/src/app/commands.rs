@@ -48,9 +48,28 @@ impl ConsoleApp {
         if self.runtime.log.len() > 500 {
             let drop = self.runtime.log.len() - 500;
             self.runtime.log.drain(0..drop);
+            // The trim shifts every index down, including the diagnostic
+            // mirror's cursor — leaving it alone would skip lines (or index
+            // past the end).
+            self.runtime.diag_mirrored = self.runtime.diag_mirrored.saturating_sub(drop);
         }
         if finished {
             self.runtime.verb_job = None;
+            // Measure what the export actually wrote, now that the verb has
+            // reported. A failed run is worth a record too: the readback says
+            // the file is stale or missing rather than silently vanishing.
+            if let Some(readback) = self.runtime.diag_readback.take() {
+                if succeeded {
+                    self.diag_export_readback(&readback);
+                } else {
+                    self.diag(&format!(
+                        "export-readback check={} kind={} out={} skipped: the export verb failed",
+                        readback.check,
+                        readback.kind,
+                        readback.path.display()
+                    ));
+                }
+            }
             self.refresh();
             self.chain_lightburn_after_verb(succeeded);
         } else {
@@ -58,11 +77,13 @@ impl ConsoleApp {
         }
     }
 
-    /// After a verb finishes, kick off a queued "run in LightBurn" if the
-    /// placement export requested one. A failed export skips the run (and says
-    /// so); a success spawns the [`LightburnRun`], unless one is already going.
+    /// After a verb finishes, kick off a queued LightBurn hand-off if the
+    /// export requested one. A failed export skips it (and says so); a success
+    /// spawns the [`LightburnRun`], unless one is already going. A hand-off with
+    /// `start == false` is LOAD-ONLY: the file opens in LightBurn and START is
+    /// never sent, so the click that queued it cannot fire the laser.
     pub(super) fn chain_lightburn_after_verb(&mut self, succeeded: bool) {
-        let Some(path) = self.runtime.pending_lightburn.take() else {
+        let Some(pending) = self.runtime.pending_lightburn.take() else {
             return;
         };
         if !succeeded {
@@ -84,15 +105,27 @@ impl ConsoleApp {
             });
             return;
         }
+        let PendingLightburn { path, start } = pending;
         let device = self.placement.lightburn_device.clone();
         self.runtime.log.push(LogLine {
-            text: format!(
-                "LightBurn: loading {} and running on {device}",
-                path.display()
-            ),
+            text: if start {
+                format!(
+                    "LightBurn: loading {} and running on {device}",
+                    path.display()
+                )
+            } else {
+                format!(
+                    "LightBurn: loading {} on {device} — NOT starting it (press ▶ there to burn)",
+                    path.display()
+                )
+            },
             err: false,
         });
-        self.runtime.lightburn_run = Some(spawn_lightburn_run(path, device));
+        self.runtime.lightburn_run = Some(if start {
+            spawn_lightburn_run(path, device)
+        } else {
+            spawn_lightburn_load(path, device)
+        });
     }
 
     /// (Re)build the preview texture from the active side's Gerbers (the back

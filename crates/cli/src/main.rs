@@ -247,7 +247,10 @@ enum Command {
 
         /// Mirror the design in X for the back side of a double-sided board
         /// (KiCad exports B.Cu in top-view coords; flipping the board
-        /// left-right needs the design mirrored to match). Winding is preserved.
+        /// left-right needs the design mirrored to match). Winding is
+        /// preserved. Requires --outline: the outline is what puts front and
+        /// back in the same frame — without it each side is framed on its own
+        /// copper extents and the two jobs will not align.
         #[arg(long)]
         mirror_x: bool,
 
@@ -432,9 +435,34 @@ enum Command {
         /// only --w-mm.
         #[arg(long, default_value_t = 0.0)]
         h_mm: f64,
+        /// Hole rendering: "line" traces each hole outline as a vector cut
+        /// (the drill treatment, and the default here — a fiducial hole is
+        /// drilled, not engraved), "fill" ablates each hole as a filled disc.
+        #[arg(long, default_value = "line")]
+        mode: String,
         /// LightBurn device name.
         #[arg(long, default_value = lbrn2::DEFAULT_DEVICE)]
         device: String,
+
+        // --- process recipe (see docs/lbrn2-schema.md) ---
+        /// Max power %.
+        #[arg(long, default_value_t = 20.0)]
+        power_pct: f64,
+        /// Scan speed, mm/s.
+        #[arg(long, default_value_t = 1000.0)]
+        speed_mm_s: f64,
+        /// Frequency, kHz (written to the file in Hz).
+        #[arg(long, default_value_t = 30.0)]
+        frequency_khz: f64,
+        /// MOPA Q-pulse width, ns (a fluence knob; 0 = source default).
+        #[arg(long, default_value_t = 1)]
+        pulse_ns: u32,
+        /// Passes.
+        #[arg(long, default_value_t = 1)]
+        passes: u32,
+        /// Fill line interval, mm (fill mode only).
+        #[arg(long, default_value_t = 0.03)]
+        interval_mm: f64,
 
         /// Laser-field calibration map. When given, every production edge is
         /// densified and pre-warped from desired physical mm to commanded mm
@@ -517,13 +545,15 @@ enum Command {
     },
     /// Export the copper + outline Gerbers a job needs from a KiCad project,
     /// via kicad-cli. Point it at a `.kicad_pcb` (or a project directory with
-    /// one) and it writes `copper.gbr` + `outline.gbr` into `--out`.
+    /// one) and it writes `copper-<layer>.gbr` + `outline.gbr` into `--out`.
     Gerbers {
         /// KiCad board (`.kicad_pcb`) or a project directory containing one.
         #[arg(long)]
         project: PathBuf,
 
-        /// Output directory for `copper.gbr` + `outline.gbr`.
+        /// Output directory for `copper-<layer>.gbr` + `outline.gbr` — the
+        /// copper name carries its layer, so a front and a back export can
+        /// share one directory.
         #[arg(long, default_value = ".")]
         out: PathBuf,
 
@@ -824,19 +854,35 @@ fn run(cli: &Cli) -> Result<(), Box<dyn std::error::Error>> {
             shape,
             w_mm,
             h_mm,
+            mode,
             device,
+            power_pct,
+            speed_mm_s,
+            frequency_khz,
+            pulse_ns,
+            passes,
+            interval_mm,
             field_map,
             field_seg_mm,
-        } => fid_holes_cmd(
+        } => fid_holes_cmd(FidHolesArgs {
             out,
             layout,
             shape,
-            *w_mm,
-            *h_mm,
+            w_mm: *w_mm,
+            h_mm: *h_mm,
+            mode,
             device,
-            field_map.as_deref(),
-            *field_seg_mm,
-        ),
+            params: AblationParams {
+                power_pct: *power_pct,
+                speed_mm_s: *speed_mm_s,
+                frequency_khz: *frequency_khz,
+                pulse_ns: *pulse_ns,
+                passes: *passes,
+            },
+            interval_mm: *interval_mm,
+            field_map: field_map.as_deref(),
+            field_seg_mm: *field_seg_mm,
+        }),
         Command::Cam {
             list,
             grab,
@@ -1272,13 +1318,17 @@ fn warp_polys(
             let field = load_field_map(path)?;
             validate_field_segment(field_seg_mm)?;
             eprintln!(
-                "{tag}: field warp on (fit RMS {:.1} µm, worst {:.1} µm), edges ≤{:.2} mm",
-                field.rms_um, field.max_um, field_seg_mm
+                "{tag}: field warp on (fit RMS {:.1} µm, worst {:.1} µm), edges ≤{:.2} mm{}",
+                field.rms_um,
+                field.max_um,
+                field_seg_mm,
+                field_bounds_note(&field)
             );
             cam::register::transform_shapes_field(
                 &polys,
                 &cam::register::Affine2::identity(),
                 field_seg_mm,
+                field.calib_mm_bounds,
                 |x, y| field.precompensate(x, y),
             )
             .map_err(|e| format!("{tag}: field warp refused — {e}"))?
@@ -1295,59 +1345,70 @@ fn warp_polys(
     })
 }
 
-/// `pcbforge fid-holes` — burn fiducial holes at operator-supplied positions.
-// The arguments mirror the clap variant one-for-one; grouping them into a
-// struct would only duplicate the flag definitions.
-#[allow(clippy::too_many_arguments)]
-fn fid_holes_cmd(
-    out: &std::path::Path,
-    layout: &str,
-    shape: &str,
+struct FidHolesArgs<'a> {
+    out: &'a std::path::Path,
+    layout: &'a str,
+    shape: &'a str,
     w_mm: f64,
     h_mm: f64,
-    device: &str,
-    field_map: Option<&std::path::Path>,
+    mode: &'a str,
+    device: &'a str,
+    params: AblationParams,
+    interval_mm: f64,
+    field_map: Option<&'a std::path::Path>,
     field_seg_mm: f64,
-) -> Result<(), Box<dyn std::error::Error>> {
-    if shape != "circle" && shape != "rect" {
-        return Err(format!("--shape must be \"circle\" or \"rect\", got {shape:?}").into());
+}
+
+/// `pcbforge fid-holes` — emit fiducial holes at operator-supplied positions.
+/// Same drill treatment as `drill-emit`: a Line layer traces each hole outline
+/// by default, and the process recipe comes from the caller rather than a
+/// baked-in one, so the holes burn at the settings the operator drills at.
+fn fid_holes_cmd(a: FidHolesArgs) -> Result<(), Box<dyn std::error::Error>> {
+    if a.shape != "circle" && a.shape != "rect" {
+        return Err(format!("--shape must be \"circle\" or \"rect\", got {:?}", a.shape).into());
     }
+    if a.mode != "fill" && a.mode != "line" {
+        return Err(format!("--mode must be \"fill\" or \"line\", got {:?}", a.mode).into());
+    }
+    let (shape, w_mm) = (a.shape, a.w_mm);
     if w_mm <= 0.0 {
         return Err("--w-mm must be positive".into());
     }
-    if shape == "circle" && h_mm != 0.0 && h_mm != w_mm {
+    if shape == "circle" && a.h_mm != 0.0 && a.h_mm != w_mm {
         return Err(
             "--h-mm is ignored for --shape circle (circles take only --w-mm); \
                      pass 0 or omit it, or match --w-mm"
                 .into(),
         );
     }
-    let resolved_h = if h_mm == 0.0 { w_mm } else { h_mm };
+    let resolved_h = if a.h_mm == 0.0 { w_mm } else { a.h_mm };
     if resolved_h <= 0.0 {
         return Err("--h-mm must be positive".into());
     }
-    if layout.trim().is_empty() {
+    if a.layout.trim().is_empty() {
         return Err("--layout must not be empty".into());
     }
-    let positions = parse_fid_layout(layout)?;
+    let positions = parse_fid_layout(a.layout)?;
 
     let polys = fid_holes_polys(shape, w_mm, resolved_h, &positions);
-    let polys = warp_polys("fid holes", polys, field_map, field_seg_mm)?;
-    let params = AblationParams {
-        power_pct: 20.0,
-        speed_mm_s: 1000.0,
-        frequency_khz: 30.0,
-        pulse_ns: 1,
-        passes: 1,
+    let polys = warp_polys("fid holes", polys, a.field_map, a.field_seg_mm)?;
+    let elems = lbrn2::polys_to_elems(&polys);
+    let layer = if a.mode == "fill" {
+        let mut layer = EmitLayer::fill("FID", a.params, elems);
+        layer.interval_mm = a.interval_mm;
+        layer
+    } else {
+        EmitLayer::line("FID", a.params, elems)
     };
-    let layer = EmitLayer::fill("FID", params, lbrn2::polys_to_elems(&polys));
+    let out = a.out;
     if let Some(dir) = out.parent().filter(|d| !d.as_os_str().is_empty()) {
         std::fs::create_dir_all(dir).ok();
     }
-    lbrn2::write_lbrn2(device, &[layer], out)?;
+    lbrn2::write_lbrn2(a.device, &[layer], out)?;
     eprintln!(
-        "fid holes: {} {shape} hole(s), {w_mm}×{resolved_h} mm",
-        positions.len()
+        "fid holes: {} {shape} hole(s), {w_mm}×{resolved_h} mm -> {} layer",
+        positions.len(),
+        if a.mode == "fill" { "Fill" } else { "Line" }
     );
     // Print the absolute path so it's findable regardless of the working dir.
     let abs = std::path::absolute(out).unwrap_or_else(|_| out.to_path_buf());
@@ -1602,6 +1663,21 @@ struct BuiltJob {
     shapes: Vec<pcb_core::Poly>,
 }
 
+/// The region a field map was fit over, for the "field warp on" log line. Says
+/// so explicitly when the map carries no bounds: that map cannot be gated, and
+/// the operator should know the outer field is being extrapolated on trust.
+fn field_bounds_note(field: &vision::FieldMap) -> String {
+    match field.calib_mm_bounds {
+        Some([x0, y0, x1, y1]) => format!(
+            ", calibrated over ({x0:.1}..{x1:.1}, {y0:.1}..{y1:.1}) mm — geometry \
+             outside it is refused"
+        ),
+        None => ", calibrated region UNKNOWN (map predates the bounds line) — \
+                 geometry outside the fitted dots cannot be refused"
+            .to_string(),
+    }
+}
+
 fn load_field_map(path: &std::path::Path) -> Result<vision::FieldMap, Box<dyn std::error::Error>> {
     let field = vision::FieldMap::parse(&std::fs::read_to_string(path)?)
         .map_err(|e| format!("field map {}: {e}", path.display()))?;
@@ -1676,6 +1752,18 @@ fn build_job(
 /// FlatCAM-replacement inversion (like `noncopper`) piped straight into a
 /// press-play LightBurn file.
 fn emit_cmd(a: EmitArgs) -> Result<(), Box<dyn std::error::Error>> {
+    // Fail closed before reading anything: without an outline the board region
+    // is the copper's own bbox, so front and back are cornered on *different*
+    // extents (min x of F.Cu vs max x of B.Cu) and the two jobs silently land
+    // in unrelated frames. The outline is what gives both sides one frame.
+    if a.mirror_x && a.outline.is_none() {
+        return Err(
+            "emit: --mirror-x requires --outline — without a board outline the \
+                    front and back jobs are framed on their own copper extents and will \
+                    not align on the flipped board"
+                .into(),
+        );
+    }
     let job = build_job(
         a.copper,
         a.outline,
@@ -1718,13 +1806,17 @@ fn emit_cmd(a: EmitArgs) -> Result<(), Box<dyn std::error::Error>> {
             let field = load_field_map(path)?;
             validate_field_segment(a.field_seg_mm)?;
             eprintln!(
-                "emit: field warp on (fit RMS {:.1} µm, worst {:.1} µm), edges ≤{:.2} mm",
-                field.rms_um, field.max_um, a.field_seg_mm
+                "emit: field warp on (fit RMS {:.1} µm, worst {:.1} µm), edges ≤{:.2} mm{}",
+                field.rms_um,
+                field.max_um,
+                a.field_seg_mm,
+                field_bounds_note(&field)
             );
             cam::register::transform_shapes_field(
                 &shapes,
                 &cam::register::Affine2::identity(),
                 a.field_seg_mm,
+                field.calib_mm_bounds,
                 |x, y| field.precompensate(x, y),
             )
             .map_err(|e| format!("emit: field warp refused — {e}"))?
@@ -1813,11 +1905,15 @@ fn register_cmd(a: RegisterArgs) -> Result<(), Box<dyn std::error::Error>> {
     }
 
     let fit = vision::fit_affine(&pairs).map_err(|e| e.to_string())?;
-    eprintln!(
-        "register: fit {} fiducials, residual RMS {:.1} µm",
-        pairs.len(),
-        fit.rms * 1000.0
-    );
+    if pairs.len() == 3 {
+        eprintln!("register: exact 3-point fit (no redundancy - residual is not a check)");
+    } else {
+        eprintln!(
+            "register: fit {} fiducials, residual RMS {:.1} µm",
+            pairs.len(),
+            fit.rms * 1000.0
+        );
+    }
     // Fail closed: `NaN > x` is false, so a plain `>` would wave a NaN fit
     // straight through the acceptance gate and into machine coordinates.
     if !fit.rms.is_finite() || fit.rms > a.max_rms_mm {
@@ -1867,14 +1963,18 @@ fn register_cmd(a: RegisterArgs) -> Result<(), Box<dyn std::error::Error>> {
             let field = load_field_map(path)?;
             validate_field_segment(a.field_seg_mm)?;
             eprintln!(
-                "register: field warp on (fit RMS {:.1} µm, worst {:.1} µm), edges ≤{:.2} mm",
-                field.rms_um, field.max_um, a.field_seg_mm
+                "register: field warp on (fit RMS {:.1} µm, worst {:.1} µm), edges ≤{:.2} mm{}",
+                field.rms_um,
+                field.max_um,
+                a.field_seg_mm,
+                field_bounds_note(&field)
             );
             (
                 cam::register::transform_shapes_field(
                     &job.shapes,
                     &affine,
                     a.field_seg_mm,
+                    field.calib_mm_bounds,
                     |x, y| field.precompensate(x, y),
                 )
                 .map_err(|e| format!("register: field warp refused — {e}"))?,
@@ -2603,10 +2703,20 @@ mod tests {
             .collect();
         let dir = std::env::temp_dir().join(format!("pcbforge-extrap-{}", std::process::id()));
         std::fs::create_dir_all(&dir).unwrap();
+        let text = vision::fit_field(&pairs).unwrap().serialize();
+        // A map that does not record what it was fit over — the pre-bounds file
+        // format — is the only way to reach the envelope check at all now: with
+        // bounds the job is refused before the polynomial is ever evaluated.
+        let legacy: String = text
+            .lines()
+            .filter(|l| !l.starts_with("calib_mm_bounds "))
+            .map(|l| format!("{l}\n"))
+            .collect();
         let path = dir.join("cubic-field.txt");
-        std::fs::write(&path, vision::fit_field(&pairs).unwrap().serialize()).unwrap();
+        std::fs::write(&path, &legacy).unwrap();
         // Loads fine: finite coefficients, usable normalization.
-        assert!(load_field_map(&path).is_ok());
+        let loaded = load_field_map(&path).expect("legacy map without bounds still loads");
+        assert!(loaded.calib_mm_bounds.is_none(), "no bounds to gate on");
 
         let polys = fid_holes_polys("rect", 2.0, 3.0, &[(5000.0, 5000.0)]);
         let err = warp_polys("fid holes", polys, Some(path.as_path()), 0.25)
@@ -2614,6 +2724,43 @@ mod tests {
             .to_string();
         assert!(err.starts_with("fid holes: field warp refused"), "{err}");
         assert!(err.contains("sanity envelope"), "{err}");
+    }
+
+    /// The same map WITH its fitted region refuses earlier and says why: the
+    /// polynomial is not a measurement out there, so it is never evaluated.
+    #[test]
+    fn warp_polys_refuses_geometry_outside_the_fitted_region() {
+        use nalgebra::Point2;
+        let pairs: Vec<_> = (0..5)
+            .flat_map(|row| {
+                (0..5).map(move |col| {
+                    let (x, y) = (col as f64 * 5.0, row as f64 * 5.0);
+                    (Point2::new(x, y), Point2::new(x + 1.0, y))
+                })
+            })
+            .collect();
+        let field = vision::fit_field(&pairs).expect("fits");
+        assert_eq!(
+            field.calib_mm_bounds,
+            Some([0.0, 0.0, 20.0, 20.0]),
+            "the fit records the span it covered"
+        );
+        let dir = std::env::temp_dir().join(format!("pcbforge-bounds-{}", std::process::id()));
+        std::fs::create_dir_all(&dir).unwrap();
+        let path = dir.join("bounded-field.txt");
+        std::fs::write(&path, field.serialize()).unwrap();
+
+        // Inside the fitted box: warps, as the operator's real job does.
+        let inside = fid_holes_polys("rect", 2.0, 3.0, &[(10.0, 10.0)]);
+        assert!(warp_polys("fid holes", inside, Some(path.as_path()), 0.25).is_ok());
+
+        // Outside it: refused, naming the offending vertex and the box.
+        let outside = fid_holes_polys("rect", 2.0, 3.0, &[(60.0, 10.0)]);
+        let err = warp_polys("fid holes", outside, Some(path.as_path()), 0.25)
+            .expect_err("geometry outside the fitted region must refuse the job")
+            .to_string();
+        assert!(err.contains("calibrated region"), "{err}");
+        assert!(err.contains("0.000..20.000"), "names the box: {err}");
     }
 
     #[test]

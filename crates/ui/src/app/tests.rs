@@ -20,8 +20,12 @@ fn tmp_db() -> PathBuf {
 }
 
 fn nonlinear_app() -> ConsoleApp {
+    nonlinear_app_with_db(&tmp_db())
+}
+
+fn nonlinear_app_with_db(db: &std::path::Path) -> ConsoleApp {
     use nalgebra::{Matrix3, Point2, Vector2};
-    let mut app = ConsoleApp::new(tmp_db(), vec!["true".into()]);
+    let mut app = ConsoleApp::new(db.to_path_buf(), vec!["true".into()]);
     let coords = [0.0, 20.0, 40.0, 60.0];
     let lens_pairs: Vec<_> = coords
         .iter()
@@ -60,6 +64,7 @@ fn nonlinear_app() -> ConsoleApp {
                     .sqrt()
                     * 1000.0,
                 resid_um: 0.0,
+                rejected: false,
             }
         })
         .collect();
@@ -88,6 +93,8 @@ fn nonlinear_app() -> ConsoleApp {
         ),
         scale: 1.0,
         extrapolated: 0,
+        rejected: 0,
+        rejection_note: String::new(),
     });
     app.calibration.field_accepted = true;
     app.calibration.lens_frame_signature = Some(((800, 800), Orientation::Normal));
@@ -112,6 +119,72 @@ fn accepted_field_composes_machine_overlay_and_uses_physical_place_projection() 
     ));
 }
 
+/// The exclusion count survives a restart. A restored field map that only
+/// passed because a dot was thrown away must not come back indistinguishable
+/// from a clean pass — the same argument that persists the fit mode.
+#[test]
+fn the_excluded_dot_count_survives_a_restart() {
+    let db = tmp_db();
+    let blob = {
+        let mut a = nonlinear_app_with_db(&db);
+        let cal = a.calibration.field.as_mut().unwrap();
+        cal.rejected = 2;
+        a.calibration.field_accepted = true;
+        std::fs::write(
+            a.field_map_path(),
+            a.calibration.field.as_ref().unwrap().field.serialize(),
+        )
+        .unwrap();
+        a.save_settings_if_changed();
+        a.settings_blob()
+    };
+    assert!(
+        blob.lines()
+            .any(|l| l.starts_with("field_stats=") && l.trim_end().ends_with(" 2")),
+        "the count serializes as the 5th field_stats token:
+{blob}"
+    );
+
+    let b = ConsoleApp::new(db, vec!["true".into()]);
+    let restored = b.calibration.field.as_ref().expect("field restored");
+    assert_eq!(restored.rejected, 2);
+    assert!(
+        restored.rejection_note.contains("EXCLUDED"),
+        "note: {}",
+        restored.rejection_note
+    );
+    assert!(b.debug_summary().contains("rejected=2"));
+}
+
+/// A field fit that only passed because a dot was excluded must not read the
+/// same as one that passed outright: the count reaches `debug_summary`, and the
+/// calib crate's sentence reaches the ③ block through the standing status.
+#[test]
+fn excluded_field_dots_are_reported_to_the_operator() {
+    let mut app = nonlinear_app();
+    assert!(app.debug_summary().contains("rejected=0"));
+
+    {
+        let cal = app.calibration.field.as_mut().unwrap();
+        cal.rejected = 1;
+        cal.dots[0].rejected = true;
+        cal.rejection_note =
+            "1 of 16 dots EXCLUDED from the fit as outliers (residual 2075 µm)".into();
+    }
+    app.calibration.field_accepted = true;
+    app.calibration.mode = CalibMode::LaserField;
+    app.runtime.tab = CentralTab::Calibrate;
+
+    // Renders without panicking on a fit carrying excluded dots: the overlay's
+    // strike-out path and the standing exclusion line. The strings themselves
+    // are not asserted here — the ③ block lives inside a fixed-height
+    // ScrollArea, so its text is clipped out of the shape list.
+    let ctx = egui::Context::default();
+    let out = ctx.run(egui::RawInput::default(), |ctx| app.ui(ctx));
+    assert!(!out.shapes.is_empty());
+    assert!(app.debug_summary().contains("rejected=1"));
+}
+
 #[test]
 fn place_with_no_calibration_at_all_has_no_projection() {
     let app = ConsoleApp::new(tmp_db(), vec!["true".into()]);
@@ -119,81 +192,57 @@ fn place_with_no_calibration_at_all_has_no_projection() {
     assert!(error.contains("needs a projection"), "got: {error}");
 }
 
-/// With no projection at all, "Load frame + job" still displays the bare
-/// frame (so the operator sees what loaded) and says what calibration is
-/// missing, instead of showing nothing.
+/// With no projection at all, "⤵ Load design" still loads the geometry and
+/// parks it in the middle of the WORK AREA — a position the operator can drag
+/// from — instead of refusing because nothing can be mapped yet.
 #[test]
-fn load_place_without_any_calibration_still_shows_the_frame() {
+fn load_design_without_any_calibration_centers_on_the_work_area() {
     let mut app = ConsoleApp::new(tmp_db(), vec!["true".into()]);
-    let dir = std::env::temp_dir().join(format!("pcbforge-place-test-{}", std::process::id()));
-    std::fs::create_dir_all(&dir).unwrap();
-    let frame = dir.join("frame.png");
-    image::GrayImage::from_pixel(64, 48, image::Luma([90]))
-        .save(&frame)
-        .unwrap();
-    // A dead camera source (File("")) so the grab-first path falls back to
-    // the bed-frame file without touching real hardware in tests.
-    app.camera.use_device = false;
-    app.camera.file = String::new();
-    app.placement.frame = frame.to_string_lossy().into_owned();
+    app.camera.field_center_auto = false;
+    app.camera.field_cx_mm = 42.0;
+    app.camera.field_cy_mm = 17.0;
     let fixtures = concat!(env!("CARGO_MANIFEST_DIR"), "/../cli/tests/fixtures");
     app.job.emit_copper = format!("{fixtures}/uv_test-F_Cu.gbr");
     app.job.emit_outline = format!("{fixtures}/uv_test-Edge_Cuts.gbr");
-    let ctx = Context::default();
-    let _ = ctx.run(egui::RawInput::default(), |ctx| app.load_place(ctx));
-    assert!(app.placement.frame_img.is_some(), "frame image cached");
-    assert!(app.placement.tex.is_some(), "bare frame texture shown");
+    app.load_place();
+    assert!(!app.placement.job.is_empty(), "the design geometry loaded");
     assert!(
-        app.placement.note.contains("needs calibration"),
-        "note explains the gap: {}",
+        (app.placement.tx_mm - 42.0).abs() < 1e-9 && (app.placement.ty_mm - 17.0).abs() < 1e-9,
+        "parked on the work-area centre: ({}, {})",
+        app.placement.tx_mm,
+        app.placement.ty_mm
+    );
+    assert!(
+        app.placement.note.contains("work area"),
+        "note says where it went: {}",
         app.placement.note
     );
-    std::fs::remove_dir_all(dir).unwrap();
 }
 
-/// "Load frame + job" ALWAYS grabs a fresh frame from the camera source (a
-/// File source here) — even when a bed-frame path is set. The persisted path
-/// must not silently win over the camera, or Place keeps showing a stale
-/// image of the bed (the file is only the fallback when the grab fails).
+/// With a fiducial frame loaded, "⤵ Load design" starts the design in the
+/// middle of THAT frame, mapped through the same projection the outline is
+/// drawn with — so it appears where the operator is looking.
 #[test]
-fn load_place_prefers_a_fresh_camera_grab_over_the_saved_frame_path() {
-    let mut app = ConsoleApp::new(tmp_db(), vec!["true".into()]);
-    let dir = std::env::temp_dir().join(format!("pcbforge-place-cam-{}", std::process::id()));
-    std::fs::create_dir_all(&dir).unwrap();
-    let cam = dir.join("cam.png");
-    image::GrayImage::from_pixel(64, 48, image::Luma([90]))
-        .save(&cam)
-        .unwrap();
-    app.camera.use_device = false;
-    app.camera.file = cam.to_string_lossy().into_owned();
-    // A stale saved bed-frame path of a DIFFERENT size: the camera grab must
-    // win, which the cached frame's dimensions prove below.
-    let stale = dir.join("stale.png");
-    image::GrayImage::from_pixel(32, 32, image::Luma([40]))
-        .save(&stale)
-        .unwrap();
-    app.placement.frame = stale.to_string_lossy().into_owned();
+fn load_design_centers_on_the_fiducial_frame_when_there_is_one() {
+    let mut app = nonlinear_app();
+    app.fiducials.frame_img = Some(image::GrayImage::new(800, 800));
     let fixtures = concat!(env!("CARGO_MANIFEST_DIR"), "/../cli/tests/fixtures");
     app.job.emit_copper = format!("{fixtures}/uv_test-F_Cu.gbr");
     app.job.emit_outline = format!("{fixtures}/uv_test-Edge_Cuts.gbr");
-    let ctx = Context::default();
-    let _ = ctx.run(egui::RawInput::default(), |ctx| app.load_place(ctx));
-    let frame = app
-        .placement
-        .frame_img
-        .as_ref()
-        .expect("camera frame cached");
-    assert_eq!(
-        (frame.width(), frame.height()),
-        (64, 48),
-        "the fresh camera grab won over the stale bed-frame file"
+    app.load_place();
+    let center = app.initial_center_mm(800.0, 800.0).unwrap();
+    assert!(
+        (app.placement.tx_mm - center.0).abs() < 1e-9
+            && (app.placement.ty_mm - center.1).abs() < 1e-9,
+        "started on the frame centre: ({}, {}) vs {center:?}",
+        app.placement.tx_mm,
+        app.placement.ty_mm
     );
     assert!(
-        app.placement.note.contains("needs calibration"),
-        "note explains the gap: {}",
+        app.placement.note.contains("fiducial frame"),
+        "note says where it went: {}",
         app.placement.note
     );
-    std::fs::remove_dir_all(dir).unwrap();
 }
 
 /// A saved ② laser anchor gives Place an approximate homography preview;
@@ -219,7 +268,7 @@ fn anchor_only_place_previews_and_exports_unwarped_with_warning() {
     ));
 
     app.placement.job = vec![pcb_core::Poly::default()];
-    app.placement.frame_img = Some(image::GrayImage::new(800, 800));
+    app.fiducials.frame_img = Some(image::GrayImage::new(800, 800));
     app.job.emit_copper = "board.gbr".into();
     app.emit_at_placement(false);
     assert!(
@@ -253,11 +302,10 @@ fn invalid_nonlinear_projection_fails_closed_without_homography_fallback() {
 fn field_corrected_emit_with_a_missing_map_file_warns_and_emits_unwarped() {
     let mut app = nonlinear_app();
     app.placement.job = vec![pcb_core::Poly::default()];
-    app.placement.frame_img = Some(image::GrayImage::new(800, 800));
+    app.fiducials.frame_img = Some(image::GrayImage::new(800, 800));
     app.job.emit_copper = "board.gbr".into();
     assert!(!app.field_map_path().exists());
     app.emit_at_placement(false);
-    assert!(!app.placement.field_correct, "field warp is not armed");
     assert!(
         app.runtime
             .log
@@ -278,13 +326,12 @@ fn field_corrected_emit_with_a_missing_map_file_warns_and_emits_unwarped() {
 fn place_export_always_arms_the_field_warp_when_the_map_exists() {
     let mut app = nonlinear_app();
     app.placement.job = vec![pcb_core::Poly::default()];
-    app.placement.frame_img = Some(image::GrayImage::new(800, 800));
+    app.fiducials.frame_img = Some(image::GrayImage::new(800, 800));
     app.job.emit_copper = "board.gbr".into();
     let map = app.calibration.field.as_ref().unwrap().field.serialize();
     std::fs::write(app.field_map_path(), map).unwrap();
 
     app.emit_at_placement(false);
-    assert!(app.placement.field_correct);
     assert!(
         app.runtime
             .log
@@ -445,20 +492,22 @@ fn fiducial_tab_lays_out_with_rect_shape() {
     );
 }
 
-/// The Place-on-board tab lays out headless (form + placement controls).
+/// The Job tab lays out headless with the placement path fields it inherited
+/// from the deleted Place tab, and the Actions panel carries the placement
+/// controls that came with them.
 #[test]
-fn place_tab_lays_out_headless() {
+fn job_tab_lays_out_with_the_placement_paths_and_actions() {
     let mut app = ConsoleApp::new(tmp_db(), vec!["true".into()]);
-    app.runtime.tab = CentralTab::Place;
+    app.runtime.tab = CentralTab::Job;
     let ctx = Context::default();
     let out = ctx.run(egui::RawInput::default(), |ctx| app.ui(ctx));
-    assert!(!out.shapes.is_empty(), "place tab must render");
+    assert!(!out.shapes.is_empty(), "job tab must render");
 }
 
-/// The fiducial check runs straight off the camera: "Grab & check" pulls
+/// The fiducial check runs straight off the camera: "📷 Load frame" pulls
 /// one frame from the camera source (a File source here — the same
 /// contract a capture app fulfills) and detects on it in one step, and
-/// "Check fiducials" with no frame file falls back to the camera too.
+/// "Check fiducials" with no frame in memory goes to the camera too.
 #[test]
 fn fiducial_check_grabs_from_the_camera() {
     let dir = std::env::temp_dir().join(format!("ui-fidgrab-{}", std::process::id()));
@@ -519,6 +568,224 @@ fn fiducial_check_grabs_from_the_camera() {
         app3.fiducials.note.starts_with("camera:"),
         "camera error surfaced: {}",
         app3.fiducials.note
+    );
+}
+
+/// A path left in the frame-file field does NOT divert the check. Check is
+/// camera-first unconditionally now: a stale path used to win, so the console
+/// decoded some old image while the board sat under the camera unlooked-at.
+/// The file is reachable only through its own ⤵ from file button.
+#[test]
+fn check_ignores_a_stale_frame_path_and_uses_the_camera() {
+    let dir = std::env::temp_dir().join(format!("ui-fidstale-{}", std::process::id()));
+    std::fs::create_dir_all(&dir).unwrap();
+    let ppm = 10.0;
+    let holes = [(10.0, 10.0), (60.0, 10.0), (10.0, 60.0)];
+    // What the camera sees, and a stale saved image of nothing at all.
+    let cam = dir.join("bed-now.png");
+    write_hole_frame(&cam, ppm, &holes);
+    let stale = dir.join("stale.png");
+    image::GrayImage::from_pixel(48, 32, image::Luma([200]))
+        .save(&stale)
+        .unwrap();
+
+    let mut app = ConsoleApp::new(tmp_db(), vec!["true".into()]);
+    app.camera.use_device = false;
+    app.camera.file = cam.to_string_lossy().into();
+    app.fiducials.frame = stale.to_string_lossy().into();
+    app.fiducials.layout = "10,10; 60,10; 10,60".into();
+    app.fiducials.px_per_mm = ppm;
+    let ctx = Context::default();
+    app.render_fiducials(&ctx);
+
+    assert_eq!(
+        app.fiducials.frame_img.as_ref().map(|f| f.dimensions()),
+        Some((700, 700)),
+        "the camera frame was installed, not the 48×32 file: {}",
+        app.fiducials.note
+    );
+    assert_eq!(
+        app.fiducials.found.iter().filter(|f| f.is_some()).count(),
+        3,
+        "Check detected on the camera frame: {:?}",
+        app.fiducials.rows
+    );
+
+    // …and with the camera dead, Check says so — it does not silently fall
+    // back to the file the operator can still see in the field.
+    let mut blind = ConsoleApp::new(tmp_db(), vec!["true".into()]);
+    blind.camera.use_device = false;
+    blind.camera.file = String::new();
+    blind.fiducials.frame = stale.to_string_lossy().into();
+    blind.fiducials.layout = "10,10; 60,10; 10,60".into();
+    blind.render_fiducials(&ctx);
+    assert!(
+        blind.fiducials.note.starts_with("camera:") && blind.fiducials.frame_img.is_none(),
+        "the camera's own error is what Check reports: {}",
+        blind.fiducials.note
+    );
+}
+
+/// Frames are resolution-checked where they enter the tab. A saved image that
+/// does not match the lens calibration is refused outright — named, with both
+/// resolutions — instead of being installed to fail several steps later in the
+/// placement projection, which knows nothing about where the frame came from.
+#[test]
+fn a_file_frame_that_does_not_match_the_calibration_is_refused_by_name() {
+    let dir = std::env::temp_dir().join(format!("ui-fidres-{}", std::process::id()));
+    std::fs::create_dir_all(&dir).unwrap();
+    let path = dir.join("not-a-frame.png");
+    image::GrayImage::from_pixel(48, 32, image::Luma([200]))
+        .save(&path)
+        .unwrap();
+
+    // Calibrated at 800×800 (see `nonlinear_app`).
+    let mut app = nonlinear_app();
+    app.fiducials.frame = path.to_string_lossy().into();
+    app.load_fid_frame(&Context::default());
+
+    assert!(
+        app.fiducials.frame_img.is_none(),
+        "the mismatched frame was not installed"
+    );
+    let note = &app.fiducials.note;
+    assert!(
+        note.contains(&*path.to_string_lossy())
+            && note.contains("48×32")
+            && note.contains("800×800")
+            && note.contains("not a usable frame for this calibration"),
+        "the note names the file and both resolutions: {note}"
+    );
+}
+
+/// The camera is treated differently on the same mismatch: it is the source the
+/// operator asked for and may well be the one that is right (mid-recalibration,
+/// the stored resolution is the stale half), so its frame is installed — but
+/// loudly, at the moment it arrives.
+#[test]
+fn a_camera_frame_that_does_not_match_the_calibration_warns_but_installs() {
+    let dir = std::env::temp_dir().join(format!("ui-fidrescam-{}", std::process::id()));
+    std::fs::create_dir_all(&dir).unwrap();
+    let path = dir.join("bed.png");
+    let ppm = 10.0;
+    write_hole_frame(&path, ppm, &[(10.0, 10.0), (60.0, 10.0), (10.0, 60.0)]);
+
+    // Calibrated at 800×800 (see `nonlinear_app`); the frame is 700×700.
+    let mut app = nonlinear_app();
+    app.camera.use_device = false;
+    app.camera.file = path.to_string_lossy().into();
+    app.fiducials.layout = "10,10; 60,10; 10,60".into();
+    app.fiducials.px_per_mm = ppm;
+    app.grab_fid_frame(&Context::default());
+
+    assert_eq!(
+        app.fiducials.frame_img.as_ref().map(|f| f.dimensions()),
+        Some((700, 700)),
+        "the camera frame is installed anyway: {}",
+        app.fiducials.note
+    );
+    let note = &app.fiducials.note;
+    assert!(
+        note.contains("⚠ camera")
+            && note.contains("700×700")
+            && note.contains("800×800")
+            && note.contains("not a usable frame for this calibration"),
+        "the warning names the camera and both resolutions: {note}"
+    );
+}
+
+/// The scale gate. The pose fit is a similarity, so holes at a uniformly wrong
+/// spacing fit with a near-zero residual — `POSE_MAX_RMS_MM` waves them
+/// through. Only the scale band stops them, and it has to, because applying the
+/// fit would resize the burn by that same factor. The placement must be left
+/// exactly as it was and the note must name the measured scale.
+#[test]
+fn an_implausible_fiducial_scale_leaves_the_placement_alone() {
+    use nalgebra::Matrix3;
+    let dir = std::env::temp_dir().join(format!("ui-fidscale-{}", std::process::id()));
+    std::fs::create_dir_all(&dir).unwrap();
+    let path = dir.join("cam.png");
+    let ppm = 10.0;
+    // Nominal layout, and the holes actually drilled at 0.85× that spacing
+    // about the layout centroid — a 15% shrink, well outside the band.
+    let layout = [(10.0, 10.0), (60.0, 10.0), (10.0, 60.0)];
+    let c = (80.0 / 3.0, 80.0 / 3.0);
+    let holes: Vec<(f64, f64)> = layout
+        .iter()
+        .map(|&(x, y)| (c.0 + 0.85 * (x - c.0), c.1 + 0.85 * (y - c.1)))
+        .collect();
+    let img = image::GrayImage::from_fn(700, 700, |x, y| {
+        let mut v = 170.0;
+        for &(mx, my) in &holes {
+            let (cx, cy) = (mx * ppm, 700.0 - my * ppm); // bed y-up
+            if (((x as f64) - cx).powi(2) + ((y as f64) - cy).powi(2)).sqrt() < 0.5 * ppm {
+                v -= 110.0;
+            }
+        }
+        image::Luma([v as u8])
+    });
+    img.save(&path).unwrap();
+
+    let mut app = ConsoleApp::new(tmp_db(), vec!["true".into()]);
+    app.camera.use_device = false;
+    app.camera.file = path.to_string_lossy().into();
+    app.fiducials.layout = "10,10; 60,10; 10,60".into();
+    app.fiducials.px_per_mm = ppm;
+    // Wide enough that each nominal window still contains its shifted hole —
+    // the point of the test is the GATE, not the detector's reach.
+    app.fiducials.search_mm = 7.0;
+    app.calibration.anchor = Some(calib::Calibration {
+        px_to_mm: vision::Homography {
+            matrix: Matrix3::new(
+                1.0 / ppm,
+                0.0,
+                0.0,
+                0.0,
+                -1.0 / ppm,
+                700.0 / ppm,
+                0.0,
+                0.0,
+                1.0,
+            ),
+            residuals: vec![],
+            rms: 0.0,
+        },
+        rms_um: 10.0,
+        found: 3,
+        total: 3,
+        dots: Vec::new(),
+    });
+    // A placement the operator set by hand; the refused fit must not touch it.
+    app.placement.tx_mm = 11.0;
+    app.placement.ty_mm = 22.0;
+    app.placement.rot_deg = 3.0;
+    app.placement.scale = 1.0;
+
+    app.grab_fid_frame(&Context::default());
+    assert_eq!(
+        app.fiducials.found.iter().filter(|f| f.is_some()).count(),
+        3,
+        "all three shrunken holes detected: {:?}",
+        app.fiducials.rows
+    );
+    assert!(
+        app.fiducials.note.contains("scale") && app.fiducials.note.contains("not updated"),
+        "the note names the measured scale and refuses: {}",
+        app.fiducials.note
+    );
+    assert!(
+        !app.placement.auto_pose && !app.fiducials.last_placed,
+        "nothing was placed"
+    );
+    assert_eq!(
+        (
+            app.placement.tx_mm,
+            app.placement.ty_mm,
+            app.placement.rot_deg,
+            app.placement.scale
+        ),
+        (11.0, 22.0, 3.0, 1.0),
+        "the manual placement is untouched"
     );
 }
 
@@ -588,7 +855,7 @@ fn fiducial_check_sets_placement_and_load_preserves_it() {
             .find(|l| l.trim_start().starts_with("place:"))
             .unwrap()
             .to_string();
-        line[..line.find(" frame=").unwrap()].trim().to_string()
+        line[..line.find(" job_polys=").unwrap()].trim().to_string()
     };
 
     // Detection maps px→machine mm, fits the (identity) pose, and writes it.
@@ -633,7 +900,7 @@ fn fiducial_check_sets_placement_and_load_preserves_it() {
     );
 
     // Load installs the job but must NOT recenter over the auto pose.
-    let _ = ctx.run(egui::RawInput::default(), |ctx| app.load_place(ctx));
+    app.load_place();
     assert!(app.placement.auto_pose, "Load kept the auto-pose flag");
     assert!(
         (app.placement.tx_mm - tx1).abs() < 1e-9
@@ -715,14 +982,14 @@ fn marking_round_walks_the_fiducials_and_the_final_click_detects() {
     );
 
     // Marking the first two holes advances the round but must NOT detect yet.
-    app.fid_mark_click(holes[0], &ctx);
+    app.fid_mark_click(holes[0]);
     assert_eq!(app.fiducials.marking, Some(1), "advanced to marker 1");
     assert!(
         app.fiducials.note.starts_with("click fiducial 2 of 3"),
         "note advanced: {}",
         app.fiducials.note
     );
-    app.fid_mark_click(holes[1], &ctx);
+    app.fid_mark_click(holes[1]);
     assert_eq!(app.fiducials.marking, Some(2), "advanced to marker 2");
     assert!(
         app.fiducials.rows.is_empty(),
@@ -731,7 +998,7 @@ fn marking_round_walks_the_fiducials_and_the_final_click_detects() {
     );
 
     // The final click closes the round and runs detection on the marked holes.
-    app.fid_mark_click(holes[2], &ctx);
+    app.fid_mark_click(holes[2]);
     assert_eq!(
         app.fiducials.marking, None,
         "round closed on the final click"
@@ -786,6 +1053,16 @@ fn clear_markers_empties_the_layout_so_nothing_reseeds() {
         app.fiducials.search.is_empty() && app.fiducials.marking.is_none(),
         "reset after clear has nothing to reseed and opens no round"
     );
+
+    // ⟳ layout from W×H is the ONE way back — an explicit rebuild, not a reset
+    // that silently resurrects a cleared set.
+    app.apply_fid_rect();
+    assert_eq!(
+        app.fiducials.search.len(),
+        4,
+        "the rectangle's four corners are rebuilt: {:?}",
+        app.fiducials.layout
+    );
 }
 
 /// A camera Grab auto-detects at the seeded positions, so it must NOT open a
@@ -836,8 +1113,7 @@ fn a_plain_click_with_no_round_implicitly_starts_marking() {
     app.sync_fid_markers();
     assert_eq!(app.fiducials.marking, None, "no round active to begin with");
 
-    let ctx = Context::default();
-    app.fid_mark_click((12.0, 9.0), &ctx);
+    app.fid_mark_click((12.0, 9.0));
     assert_eq!(
         app.fiducials.marking,
         Some(1),
@@ -853,6 +1129,173 @@ fn a_plain_click_with_no_round_implicitly_starts_marking() {
         "note advanced to the second marker: {}",
         app.fiducials.note
     );
+}
+
+/// Dragging one ✛ touches ONLY that search marker. The layout is the design
+/// nominal the pose fit and the measured px/mm are taken against, so a dragged
+/// position must never leak into it (LR-17) — and the dragged marker's old
+/// detection is stale the moment it moves.
+#[test]
+fn dragging_a_marker_moves_only_its_own_search_entry() {
+    let mut app = ConsoleApp::new(tmp_db(), vec!["true".into()]);
+    app.fiducials.layout = "10,10; 60,10; 10,60".into();
+    app.sync_fid_markers();
+    let layout_before = app.fiducials.layout.clone();
+    let search_before = app.fiducials.search.clone();
+    app.fiducials.found = vec![
+        Some((100.0, 600.0)),
+        Some((600.0, 600.0)),
+        Some((100.0, 100.0)),
+    ];
+
+    // Two frames of one gesture: the nudges accumulate on the grabbed marker.
+    app.fiducials.marker_drag = Some(1);
+    app.fid_drag_marker(1, (0.8, -0.3));
+    app.fid_drag_marker(1, (0.2, -0.2));
+
+    assert_eq!(
+        app.fiducials.layout, layout_before,
+        "the expected layout is byte-identical after a drag"
+    );
+    let (x, y) = app.fiducials.search[1];
+    assert!(
+        (x - (search_before[1].0 + 1.0)).abs() < 1e-9
+            && (y - (search_before[1].1 - 0.5)).abs() < 1e-9,
+        "marker 1 moved by the summed delta: {:?}",
+        app.fiducials.search[1]
+    );
+    assert_eq!(
+        (app.fiducials.search[0], app.fiducials.search[2]),
+        (search_before[0], search_before[2]),
+        "the other markers stayed put"
+    );
+    assert_eq!(
+        app.fiducials.found[1], None,
+        "the dragged marker's detection is stale and cleared"
+    );
+    assert!(
+        app.fiducials.found[0].is_some() && app.fiducials.found[2].is_some(),
+        "the other detections survive"
+    );
+
+    // A layout edit can shrink the ✛ set under an in-flight drag; the latched
+    // index must not index past it.
+    app.fiducials.marker_drag = Some(7);
+    app.fid_drag_marker(7, (1.0, 1.0));
+    assert_eq!(
+        app.fiducials.marker_drag, None,
+        "an out-of-range latch is dropped, not indexed"
+    );
+}
+
+/// A drag that grabbed a ✛ owns the whole gesture: it must not also drop the
+/// next marker of a marking round, add a click-to-place fiducial, or remove one
+/// on right-click. Same latch-and-gate shape as the design drag.
+#[test]
+fn a_marker_drag_suppresses_the_marking_and_click_to_place_paths() {
+    let mut app = ConsoleApp::new(tmp_db(), vec!["true".into()]);
+    app.fiducials.layout = "10,10; 60,10; 10,60".into();
+    app.sync_fid_markers();
+    assert!(app.fid_marking_allowed(), "idle canvas marks as usual");
+
+    app.fiducials.marker_drag = Some(0);
+    assert!(
+        !app.fid_marking_allowed(),
+        "a grabbed marker suppresses marking / click-to-place"
+    );
+    app.fiducials.marker_drag = None;
+    app.fiducials.design_drag = true;
+    assert!(
+        !app.fid_marking_allowed(),
+        "the design latch still suppresses them too"
+    );
+
+    // The hit test the grab runs: nearest ✛ within the grab radius, nothing
+    // outside it.
+    use super::fiducial_ui::MARKER_GRAB_PX;
+    let markers = [(100.0_f32, 100.0_f32), (140.0, 100.0)];
+    assert_eq!(
+        crate::fiducial::nearest_marker(&markers, (108.0, 104.0), MARKER_GRAB_PX),
+        Some(0),
+        "a press near marker 0 grabs it"
+    );
+    assert_eq!(
+        crate::fiducial::nearest_marker(&markers, (125.0, 100.0), MARKER_GRAB_PX),
+        Some(1),
+        "between the two, the NEAREST inside the radius wins"
+    );
+    assert_eq!(
+        crate::fiducial::nearest_marker(&markers, (120.0, 100.0), MARKER_GRAB_PX),
+        None,
+        "a press outside every marker's radius grabs nothing"
+    );
+}
+
+/// The point of the gesture: nudge a marker the detector missed onto its hole,
+/// let go, and the check re-runs and finds it — without redoing the other three
+/// and without the ladder seeding over the correction.
+#[test]
+fn releasing_a_dragged_marker_rechecks_and_keeps_the_manual_position() {
+    let dir = std::env::temp_dir().join(format!("ui-fiddrag-{}", std::process::id()));
+    std::fs::create_dir_all(&dir).unwrap();
+    let path = dir.join("bed.png");
+    let ppm = 10.0;
+    let holes = [(10.0, 10.0), (60.0, 10.0), (10.0, 60.0), (60.0, 60.0)];
+    write_hole_frame(&path, ppm, &holes);
+
+    let mut app = ConsoleApp::new(tmp_db(), vec!["true".into()]);
+    app.fiducials.frame = path.to_string_lossy().into();
+    app.fiducials.layout = "10,10; 60,10; 10,60; 60,60".into();
+    app.fiducials.px_per_mm = ppm;
+    app.fiducials.search_mm = 2.0;
+    let ctx = Context::default();
+    app.load_fid_frame(&ctx);
+
+    // Marker 2 sits 3 mm off its hole — well outside the 2 mm search window —
+    // so a check finds the other three and misses that one.
+    app.fiducials.search[2] = (7.0, 60.0);
+    app.render_fiducials(&ctx);
+    assert_eq!(
+        app.fiducials.found.iter().filter(|f| f.is_some()).count(),
+        3,
+        "the offset marker misses: {:?}",
+        app.fiducials.rows
+    );
+    assert_eq!(
+        app.fiducials.found[2], None,
+        "and it is marker 2 that missed"
+    );
+    let layout_before = app.fiducials.layout.clone();
+
+    // Drag it onto the hole and let go.
+    app.fiducials.marker_drag = Some(2);
+    app.fid_drag_marker(2, (2.0, 0.0));
+    app.fid_drag_marker(2, (1.0, 0.0));
+    app.fid_marker_drag_release();
+
+    assert_eq!(
+        app.fiducials.marker_drag, None,
+        "the latch is released with the pointer"
+    );
+    assert_eq!(
+        app.fiducials.found.iter().filter(|f| f.is_some()).count(),
+        4,
+        "the release re-checked and the nudged marker locked: {:?}",
+        app.fiducials.rows
+    );
+    // The detection ladder installs the winning stage's seeds, so this is the
+    // assertion that the manual placement was kept rather than seeded over.
+    assert_eq!(
+        app.fiducials.search[2],
+        (10.0, 60.0),
+        "the dragged position survives the re-check"
+    );
+    assert_eq!(
+        app.fiducials.layout, layout_before,
+        "the expected layout is untouched by the whole gesture"
+    );
+
+    std::fs::remove_dir_all(dir).ok();
 }
 
 /// FLD-11: live tracking pulls frames from the camera source and re-detects
@@ -902,11 +1345,111 @@ fn live_fiducial_tracking_detects_on_the_feed() {
         "perspective fitted from 4 live fiducials"
     );
 
+    // Live off: this tab stops pumping, but the shared capture is the console's
+    // and survives until the idle rule releases it (another tab may be live).
     app.fiducials.live = false;
     app.pump_fid_live(&ctx);
+    app.runtime.camera_last_used = Some(std::time::Instant::now() - CAMERA_IDLE_RELEASE);
+    app.release_idle_capture();
     assert!(
-        app.fiducials.capture.is_none(),
-        "capture stops when Live is off"
+        app.runtime.camera_capture.is_none(),
+        "the shared capture is released once no tab is live and it has gone idle"
+    );
+}
+
+/// One capture, shared: the tabs' pumps reuse the same thread instead of each
+/// opening the source, and a source change restarts it. (`File` source — the
+/// device timings this exists for need real hardware and aren't testable here.)
+#[test]
+fn shared_capture_is_reused_and_restarts_on_source_change() {
+    let dir = std::env::temp_dir().join(format!("ui-sharedcap-{}", std::process::id()));
+    std::fs::create_dir_all(&dir).unwrap();
+    let a = dir.join("a.png");
+    let b = dir.join("b.png");
+    image::GrayImage::from_pixel(20, 10, image::Luma([90]))
+        .save(&a)
+        .unwrap();
+    image::GrayImage::from_pixel(30, 12, image::Luma([90]))
+        .save(&b)
+        .unwrap();
+
+    let mut app = ConsoleApp::new(tmp_db(), vec!["true".into()]);
+    app.camera.use_device = false;
+    app.camera.file = a.to_string_lossy().into();
+
+    app.ensure_capture();
+    let first = app.runtime.camera_capture.as_ref().unwrap() as *const _;
+    app.ensure_capture();
+    assert_eq!(
+        app.runtime.camera_capture.as_ref().unwrap() as *const _,
+        first,
+        "an unchanged source reuses the running capture"
+    );
+
+    // Every tab pulls from that same capture.
+    let ctx = Context::default();
+    app.camera.live = true;
+    app.fiducials.live = true;
+    app.pump_camera(&ctx);
+    app.pump_fid_live(&ctx);
+    assert_eq!(
+        app.runtime.camera_capture.as_ref().unwrap() as *const _,
+        first,
+        "the live pumps share one capture rather than starting their own"
+    );
+    assert_eq!(
+        app.runtime.camera_capture_src,
+        Some(crate::camera::Source::File(a.to_string_lossy().into())),
+        "still streaming the source it was started for"
+    );
+
+    // Switching source restarts it — checked by the frames that arrive, since a
+    // freed capture's address can be handed straight back to the new one.
+    app.camera.file = b.to_string_lossy().into();
+    app.ensure_capture();
+    assert_eq!(
+        app.runtime.camera_capture_src,
+        Some(crate::camera::Source::File(b.to_string_lossy().into()))
+    );
+    let mut dims = None;
+    for _ in 0..200 {
+        if let Some(Ok(f)) = app.capture_latest() {
+            dims = Some(f.dimensions());
+            break;
+        }
+        std::thread::sleep(std::time::Duration::from_millis(5));
+    }
+    assert_eq!(
+        dims,
+        Some((30, 12)),
+        "the restarted capture streams the new source"
+    );
+}
+
+/// The idle-release rule: hold the device while any tab streams, hand it back
+/// once nothing does and it has gone quiet — the CLI can't open a busy camera.
+#[test]
+fn idle_release_holds_while_live_and_frees_when_quiet() {
+    let now = std::time::Instant::now();
+    let idle = CAMERA_IDLE_RELEASE;
+    let fresh = Some(now - idle / 2);
+    let stale = Some(now - idle * 2);
+
+    assert!(
+        !should_release_capture(true, stale, now, idle),
+        "a live tab keeps the device however long ago the last read was"
+    );
+    assert!(
+        !should_release_capture(false, fresh, now, idle),
+        "a recent grab keeps the fast path warm for the next one"
+    );
+    assert!(
+        should_release_capture(false, stale, now, idle),
+        "nothing live and long idle: release"
+    );
+    assert!(
+        should_release_capture(false, None, now, idle),
+        "a capture nobody ever read is released, not held"
     );
 }
 
@@ -1037,7 +1580,7 @@ fn clicking_the_lone_marker_places_and_detects() {
 
     // Click at the design nominal: the lone click closes the round and detects,
     // but the hole is 3 mm off so nothing is found there.
-    app.fid_mark_click((10.0, 10.0), &ctx);
+    app.fid_mark_click((10.0, 10.0));
     assert_eq!(
         app.fiducials.marking, None,
         "the lone click closed the round"
@@ -1049,7 +1592,7 @@ fn clicking_the_lone_marker_places_and_detects() {
 
     // A fresh click with no active round implicitly reopens it; landing on the
     // actual hole makes detection lock on.
-    app.fid_mark_click((13.0, 10.0), &ctx);
+    app.fid_mark_click((13.0, 10.0));
     assert_eq!(
         app.fiducials.marking, None,
         "the reopened lone click closed again"
@@ -1235,7 +1778,6 @@ fn ar_overlay_projects_design_through_the_homography() {
 #[test]
 fn place_drag_tracks_cursor_in_the_physical_lens_frame() {
     let mut app = nonlinear_app();
-    app.placement.frame_img = Some(image::GrayImage::from_pixel(800, 800, image::Luma([120])));
     app.placement.tx_mm = 30.0;
     app.placement.ty_mm = 25.0;
 
@@ -1246,7 +1788,7 @@ fn place_drag_tracks_cursor_in_the_physical_lens_frame() {
             .unwrap()
     };
     let before = pivot(&app);
-    app.drag_place_px(12.0, -7.0).unwrap();
+    app.drag_place_px(800, 800, 12.0, -7.0).unwrap();
     let after = pivot(&app);
     assert!(
         (after.0 - (before.0 + 12.0)).abs() < 1e-6,
@@ -1265,15 +1807,37 @@ fn place_drag_tracks_cursor_in_the_physical_lens_frame() {
 #[test]
 fn place_drag_refuses_an_uncalibrated_uniform_fallback() {
     let mut app = ConsoleApp::new(tmp_db(), vec!["true".into()]);
-    app.placement.frame_img = Some(image::GrayImage::from_pixel(100, 100, image::Luma([120])));
     app.placement.tx_mm = 5.0;
     app.placement.ty_mm = 5.0;
     assert!(
-        app.drag_place_px(20.0, -30.0)
+        app.drag_place_px(100, 100, 20.0, -30.0)
             .unwrap_err()
             .contains("needs a projection"),
         "no anchor and no nonlinear cal: dragging has no frame to move in"
     );
+}
+
+/// Shift+drag on the design rotates it the way the pointer sweeps ON THE BED,
+/// not on the screen. The two senses are opposite (screen y grows down, machine
+/// y grows up), and getting it backwards is the obvious failure — so pin the
+/// sign: from the pivot's +x axis, dragging the pointer UP the screen is toward
+/// machine +y, i.e. a quarter turn counter-clockwise on the bed, i.e. +90°
+/// (`Placement::affine` is `[cos, −sin; sin, cos]`, CCW-positive).
+#[test]
+fn shift_drag_rotates_in_the_machine_sense_not_the_screen_sense() {
+    use super::fiducial_ui::rot_delta_deg;
+    let pivot = egui::pos2(0.0, 0.0);
+    let quarter = rot_delta_deg(pivot, egui::pos2(1.0, 0.0), egui::pos2(0.0, -1.0));
+    assert!(
+        (quarter - 90.0).abs() < 1e-9,
+        "pointer swept up-screen = +90° on the bed, got {quarter}"
+    );
+    // …and the mirror image of that drag is the mirror image of the rotation.
+    let back = rot_delta_deg(pivot, egui::pos2(1.0, 0.0), egui::pos2(0.0, 1.0));
+    assert!((back + 90.0).abs() < 1e-9, "swept down-screen: {back}");
+    // A sweep across the ±180 seam nudges rather than spinning a full turn.
+    let seam = rot_delta_deg(pivot, egui::pos2(-1.0, -0.01), egui::pos2(-1.0, 0.01));
+    assert!(seam.abs() < 2.0, "no ±360 jump at the seam: {seam}");
 }
 
 /// Double-sided: on the back, the expected fiducial positions are the
@@ -1353,21 +1917,129 @@ fn scan_center_override_moves_the_parallax_origin() {
 }
 
 /// Switching side clears the per-side caches so nothing from the front
-/// bleeds into the back view.
+/// bleeds into the back view — including the PHOTO. A surviving front frame is
+/// not just a confusing picture: a Check pressed against it detects real holes
+/// and can fit and lock a placement from the wrong face.
 #[test]
 fn set_side_resets_per_side_caches() {
+    let ctx = Context::default();
     let mut app = ConsoleApp::new(tmp_db(), vec!["true".into()]);
     app.fiducials.layout = "10,10; 60,10".into();
     app.sync_fid_markers();
     app.ar.copper = vec![pcb_core::Poly::default()];
     assert!(!app.fiducials.search.is_empty());
+
+    // The front face's frame, its texture, the scale measured off it, the note
+    // describing that detection, and the Live scan's backoff.
+    app.fiducials.frame_img = Some(image::GrayImage::new(64, 64));
+    app.fiducials.frame_tex = Some(ctx.load_texture(
+        "fid-side-test",
+        egui::ColorImage {
+            size: [2, 2],
+            pixels: vec![egui::Color32::BLACK; 4],
+        },
+        egui::TextureOptions::NEAREST,
+    ));
+    app.fiducials.measured_ppm = Some(9.87);
+    app.fiducials.note = "4 strong, 0 weak, 0 missed".into();
+    app.fiducials.last_global_recover = Some((std::time::Instant::now(), false));
+
     app.set_side(Side::Back);
     assert!(
         app.fiducials.search.is_empty(),
         "markers cleared on side switch"
     );
     assert!(app.ar.copper.is_empty(), "AR design cleared on side switch");
+    assert!(
+        app.fiducials.frame_img.is_none() && app.fiducials.frame_tex.is_none(),
+        "the other face's photo is gone"
+    );
+    assert!(
+        app.fiducials.measured_ppm.is_none(),
+        "and the scale measured off it"
+    );
+    assert!(
+        !app.fiducials.note.contains("strong"),
+        "the stale detection note is replaced: {}",
+        app.fiducials.note
+    );
+    assert!(
+        !app.fiducials.note.is_empty(),
+        "…with the tab's instruction, not a blank line"
+    );
+    assert!(
+        app.fiducials.last_global_recover.is_none(),
+        "a side switch is a new scene: the old face's Live backoff must not \
+         suppress the scans a flip needs"
+    );
     assert_eq!(app.job.side, Side::Back);
+}
+
+/// Exporting Front then Back must leave each side pointing at its own copper
+/// Gerber — they used to share one `copper.gbr`, so the back export silently
+/// re-aimed the front job at back copper.
+#[test]
+fn front_then_back_gerber_export_keeps_both_sides() {
+    let mut app = ConsoleApp::new(tmp_db(), vec!["true".into()]);
+    app.job.kicad_project = concat!(
+        env!("CARGO_MANIFEST_DIR"),
+        "/../../samples/kicad/valdemo2.kicad_pcb"
+    )
+    .into();
+    app.gerbers_from_kicad();
+    let front_copper = app.job.emit_copper.clone();
+    let front_outline = app.job.emit_outline.clone();
+    assert!(
+        front_copper.ends_with("copper-F_Cu.gbr"),
+        "front copper path: {front_copper}"
+    );
+
+    app.set_side(Side::Back);
+    app.gerbers_from_kicad();
+    assert!(
+        app.job.back_copper.ends_with("copper-B_Cu.gbr"),
+        "back copper path: {}",
+        app.job.back_copper
+    );
+    assert_eq!(
+        app.job.emit_copper, front_copper,
+        "the back export left the front copper path alone"
+    );
+    assert_ne!(app.job.emit_copper, app.job.back_copper);
+    // Edge.Cuts is side-independent, so both sides share the one outline.
+    assert_eq!(app.job.back_outline, front_outline);
+}
+
+/// Each side emits to its own `.lbrn2`, so a back emit can't overwrite the
+/// front job's output file.
+#[test]
+fn each_side_emits_to_its_own_lbrn2() {
+    let mut app = ConsoleApp::new(tmp_db(), vec!["true".into()]);
+    let front = app.active_lbrn2().to_string();
+    app.set_side(Side::Back);
+    let back = app.active_lbrn2().to_string();
+    assert_eq!(front, app.job.emit_lbrn2);
+    assert_eq!(back, app.job.back_lbrn2);
+    assert_ne!(front, back, "the two sides' outputs are distinct files");
+}
+
+/// A back-side emit mirrors in X, which the CLI refuses without an outline —
+/// the console says so itself instead of letting the operator dig it out of
+/// the CLI's stderr.
+#[test]
+fn back_emit_without_an_outline_is_refused_with_a_reason() {
+    let mut app = ConsoleApp::new(tmp_db(), vec!["true".into()]);
+    app.set_side(Side::Back);
+    app.job.back_copper = "B_Cu.gbr".into();
+    app.job.back_outline.clear();
+    app.emit_clicked();
+    let last = app.runtime.log.last().expect("the refusal was logged");
+    assert!(last.err, "logged as an error");
+    assert!(
+        last.text.contains("back outline"),
+        "names what is missing: {}",
+        last.text
+    );
 }
 
 /// The Job tab lays out with the Back side selected (the back form renders).
@@ -1466,7 +2138,6 @@ field_frame=\n";
     // A pre-split blob has one shared parameter set: the paper set is seeded
     // from it, since that's what ① was last fit with.
     assert_eq!(app.calibration.paper, app.calibration.burn);
-    assert!(app.placement.field_correct);
 
     let before = crate::settings::parse(legacy);
     let after = crate::settings::parse(&app.settings_blob());
@@ -1480,23 +2151,36 @@ field_frame=\n";
     assert_eq!(
         new_keys,
         vec![
+            "back_lbrn2",
             "calib_accept_rms_um",
             "calib_accept_worst_um",
-            "calib_allow_machine_scale",
+            "calib_field_scale",
+            "calib_laser_height_mm",
             "calib_paper_dot_kind",
             "calib_paper_dot_mm",
+            "calib_paper_height_mm",
             "calib_paper_n",
             "calib_paper_out",
             "calib_paper_pitch_mm",
-            "fid_board_h_mm",
-            "fid_board_w_mm",
+            "drill_frequency_khz",
+            "drill_interval_mm",
+            "drill_passes",
+            "drill_pulse_ns",
+            "drill_speed_mm_s",
+            "drill_wobble",
+            "drill_wobble_size_mm",
+            "drill_wobble_step_mm",
             "fid_diameter_mm",
             "fid_height_mm",
-            "fid_margin_mm",
+            "fid_live_recover_s",
             "fid_out",
             "fid_profile",
+            "fid_rect_h_mm",
+            "fid_rect_w_mm",
+            "fid_ref_holes",
             "fid_search_mm",
             "fid_shape",
+            "fid_surface_height_mm",
             "job_frequency_khz",
             "job_interval_mm",
             "job_passes",
@@ -1509,8 +2193,19 @@ field_frame=\n";
             "place_drill_lbrn2",
             "place_drills",
             "place_lightburn_device",
+            "scan_center_auto",
+            "scan_center_x_mm",
+            "scan_center_y_mm",
         ]
     );
+    // place_field_correct is a retired key: unknown keys in an old blob are
+    // tolerated and simply not re-written, rather than migrated.
+    let dropped: Vec<_> = before
+        .keys()
+        .filter(|k| !after.contains_key(*k))
+        .map(|k| k.as_str())
+        .collect();
+    assert_eq!(dropped, vec!["place_field_correct"]);
     assert_eq!(after.get("calib_paper_n"), Some(&"9".to_string()));
     assert_eq!(after.get("calib_paper_pitch_mm"), Some(&"8".to_string()));
     assert_eq!(
@@ -1518,8 +2213,61 @@ field_frame=\n";
         Some(&"bright".to_string())
     );
     for (key, value) in before {
+        if key == "place_field_correct" {
+            continue;
+        }
         assert_eq!(after.get(&key), Some(&value), "setting {key}");
     }
+}
+
+/// The ③ scale handling used to be a bool (`calib_allow_machine_scale`). A
+/// blob written by that build must still land the operator on the equivalent
+/// three-way choice — and the save writes only the new key.
+#[test]
+fn retired_machine_scale_bool_migrates_to_the_three_way_choice() {
+    for (legacy, want) in [
+        ("true", calib::FieldScale::Compensate),
+        ("false", calib::FieldScale::Refuse),
+    ] {
+        let db = tmp_db();
+        let settings = crate::settings::path_for_db(&db);
+        std::fs::write(
+            &settings,
+            format!("pcbforge console settings v1\ncalib_allow_machine_scale={legacy}\n"),
+        )
+        .unwrap();
+        let app = ConsoleApp::new(&db, vec!["true".into()]);
+        assert_eq!(app.calibration.field_scale, want, "legacy {legacy}");
+        let saved = crate::settings::parse(&app.settings_blob());
+        assert_eq!(
+            saved.get("calib_field_scale").map(String::as_str),
+            Some(field_scale_token(want))
+        );
+    }
+    // An absent key (a blob from before either setting existed) is the default.
+    let db = tmp_db();
+    std::fs::write(
+        crate::settings::path_for_db(&db),
+        "pcbforge console settings v1\n",
+    )
+    .unwrap();
+    let app = ConsoleApp::new(&db, vec!["true".into()]);
+    assert_eq!(app.calibration.field_scale, calib::FieldScale::Refuse);
+
+    // The new key wins over a stale bool left behind by an older build.
+    let db = tmp_db();
+    std::fs::write(
+        crate::settings::path_for_db(&db),
+        "pcbforge console settings v1\n\
+calib_allow_machine_scale=true\n\
+calib_field_scale=distortion_only\n",
+    )
+    .unwrap();
+    let app = ConsoleApp::new(&db, vec!["true".into()]);
+    assert_eq!(
+        app.calibration.field_scale,
+        calib::FieldScale::DistortionOnly
+    );
 }
 
 /// The operator-configurable step 3 field acceptance limits round-trip.
@@ -1568,44 +2316,198 @@ fn job_export_recipe_persists() {
     assert_eq!(fresh.job.passes, 1);
 }
 
-/// The ④ auto fiducial-layout board size + margin round-trip through a save +
-/// reload; a blob without them keeps the 70/50/5 defaults.
+/// The drill's own recipe round-trips through a save + reload, and a settings
+/// file written before the keys existed loads the drill defaults — the values
+/// the machine drills at, not the etch ones it used to borrow.
 #[test]
-fn fid_board_dimensions_persist() {
+fn drill_export_recipe_persists() {
     let db = tmp_db();
     {
         let mut a = ConsoleApp::new(db.clone(), vec!["true".into()]);
-        a.fiducials.board_w_mm = 90.0;
-        a.fiducials.board_h_mm = 60.0;
-        a.fiducials.margin_mm = 3.0;
+        a.drill.speed_mm_s = 800.0;
+        a.drill.frequency_khz = 60.0;
+        a.drill.pulse_ns = 30;
+        a.drill.interval_mm = 0.02;
+        a.drill.passes = 6;
+        a.drill.wobble = false;
+        a.drill.wobble_step_mm = 0.01;
+        a.drill.wobble_size_mm = 0.03;
         a.save_settings_if_changed();
     }
     let b = ConsoleApp::new(db, vec!["true".into()]);
-    assert!((b.fiducials.board_w_mm - 90.0).abs() < 1e-9);
-    assert!((b.fiducials.board_h_mm - 60.0).abs() < 1e-9);
-    assert!((b.fiducials.margin_mm - 3.0).abs() < 1e-9);
+    assert!((b.drill.speed_mm_s - 800.0).abs() < 1e-9);
+    assert!((b.drill.frequency_khz - 60.0).abs() < 1e-9);
+    assert_eq!(b.drill.pulse_ns, 30);
+    assert!((b.drill.interval_mm - 0.02).abs() < 1e-9);
+    assert_eq!(b.drill.passes, 6);
+    assert!(!b.drill.wobble);
+    assert!((b.drill.wobble_step_mm - 0.01).abs() < 1e-9);
+    assert!((b.drill.wobble_size_mm - 0.03).abs() < 1e-9);
+
+    // The operator's existing settings file predates every drill_* key: it must
+    // come back with the drill defaults, and never with the etch recipe.
+    let db = tmp_db();
+    std::fs::write(
+        crate::settings::path_for_db(&db),
+        "pcbforge console settings v1\n\
+job_speed_mm_s=2500\n\
+job_interval_mm=0.03\n\
+job_passes=1\n",
+    )
+    .unwrap();
+    let old = ConsoleApp::new(db, vec!["true".into()]);
+    assert!((old.drill.speed_mm_s - 1000.0).abs() < 1e-9);
+    assert!((old.drill.frequency_khz - 30.0).abs() < 1e-9);
+    assert_eq!(old.drill.pulse_ns, 5);
+    assert!((old.drill.interval_mm - 0.05).abs() < 1e-9);
+    assert_eq!(old.drill.passes, 2);
+    assert!(old.drill.wobble);
+    assert!((old.drill.wobble_step_mm - 0.02).abs() < 1e-9);
+    assert!((old.drill.wobble_size_mm - 0.05).abs() < 1e-9);
+    assert!(
+        old.debug_summary().contains(
+            "drill: speed=1000 freq_khz=30 pulse_ns=5 interval=0.05 passes=2 wobble=true"
+        ),
+        "the summary reports the drill recipe: {}",
+        old.debug_summary()
+    );
+}
+
+/// The fiducial rectangle's spans round-trip through a save + reload; a blob
+/// without them keeps the 50/50 defaults.
+#[test]
+fn fid_rect_dimensions_persist() {
+    let db = tmp_db();
+    {
+        let mut a = ConsoleApp::new(db.clone(), vec!["true".into()]);
+        a.fiducials.rect_w_mm = 90.0;
+        a.fiducials.rect_h_mm = 60.0;
+        a.save_settings_if_changed();
+    }
+    let b = ConsoleApp::new(db, vec!["true".into()]);
+    assert!((b.fiducials.rect_w_mm - 90.0).abs() < 1e-9);
+    assert!((b.fiducials.rect_h_mm - 60.0).abs() < 1e-9);
 
     // A fresh console with no persisted keys keeps the operator defaults.
     let fresh = ConsoleApp::new(tmp_db(), vec!["true".into()]);
-    assert!((fresh.fiducials.board_w_mm - 70.0).abs() < 1e-9);
-    assert!((fresh.fiducials.board_h_mm - 50.0).abs() < 1e-9);
-    assert!((fresh.fiducials.margin_mm - 5.0).abs() < 1e-9);
+    assert!((fresh.fiducials.rect_w_mm - 50.0).abs() < 1e-9);
+    assert!((fresh.fiducials.rect_h_mm - 50.0).abs() < 1e-9);
 }
 
-/// ④ Fiducial holes: the `fid_board:` summary line reports the board/margin
-/// and the layout computed against the auto-centred field. Field 90 auto →
-/// centre 45,45; board 70×50, margin 5 → x 15..75, y 25..65.
+/// The Live re-acquire interval round-trips, defaults to the operator's 500 ms,
+/// and cannot be pushed out of range by a hand-edited blob — the DragValue
+/// clamps what the console writes, but nothing stops someone typing a value the
+/// ladder would then hand to `Duration::from_secs_f64`.
 #[test]
-fn fid_board_summary_reports_the_computed_layout() {
+fn fid_live_recover_interval_persists_and_clamps() {
+    let db = tmp_db();
+    {
+        let mut a = ConsoleApp::new(db.clone(), vec!["true".into()]);
+        assert!(
+            (a.fiducials.live_recover_s - 0.5).abs() < 1e-9,
+            "a fresh console re-acquires every 500 ms"
+        );
+        a.fiducials.live_recover_s = 0.2;
+        a.save_settings_if_changed();
+    }
+    let b = ConsoleApp::new(db, vec!["true".into()]);
+    assert!((b.fiducials.live_recover_s - 0.2).abs() < 1e-9);
+
+    // Out of range on both sides, planted straight into the settings file.
+    for (written, want) in [("99", 10.0), ("-1", 0.1), ("0", 0.1)] {
+        let db = tmp_db();
+        let settings = crate::settings::path_for_db(&db);
+        std::fs::write(
+            &settings,
+            format!("pcbforge console settings v1\nfid_live_recover_s={written}\n"),
+        )
+        .unwrap();
+        let app = ConsoleApp::new(db, vec!["true".into()]);
+        assert!(
+            (app.fiducials.live_recover_s - want).abs() < 1e-9,
+            "{written} clamps to {want}, got {}",
+            app.fiducials.live_recover_s
+        );
+    }
+}
+
+/// The scan-center override round-trips through a save + reload — it's a
+/// measured per-rig constant (the Job tab hover text says so), so it needs to
+/// survive a restart like its `thickness_mm`/`focal_mm` neighbours do. A blob
+/// without the keys keeps the auto-centroid default.
+#[test]
+fn scan_center_persists_and_defaults() {
+    let db = tmp_db();
+    {
+        let mut a = ConsoleApp::new(db.clone(), vec!["true".into()]);
+        a.job.scan_center_auto = false;
+        a.job.scan_center_mm = (12.5, -7.25);
+        a.save_settings_if_changed();
+    }
+    let b = ConsoleApp::new(db, vec!["true".into()]);
+    assert!(!b.job.scan_center_auto, "auto=false persists");
+    assert!((b.job.scan_center_mm.0 - 12.5).abs() < 1e-9);
+    assert!((b.job.scan_center_mm.1 - (-7.25)).abs() < 1e-9);
+
+    // A blob with none of the scan-center keys keeps today's defaults.
+    let fresh = ConsoleApp::new(tmp_db(), vec!["true".into()]);
+    assert!(fresh.job.scan_center_auto, "defaults to the auto centroid");
+    assert!((fresh.job.scan_center_mm.0 - 35.0).abs() < 1e-9);
+    assert!((fresh.job.scan_center_mm.1 - 35.0).abs() < 1e-9);
+}
+
+/// A hand-edited or corrupt blob can't push `thickness_mm`, `focal_mm`, or the
+/// scan-center override out of their sane ranges — clamped on load the same
+/// way the neighbouring fiducial fields are.
+#[test]
+fn thickness_focal_and_scan_center_clamp_on_load() {
+    let db = tmp_db();
+    let settings = crate::settings::path_for_db(&db);
+    std::fs::write(
+        &settings,
+        "pcbforge console settings v1\n\
+thickness_mm=-1.0\n\
+focal_mm=0.5\n\
+scan_center_x_mm=5000\n\
+scan_center_y_mm=-5000\n",
+    )
+    .unwrap();
+    let app = ConsoleApp::new(db, vec!["true".into()]);
+    assert!(
+        (app.job.board_thickness_mm - 0.0).abs() < 1e-9,
+        "thickness clamps to the DragValue floor, got {}",
+        app.job.board_thickness_mm
+    );
+    assert!(
+        (app.job.focal_mm - 1.0).abs() < 1e-9,
+        "focal clamps to the DragValue floor, got {}",
+        app.job.focal_mm
+    );
+    assert!(
+        (app.job.scan_center_mm.0 - 1000.0).abs() < 1e-9,
+        "scan center x clamps to +1000, got {}",
+        app.job.scan_center_mm.0
+    );
+    assert!(
+        (app.job.scan_center_mm.1 - (-1000.0)).abs() < 1e-9,
+        "scan center y clamps to -1000, got {}",
+        app.job.scan_center_mm.1
+    );
+}
+
+/// ④ Fiducial holes: the `fid_rect:` summary line reports the rectangle spans
+/// and the layout computed against the auto-centred field. Field 90 auto →
+/// centre 45,45; rect 60×40 → x 15..75, y 25..65.
+#[test]
+fn fid_rect_summary_reports_the_computed_layout() {
     let mut app = ConsoleApp::new(tmp_db(), vec!["true".into()]);
     app.runtime.tab = CentralTab::Calibrate;
     app.calibration.mode = CalibMode::FidHoles;
     app.camera.field_mm = 90.0;
     app.camera.field_center_auto = true;
     app.sync_auto_field_center();
-    app.fiducials.board_w_mm = 70.0;
-    app.fiducials.board_h_mm = 50.0;
-    app.fiducials.margin_mm = 5.0;
+    app.fiducials.rect_w_mm = 60.0;
+    app.fiducials.rect_h_mm = 40.0;
 
     let summary = app.debug_summary();
     assert!(
@@ -1614,10 +2516,10 @@ fn fid_board_summary_reports_the_computed_layout() {
     );
     assert!(
         summary.contains(
-            "fid_board: w=70 h=50 margin=5 \
+            "fid_rect: w=60 h=40 \
              layout=15.00,25.00; 75.00,25.00; 15.00,65.00; 75.00,65.00"
         ),
-        "fid_board line reports the computed layout:\n{summary}"
+        "fid_rect line reports the computed layout:\n{summary}"
     );
 }
 
@@ -1683,6 +2585,8 @@ fn field_frame_mirror_flag_round_trips() {
             field_verdict: vision::classify_field_error(&[]),
             scale: 1.0,
             extrapolated: 0,
+            rejected: 0,
+            rejection_note: String::new(),
         });
         a.calibration.field_accepted = true;
         a.calibration.lens_frame_signature = Some(((800, 800), Orientation::Normal));
@@ -1898,6 +2802,91 @@ fn lens_calibration_pixel_bounds_round_trip() {
             .is_none(),
         "a missing bounds key restores as None"
     );
+    // And silently: a map that predates the key is not a fault to report.
+    assert!(
+        !c.runtime
+            .log
+            .iter()
+            .any(|l| l.text.contains("lens_px_bounds")),
+        "an absent bounds key says nothing: {:?}",
+        c.runtime.log
+    );
+}
+
+/// A `lens_px_bounds` row that is PRESENT but unusable is a corrupt save, not
+/// a pre-bounds map: it restores as `None` — which silently disables the ③
+/// extrapolation check — so it has to say so in the log.
+#[test]
+fn a_malformed_lens_px_bounds_row_restores_none_and_complains() {
+    use nalgebra::Point2;
+    let coords = [0.0, 20.0, 40.0, 60.0];
+    let pairs: Vec<_> = coords
+        .iter()
+        .flat_map(|&y| {
+            coords.iter().map(move |&x| {
+                (
+                    Point2::new(10.0 * x + 20.0, 800.0 - 10.0 * y),
+                    Point2::new(x, y),
+                )
+            })
+        })
+        .collect();
+    let lens = vision::fit_lens(&pairs).unwrap();
+
+    // Every shape of wrong: a junk token, too few values, a non-finite, and a
+    // box whose corners are the wrong way round.
+    for row in [
+        "0 0 nonsense 700",
+        "0 0 700",
+        "0 0 700 700 700",
+        "0 0 NaN 700",
+        "700 0 20 700",
+        "0 700 700 20",
+    ] {
+        let db = tmp_db();
+        let blob = {
+            let mut a = ConsoleApp::new(db.clone(), vec!["true".into()]);
+            a.calibration.lens = Some(calib::CameraCal {
+                lens: lens.clone(),
+                dots: Vec::new(),
+                found: 16,
+                total: 16,
+            });
+            a.settings_blob()
+        };
+        let corrupted: String = blob
+            .lines()
+            .map(|l| {
+                if l.starts_with("lens_px_bounds=") {
+                    format!("lens_px_bounds={row}\n")
+                } else {
+                    format!("{l}\n")
+                }
+            })
+            .collect();
+        std::fs::write(crate::settings::path_for_db(&db), corrupted).unwrap();
+
+        let app = ConsoleApp::new(db, vec!["true".into()]);
+        assert!(
+            app.calibration
+                .lens
+                .as_ref()
+                .expect("the lens maps still restore")
+                .lens
+                .calib_px_bounds
+                .is_none(),
+            "{row:?} must not restore as bounds"
+        );
+        let complaint = format!(
+            "settings: lens_px_bounds is malformed ({row}) — lens extrapolation \
+             checks are disabled until step 1 is re-fit"
+        );
+        assert!(
+            app.runtime.log.iter().any(|l| l.err && l.text == complaint),
+            "{row:?} must complain, got {:?}",
+            app.runtime.log
+        );
+    }
 }
 
 /// "Etch here" resolves a bare output filename next to the copper Gerber
@@ -2538,7 +3527,7 @@ fn etch_and_run_arms_an_absolute_pending_path() {
         dots: Vec::new(),
     });
     app.placement.job = vec![pcb_core::Poly::default()];
-    app.placement.frame_img = Some(image::GrayImage::new(800, 800));
+    app.fiducials.frame_img = Some(image::GrayImage::new(800, 800));
     app.job.emit_copper = "board.gbr".into();
 
     app.emit_at_placement(true);
@@ -2548,46 +3537,58 @@ fn etch_and_run_arms_an_absolute_pending_path() {
         .as_ref()
         .expect("a LightBurn run was queued");
     assert!(
-        pending.is_absolute(),
-        "queued path is absolute: {pending:?}"
+        pending.path.is_absolute(),
+        "queued path is absolute: {:?}",
+        pending.path
     );
+    assert!(pending.start, "the etch chain presses START");
     assert!(app.debug_summary().contains("lightburn=pending"));
 }
 
-/// "Generate + burn holes" queues an ABSOLUTE holes path once the export
-/// launches, so `pump_verb` chains the LightBurn load + START — the holes
-/// burn immediately instead of waiting for a manual load-and-press-play.
+/// "⚙ Generate holes" queues an ABSOLUTE holes path once the export launches,
+/// so the file LOADS in LightBurn — but as a load-only hand-off: `start` is
+/// false, so the chain can never press START and the click cannot fire the
+/// laser.
 #[test]
-fn generate_holes_arms_an_absolute_pending_burn() {
+fn generate_holes_arms_an_absolute_load_only_handoff() {
     let mut app = ConsoleApp::new(tmp_db(), vec!["true".into()]);
     app.fiducial_generate_holes();
     let pending = app
         .runtime
         .pending_lightburn
         .as_ref()
-        .expect("a LightBurn burn was queued");
+        .expect("a LightBurn load was queued");
     assert!(
-        pending.is_absolute(),
-        "queued path is absolute: {pending:?}"
+        pending.path.is_absolute(),
+        "queued path is absolute: {:?}",
+        pending.path
     );
     assert!(
-        pending.ends_with("fid-holes.lbrn2"),
-        "queued path is the holes output: {pending:?}"
+        pending.path.ends_with("fid-holes.lbrn2"),
+        "queued path is the holes output: {:?}",
+        pending.path
     );
-    assert!(app.debug_summary().contains("lightburn=pending"));
+    assert!(!pending.start, "load-only: the chain never presses START");
+    assert!(app.debug_summary().contains("lightburn=pending-load"));
 }
 
-/// A refused holes generation (bad layout) arms no burn.
+/// A bad layout is refused BEFORE the export shells: the note names the layout
+/// error and no verb job is spawned. (Asserting "no burn was queued" would be
+/// vacuous now that this path never queues one for any input.)
 #[test]
-fn generate_holes_guard_refusal_arms_no_burn() {
+fn generate_holes_refuses_a_bad_layout_before_exporting() {
     let mut app = ConsoleApp::new(tmp_db(), vec!["true".into()]);
     app.fiducials.layout = "not a layout".into();
     app.fiducial_generate_holes();
     assert!(
-        app.runtime.pending_lightburn.is_none(),
-        "nothing queued when the layout is rejected"
+        app.runtime.verb_job.is_none(),
+        "the export never shelled for a rejected layout"
     );
-    assert!(app.debug_summary().contains("lightburn=idle"));
+    assert!(
+        app.fiducials.note.starts_with("layout:"),
+        "the note names the layout error: {:?}",
+        app.fiducials.note
+    );
 }
 
 /// The placement guard (no frame/job loaded) refuses before the export starts,
@@ -2595,7 +3596,7 @@ fn generate_holes_guard_refusal_arms_no_burn() {
 #[test]
 fn guard_refusal_does_not_arm_a_lightburn_run() {
     let mut app = ConsoleApp::new(tmp_db(), vec!["true".into()]);
-    // Front side, but no placement job loaded → the "load a frame + job" guard.
+    // Front side, but no placement job loaded → the "load the design" guard.
     app.emit_at_placement(true);
     assert!(
         app.runtime.pending_lightburn.is_none(),
@@ -2605,7 +3606,7 @@ fn guard_refusal_does_not_arm_a_lightburn_run() {
         app.runtime
             .log
             .iter()
-            .any(|l| l.err && l.text.contains("load a frame")),
+            .any(|l| l.err && l.text.contains("load the design first")),
         "the guard error was logged"
     );
     assert!(app.debug_summary().contains("lightburn=idle"));
@@ -2616,7 +3617,10 @@ fn guard_refusal_does_not_arm_a_lightburn_run() {
 #[test]
 fn failed_export_skips_the_queued_lightburn_run() {
     let mut app = ConsoleApp::new(tmp_db(), vec!["true".into()]);
-    app.runtime.pending_lightburn = Some(std::path::PathBuf::from("/tmp/placed.lbrn2"));
+    app.runtime.pending_lightburn = Some(PendingLightburn {
+        path: std::path::PathBuf::from("/tmp/placed.lbrn2"),
+        start: true,
+    });
     app.chain_lightburn_after_verb(false);
     assert!(
         app.runtime.pending_lightburn.is_none(),
@@ -2650,26 +3654,10 @@ G05
 M30
 ";
 
-/// All shape vertices of an emitted document, mm.
-fn lbrn2_verts(doc: &str) -> Vec<(f64, f64)> {
-    doc.split("<VertList>")
-        .skip(1)
-        .flat_map(|s| s.split("</VertList>").next().unwrap_or("").split('V'))
-        .filter(|t| !t.is_empty())
-        .filter_map(|t| {
-            let xy = t.split('c').next()?;
-            let mut it = xy.split_whitespace();
-            Some((it.next()?.parse().ok()?, it.next()?.parse().ok()?))
-        })
-        .collect()
-}
-
-fn verts_bbox(pts: &[(f64, f64)]) -> (f64, f64, f64, f64) {
-    pts.iter().fold(
-        (f64::MAX, f64::MAX, f64::MIN, f64::MIN),
-        |(x0, y0, x1, y1), &(x, y)| (x0.min(x), y0.min(y), x1.max(x), y1.max(y)),
-    )
-}
+// The emitted-geometry parser is shared with the diagnostic log's export
+// readback: the record that says where a job landed must read the file the same
+// way the tests that assert it do.
+use crate::diag::{lbrn2_verts, verts_bbox};
 
 /// "⤓ Emit drill holes → LightBurn (no burn)" writes the hole geometry at the
 /// placement affine (translation + rotation, NO frame normalization — the
@@ -2685,18 +3673,39 @@ fn emit_drill_holes_writes_placed_geometry_without_queueing_a_burn() {
     let out = dir.join("drill-holes.lbrn2");
 
     app.placement.job = vec![pcb_core::Poly::default()];
-    app.placement.frame_img = Some(image::GrayImage::new(800, 800));
+    app.fiducials.frame_img = Some(image::GrayImage::new(800, 800));
     app.placement.drills = drl.to_string_lossy().into_owned();
     app.placement.drill_lbrn2 = out.to_string_lossy().into_owned();
     app.placement.pivot = (0.0, 0.0);
     app.placement.tx_mm = 100.0;
     app.placement.ty_mm = 50.0;
     app.placement.rot_deg = 0.0;
+    // Distinctive etch numbers: the drill export must ignore them entirely.
+    app.job.speed_mm_s = 4321.0;
+    app.job.interval_mm = 0.011;
+    app.job.passes = 9;
 
     app.emit_drill_at_placement();
 
     let doc = std::fs::read_to_string(&out).expect("the .lbrn2 was written");
     assert!(doc.contains("<name Value=\"DRILL\"/>"));
+    // The drill recipe reaches the file verbatim: a traced (Line) layer at the
+    // drill speed/interval/wobble/passes, NOT the etch numbers.
+    for field in [
+        "type=\"Cut\"",
+        "<speed Value=\"1000\"/>",
+        "<interval Value=\"0.05\"/>",
+        "<wobbleEnable Value=\"1\"/>",
+        "<wobbleStep Value=\"0.02\"/>",
+        "<wobbleSize Value=\"0.05\"/>",
+        "<numPasses Value=\"2\"/>",
+    ] {
+        assert!(doc.contains(field), "drill .lbrn2 must carry {field}");
+    }
+    assert!(
+        !doc.contains("4321") && !doc.contains("0.011"),
+        "the etch recipe must not leak into the drill export"
+    );
     assert_eq!(
         doc.matches("Type=\"Path\"").count(),
         3,
@@ -2810,6 +3819,54 @@ fn drills_from_kicad_fills_the_field_with_stable_paths() {
     );
 }
 
+/// An empty drill field is not a refusal while a KiCad project is set: the
+/// emit derives the export's deterministic pth/npth pair, fills the field with
+/// the files that exist, and proceeds — one click instead of a dead end.
+#[test]
+fn drill_emit_derives_the_drill_paths_from_the_kicad_project() {
+    let mut app = ConsoleApp::new(tmp_db(), vec!["true".into()]);
+    let dir = std::env::temp_dir().join(format!("ui-drill-derive-{}", std::process::id()));
+    let gerbers = dir.join("pcbforge-gerbers");
+    std::fs::create_dir_all(&gerbers).unwrap();
+    let board = dir.join("demo.kicad_pcb");
+    std::fs::write(&board, "").unwrap();
+    std::fs::write(gerbers.join("pth.drl"), DRILL_SAMPLE).unwrap();
+    let out = dir.join("drill-holes.lbrn2");
+
+    app.placement.job = vec![pcb_core::Poly::default()];
+    app.fiducials.frame_img = Some(image::GrayImage::new(800, 800));
+    app.placement.drill_lbrn2 = out.to_string_lossy().into_owned();
+    assert!(app.placement.drills.is_empty(), "the field starts empty");
+
+    // No project either: the clear error still stands.
+    app.emit_drill_at_placement();
+    assert!(
+        app.runtime
+            .log
+            .iter()
+            .any(|l| l.err && l.text.contains("set a drill file")),
+        "no project, no derivation — the error is kept"
+    );
+    assert!(!out.exists(), "nothing written");
+
+    // With the project set, the existing pth.drl is found and used. npth.drl
+    // was never exported here, so only the file that exists lands in the field.
+    app.job.kicad_project = board.to_string_lossy().into_owned();
+    app.emit_drill_at_placement();
+    assert_eq!(
+        app.placement.drills,
+        gerbers.join("pth.drl").display().to_string(),
+        "the derived path filled the field"
+    );
+    assert!(
+        out.exists(),
+        "the drill job was written: {}",
+        app.placement.note
+    );
+
+    std::fs::remove_dir_all(dir).ok();
+}
+
 /// The drill-emit guards refuse (back side, no job, no drill file) without
 /// writing anything or arming the LightBurn chain.
 #[test]
@@ -2822,13 +3879,13 @@ fn emit_drill_holes_guards_refuse_without_queueing() {
         app.runtime
             .log
             .iter()
-            .any(|l| l.err && l.text.contains("load a frame")),
+            .any(|l| l.err && l.text.contains("load the design first")),
         "missing-job guard logged"
     );
 
     // Job loaded but no drill file named.
     app.placement.job = vec![pcb_core::Poly::default()];
-    app.placement.frame_img = Some(image::GrayImage::new(800, 800));
+    app.fiducials.frame_img = Some(image::GrayImage::new(800, 800));
     app.emit_drill_at_placement();
     assert!(
         app.runtime
@@ -2910,4 +3967,1820 @@ fn app_survives_refresh_and_relayout() {
     for _ in 0..2 {
         let _ = ctx.run(egui::RawInput::default(), |ctx| app.ui(ctx));
     }
+}
+
+/// A Check keeps the operator's own markers when they work. Detection must try
+/// them FIRST — re-seeding through the calibrated projection up front used to
+/// throw away markers that were already on the holes, which turned a working
+/// 4-of-4 Check into 0-of-4 for any layout whose coordinates were click-derived
+/// rather than true machine coordinates.
+#[test]
+fn check_locates_via_the_operators_markers_when_they_work() {
+    let dir = std::env::temp_dir().join(format!("ui-fidladder-a-{}", std::process::id()));
+    std::fs::create_dir_all(&dir).unwrap();
+    let path = dir.join("bed4.png");
+    let ppm = 10.0;
+    let holes = [(15.0, 25.0), (55.0, 25.0), (55.0, 60.0), (15.0, 60.0)];
+    write_hole_frame(&path, ppm, &holes);
+
+    let mut app = ConsoleApp::new(tmp_db(), vec!["true".into()]);
+    app.runtime.tab = CentralTab::Fiducials;
+    app.fiducials.frame = path.to_string_lossy().into();
+    app.fiducials.layout = "15,25; 55,25; 55,60; 15,60".into();
+    app.fiducials.px_per_mm = ppm;
+    app.fiducials.diameter_mm = 1.0;
+    app.fiducials.search_mm = 2.0;
+    let ctx = Context::default();
+    app.load_fid_frame(&ctx);
+    app.render_fiducials(&ctx);
+
+    assert_eq!(
+        app.fiducials.found.iter().filter(|f| f.is_some()).count(),
+        4,
+        "all four found: {}",
+        app.fiducials.note
+    );
+    assert!(
+        app.fiducials.note.contains("located via markers"),
+        "the operator's markers were used as-is: {}",
+        app.fiducials.note
+    );
+    // The markers stayed where they were — no stage moved them.
+    for (m, h) in app.fiducials.search.iter().zip(&holes) {
+        assert!(
+            (m.0 - h.0).abs() < 1e-9 && (m.1 - h.1).abs() < 1e-9,
+            "marker {m:?} moved off {h:?}"
+        );
+    }
+}
+
+/// The board is 10 mm from where the layout says and there is no calibration,
+/// so neither the markers nor a projection can find it. The whole-frame
+/// rectangle match recovers all four, moves the markers onto them, and the note
+/// says which stage did it plus why the earlier ones did not.
+#[test]
+fn check_recovers_a_displaced_board_via_the_rectangle_match() {
+    let dir = std::env::temp_dir().join(format!("ui-fidladder-c-{}", std::process::id()));
+    std::fs::create_dir_all(&dir).unwrap();
+    let path = dir.join("bed5.png");
+    let ppm = 10.0;
+    // Layout corners, and the board actually sitting 10 mm right / 10 mm down
+    // from them — five times the 2 mm search window, so every local window is
+    // looking at bare copper.
+    let layout = [(15.0, 25.0), (55.0, 25.0), (55.0, 60.0), (15.0, 60.0)];
+    let holes: Vec<(f64, f64)> = layout.iter().map(|&(x, y)| (x + 10.0, y - 10.0)).collect();
+    write_hole_frame(&path, ppm, &holes);
+
+    let mut app = ConsoleApp::new(tmp_db(), vec!["true".into()]);
+    app.runtime.tab = CentralTab::Fiducials;
+    app.fiducials.frame = path.to_string_lossy().into();
+    app.fiducials.layout = "15,25; 55,25; 55,60; 15,60".into();
+    app.fiducials.px_per_mm = ppm;
+    app.fiducials.diameter_mm = 1.0;
+    app.fiducials.search_mm = 2.0;
+    let ctx = Context::default();
+    app.load_fid_frame(&ctx);
+    app.render_fiducials(&ctx);
+
+    assert_eq!(
+        app.fiducials.found.iter().filter(|f| f.is_some()).count(),
+        4,
+        "recovered all four: {}",
+        app.fiducials.note
+    );
+    assert!(
+        app.fiducials.note.contains("located via rectangle match")
+            && app.fiducials.note.contains("candidates"),
+        "the note names the stage and its candidate count: {}",
+        app.fiducials.note
+    );
+    // The markers were moved onto the real holes, so the ✛ set now shows where
+    // the board actually is.
+    for (m, h) in app.fiducials.search.iter().zip(&holes) {
+        assert!(
+            (m.0 - h.0).abs() < 0.5 && (m.1 - h.1).abs() < 0.5,
+            "marker {m:?} not on hole {h:?}"
+        );
+    }
+}
+
+/// Nothing matches: no stage improves on the operator's markers, so the ✛ set
+/// is left exactly where they put it rather than parked wherever the last
+/// failed attempt happened to leave it.
+#[test]
+fn a_failed_check_leaves_the_markers_where_the_operator_put_them() {
+    let dir = std::env::temp_dir().join(format!("ui-fidladder-d-{}", std::process::id()));
+    std::fs::create_dir_all(&dir).unwrap();
+    let path = dir.join("bed6.png");
+    let ppm = 10.0;
+    // A blank bed: no holes at all, so every stage comes up empty.
+    write_hole_frame(&path, ppm, &[]);
+
+    let mut app = ConsoleApp::new(tmp_db(), vec!["true".into()]);
+    app.runtime.tab = CentralTab::Fiducials;
+    app.fiducials.frame = path.to_string_lossy().into();
+    app.fiducials.layout = "15,25; 55,25; 55,60; 15,60".into();
+    app.fiducials.px_per_mm = ppm;
+    app.fiducials.diameter_mm = 1.0;
+    app.fiducials.search_mm = 2.0;
+    let ctx = Context::default();
+    app.load_fid_frame(&ctx);
+    let placed = [(16.0, 26.0), (54.0, 24.0), (56.0, 61.0), (14.0, 59.0)];
+    app.fiducials.search = placed.to_vec();
+    app.render_fiducials(&ctx);
+
+    assert_eq!(
+        app.fiducials.found.iter().filter(|f| f.is_some()).count(),
+        0,
+        "nothing to find: {}",
+        app.fiducials.note
+    );
+    assert_eq!(
+        app.fiducials.search,
+        placed.to_vec(),
+        "the markers survived a failed Check: {}",
+        app.fiducials.note
+    );
+    assert!(
+        app.fiducials.note.contains("rectangle match"),
+        "the note says the rescan was tried and why it came up short: {}",
+        app.fiducials.note
+    );
+}
+
+/// The throttle on the ladder's third stage. Under Live the whole-frame scan
+/// costs a visible hitch, so it may fire on a short frame only once per the
+/// operator's re-acquire interval — and backs off four times as far after a run
+/// that found nothing. A manual Check is never throttled.
+///
+/// (The live loop itself — real frames streaming off a device while the board
+/// moves — is not testable headlessly; this pins the decision, not the feed.)
+#[test]
+fn the_rectangle_match_is_throttled_under_live_but_not_under_a_check() {
+    use super::fiducial_ui::{LIVE_RECOVER_MAX_S, LIVE_RECOVER_MIN_S, recover_window};
+    use std::time::Duration;
+    // Built by addition only: an Instant cannot be safely walked backwards.
+    let t0 = std::time::Instant::now();
+    // The dial the probes below are read against, and the two windows it
+    // implies — derived the way the ladder derives them, so the probe times
+    // stay right whatever the default interval becomes.
+    let dial = 1.0;
+    let cooldown = recover_window(dial, true);
+    let backoff = recover_window(dial, false);
+    assert_eq!(backoff, cooldown * RECOVER_BACKOFF_FACTOR);
+
+    // Enough hits: no stage 3 at all, live or not.
+    assert!(!should_global_recover(true, 3, None, t0, dial));
+    assert!(!should_global_recover(false, 4, None, t0, dial));
+
+    // First short frame under Live scans; a second one inside the window does
+    // not, whichever window the previous run earned.
+    assert!(should_global_recover(true, 1, None, t0, dial));
+    let after_win = Some((t0, true));
+    let after_lose = Some((t0, false));
+    assert!(!should_global_recover(
+        true,
+        1,
+        after_win,
+        t0 + cooldown / 5,
+        dial
+    ));
+
+    // The two windows differ: halfway through the backoff a recovered scan is
+    // due again, a failed one is still held off; at the backoff both are due.
+    let mid = t0 + backoff / 2;
+    assert!(should_global_recover(true, 1, after_win, mid, dial));
+    assert!(!should_global_recover(true, 1, after_lose, mid, dial));
+    assert!(should_global_recover(
+        true,
+        1,
+        after_lose,
+        t0 + backoff,
+        dial
+    ));
+    assert!(
+        cooldown < backoff,
+        "a failed recovery must back off further than a successful one"
+    );
+
+    // The configured interval is the one that governs, not a constant: at
+    // 0.2 s the success window is 0.2 s and the failure window 0.8 s.
+    assert_eq!(recover_window(0.2, false), Duration::from_millis(800));
+    assert!(!should_global_recover(
+        true,
+        1,
+        after_win,
+        t0 + Duration::from_millis(199),
+        0.2
+    ));
+    assert!(should_global_recover(
+        true,
+        1,
+        after_win,
+        t0 + Duration::from_millis(200),
+        0.2
+    ));
+    assert!(!should_global_recover(
+        true,
+        1,
+        after_lose,
+        t0 + Duration::from_millis(799),
+        0.2
+    ));
+    assert!(should_global_recover(
+        true,
+        1,
+        after_lose,
+        t0 + Duration::from_millis(800),
+        0.2
+    ));
+
+    // …and it is read when the throttle is CHECKED, not snapshotted when the
+    // scan ran. Turning the dial down has to shorten the window ALREADY
+    // running — the hover text promises exactly that, and a scan stamped under
+    // a 10 s interval would otherwise ignore the change for another 40 s.
+    let half = t0 + Duration::from_millis(500);
+    assert!(!should_global_recover(true, 1, after_win, half, 10.0));
+    assert!(
+        should_global_recover(true, 1, after_win, half, 0.2),
+        "lowering the dial applies to the window in flight"
+    );
+    // Raising it lengthens the same window, symmetrically.
+    assert!(should_global_recover(true, 1, after_win, half, 0.2));
+    assert!(!should_global_recover(true, 1, after_win, half, 2.0));
+
+    // Out-of-range dials are bounded rather than trusted: `from_secs_f64`
+    // panics on a negative, and NaN survives `clamp`.
+    assert_eq!(
+        recover_window(-5.0, true),
+        recover_window(LIVE_RECOVER_MIN_S, true)
+    );
+    assert_eq!(
+        recover_window(f64::NAN, true),
+        recover_window(LIVE_RECOVER_MIN_S, true)
+    );
+    assert_eq!(
+        recover_window(1.0e6, true),
+        recover_window(LIVE_RECOVER_MAX_S, true)
+    );
+
+    // A manual Check ignores the cooldown entirely — one deliberate press, and
+    // the operator is waiting for the answer.
+    assert!(should_global_recover(false, 1, after_lose, t0, dial));
+    assert!(should_global_recover(false, 0, after_win, t0, dial));
+}
+
+/// The throttle wired into the ladder: under Live a hopeless frame runs the
+/// whole-frame scan once, and the next detection on the same feed reports it as
+/// throttled instead of paying for a second scan.
+#[test]
+fn a_second_short_live_frame_does_not_rescan() {
+    let dir = std::env::temp_dir().join(format!("ui-fidthrottle-{}", std::process::id()));
+    std::fs::create_dir_all(&dir).unwrap();
+    let path = dir.join("bed7.png");
+    let ppm = 10.0;
+    // A blank bed: every stage comes up empty, so every frame is "short".
+    write_hole_frame(&path, ppm, &[]);
+
+    let mut app = ConsoleApp::new(tmp_db(), vec!["true".into()]);
+    app.runtime.tab = CentralTab::Fiducials;
+    app.fiducials.frame = path.to_string_lossy().into();
+    app.fiducials.layout = "15,25; 55,25; 55,60; 15,60".into();
+    app.fiducials.px_per_mm = ppm;
+    app.fiducials.diameter_mm = 1.0;
+    app.fiducials.search_mm = 2.0;
+    let ctx = Context::default();
+    app.load_fid_frame(&ctx);
+    app.fiducials.live = true;
+    // Pin the interval instead of inheriting the operator default: the two
+    // detection passes below run back to back, and a slow (dev, loaded) machine
+    // could otherwise walk past a sub-second window between them and rescan.
+    app.fiducials.live_recover_s = 10.0;
+
+    // Streamed frames driven directly (the pump's path), not through the
+    // Check button — the two are now distinct on purpose.
+    app.detect_fiducials(true);
+    assert!(
+        app.fiducials.note.contains("rectangle match") && !app.fiducials.note.contains("throttled"),
+        "the first short frame under Live still runs the scan: {}",
+        app.fiducials.note
+    );
+    app.detect_fiducials(true);
+    assert!(
+        app.fiducials.note.contains("rectangle match throttled"),
+        "the very next short frame is throttled, not rescanned: {}",
+        app.fiducials.note
+    );
+
+    // A manual Check is not on the feed's budget, so it scans regardless of
+    // how recently the live loop did — WITHOUT Live being switched off first.
+    // A button that sometimes does nothing while the feed runs was the wart
+    // this parameter exists to remove.
+    let stamp = app.fiducials.last_global_recover;
+    app.render_fiducials(&ctx);
+    assert!(
+        !app.fiducials.note.contains("throttled"),
+        "a Check ignores the cooldown even while Live is on: {}",
+        app.fiducials.note
+    );
+    // …and does not SPEND that budget either. Stamping here would let one
+    // press silence the feed's next scans for up to the full backoff — the
+    // opposite of what pressing Check means.
+    assert_eq!(
+        app.fiducials.last_global_recover, stamp,
+        "a manual Check leaves the feed's throttle exactly as the stream left it"
+    );
+
+    // The dial is read when the throttle is checked, not snapshotted when the
+    // scan ran, so turning it down shortens the window already in flight.
+    let stamped = std::time::Instant::now();
+    app.fiducials.last_global_recover = Some((stamped, false));
+    // Just past the 0.4 s the floor implies for a failed scan, and nowhere
+    // near the 40 s the 10 s setting implies. The sleep can only overshoot.
+    std::thread::sleep(std::time::Duration::from_millis(450));
+    app.fiducials.live_recover_s = 10.0;
+    app.detect_fiducials(true);
+    assert!(
+        app.fiducials.note.contains("rectangle match throttled"),
+        "at 10 s the window has not expired: {}",
+        app.fiducials.note
+    );
+    assert_eq!(
+        app.fiducials.last_global_recover,
+        Some((stamped, false)),
+        "a throttled frame does not re-stamp"
+    );
+    app.fiducials.live_recover_s = super::fiducial_ui::LIVE_RECOVER_MIN_S;
+    app.detect_fiducials(true);
+    assert!(
+        !app.fiducials.note.contains("throttled"),
+        "the lowered dial applies to the window already running: {}",
+        app.fiducials.note
+    );
+}
+
+/// Everything a diagnostic-log reader depends on: the records exist, they carry
+/// the `check=N` that makes a check greppable as one unit, and the overlay
+/// record — the only one reached from a per-frame path — writes once per
+/// position rather than once per frame.
+#[test]
+fn the_diagnostic_log_records_a_check_and_its_overlay_without_flooding() {
+    use nalgebra::Matrix3;
+    let mut app = ConsoleApp::new(tmp_db(), vec!["true".into()]);
+    let log_path = app.runtime.diag.path().to_path_buf();
+    // A laser anchor at 10 px/mm, so camera px → machine mm is exact.
+    app.calibration.anchor = Some(calib::Calibration {
+        px_to_mm: vision::Homography {
+            matrix: Matrix3::new(0.1, 0.0, 0.0, 0.0, 0.1, 0.0, 0.0, 0.0, 1.0),
+            residuals: vec![],
+            rms: 0.0,
+        },
+        rms_um: 0.0,
+        found: 4,
+        total: 4,
+        dots: vec![],
+    });
+    app.fiducials.frame_img = Some(image::GrayImage::new(800, 800));
+    app.fiducials.layout = "10,10; 60,10; 10,60; 60,60".into();
+    // Detected exactly on the nominal layout: an identity fit, so the check is
+    // applied rather than gated.
+    app.fiducials.found = vec![
+        Some((100.0, 100.0)),
+        Some((600.0, 100.0)),
+        Some((100.0, 600.0)),
+        Some((600.0, 600.0)),
+    ];
+    app.update_placement_from_fiducials_via(
+        "rectangle match (12 candidates, 4/4, 0.4 px RMS)",
+        &["seed scale 0 px/mm is not positive".into()],
+    );
+    assert!(app.fiducials.last_placed, "the fit was applied");
+
+    let text = std::fs::read_to_string(&log_path).expect("the log file exists");
+    assert!(
+        text.starts_with(|c: char| c.is_ascii_digit()),
+        "timestamped"
+    );
+    assert!(text.contains("startup version="), "record 1");
+    assert!(
+        text.contains("fid-check check=1") && text.contains("projection=homography"),
+        "record 2a names the projection variant: {text}"
+    );
+    assert!(
+        text.contains("detected_machine_mm=[10.000,10.000 60.000,10.000"),
+        "record 2a carries the detections in MACHINE mm: {text}"
+    );
+    assert!(
+        text.contains("layout_centroid_mm=35.000,35.000"),
+        "record 2b carries the layout centroid: {text}"
+    );
+    assert!(
+        text.contains("via=\"rectangle match (12 candidates, 4/4, 0.4 px RMS)\""),
+        "record 2a names the ladder stage that found the holes: {text}"
+    );
+    assert!(
+        text.contains("stages_declined=[\"seed scale 0 px/mm is not positive\"]"),
+        "record 2a carries the stages that declined: {text}"
+    );
+    assert!(
+        text.contains("detected_px=[100.0,100.0 600.0,100.0 100.0,600.0 600.0,600.0]"),
+        "record 2a carries the raw camera pixels beside the millimetres: {text}"
+    );
+    // No ① lens fit at all, so there is no calibrated box to be outside of —
+    // which is a different thing from every point being inside one.
+    assert!(
+        text.contains("out_of_lens_bounds=none"),
+        "record 2a says there is no lens box: {text}"
+    );
+    assert!(text.contains("outcome=applied"), "record 2c: {text}");
+
+    // Record 3: the overlay bbox. It is called from the frame path, so it must
+    // write once for a position and stay silent while nothing moves.
+    app.placement.job = vec![pcb_core::Poly {
+        outer: vec![
+            pcb_core::P { x: 0, y: 0 },
+            pcb_core::P {
+                x: 10 * NM_PER_MM,
+                y: 0,
+            },
+            pcb_core::P {
+                x: 10 * NM_PER_MM,
+                y: 10 * NM_PER_MM,
+            },
+        ],
+        holes: vec![],
+    }];
+    app.placement.pivot = (5.0, 5.0);
+    for _ in 0..20 {
+        app.diag_overlay(None, (800, 800));
+    }
+    let overlays = |t: &str| t.matches("overlay check=").count();
+    let text = std::fs::read_to_string(&log_path).unwrap();
+    assert_eq!(overlays(&text), 1, "20 frames, one record: {text}");
+
+    // A sub-epsilon nudge is not a new position.
+    app.placement.tx_mm += 0.001;
+    app.diag_overlay(None, (800, 800));
+    let text = std::fs::read_to_string(&log_path).unwrap();
+    assert_eq!(overlays(&text), 1, "jitter below the epsilon is not logged");
+
+    // A real move is.
+    app.placement.tx_mm += 5.0;
+    app.diag_overlay(None, (800, 800));
+    let text = std::fs::read_to_string(&log_path).unwrap();
+    assert_eq!(overlays(&text), 2, "a real move is recorded");
+    assert!(
+        text.contains("overlay check=1"),
+        "the overlay is tagged with the check it belongs to: {text}"
+    );
+
+    // With a ① lens fit installed the count becomes k/n. The box is grown 5% of
+    // its own span per side first — the same slack the field fit gives its grid
+    // dots — so the 600 px detections sit inside a 580 px box; unexpanded they
+    // would read 3/4. Only the lens is set, so `place_projection` still falls
+    // back to the anchor homography and the detections are unchanged.
+    let coords = [0.0, 20.0, 40.0, 60.0];
+    let lens_pairs: Vec<_> = coords
+        .iter()
+        .flat_map(|&y| {
+            coords.iter().map(move |&x| {
+                (
+                    nalgebra::Point2::new(10.0 * x + 20.0, 800.0 - 10.0 * y),
+                    nalgebra::Point2::new(x, y),
+                )
+            })
+        })
+        .collect();
+    let mut lens = vision::fit_lens(&lens_pairs).unwrap();
+    lens.calib_px_bounds = Some([0.0, 0.0, 580.0, 580.0]);
+    app.calibration.lens = Some(calib::CameraCal {
+        lens,
+        dots: vec![],
+        found: 16,
+        total: 16,
+    });
+    app.update_placement_from_fiducials();
+    let text = std::fs::read_to_string(&log_path).unwrap();
+    assert!(
+        text.contains("out_of_lens_bounds=0/4"),
+        "the box is grown 5% per side before anything is called outside it: {text}"
+    );
+    // Tighten it until the growth cannot save them.
+    if let Some(cal) = app.calibration.lens.as_mut() {
+        cal.lens.calib_px_bounds = Some([0.0, 0.0, 500.0, 500.0]);
+    }
+    app.update_placement_from_fiducials();
+    let text = std::fs::read_to_string(&log_path).unwrap();
+    assert!(
+        text.contains("out_of_lens_bounds=3/4"),
+        "detections the lens fit never covered are counted: {text}"
+    );
+    // The wrapper reports the ladder's own starting stage.
+    assert!(
+        text.contains("via=\"markers\"") && text.contains("stages_declined=[]"),
+        "a re-fit with no ladder context still names a stage: {text}"
+    );
+}
+
+/// A gated-out check still records its fit and names the gate that refused it —
+/// a refusal is the case the log exists for.
+#[test]
+fn the_diagnostic_log_names_the_gate_that_refused_a_check() {
+    let mut app = ConsoleApp::new(tmp_db(), vec!["true".into()]);
+    let log_path = app.runtime.diag.path().to_path_buf();
+    app.fiducials.frame_img = Some(image::GrayImage::new(800, 800));
+    // No calibration at all, so `place_projection` refuses.
+    app.update_placement_from_fiducials_via(
+        "projection seed",
+        &["no frame to seed against".into()],
+    );
+    let text = std::fs::read_to_string(&log_path).unwrap();
+    assert!(
+        text.contains("outcome=refused-projection"),
+        "the gate is named: {text}"
+    );
+    // The early return still names the stage that produced the markers; there
+    // is nothing measured yet, so the rest of record 2a is empty.
+    assert!(
+        text.contains("via=\"projection seed\""),
+        "a refused check still names its ladder stage: {text}"
+    );
+    assert!(
+        text.contains("stages_declined=[] detected_px=[] out_of_lens_bounds=none"),
+        "the early return carries no detections: {text}"
+    );
+    // Record 5: the projection failure also reaches the file as an error line
+    // once the frame's log sweep runs.
+    app.runtime.log.push(LogLine {
+        text: "synthetic failure".into(),
+        err: true,
+    });
+    app.diag_mirror_errors();
+    let text = std::fs::read_to_string(&log_path).unwrap();
+    assert!(text.contains("error synthetic failure"), "record 5: {text}");
+}
+
+/// The error mirror tracks an index into a log the verb pump trims from the
+/// front. A shrunk log must clamp, not slice out of bounds.
+#[test]
+fn the_error_mirror_survives_the_log_being_trimmed() {
+    let mut app = ConsoleApp::new(tmp_db(), vec!["true".into()]);
+    for i in 0..600 {
+        app.runtime.log.push(LogLine {
+            text: format!("line {i}"),
+            err: i % 100 == 0,
+        });
+    }
+    app.diag_mirror_errors();
+    // The pump's 500-line trim, and then a full clear — both leave the cursor
+    // past the end.
+    app.runtime.log.clear();
+    app.diag_mirror_errors();
+    app.runtime.log.push(LogLine {
+        text: "after the trim".into(),
+        err: true,
+    });
+    app.diag_mirror_errors();
+    let text = std::fs::read_to_string(app.runtime.diag.path()).unwrap();
+    assert!(text.contains("error after the trim"), "mirroring resumes");
+}
+
+/// The default layout, and the exit magnification the default optics imply.
+/// `m` is the factor a wrong-face fit leaves in the scale — the only signal
+/// left once the layout's own mirror symmetry has neutered `pose.flipped`.
+const SYM_LAYOUT: &str = "10,10; 60,10; 10,60; 60,60";
+const SYM_CENTER: (f64, f64) = (35.0, 35.0);
+fn exit_mag() -> f64 {
+    1.0 + 1.6 / 70.0
+}
+
+/// An app wired to fit a pose straight from millimetre "detections": a 10 px/mm
+/// anchor with no y-flip, so a detection at `(x, y)` mm is simply `(10x, 10y)`
+/// px, plus a frame big enough to hold it.
+///
+/// The side is switched BEFORE the frame is installed — `set_side` clears the
+/// previous face's photo, which is the whole point of that clearing.
+fn mirror_gate_app(side: Side, layout: &str, detected_mm: &[(f64, f64)]) -> ConsoleApp {
+    use nalgebra::Matrix3;
+    let mut app = ConsoleApp::new(tmp_db(), vec!["true".into()]);
+    app.fiducials.layout = layout.into();
+    app.set_side(side);
+    app.calibration.anchor = Some(calib::Calibration {
+        px_to_mm: vision::Homography {
+            matrix: Matrix3::new(0.1, 0.0, 0.0, 0.0, 0.1, 0.0, 0.0, 0.0, 1.0),
+            residuals: vec![],
+            rms: 0.0,
+        },
+        rms_um: 0.0,
+        found: 4,
+        total: 4,
+        dots: vec![],
+    });
+    app.fiducials.frame_img = Some(image::GrayImage::new(800, 800));
+    app.fiducials.found = detected_mm
+        .iter()
+        .map(|&(x, y)| Some((x * 10.0, y * 10.0)))
+        .collect();
+    app
+}
+
+/// The default layout is its own mirror image, and every rectangle the
+/// fid-holes generator emits is too — which is precisely when `pose.flipped`
+/// stops being a face check. An L or any chiral arrangement is not.
+#[test]
+fn mirror_symmetry_is_detected_for_the_layouts_that_make_the_flip_gate_blind() {
+    let sym = crate::fiducial::parse_layout(SYM_LAYOUT).unwrap();
+    assert!(
+        crate::fiducial::layout_is_mirror_symmetric(&sym),
+        "the default layout is mirror-symmetric"
+    );
+    // The generator's rectangles, wherever they are centred.
+    let rect = crate::fiducial::centered_fid_layout(35.0, 35.0, 50.0, 30.0);
+    assert!(crate::fiducial::layout_is_mirror_symmetric(&rect));
+    let rect = crate::fiducial::centered_fid_layout(12.5, 88.0, 41.0, 41.0);
+    assert!(crate::fiducial::layout_is_mirror_symmetric(&rect));
+    // A chiral quad is not — there the mirror flag genuinely works.
+    let chiral = crate::fiducial::parse_layout("10,10; 58,10; 14,58; 50,40").unwrap();
+    assert!(!crate::fiducial::layout_is_mirror_symmetric(&chiral));
+    // Two points cannot pin a mirror axis, so they are never called symmetric.
+    let pair = crate::fiducial::parse_layout("10,10; 60,10").unwrap();
+    assert!(!crate::fiducial::layout_is_mirror_symmetric(&pair));
+}
+
+/// THE double-sided hazard. The board has been physically flipped but Front is
+/// still selected. On a mirror-symmetric layout each ✛ latches onto its mirror
+/// PARTNER, so the fit comes back proper (`flipped == false`, matching Front)
+/// with an essentially zero residual — the mirror gate waves it through and a
+/// front job locks onto a back-side board.
+///
+/// What gives it away is the scale: the camera images the holes' EXIT openings,
+/// so the fit carries one whole factor of `m = 1 + thickness/focal` instead of
+/// landing at 1.0. Refuse, and say which face is in doubt.
+#[test]
+fn a_flipped_board_checked_as_front_is_refused_on_a_symmetric_layout() {
+    let m = exit_mag();
+    let (cx, cy) = SYM_CENTER;
+    // The swapped correspondence, reduced: layout point i pairs with the hole
+    // that is its mirror partner, leaving a pure magnification about the
+    // layout centroid.
+    let detected: Vec<(f64, f64)> = crate::fiducial::parse_layout(SYM_LAYOUT)
+        .unwrap()
+        .iter()
+        .map(|&(x, y)| (cx + m * (x - cx), cy + m * (y - cy)))
+        .collect();
+    let mut app = mirror_gate_app(Side::Front, SYM_LAYOUT, &detected);
+    app.update_placement_from_fiducials();
+
+    assert!(
+        !app.fiducials.last_placed,
+        "a flipped board must not lock as Front: {}",
+        app.fiducials.note
+    );
+    assert!(
+        app.fiducials.note.contains("mirror-symmetric")
+            && app.fiducials.note.contains("OTHER face"),
+        "the note names the ambiguity and the suspicion: {}",
+        app.fiducials.note
+    );
+    assert!(
+        !app.placement.auto_pose,
+        "nothing was written into the placement"
+    );
+    let log = std::fs::read_to_string(app.runtime.diag.path()).unwrap();
+    assert!(
+        log.contains("outcome=refused-mirror-scale"),
+        "the gate is named in the log: {log}"
+    );
+}
+
+/// The inverse: Back is selected but the board was never turned over. The fit
+/// sources carry the exit magnification while the detections do not, so the
+/// swapped correspondence produces an improper fit (`flipped == true`, matching
+/// Back) at 1/m. Same tell, other direction.
+#[test]
+fn an_unflipped_board_checked_as_back_is_refused_on_a_symmetric_layout() {
+    let (cx, _) = SYM_CENTER;
+    // The holes as the camera sees them with the board still front-up, read
+    // through the back's mirrored markers: hole i is the mirror partner.
+    let detected: Vec<(f64, f64)> = crate::fiducial::parse_layout(SYM_LAYOUT)
+        .unwrap()
+        .iter()
+        .map(|&(x, y)| (2.0 * cx - x, y))
+        .collect();
+    let mut app = mirror_gate_app(Side::Back, SYM_LAYOUT, &detected);
+    app.update_placement_from_fiducials();
+
+    assert!(
+        !app.fiducials.last_placed,
+        "an unflipped board must not lock as Back: {}",
+        app.fiducials.note
+    );
+    assert!(
+        app.fiducials.note.contains("mirror-symmetric"),
+        "the note names the ambiguity: {}",
+        app.fiducials.note
+    );
+    let log = std::fs::read_to_string(app.runtime.diag.path()).unwrap();
+    assert!(
+        log.contains("outcome=refused-mirror-scale"),
+        "the gate is named in the log: {log}"
+    );
+}
+
+/// …and the tell must not cost the legitimate cases anything. A real front fit
+/// and a real back fit both land at scale 1.0 — the back's sources already
+/// carry the magnification, so it is modelled out rather than fitted — which is
+/// nowhere near either wrong-face signature.
+#[test]
+fn legitimate_front_and_back_fits_still_pass_the_mirror_scale_tell() {
+    let layout = crate::fiducial::parse_layout(SYM_LAYOUT).unwrap();
+
+    // Front, board front-up: the holes are the layout.
+    let mut front = mirror_gate_app(Side::Front, SYM_LAYOUT, &layout);
+    front.update_placement_from_fiducials();
+    assert!(
+        front.fiducials.last_placed,
+        "an honest front fit is applied: {}",
+        front.fiducials.note
+    );
+    let pose = front.fiducials.pose.expect("front pose cached");
+    assert!((pose.scale - 1.0).abs() < 1e-9, "scale {}", pose.scale);
+    assert!(!pose.flipped);
+
+    // Back, board turned over: the camera sees the exit openings, mirrored
+    // about the layout centreline — exactly what `expected_points` predicts.
+    let m = exit_mag();
+    let (cx, cy) = SYM_CENTER;
+    let detected: Vec<(f64, f64)> = layout
+        .iter()
+        .map(|&(x, y)| (2.0 * cx - (cx + m * (x - cx)), cy + m * (y - cy)))
+        .collect();
+    let mut back = mirror_gate_app(Side::Back, SYM_LAYOUT, &detected);
+    back.update_placement_from_fiducials();
+    assert!(
+        back.fiducials.last_placed,
+        "an honest back fit is applied: {}",
+        back.fiducials.note
+    );
+    let pose = back.fiducials.pose.expect("back pose cached");
+    assert!(
+        (pose.scale - 1.0).abs() < 1e-9,
+        "the exit magnification is modelled, not fitted: scale {}",
+        pose.scale
+    );
+    assert!(pose.flipped, "the physical flip is seen");
+}
+
+/// With no optics the magnification collapses to 1.0 and the tell vanishes: the
+/// two faces really are indistinguishable from a symmetric layout. Refusing
+/// here would block ordinary front work on the default layout, so the check
+/// says so instead of guessing — and keeps placing.
+#[test]
+fn a_symmetric_layout_without_optics_warns_instead_of_refusing_on_the_front() {
+    let layout = crate::fiducial::parse_layout(SYM_LAYOUT).unwrap();
+    let mut app = mirror_gate_app(Side::Front, SYM_LAYOUT, &layout);
+    app.job.focal_mm = 0.0;
+    app.job.board_thickness_mm = 0.0;
+    app.update_placement_from_fiducials();
+
+    assert!(
+        app.fiducials.last_placed,
+        "front work is not blocked: {}",
+        app.fiducials.note
+    );
+    assert!(
+        app.fiducials.note.contains("mirror-symmetric") && app.fiducials.note.contains("thickness"),
+        "but the operator is told the mirror check is blind here: {}",
+        app.fiducials.note
+    );
+}
+
+/// Back registration with the optics unset is refused outright. Without them
+/// `exit_magnification` degrades to 1.0, the ~2.3% hole-exit parallax lands in
+/// the FITTED SCALE — inside the 0.90–1.10 band, so nothing else stops it — and
+/// the back job is emitted 2.3% oversized with no warning anywhere.
+#[test]
+fn back_registration_without_board_thickness_or_focal_length_is_refused() {
+    let layout = crate::fiducial::parse_layout(SYM_LAYOUT).unwrap();
+    let (cx, _) = SYM_CENTER;
+    // A perfectly good back-face detection — plain mirror, since with the
+    // optics unset that is all the console can predict.
+    let detected: Vec<(f64, f64)> = layout.iter().map(|&(x, y)| (2.0 * cx - x, y)).collect();
+
+    for (thickness, focal) in [(0.0, 70.0), (1.6, 0.0), (0.0, 0.0)] {
+        let mut app = mirror_gate_app(Side::Back, SYM_LAYOUT, &detected);
+        app.job.board_thickness_mm = thickness;
+        app.job.focal_mm = focal;
+        app.update_placement_from_fiducials();
+        assert!(
+            !app.fiducials.last_placed,
+            "thickness {thickness}, focal {focal}: must not lock: {}",
+            app.fiducials.note
+        );
+        assert!(
+            app.fiducials.note.contains("board thickness")
+                && app.fiducials.note.contains("focal length"),
+            "the note says what to set: {}",
+            app.fiducials.note
+        );
+        let log = std::fs::read_to_string(app.runtime.diag.path()).unwrap();
+        assert!(
+            log.contains("outcome=refused-optics"),
+            "the gate is named in the log: {log}"
+        );
+    }
+
+    // With both set the same detections get past this gate (they are then
+    // refused by the mirror tell instead — the board is not actually flipped).
+    let mut app = mirror_gate_app(Side::Back, SYM_LAYOUT, &detected);
+    app.update_placement_from_fiducials();
+    let log = std::fs::read_to_string(app.runtime.diag.path()).unwrap();
+    assert!(
+        !log.contains("outcome=refused-optics"),
+        "the optics gate is about the OPTICS, not the pose: {log}"
+    );
+}
+
+/// Stage 3, the whole-frame rectangle match, must look for the arrangement THIS
+/// FACE shows. On the back the holes are physically mirrored, and the matcher
+/// enumerates proper similarities only — so matching the raw design layout can
+/// never succeed on a chiral board, leaving recovery dead exactly when the
+/// board has just been flipped.
+///
+/// The layout here is deliberately chiral (its mirror image is not a rotation
+/// of it), so the front/back distinction is the whole difference: the same
+/// frame recovers all four holes in layout order on Back and matches nothing on
+/// Front.
+#[test]
+fn the_rectangle_match_follows_the_back_faces_mirrored_geometry() {
+    let dir = std::env::temp_dir().join(format!("ui-fidback-{}", std::process::id()));
+    std::fs::create_dir_all(&dir).unwrap();
+    let path = dir.join("back-bed.png");
+    let ppm = 10.0;
+    let layout = "10,10; 58,10; 14,58; 50,40";
+
+    // Where the holes really are: the back-expected positions, displaced far
+    // enough (5 mm, against a 2 mm window) that no local search can reach them
+    // and only stage 3 can.
+    let ctx = Context::default();
+    let holes: Vec<(f64, f64)> = {
+        let mut probe = ConsoleApp::new(tmp_db(), vec!["true".into()]);
+        probe.fiducials.layout = layout.into();
+        probe.set_side(Side::Back);
+        probe
+            .expected_points()
+            .iter()
+            .map(|&(x, y)| (x + 5.0, y - 5.0))
+            .collect()
+    };
+    write_hole_frame(&path, ppm, &holes);
+
+    let mut app = ConsoleApp::new(tmp_db(), vec!["true".into()]);
+    app.runtime.tab = CentralTab::Fiducials;
+    app.fiducials.layout = layout.into();
+    // Before the frame — a side switch drops it.
+    app.set_side(Side::Back);
+    app.fiducials.frame = path.to_string_lossy().into();
+    app.fiducials.px_per_mm = ppm;
+    app.fiducials.diameter_mm = 1.0;
+    app.fiducials.search_mm = 2.0;
+    app.load_fid_frame(&ctx);
+    app.render_fiducials(&ctx);
+
+    assert_eq!(
+        app.fiducials.found.iter().filter(|f| f.is_some()).count(),
+        4,
+        "the back face's own arrangement is recovered: {}",
+        app.fiducials.note
+    );
+    assert!(
+        app.fiducials.note.contains("located via rectangle match"),
+        "stage 3 is what did it: {}",
+        app.fiducials.note
+    );
+    // Correspondence, not just a count: marker i must sit on hole i, or every
+    // downstream index (residual rows, the pose fit, ⌖ adopt) is scrambled.
+    for (i, (m, h)) in app.fiducials.search.iter().zip(&holes).enumerate() {
+        assert!(
+            (m.0 - h.0).abs() < 0.5 && (m.1 - h.1).abs() < 0.5,
+            "marker {i} at {m:?} is not on hole {h:?}"
+        );
+    }
+
+    // The same frame on the FRONT: the arrangement is the mirror of what the
+    // front expects, and no proper similarity within ±20° fits it.
+    let mut front = ConsoleApp::new(tmp_db(), vec!["true".into()]);
+    front.runtime.tab = CentralTab::Fiducials;
+    front.fiducials.layout = layout.into();
+    front.fiducials.frame = path.to_string_lossy().into();
+    front.fiducials.px_per_mm = ppm;
+    front.fiducials.diameter_mm = 1.0;
+    front.fiducials.search_mm = 2.0;
+    front.load_fid_frame(&ctx);
+    front.render_fiducials(&ctx);
+    assert_eq!(
+        front.fiducials.found.iter().filter(|f| f.is_some()).count(),
+        0,
+        "a mirrored arrangement is not the front's: {}",
+        front.fiducials.note
+    );
+    assert!(
+        front.fiducials.note.contains("none form the layout"),
+        "and stage 3 says so rather than matching something: {}",
+        front.fiducials.note
+    );
+}
+
+// ---------------------------------------------------------------------------
+// Where the placed job sits relative to the pose the fiducials fitted: the
+// drag rule that moves it, the readout and burn record that name the offset,
+// and the mirror-scale tell, which measures against the machine's own field
+// scale rather than against 1.0 and refuses only within 0.4% of the wrong-face
+// signature.
+// ---------------------------------------------------------------------------
+
+/// An identity `layout → bed` fit, so the fiducial pose is exactly the layout
+/// centroid at 0° and 1.0 — arithmetic a reader can do in their head.
+fn identity_fit() -> calib::Similarity2 {
+    calib::Similarity2 {
+        scale: 1.0,
+        rigid: calib::Rigid2::IDENTITY,
+    }
+}
+
+/// An app with a design placed exactly on the fiducial pose, ready to etch:
+/// a frame to size the export against, copper to register, and a fit to
+/// measure the placement against.
+fn placed_app() -> ConsoleApp {
+    let mut app = ConsoleApp::new(tmp_db(), vec!["true".into()]);
+    app.fiducials.layout = SYM_LAYOUT.into();
+    app.fiducials.last_fit = Some(identity_fit());
+    app.fiducials.frame_img = Some(image::GrayImage::new(800, 800));
+    app.placement.job = vec![pcb_core::Poly::default()];
+    app.placement.auto_pose = true;
+    app.job.emit_copper = "board.gbr".into();
+    let (cx, cy) = SYM_CENTER;
+    app.placement.tx_mm = cx;
+    app.placement.ty_mm = cy;
+    app.placement.rot_deg = 0.0;
+    app
+}
+
+/// The gate that decides whether a press moves the job: Ctrl is navigation, a
+/// ✛ wins over the design's coarse bbox, and a bare press inside the outline
+/// moves the design — the operator's ordinary way of placing a job.
+#[test]
+fn a_bare_press_inside_the_design_latches_a_job_move() {
+    use super::fiducial_ui::design_drag_latches;
+    // A bare press inside the outline moves the job.
+    assert!(design_drag_latches(true, false, false));
+    // Ctrl wins outright: navigation grabs nothing.
+    assert!(!design_drag_latches(true, true, false));
+    // A ✛ under the cursor beats the design's coarse bbox.
+    assert!(!design_drag_latches(true, false, true));
+    // Nowhere near the design: nothing to latch.
+    assert!(!design_drag_latches(false, false, false));
+}
+
+/// Undoing a drag puts the design back on the fitted pose — translation,
+/// rotation and scale — and zeroes the offset the readout was quoting.
+#[test]
+fn recentring_zeroes_the_offset() {
+    let mut app = placed_app();
+    // A big manual nudge: 17.7 mm down-right and +5.13°.
+    app.placement.tx_mm += 12.5;
+    app.placement.ty_mm -= 12.5;
+    app.placement.rot_deg = 5.13;
+    app.placement.scale = 1.02;
+
+    let (mm, deg) = app
+        .placement_deviation()
+        .expect("there is a fit to measure");
+    assert!((mm - 17.68).abs() < 0.01, "17.7 mm off the pose: {mm}");
+    assert!((deg - 5.13).abs() < 0.01, "and +5.13°: {deg}");
+    let (ok, text) = app.placement_offset_text();
+    assert!(!ok, "which reads as a problem");
+    assert!(
+        text.contains("17.68 mm") && text.contains("+5.13°") && text.contains("off the fiducial"),
+        "and names both numbers: {text}"
+    );
+
+    app.recentre_on_fiducials();
+    let (mm, deg) = app.placement_deviation().unwrap();
+    assert!(
+        mm < 1e-9 && deg.abs() < 1e-9,
+        "back on the pose: {mm}, {deg}"
+    );
+    assert!(
+        (app.placement.scale - 1.0).abs() < 1e-9,
+        "including the fitted resize: {}",
+        app.placement.scale
+    );
+    assert!(app.placement.auto_pose, "and it is still an auto pose");
+    assert!(
+        app.fiducials.note.contains("17.68 mm") && app.fiducials.note.contains("+5.13°"),
+        "the note says what was dropped: {}",
+        app.fiducials.note
+    );
+    let (ok, text) = app.placement_offset_text();
+    assert!(ok && text.contains("on the fiducial pose"), "{text}");
+}
+
+/// With no fit at all the deviation is not zero, it is undefined — and both the
+/// readout and the etch log say so rather than claiming the job is on a
+/// reference that does not exist.
+#[test]
+fn a_placement_with_no_fit_reports_no_fiducial_reference() {
+    let mut app = placed_app();
+    app.fiducials.last_fit = None;
+    assert!(app.placement_deviation().is_none());
+    let (ok, text) = app.placement_offset_text();
+    assert!(ok, "a manual placement is not an error");
+    assert!(
+        text.contains("manual placement — no fiducial reference"),
+        "{text}"
+    );
+    assert!(app.debug_summary().contains("fid_offset=no_fit"));
+
+    app.emit_at_placement(false);
+    let placed = app
+        .runtime
+        .log
+        .iter()
+        .find(|l| l.text.contains("job placed at"))
+        .expect("the etch logged its placement");
+    assert!(
+        placed
+            .text
+            .contains("manual placement — no fiducial reference"),
+        "the burn record says there was nothing to be off from: {}",
+        placed.text
+    );
+}
+
+/// A placement sitting on the fiducial pose etches on the click — and the log
+/// line states the offset even though it is zero, because "0.00 mm off" is the
+/// sentence the burn record was missing.
+#[test]
+fn an_on_pose_etch_emits_and_logs_the_offset() {
+    let mut app = placed_app();
+    app.emit_at_placement(false);
+    let placed = app
+        .runtime
+        .log
+        .iter()
+        .find(|l| l.text.contains("job placed at"))
+        .expect("it exported");
+    assert!(
+        placed
+            .text
+            .contains("0.00 mm / +0.00° off the fiducial pose"),
+        "the offset is on the burn record unconditionally: {}",
+        placed.text
+    );
+}
+
+/// A job nudged well off the pose it was registered at still etches on the
+/// click — moving the design is the operator's workflow, not an accident — but
+/// the offset is on the readout and on the burn record.
+#[test]
+fn an_off_pose_etch_emits_and_the_record_names_the_offset() {
+    let mut app = placed_app();
+    app.placement.tx_mm += 12.5;
+    app.placement.ty_mm -= 12.5;
+    app.placement.rot_deg = 5.13;
+
+    let (ok, text) = app.placement_offset_text();
+    assert!(!ok, "the readout flags it: {text}");
+
+    app.emit_at_placement(false);
+    let placed = app
+        .runtime
+        .log
+        .iter()
+        .find(|l| l.text.contains("job placed at"))
+        .expect("the click exported");
+    assert!(
+        placed.text.contains("17.68 mm") && placed.text.contains("+5.13°"),
+        "and the burn record carries the offset it was burned at: {}",
+        placed.text
+    );
+    assert!(
+        app.debug_summary().contains("fid_offset=17.68mm/+5.13deg"),
+        "greppable from a headless run: {}",
+        app.debug_summary()
+    );
+}
+
+/// A field calibration carrying a known uniform scale error, for the mirror
+/// tell's baseline. Only `scale` matters here; the rest is the smallest valid
+/// fit that will construct.
+fn field_cal_with_scale(scale: f64) -> calib::FieldCal {
+    use nalgebra::{Matrix3, Point2};
+    let coords = [0.0, 20.0, 40.0, 60.0];
+    let pairs: Vec<_> = coords
+        .iter()
+        .flat_map(|&y| {
+            coords
+                .iter()
+                .map(move |&x| (Point2::new(x, y), Point2::new(x, y)))
+        })
+        .collect();
+    calib::FieldCal {
+        field: vision::fit_field(&pairs).unwrap(),
+        paper_to_machine: calib::Rigid2::IDENTITY,
+        to_px: vision::Homography {
+            matrix: Matrix3::new(10.0, 0.0, 0.0, 0.0, -10.0, 800.0, 0.0, 0.0, 1.0),
+            residuals: vec![],
+            rms: 0.0,
+        },
+        dots: Vec::new(),
+        found: 16,
+        total: 16,
+        field_verdict: vision::classify_field_error(&[]),
+        scale,
+        extrapolated: 0,
+        rejected: 0,
+        rejection_note: String::new(),
+    }
+}
+
+/// Fix 4. The baseline a right-face fit is expected to land at.
+#[test]
+fn the_mirror_tell_baseline_follows_the_field_calibrations_scale() {
+    // No field map: the machine is assumed true, exactly as the tell shipped.
+    let mut app = ConsoleApp::new(tmp_db(), vec!["true".into()]);
+    assert!((app.mirror_scale_baseline() - 1.0).abs() < 1e-12);
+
+    // The operator's machine: 3.58% oversized, error left in the geometry.
+    app.calibration.field = Some(field_cal_with_scale(1.0358));
+    app.calibration.field_scale_used = calib::FieldScale::Refuse;
+    assert!((app.mirror_scale_baseline() - 1.0358).abs() < 1e-12);
+    app.calibration.field_scale_used = calib::FieldScale::DistortionOnly;
+    assert!(
+        (app.mirror_scale_baseline() - 1.0358).abs() < 1e-12,
+        "distortion-only leaves the scale error in the burn too"
+    );
+
+    // Compensated, the holes burn true and the baseline goes back to 1.0.
+    app.calibration.field_scale_used = calib::FieldScale::Compensate;
+    assert!((app.mirror_scale_baseline() - 1.0).abs() < 1e-12);
+
+    // An implausible baseline is not a machine, it is a bad calibration — fall
+    // back rather than build a tell on it.
+    app.calibration.field_scale_used = calib::FieldScale::Refuse;
+    for bad in [0.5, 1.5, f64::NAN, 0.0] {
+        app.calibration.field = Some(field_cal_with_scale(bad));
+        assert!(
+            (app.mirror_scale_baseline() - 1.0).abs() < 1e-12,
+            "baseline {bad} is refused"
+        );
+    }
+}
+
+/// Fix 4, acceptance (a). The regression that blocked the bench: on a machine
+/// whose field is 3.58% oversized, the drilled holes are oversized to match, so
+/// an honest front fit lands at ~1.021 — nowhere near 1.0, and past the
+/// half-way boundary the tell used to draw there. Twelve consecutive Checks
+/// were refused as `refused-mirror-scale`. Against the machine's own baseline
+/// the same fit is unremarkable.
+#[test]
+fn a_legitimate_front_fit_on_an_oversized_field_is_not_refused_as_a_mirror() {
+    let layout = crate::fiducial::parse_layout(SYM_LAYOUT).unwrap();
+    let (cx, cy) = SYM_CENTER;
+    // The logged fit: s = 1.0213, with m = 1.0229 and a field scale of 1.0358.
+    let s = 1.0213;
+    let detected: Vec<(f64, f64)> = layout
+        .iter()
+        .map(|&(x, y)| (cx + s * (x - cx), cy + s * (y - cy)))
+        .collect();
+    let mut app = mirror_gate_app(Side::Front, SYM_LAYOUT, &detected);
+    app.calibration.field = Some(field_cal_with_scale(1.0358));
+    app.calibration.field_scale_used = calib::FieldScale::Refuse;
+    app.update_placement_from_fiducials();
+
+    assert!(
+        app.fiducials.last_placed,
+        "a legitimate front fit must place: {}",
+        app.fiducials.note
+    );
+    let log = std::fs::read_to_string(app.runtime.diag.path()).unwrap();
+    assert!(
+        !log.contains("outcome=refused-mirror-scale"),
+        "and must not be called a wrong-face fit: {log}"
+    );
+}
+
+/// Fix 4, acceptance (b). The hazard still closes on that same machine: a board
+/// genuinely on the wrong face fits at the baseline times the exit
+/// magnification, and that is refused — with the baseline spelled out, since
+/// "not 1.0000" would be a lie here.
+#[test]
+fn a_flipped_board_on_an_oversized_field_is_still_refused() {
+    let layout = crate::fiducial::parse_layout(SYM_LAYOUT).unwrap();
+    let (cx, cy) = SYM_CENTER;
+    let b = 1.0358;
+    let s = b * exit_mag();
+    let detected: Vec<(f64, f64)> = layout
+        .iter()
+        .map(|&(x, y)| (cx + s * (x - cx), cy + s * (y - cy)))
+        .collect();
+    let mut app = mirror_gate_app(Side::Front, SYM_LAYOUT, &detected);
+    app.calibration.field = Some(field_cal_with_scale(b));
+    app.calibration.field_scale_used = calib::FieldScale::Refuse;
+    app.update_placement_from_fiducials();
+
+    assert!(
+        !app.fiducials.last_placed,
+        "a flipped board must not lock as Front: {}",
+        app.fiducials.note
+    );
+    assert!(
+        app.fiducials.note.contains("OTHER face") && app.fiducials.note.contains("1.0358"),
+        "the note names the baseline the fit was judged against: {}",
+        app.fiducials.note
+    );
+    let log = std::fs::read_to_string(app.runtime.diag.path()).unwrap();
+    assert!(
+        log.contains("outcome=refused-mirror-scale") && log.contains("baseline=1.035800"),
+        "and the log records it: {log}"
+    );
+}
+
+/// Fix 4. A fit that is nearer the wrong-face signature but sits on neither is
+/// not evidence of anything — most likely the baseline is wrong. Say so and
+/// keep placing, rather than refusing on a number the console cannot defend.
+#[test]
+fn a_scale_between_the_two_signatures_warns_instead_of_refusing() {
+    let layout = crate::fiducial::parse_layout(SYM_LAYOUT).unwrap();
+    let (cx, cy) = SYM_CENTER;
+    // Well past the midpoint towards m, but ~1.2% clear of it — four times
+    // MIRROR_TELL_MAX_DEV, so outside anything a real flip would produce.
+    let s = exit_mag() + 0.012;
+    let detected: Vec<(f64, f64)> = layout
+        .iter()
+        .map(|&(x, y)| (cx + s * (x - cx), cy + s * (y - cy)))
+        .collect();
+    let mut app = mirror_gate_app(Side::Front, SYM_LAYOUT, &detected);
+    app.update_placement_from_fiducials();
+
+    assert!(
+        app.fiducials.last_placed,
+        "an unprovable suspicion does not block the bench: {}",
+        app.fiducials.note
+    );
+    assert!(
+        app.fiducials.note.contains("too far from either to call")
+            && app.fiducials.note.contains("confirm which face is up"),
+        "but the operator is told what it looks like: {}",
+        app.fiducials.note
+    );
+    let log = std::fs::read_to_string(app.runtime.diag.path()).unwrap();
+    assert!(
+        log.contains("outcome=warned-mirror-scale-ambiguous"),
+        "and it is greppable: {log}"
+    );
+}
+
+/// The incident these two guards were built from, reconstructed from the bench
+/// log. The console commanded a 40 mm fiducial square at (25,25)..(65,65) and
+/// burned it; the camera was then physically moved. Every later Check read those
+/// same holes as a 42.4×42.9 mm quad rotated 8.5° — 1.065× and 8.5° of pure
+/// camera↔laser map error, ~9 mm of burn error at the corners.
+///
+/// Nothing in the fiducial fit could say so: a board is allowed to sit anywhere,
+/// so rotation proves nothing, and the scale went out as one line of note text.
+/// The holes are the fixed point — the laser cut them where it was told to, and
+/// they cannot move afterwards.
+const INCIDENT_HOLES: &str = "25,25; 65,25; 25,65; 65,65";
+const INCIDENT_DETECTED: [(f64, f64); 4] = [
+    (33.244, 23.124),
+    (75.208, 28.914),
+    (26.872, 65.540),
+    (68.247, 71.639),
+];
+
+#[test]
+fn the_camera_shift_is_measured_against_the_holes_the_laser_itself_burned() {
+    let mut app = mirror_gate_app(Side::Front, INCIDENT_HOLES, &INCIDENT_DETECTED);
+    app.fiducials.ref_holes = crate::fiducial::parse_layout(INCIDENT_HOLES).unwrap();
+    app.update_placement_from_fiducials();
+
+    let health = app
+        .fiducials
+        .loop_health
+        .expect("the burned holes were matched");
+    assert!(
+        (health.scale - 1.0647).abs() < 0.001,
+        "the map reads the laser's own 40 mm square 6.5% too big: {health:?}"
+    );
+    assert!(
+        (health.rot_deg - 8.52).abs() < 0.05,
+        "…and 8.5° turned: {health:?}"
+    );
+    assert_eq!(health.used, 4, "all four holes matched");
+    assert!(
+        health.rms_mm < 1.0,
+        "the detections really are that burned pattern, seen through a bad map: {health:?}"
+    );
+    assert!(
+        app.fiducials.loop_alarm.is_some(),
+        "and it latches — the warning it replaces scrolled away seven checks running"
+    );
+    // The check itself only WARNED, exactly as it did on the bench: a
+    // mirror-symmetric layout with the fitted scale between the two face
+    // signatures. That is the hole this guard fills.
+    assert!(
+        app.fiducials.note.contains("too far from either to call"),
+        "the pre-existing tells still only warn: {}",
+        app.fiducials.note
+    );
+    let summary = app.debug_summary();
+    assert!(
+        summary.contains("fid_loop: ALARM") && summary.contains("ref_holes=4"),
+        "the loop verdict is greppable from a headless run: {summary}"
+    );
+    // Error lines reach the diagnostic file via the mirror pass the frame
+    // update runs; there is no frame here, so run it directly.
+    app.diag_mirror_errors();
+    let log = std::fs::read_to_string(app.runtime.diag.path()).unwrap();
+    assert!(
+        log.contains("disagrees with the laser's own fiducial holes"),
+        "and it reaches the diagnostic log: {log}"
+    );
+}
+
+/// The other half of the incident: the operator answered the refused fits by
+/// re-typing the layout to the DETECTED positions. From then on every Check
+/// compared the measurement to itself — scale 1.000, all gates green, the whole
+/// 6.5% still in the burn. Adopting a measurement that is a different SIZE from
+/// the layout it replaces is refused, with the number named.
+#[test]
+fn adopting_a_resized_measurement_as_the_layout_is_refused() {
+    let mut app = mirror_gate_app(Side::Front, INCIDENT_HOLES, &INCIDENT_DETECTED);
+    app.fiducials.ref_holes = crate::fiducial::parse_layout(INCIDENT_HOLES).unwrap();
+    app.update_placement_from_fiducials();
+    app.adopt_measured_layout();
+
+    assert_eq!(
+        app.fiducials.layout, INCIDENT_HOLES,
+        "the nominal layout is left exactly as it was"
+    );
+    assert!(
+        app.fiducials.note.contains("REFUSED") && app.fiducials.note.contains("+6.47%"),
+        "the refusal names the size change: {}",
+        app.fiducials.note
+    );
+    assert!(
+        app.fiducials.note.contains("camera→machine map")
+            && app.fiducials.note.contains("① Camera lens"),
+        "…and points at the calibration, not at the layout: {}",
+        app.fiducials.note
+    );
+    let confirm = app.fiducials.adopt_confirm.expect("the escape is armed");
+    assert!((confirm - 1.0647).abs() < 0.001, "with the scale on it");
+
+    // The escape exists — a re-jigged plate really does re-site the holes — but
+    // it is a second, differently-labelled press, and it says so in the log.
+    app.adopt_measured_layout_confirmed();
+    assert_eq!(
+        app.fiducials.layout,
+        crate::fiducial::format_layout(&INCIDENT_DETECTED),
+        "the deliberate second action does adopt"
+    );
+    assert!(app.fiducials.adopt_confirm.is_none(), "and disarms");
+    assert!(
+        app.runtime
+            .log
+            .iter()
+            .any(|l| l.err && l.text.contains("over a +6.47% size change")),
+        "the override is on the record"
+    );
+}
+
+/// Adoption cannot be gated where it is typed rather than pressed, so the
+/// console watches for the RESULT: a layout that is the last detections, and a
+/// different size from the layout those detections were measured against.
+///
+/// The same test pins why the loop check exists at all — after the adoption the
+/// fiducial fit reads a clean 1.000 while the map is still 6.5% out, and only
+/// the burned holes still say so.
+#[test]
+fn a_layout_typed_to_the_detections_is_recognised_as_an_adoption() {
+    let mut app = mirror_gate_app(Side::Front, INCIDENT_HOLES, &INCIDENT_DETECTED);
+    app.fiducials.ref_holes = crate::fiducial::parse_layout(INCIDENT_HOLES).unwrap();
+    app.update_placement_from_fiducials();
+    assert!(
+        app.fiducials.adopt_warn.is_none(),
+        "nothing to warn about yet"
+    );
+
+    // What typing the measured coordinates into the layout does.
+    app.fiducials.layout = crate::fiducial::format_layout(&INCIDENT_DETECTED);
+    app.update_placement_from_fiducials();
+
+    let warn = app
+        .fiducials
+        .adopt_warn
+        .clone()
+        .expect("the adoption is recognised");
+    assert!(
+        // +6.49 rather than the fit's +6.47: a typed layout carries the two
+        // decimals `format_layout` writes, and that is what is being judged.
+        warn.contains("+6.49%") && warn.contains("compares the measurement to itself"),
+        "the warning names the size change and what it costs: {warn}"
+    );
+    let fit_scale = app.fiducials.pose.expect("the check applied").scale;
+    assert!(
+        (fit_scale - 1.0).abs() < 0.001,
+        "the fit is now identity — this is the laundering: {fit_scale}"
+    );
+    let health = app.fiducials.loop_health.expect("the holes still match");
+    assert!(
+        (health.scale - 1.0647).abs() < 0.001,
+        "but the laser's own holes are unmoved by a layout edit: {health:?}"
+    );
+    assert!(app.fiducials.loop_alarm.is_some(), "so the banner stays");
+
+    // Rebuilding a nominal layout from the rectangle is the way out.
+    app.apply_fid_rect();
+    assert!(app.fiducials.adopt_warn.is_none(), "and the warning clears");
+}
+
+/// A healthy loop clears the latch — the banner is a verdict on the machine
+/// now, not a permanent scar.
+#[test]
+fn a_healthy_loop_clears_a_latched_alarm() {
+    let holes = crate::fiducial::parse_layout(SYM_LAYOUT).unwrap();
+    let mut app = mirror_gate_app(Side::Front, SYM_LAYOUT, &holes);
+    app.fiducials.ref_holes = holes.clone();
+    app.fiducials.loop_alarm = Some(super::fiducial_ui::LoopHealth {
+        scale: 1.0647,
+        rot_deg: 8.52,
+        rms_mm: 0.44,
+        used: 4,
+    });
+    app.update_placement_from_fiducials();
+
+    let health = app.fiducials.loop_health.expect("matched");
+    assert!(health.healthy(), "an exact loop is green: {health:?}");
+    assert!(app.fiducials.loop_alarm.is_none(), "which clears the latch");
+    assert!(
+        app.loop_health_token().starts_with("ok "),
+        "and the etch log line says so: {}",
+        app.loop_health_token()
+    );
+}
+
+/// The correspondence is a heuristic, so it has to fail closed: detections that
+/// are not the burned pattern must produce "no reference holes matched", never a
+/// number. A number here would be read as a verdict on the machine.
+#[test]
+fn detections_that_are_not_the_burned_pattern_decline_to_measure_the_loop() {
+    let holes = crate::fiducial::parse_layout(INCIDENT_HOLES).unwrap();
+    // Three corners of the burned square plus one hole 25 mm away from the
+    // fourth — no similarity carries the pattern onto that.
+    let elsewhere = [(25.0, 25.0), (65.0, 25.0), (25.0, 65.0), (90.0, 90.0)];
+    let why = super::fiducial_ui::measure_loop(&holes, &elsewhere)
+        .expect_err("a different plate is not a measurement");
+    assert!(
+        why.starts_with("no reference holes matched"),
+        "and it says which: {why}"
+    );
+
+    // Nothing burned from this console at all is its own answer.
+    let why = super::fiducial_ui::measure_loop(&[], &elsewhere).expect_err("no reference");
+    assert!(why.contains("no fiducial holes have been burned"), "{why}");
+
+    // The plate may sit anywhere: a pure translation is not loop error.
+    let moved: Vec<(f64, f64)> = holes.iter().map(|&(x, y)| (x + 12.0, y - 7.0)).collect();
+    let health = super::fiducial_ui::measure_loop(&holes, &moved).expect("still the same plate");
+    assert!(
+        health.healthy(),
+        "a re-placed plate reads green: {health:?}"
+    );
+}
+
+/// The reference holes outlive the session that burned them — the plate is
+/// still bolted to the bed after a restart.
+#[test]
+fn the_burned_reference_holes_survive_a_restart() {
+    let db = tmp_db();
+    {
+        let mut a = ConsoleApp::new(&db, vec!["true".into()]);
+        a.fiducials.ref_holes = crate::fiducial::parse_layout(INCIDENT_HOLES).unwrap();
+        a.save_settings_if_changed();
+    }
+    let b = ConsoleApp::new(&db, vec!["true".into()]);
+    assert_eq!(
+        b.fiducials.ref_holes,
+        crate::fiducial::parse_layout(INCIDENT_HOLES).unwrap(),
+        "the commanded hole positions are restored"
+    );
+
+    // A corrupt blob leaves the check unarmed rather than measuring the machine
+    // against nonsense.
+    let db = tmp_db();
+    std::fs::write(
+        crate::settings::path_for_db(&db),
+        "pcbforge console settings v1\nfid_ref_holes=25,25; 65,nan\n",
+    )
+    .unwrap();
+    let c = ConsoleApp::new(&db, vec!["true".into()]);
+    assert!(c.fiducials.ref_holes.is_empty(), "unparseable is unarmed");
+    assert!(
+        c.loop_health_token() == "unmeasured",
+        "and it reports itself as unmeasured: {}",
+        c.loop_health_token()
+    );
+}
+
+/// A console whose ① lens fit is a synthetic tilted pinhole: the camera hangs
+/// `TILT_HEIGHT_MM` above the calibration plane, its optical axis leaning
+/// toward +y by `atan(0.5)`, so +y is the foreshortened axis and a surface
+/// 1 mm above the plane reads 0.5 mm too far along it. The nadir is placed so
+/// the field centre (35, 35) sits on the optical axis, which keeps the whole
+/// 70 mm field inside an 800×800 frame.
+///
+/// The burned-grid frame is the identity, so paper mm ARE machine mm and every
+/// expected number below is readable without composing a pose.
+const TILT_HEIGHT_MM: f64 = 300.0;
+const TILT_TAN: f64 = 0.5;
+const TILT_NADIR: (f64, f64) = (35.0, 35.0 - TILT_HEIGHT_MM * TILT_TAN);
+/// The pixel the optical axis passes through, which images the field centre.
+const TILT_AXIS_PX: (f64, f64) = (400.0, 400.0);
+
+fn tilted_lens_map() -> vision::LensMap {
+    use nalgebra::Point2;
+    let tilt = TILT_TAN.atan();
+    let (s, c) = tilt.sin_cos();
+    let focal = 2500.0;
+    let pairs: Vec<_> = (0..7)
+        .flat_map(|i| (0..7).map(move |j| (i, j)))
+        .map(|(i, j)| {
+            let x = 70.0 * i as f64 / 6.0;
+            let y = 70.0 * j as f64 / 6.0;
+            let (dx, dy) = (x - TILT_NADIR.0, y - TILT_NADIR.1);
+            let cam_y = c * dy - s * TILT_HEIGHT_MM;
+            let cam_z = s * dy + c * TILT_HEIGHT_MM;
+            (
+                Point2::new(400.0 + focal * dx / cam_z, 400.0 + focal * cam_y / cam_z),
+                Point2::new(x, y),
+            )
+        })
+        .collect();
+    vision::fit_lens(&pairs).unwrap()
+}
+
+/// `nonlinear_app` with its lens swapped for the tilted pinhole above. The ③
+/// field map and its dots are left alone: only the lens feeds the tilt
+/// derivation, and the frame stays the identity either way.
+fn tilted_app() -> ConsoleApp {
+    let mut app = nonlinear_app();
+    app.calibration.lens = Some(calib::CameraCal {
+        lens: tilted_lens_map(),
+        dots: Vec::new(),
+        found: 49,
+        total: 49,
+    });
+    app
+}
+
+#[test]
+fn the_tilt_model_recovers_the_synthetic_camera_geometry() {
+    let app = tilted_app();
+    let tilt = app.camera_tilt().expect("the fit has perspective terms");
+    assert!(
+        (tilt.tilt_rad.tan() - TILT_TAN).abs() < 0.03,
+        "tilt tan {} vs {TILT_TAN}",
+        tilt.tilt_rad.tan()
+    );
+    assert!(
+        (tilt.height_mm - TILT_HEIGHT_MM).abs() < 15.0,
+        "standoff {} mm",
+        tilt.height_mm
+    );
+    // The camera leans toward +y, so depth increases toward +y.
+    assert!(
+        tilt.away_dir.1 > 0.95 && tilt.away_dir.0.abs() < 0.15,
+        "foreshortened axis {:?}",
+        tilt.away_dir
+    );
+    // And it says all of that out loud.
+    let summary = app.debug_summary();
+    assert!(
+        summary.contains("height_comp: active=false") && summary.contains("foreshortened"),
+        "{summary}"
+    );
+}
+
+/// The shipped defaults are the old behaviour, exactly. Not "close enough":
+/// the correction has to be the identity or every existing placement moves.
+#[test]
+fn zero_heights_leave_every_conversion_untouched() {
+    let app = tilted_app();
+    assert_eq!(app.calibration.paper_height_mm, 0.0);
+    assert_eq!(app.calibration.laser_height_mm, 0.0);
+    assert_eq!(app.fiducials.surface_height_mm, 0.0);
+    let planes = app.plane_shift();
+    assert!(planes.tilt.is_some(), "the tilt model IS available");
+    assert!(!planes.active(), "but with equal planes it moves nothing");
+
+    let projection = app.place_projection(800, 800).unwrap();
+    let lens = &app.calibration.lens.as_ref().unwrap().lens;
+    let frame = app.calibration.field.as_ref().unwrap().paper_to_machine;
+    for px in [(400.0, 400.0), (200.0, 250.0), (610.0, 590.0)] {
+        let got = projection.from_px(px).unwrap();
+        let bare = calib::camera_px_to_physical(lens, &frame, px).unwrap();
+        assert_eq!(got, bare, "uncompensated chain, bit for bit, at {px:?}");
+    }
+}
+
+/// The headline number the operator is buying: a board 1.6 mm above the
+/// calibration plane is imaged ~0.8 mm too far along the foreshortened axis,
+/// so the compensated read pulls back by that much toward the camera.
+#[test]
+fn a_1p6_mm_mark_surface_shifts_the_read_by_0p8_mm_toward_the_camera() {
+    let mut app = tilted_app();
+    let before = app
+        .place_projection(800, 800)
+        .unwrap()
+        .from_px(TILT_AXIS_PX);
+    app.fiducials.surface_height_mm = 1.6;
+    assert!(
+        app.plane_shift().active(),
+        "a board 1.6 mm over both calibration planes is live"
+    );
+
+    let after = app
+        .place_projection(800, 800)
+        .unwrap()
+        .from_px(TILT_AXIS_PX);
+    let (before, after) = (before.unwrap(), after.unwrap());
+    let shift = (after.0 - before.0, after.1 - before.1);
+    let expected = 1.6 * TILT_TAN;
+    assert!(
+        (shift.1.hypot(shift.0) - expected).abs() < 0.08,
+        "shift {shift:?}, expected ~{expected} mm"
+    );
+    // Along -y: back toward the camera, against the increasing-depth
+    // direction. A sign error here is a 1.6 mm miss the wrong way.
+    assert!(
+        shift.1 < -0.7 && shift.0.abs() < 0.1,
+        "shift {shift:?} must point at -y"
+    );
+    // The console quotes the same number rather than making the operator
+    // difference two placements to find it.
+    let (text, active) = app.height_comp_status();
+    assert!(active, "{text}");
+    assert!(text.contains("at field centre"), "{text}");
+}
+
+/// Only DIFFERENCES between the heights move anything: a marked surface level
+/// with the ③ burn plane is exactly where the frame was anchored.
+#[test]
+fn a_mark_surface_level_with_the_field_plane_needs_no_correction() {
+    let mut app = tilted_app();
+    let before = app
+        .place_projection(800, 800)
+        .unwrap()
+        .from_px(TILT_AXIS_PX)
+        .unwrap();
+    app.fiducials.surface_height_mm = 1.6;
+    app.calibration.laser_height_mm = 1.6;
+    assert!(!app.plane_shift().active());
+    let after = app
+        .place_projection(800, 800)
+        .unwrap()
+        .from_px(TILT_AXIS_PX)
+        .unwrap();
+    assert_eq!(before, after);
+}
+
+/// px → machine → px has to come back to the same pixel with the correction
+/// on, or the overlay and the detections have drifted apart.
+#[test]
+fn the_corrected_projection_round_trips_px_to_machine_and_back() {
+    let mut app = tilted_app();
+    app.fiducials.surface_height_mm = 1.6;
+    app.calibration.laser_height_mm = -0.4;
+    for (label, projection) in [
+        ("physical", app.place_projection(800, 800).unwrap()),
+        (
+            "commanded",
+            app.camera_projection((800, 800)).unwrap().unwrap(),
+        ),
+    ] {
+        for px in [(400.0, 400.0), (200.0, 250.0), (610.0, 590.0)] {
+            let mm = projection.from_px(px).expect(label);
+            let back = projection.to_px(mm).expect(label);
+            assert!(
+                (back.0 - px.0).abs() < 1e-3 && (back.1 - px.1).abs() < 1e-3,
+                "{label}: {px:?} → {mm:?} → {back:?}"
+            );
+        }
+    }
+}
+
+/// Without perspective in the fit there is nothing to derive from, and the
+/// feature says so instead of inventing a tilt. `nonlinear_app`'s lens is a
+/// pure affine, which is exactly that case.
+#[test]
+fn an_untilted_lens_fit_reports_no_tilt_model_and_corrects_nothing() {
+    let mut app = nonlinear_app();
+    app.fiducials.surface_height_mm = 5.0;
+    assert!(app.camera_tilt().is_none());
+    assert!(!app.plane_shift().active());
+    let (text, active) = app.height_comp_status();
+    assert!(!active);
+    assert_eq!(
+        text,
+        "no tilt model in the lens fit — height compensation inactive"
+    );
+    assert!(app.debug_summary().contains("height_comp: active=false"));
+
+    // And the conversions are untouched despite the 5 mm setting.
+    let projection = app.place_projection(800, 800).unwrap();
+    let lens = &app.calibration.lens.as_ref().unwrap().lens;
+    let frame = app.calibration.field.as_ref().unwrap().paper_to_machine;
+    let px = (300.0, 450.0);
+    assert_eq!(
+        projection.from_px(px).unwrap(),
+        calib::camera_px_to_physical(lens, &frame, px).unwrap()
+    );
+}
+
+#[test]
+fn the_plane_heights_persist_and_are_clamped_on_load() {
+    let db = tmp_db();
+    let mut app = ConsoleApp::new(&db, vec!["true".into()]);
+    app.calibration.paper_height_mm = 2.0;
+    app.calibration.laser_height_mm = -0.25;
+    app.fiducials.surface_height_mm = 1.6;
+    std::fs::write(crate::settings::path_for_db(&db), app.settings_blob()).unwrap();
+    let back = ConsoleApp::new(&db, vec!["true".into()]);
+    assert_eq!(back.calibration.paper_height_mm, 2.0);
+    assert_eq!(back.calibration.laser_height_mm, -0.25);
+    assert_eq!(back.fiducials.surface_height_mm, 1.6);
+
+    // A blob claiming metres is a corrupt blob, not a bench setup.
+    let db = tmp_db();
+    std::fs::write(
+        crate::settings::path_for_db(&db),
+        "pcbforge console settings v1\ncalib_paper_height_mm=9000\n\
+         calib_laser_height_mm=-9000\nfid_surface_height_mm=9000\n",
+    )
+    .unwrap();
+    let clamped = ConsoleApp::new(&db, vec!["true".into()]);
+    assert_eq!(clamped.calibration.paper_height_mm, 50.0);
+    assert_eq!(clamped.calibration.laser_height_mm, -50.0);
+    assert_eq!(clamped.fiducials.surface_height_mm, 50.0);
+
+    // An absent key keeps the default, which is the uncompensated behaviour.
+    let db = tmp_db();
+    std::fs::write(
+        crate::settings::path_for_db(&db),
+        "pcbforge console settings v1\ncam_show_bed=true\n",
+    )
+    .unwrap();
+    let bare = ConsoleApp::new(&db, vec!["true".into()]);
+    assert_eq!(bare.calibration.paper_height_mm, 0.0);
+    assert_eq!(bare.calibration.laser_height_mm, 0.0);
+    assert_eq!(bare.fiducials.surface_height_mm, 0.0);
+}
+
+/// The three heights share ONE reference (the bed surface) and only their
+/// differences reach the projection: a bench where the paper sat 2 mm up, the
+/// field grid was burned at 0.4 mm and the board face is at 3.6 mm is the same
+/// correction as the flat-paper bench with a 1.6 mm board over a −1.6 mm grid.
+/// A reference slip would show up here and nowhere else.
+#[test]
+fn only_the_differences_between_the_three_heights_reach_the_projection() {
+    let relative = {
+        let mut app = tilted_app();
+        app.fiducials.surface_height_mm = 1.6;
+        app.calibration.laser_height_mm = -1.6;
+        app.place_projection(800, 800).unwrap()
+    };
+    let mut app = tilted_app();
+    app.calibration.paper_height_mm = 2.0;
+    app.calibration.laser_height_mm = 0.4;
+    app.fiducials.surface_height_mm = 3.6;
+    let planes = app.plane_shift();
+    assert_eq!((planes.mark_mm, planes.field_mm), (1.6, -1.6));
+
+    let shifted = app.place_projection(800, 800).unwrap();
+    for px in [TILT_AXIS_PX, (200.0, 250.0), (610.0, 590.0)] {
+        assert_eq!(
+            shifted.from_px(px).unwrap(),
+            relative.from_px(px).unwrap(),
+            "the same correction, bit for bit, at {px:?}"
+        );
+    }
+    // And the debug summary quotes the raw trio, not the differences.
+    let summary = app.debug_summary();
+    assert!(
+        summary.contains("height_comp: active=true paper=2.00 laser=0.40 surface=3.60 mm"),
+        "{summary}"
+    );
 }

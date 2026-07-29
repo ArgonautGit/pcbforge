@@ -1,5 +1,10 @@
 use super::*;
 
+/// Inset per side applied when deriving the fiducial rectangle from a measured
+/// board bbox: the bbox is the board OUTLINE, the rectangle is a hole-CENTRE
+/// span, so each side moves this far in from the edge.
+const FID_EDGE_INSET_MM: f64 = 5.0;
+
 impl ConsoleApp {
     pub(super) fn calib_grid(&self) -> calib::GridSpec {
         calib::GridSpec {
@@ -104,7 +109,7 @@ impl ConsoleApp {
     /// clear any prior corner clicks.
     pub(super) fn calibrate_load_frame(&mut self, ctx: &Context) {
         let img = if crate::clean_path(&self.calibration.frame).is_empty() {
-            match crate::camera::grab(&self.cam_source()) {
+            match self.grab_shared() {
                 Ok(g) => self.camera.orientation.apply(g),
                 Err(e) => {
                     self.calibration.note = format!("camera: {e}");
@@ -196,7 +201,6 @@ impl ConsoleApp {
                         // physical frame. Re-fitting the lens invalidates it.
                         self.calibration.field = None;
                         self.calibration.field_accepted = false;
-                        self.placement.field_correct = false;
                     }
                     Err(e) => {
                         // Keep any previous lens calibration — a bad fit
@@ -243,7 +247,6 @@ impl ConsoleApp {
                         self.calibration.lens_frame_signature, signature
                     );
                     self.calibration.field_accepted = false;
-                    self.placement.field_correct = false;
                     return;
                 }
                 match calib::fit_laser_field(
@@ -253,7 +256,7 @@ impl ConsoleApp {
                     b.dot_mm,
                     b.dot_kind,
                     &lens,
-                    self.calibration.allow_machine_scale,
+                    self.calibration.field_scale,
                 ) {
                     Ok(cal) => {
                         // A successful fit produced fresh feedback worth showing,
@@ -267,7 +270,6 @@ impl ConsoleApp {
                             self.calibration.accept_worst_um,
                         );
                         self.calibration.field_accepted = acceptance.is_ok();
-                        self.placement.field_correct = false;
                         // classify_field_error assumes the grid is centred on
                         // the scan field: off-axis, genuine curvature reads as
                         // a uniform scale. Warn when the burn is well off the
@@ -303,28 +305,44 @@ impl ConsoleApp {
                         } else {
                             String::new()
                         };
+                        // A fit that passes only because a dot was thrown away
+                        // must not read the same as one that passes outright,
+                        // so this rides on BOTH the accepted and rejected note.
+                        let rejection_note = if cal.rejection_note.is_empty() {
+                            String::new()
+                        } else {
+                            format!(" note: {}", cal.rejection_note)
+                        };
                         self.calibration.note = match acceptance {
                             Ok(()) => {
                                 let path = self.field_map_path();
                                 match std::fs::write(&path, cal.field.serialize()) {
                                     Ok(()) => {
-                                        self.placement.field_correct = true;
                                         // When the operator opted to absorb a
                                         // large machine scale, say so loudly: the
                                         // polynomial makes shapes true, but the
                                         // machine's physical speeds and hatch
                                         // spacing stay in its oversized units, so
                                         // energy density differs by this factor.
-                                        let scale_absorbed = if self.calibration.allow_machine_scale
-                                            && (cal.scale - 1.0).abs()
-                                                > calib::FIELD_SCALE_FAIL_FRAC
-                                        {
-                                            format!(
-                                                "machine scale {:+.1}% ABSORBED in software — physical speeds/hatch density differ from commanded by this factor; ",
+                                        let scale_absorbed = match self.calibration.field_scale {
+                                            calib::FieldScale::Compensate
+                                                if (cal.scale - 1.0).abs()
+                                                    > calib::FIELD_SCALE_FAIL_FRAC =>
+                                            {
+                                                format!(
+                                                    "machine scale {:+.1}% ABSORBED in software — physical speeds/hatch density differ from commanded by this factor; ",
+                                                    (cal.scale - 1.0) * 100.0
+                                                )
+                                            }
+                                            // Distortion-only never hides the
+                                            // mis-size: the correction is 1:1,
+                                            // so the machine still burns this
+                                            // much off size until it is fixed.
+                                            calib::FieldScale::DistortionOnly => format!(
+                                                "distortion only — machine scale {:+.1}% measured and NOT corrected (burns stay this much off size); the correction is 1:1 and covers the whole work area; ",
                                                 (cal.scale - 1.0) * 100.0
-                                            )
-                                        } else {
-                                            String::new()
+                                            ),
+                                            _ => String::new(),
                                         };
                                         // A fitted mirror means the machine's X
                                         // axis runs backwards vs commanded
@@ -338,7 +356,7 @@ impl ConsoleApp {
                                             ""
                                         };
                                         format!(
-                                            "field accepted: {}/{} dots, raw worst {:.0} µm, fit RMS/worst {:.0}/{:.0} µm — {mirror_note}{scale_absorbed}{}{off_center_note}{extrapolated_note}",
+                                            "field accepted: {}/{} dots, raw worst {:.0} µm, fit RMS/worst {:.0}/{:.0} µm — {mirror_note}{scale_absorbed}{}{rejection_note}{off_center_note}{extrapolated_note}",
                                             cal.found,
                                             cal.total,
                                             worst,
@@ -349,7 +367,6 @@ impl ConsoleApp {
                                     }
                                     Err(e) => {
                                         self.calibration.field_accepted = false;
-                                        self.placement.field_correct = false;
                                         format!(
                                             "field fit met quality limits ({}/{}, RMS/worst {:.0}/{:.0} µm) but saving {} failed: {e}; correction remains disabled",
                                             cal.found,
@@ -362,11 +379,12 @@ impl ConsoleApp {
                                 }
                             }
                             Err(reason) => format!(
-                                "field rejected: {}/{} dots, raw worst {:.0} µm, fit RMS/worst {:.0}/{:.0} µm — {reason}; correction remains disabled{off_center_note}{extrapolated_note}",
+                                "field rejected: {}/{} dots, raw worst {:.0} µm, fit RMS/worst {:.0}/{:.0} µm — {reason}; correction remains disabled{rejection_note}{off_center_note}{extrapolated_note}",
                                 cal.found, cal.total, worst, cal.field.rms_um, cal.field.max_um
                             ),
                         };
                         self.calibration.field = Some(cal);
+                        self.calibration.field_scale_used = self.calibration.field_scale;
                     }
                     Err(e) => {
                         // Keep any previous field calibration on a failed fit
@@ -428,7 +446,7 @@ impl ConsoleApp {
         let grid = self.calib_grid();
         let dot = self.calibration.burn.dot_mm;
         let kind = self.calibration.burn.dot_kind;
-        match crate::camera::grab(&self.cam_source()) {
+        match self.grab_shared() {
             Ok(g) => {
                 let frame = self.camera.orientation.apply(g);
                 match calib::re_anchor(&frame, &prev, &grid, dot, kind) {
@@ -455,11 +473,10 @@ impl ConsoleApp {
     /// as it moves (the burned grid must stay in view). Stops the capture when
     /// off.
     pub(super) fn pump_calib_live(&mut self, ctx: &Context) {
+        // Live-off only means this tab stops asking for frames — the capture is
+        // shared with the Camera and Fiducial tabs, and only the idle rule in
+        // `ui()` may drop it.
         if !self.calibration.live {
-            if self.calibration.capture.is_some() {
-                self.calibration.capture = None;
-                self.calibration.capture_src = None;
-            }
             return;
         }
         let Some(prev) = self.calibration.anchor.clone() else {
@@ -467,14 +484,7 @@ impl ConsoleApp {
             self.calibration.note = "calibrate once (Fit) before live anchoring".into();
             return;
         };
-        let src = self.cam_source();
-        if self.calibration.capture.is_none() || self.calibration.capture_src.as_ref() != Some(&src)
-        {
-            self.calibration.capture = None;
-            self.calibration.capture = Some(crate::camera::Capture::start(src.clone()));
-            self.calibration.capture_src = Some(src);
-        }
-        if let Some(Ok(g)) = self.calibration.capture.as_ref().and_then(|c| c.latest()) {
+        if let Some(Ok(g)) = self.capture_latest() {
             let frame = self.camera.orientation.apply(g);
             let (w, h) = (frame.width() as usize, frame.height() as usize);
             let color = ColorImage {
@@ -825,6 +835,7 @@ impl ConsoleApp {
                 let green = Color32::from_rgb(0x40, 0xc0, 0x50);
                 let amber = Color32::from_rgb(0xe0, 0x90, 0x20);
                 let red = Color32::from_rgb(0xd0, 0x40, 0x40);
+                let magenta = Color32::from_rgb(0xe0, 0x40, 0xd0);
                 for d in &cal.dots {
                     let det = to_screen(d.px.0, d.px.1);
                     if let Some(desired) = calib::physical_to_camera_px(
@@ -833,6 +844,25 @@ impl ConsoleApp {
                         d.commanded_mm,
                     ) {
                         painter.line_segment([to_screen(desired.0, desired.1), det], (1.2, orange));
+                    }
+                    // An excluded dot did not shape the map, so its residual
+                    // colour would be misleading: mark it as struck out instead
+                    // — a magenta ring with an ✕ through it, at double radius so
+                    // it is findable on the sheet without hunting.
+                    if d.rejected {
+                        let r = 8.0_f32;
+                        let stroke = egui::Stroke::new(2.0_f32, magenta);
+                        painter.circle_stroke(det, r, stroke);
+                        let d1 = r * std::f32::consts::FRAC_1_SQRT_2;
+                        painter.line_segment(
+                            [det + egui::vec2(-d1, -d1), det + egui::vec2(d1, d1)],
+                            stroke,
+                        );
+                        painter.line_segment(
+                            [det + egui::vec2(-d1, d1), det + egui::vec2(d1, -d1)],
+                            stroke,
+                        );
+                        continue;
                     }
                     let col = if d.resid_um < 50.0 {
                         green
@@ -845,8 +875,13 @@ impl ConsoleApp {
                 }
 
                 let raw_worst = cal.dots.iter().map(|d| d.field_um).fold(0.0_f64, f64::max);
+                let excluded = if cal.rejected > 0 {
+                    format!(" · {} ✕ EXCLUDED", cal.rejected)
+                } else {
+                    String::new()
+                };
                 let txt = format!(
-                    "field {} {}/{} · raw worst {:.0} µm · fit RMS/worst {:.0}/{:.0} µm",
+                    "field {} {}/{}{excluded} · raw worst {:.0} µm · fit RMS/worst {:.0}/{:.0} µm",
                     if self.calibration.field_accepted {
                         "accepted"
                     } else {
@@ -1056,6 +1091,24 @@ impl ConsoleApp {
                         "Where the printable A4 dot-grid SVG is written. Print it at 100%.",
                     );
                     ui.end_row();
+                    // Recorded here, with the fit it describes: the lens map
+                    // reads on whatever plane the sheet lay on, and that is
+                    // only known while the sheet is on the bed.
+                    let height_label = ui.label("paper grid height mm");
+                    ui.add(
+                        egui::DragValue::new(&mut self.calibration.paper_height_mm)
+                            .speed(0.1)
+                            .range(-PLANE_HEIGHT_MAX_MM..=PLANE_HEIGHT_MAX_MM),
+                    )
+                    .labelled_by(height_label.id)
+                    .on_hover_text(
+                        "Height above the bed surface, positive up, that this printed \
+                         paper grid sat at — the sheet plus whatever it lay on, mm. \
+                         The step-1 lens map reads on that plane, so it is what the \
+                         other two heights are measured against; only DIFFERENCES \
+                         between the three heights affect anything.",
+                    );
+                    ui.end_row();
                 }
                 if self.calibration.mode != CalibMode::CameraLens {
                     ui.label("grid out .lbrn2");
@@ -1101,6 +1154,24 @@ impl ConsoleApp {
                     ui.end_row();
                 }
                 if self.calibration.mode == CalibMode::LaserField {
+                    // Same reasoning as the ① paper height: the plane the grid
+                    // was burned at is a fact about this fit.
+                    let height_label = ui.label("laser grid height mm");
+                    ui.add(
+                        egui::DragValue::new(&mut self.calibration.laser_height_mm)
+                            .speed(0.1)
+                            .range(-PLANE_HEIGHT_MAX_MM..=PLANE_HEIGHT_MAX_MM),
+                    )
+                    .labelled_by(height_label.id)
+                    .on_hover_text(
+                        "Height above the bed surface, positive up, that this field \
+                         grid was BURNED at — the plate's top face, mm. The grid was \
+                         measured through the camera at that height, so the machine \
+                         frame and field polynomial it anchors are keyed on readings \
+                         of features there; only DIFFERENCES between the three \
+                         heights affect anything.",
+                    );
+                    ui.end_row();
                     let rms_label = ui.label("accept RMS µm");
                     ui.add(
                         egui::DragValue::new(&mut self.calibration.accept_rms_um)
@@ -1169,20 +1240,41 @@ impl ConsoleApp {
                 );
         });
 
-        // ③ only: let the operator opt into absorbing a large machine-scale
-        // error into the field correction, near the Fit control that uses it.
+        // ③ only: what the fit does about a large machine-scale error, next to
+        // the Fit control that uses it. Radio buttons rather than a combo so
+        // each choice is its own labelled, clickable node.
         if self.calibration.mode == CalibMode::LaserField {
-            ui.checkbox(
-                &mut self.calibration.allow_machine_scale,
-                "compensate machine scale",
-            )
-            .on_hover_text(
-                "Absorb any machine scale error into the field correction instead of refusing. \
-                 Shapes burn dimensionally true, but the machine's speeds and hatch spacing stay \
-                 in its own oversized units — physical speed and line spacing scale by the same \
-                 factor, so energy density changes; re-tune power/speed after enabling. Fixing the \
-                 field size in LightBurn is the cleaner solution.",
-            );
+            ui.label("Machine scale error:");
+            for mode in FIELD_SCALE_ALL {
+                let hint = match mode {
+                    calib::FieldScale::Refuse => {
+                        "Refuse the fit when the burn reads more than 5% off the paper ruler. A \
+                         gross mismatch is usually a setup error (wrong pitch entered, camera \
+                         moved, paper out of the burn plane), not a real field — fix it at the \
+                         source."
+                    }
+                    calib::FieldScale::Compensate => {
+                        "Absorb the scale error into the field correction. Shapes burn \
+                         dimensionally true, but command space stretches by the same factor, so \
+                         the usable work area shrinks — and the machine's speeds and hatch \
+                         spacing stay in its own units, so energy density changes; re-tune \
+                         power/speed after enabling."
+                    }
+                    calib::FieldScale::DistortionOnly => {
+                        "Extrapolate the radial distortion to the work area without shrinking it. \
+                         The uniform scale is measured and reported but divided out, so the \
+                         correction is 1:1 — commanding 90 mm still asks for 90 mm — and it \
+                         applies beyond the burned grid's span. Burns stay off size by the \
+                         reported scale until the machine's field size is fixed."
+                    }
+                };
+                ui.radio_value(
+                    &mut self.calibration.field_scale,
+                    mode,
+                    field_scale_label(mode),
+                )
+                .on_hover_text(hint);
+            }
         }
 
         // Mode-specific status + controls.
@@ -1320,9 +1412,32 @@ impl ConsoleApp {
                 let (status, ok) = match &self.calibration.field {
                     Some(c) => {
                         let worst = c.dots.iter().map(|d| d.field_um).fold(0.0_f64, f64::max);
+                        // Distortion-only leaves the machine's mis-size in
+                        // place, so the mode and the measured scale belong in
+                        // the standing status, not just the one-shot fit note:
+                        // otherwise a real mis-size reads as "accepted" and
+                        // disappears.
+                        let mode = if self.calibration.field_scale_used
+                            == calib::FieldScale::DistortionOnly
+                        {
+                            format!(
+                                ", distortion only — machine scale {:+.1}% measured, NOT corrected",
+                                (c.scale - 1.0) * 100.0
+                            )
+                        } else {
+                            String::new()
+                        };
+                        // The residuals are over the SURVIVORS, so an accepted
+                        // fit that only passed once a dot was excluded has to
+                        // keep saying so for as long as it is the active one.
+                        let excluded = if c.rejected > 0 {
+                            format!(", {} EXCLUDED as outliers", c.rejected)
+                        } else {
+                            String::new()
+                        };
                         (
                             format!(
-                                "{} field fit ({}/{} dots, raw worst {:.0} µm, fit RMS/worst {:.0}/{:.0} µm)",
+                                "{} field fit ({}/{} dots{excluded}, raw worst {:.0} µm, fit RMS/worst {:.0}/{:.0} µm{mode})",
                                 if self.calibration.field_accepted {
                                     "● accepted"
                                 } else {
@@ -1364,6 +1479,17 @@ impl ConsoleApp {
                             field_verdict_phrase(&c.field_verdict, c.scale)
                         ),
                     );
+                    // Outlier rejection is never allowed to be a silent step:
+                    // the same sentence stands here for as long as the fit is
+                    // active, in the ✕ colour the overlay strikes those dots
+                    // out with. Also carries the "nothing was excluded, and
+                    // here is why" cases, so `rejected == 0` is not the test.
+                    if !c.rejection_note.is_empty() {
+                        ui.colored_label(
+                            Color32::from_rgb(0xe0, 0x40, 0xd0),
+                            format!("✕ {}", c.rejection_note),
+                        );
+                    }
                     let hint = if !self.calibration.field_accepted {
                         format!(
                             "This fit did not meet 80% + four-corner + {:.0}/{:.0} µm acceptance; recapture before use.",
@@ -1394,7 +1520,7 @@ impl ConsoleApp {
         ui.weak(NAV_HINT);
     }
 
-    /// ④ Fiducial holes: enter the board size + edge margin, preview the
+    /// ④ Fiducial holes: enter the fiducial rectangle's W/H, preview the
     /// computed layout + effective field centre, and generate the holes .lbrn2
     /// (writing the layout into the fiducial check first).
     fn fid_holes_controls(&mut self, ui: &mut egui::Ui) {
@@ -1402,27 +1528,24 @@ impl ConsoleApp {
             .num_columns(2)
             .spacing([8.0, 6.0])
             .show(ui, |ui| {
-                ui.label("board W mm");
+                ui.label("fiducial rect W mm");
                 ui.add(
-                    egui::DragValue::new(&mut self.fiducials.board_w_mm)
+                    egui::DragValue::new(&mut self.fiducials.rect_w_mm)
                         .speed(0.5)
                         .range(5.0..=500.0),
-                );
-                ui.end_row();
-                ui.label("board H mm");
-                ui.add(
-                    egui::DragValue::new(&mut self.fiducials.board_h_mm)
-                        .speed(0.5)
-                        .range(5.0..=500.0),
-                );
-                ui.end_row();
-                ui.label("margin mm");
-                ui.add(
-                    egui::DragValue::new(&mut self.fiducials.margin_mm)
-                        .speed(0.1)
-                        .range(0.5..=50.0),
                 )
-                .on_hover_text("Distance from the board edge to the hole centre.");
+                .on_hover_text(
+                    "Centre-to-centre x span of the four holes. The rectangle is \
+                     centred in the work area, so no coordinates are needed.",
+                );
+                ui.end_row();
+                ui.label("fiducial rect H mm");
+                ui.add(
+                    egui::DragValue::new(&mut self.fiducials.rect_h_mm)
+                        .speed(0.5)
+                        .range(5.0..=500.0),
+                )
+                .on_hover_text("Centre-to-centre y span of the four holes.");
                 ui.end_row();
                 ui.label("shape");
                 egui::ComboBox::from_id_salt("fid-holes-shape")
@@ -1469,8 +1592,8 @@ impl ConsoleApp {
                 ui.end_row();
             });
 
-        // Read the (now-edited) board/margin values and the effective field
-        // centre after the form closure so the preview + validation reflect this
+        // Read the (now-edited) rectangle spans and the effective field centre
+        // after the form closure so the preview + validation reflect this
         // frame's edits, not the last one.
         self.sync_auto_field_center();
         let (cx, cy) = (
@@ -1478,58 +1601,50 @@ impl ConsoleApp {
             self.camera.field_cy_mm as f64,
         );
         let field = self.camera.field_mm as f64;
-        let (w, h, margin) = (
-            self.fiducials.board_w_mm,
-            self.fiducials.board_h_mm,
-            self.fiducials.margin_mm,
-        );
-        let pts = crate::fiducial::board_fid_layout(cx, cy, w, h, margin);
+        let (w, h) = (self.fiducials.rect_w_mm, self.fiducials.rect_h_mm);
+        let pts = crate::fiducial::centered_fid_layout(cx, cy, w, h);
         let layout = crate::fiducial::format_layout(&pts);
         ui.label(format!(
-            "layout: {layout}   (board centred at {cx:.1},{cy:.1})"
+            "layout: {layout}   (rectangle centred at {cx:.1},{cy:.1})"
         ));
 
-        // Validation: a margin that swallows the shorter side, or any hole
-        // outside the addressable field, disables generation.
-        let margin_too_big = 2.0 * margin >= w.min(h);
+        // Validation: any hole outside the addressable field disables
+        // generation. Centred, that is just a span wider than the field.
         let out_of_field = pts
             .iter()
             .any(|&(x, y)| x < 0.0 || y < 0.0 || x > field || y > field);
-        if margin_too_big {
-            ui.colored_label(
-                status_color(false),
-                "margin too large for the board — 2×margin must be under the shorter side",
-            );
-        }
         if out_of_field {
             ui.colored_label(
                 status_color(false),
                 format!(
-                    "holes fall outside the {field:.0} mm laser field — shrink the board, lower \
-                     the margin, or recentre the field"
+                    "holes fall outside the {field:.0} mm laser field — shrink the rectangle or \
+                     recentre the field"
                 ),
             );
         }
 
-        ui.horizontal(|ui| {
+        ui.horizontal_wrapped(|ui| {
             if ui
-                .button("⤵ board size from job")
-                .on_hover_text(
-                    "Measure the board bbox from the active side's Gerbers and fill W/H.",
-                )
+                .button("⤵ rect from job board size")
+                .on_hover_text(format!(
+                    "Measure the board bbox from the active side's Gerbers and fill W/H, \
+                     inset {FID_EDGE_INSET_MM:.0} mm per side so the holes land inside the board \
+                     edge.",
+                ))
                 .clicked()
             {
                 self.fid_holes_board_size_from_job();
             }
             if ui
                 .add_enabled(
-                    !margin_too_big && !out_of_field && !self.lightburn_busy(),
-                    egui::Button::new("⚙ Generate + burn fiducial holes"),
+                    !out_of_field && !self.lightburn_busy(),
+                    egui::Button::new("⚙ Generate fiducial holes → LightBurn (no burn)"),
                 )
                 .on_hover_text(
-                    "Write this layout into the fiducial check, emit the holes .lbrn2 with \
-                     laser-field pre-distortion, then drive LightBurn to load and START it. \
-                     LightBurn must be open with the Place-tab device configured.",
+                    "Write this layout into the fiducial check and emit the holes .lbrn2 with \
+                     laser-field pre-distortion, as a Line layer at the Job-tab drill settings, \
+                     then LOAD it in LightBurn (FORCELOAD) without pressing start — you burn it \
+                     from LightBurn yourself.",
                 )
                 .clicked()
             {
@@ -1541,7 +1656,9 @@ impl ConsoleApp {
     }
 
     /// Measure the active side's board bbox from its Gerbers and fill the
-    /// board W/H fields (rounded to 0.01 mm, clamped to the field ranges).
+    /// fiducial rectangle W/H (rounded to 0.01 mm, clamped to the field
+    /// ranges). The bbox is the board OUTLINE, so it is inset
+    /// [`FID_EDGE_INSET_MM`] per side to become a hole-centre span.
     fn fid_holes_board_size_from_job(&mut self) {
         let (copper, outline) = self.active_gerbers();
         let (copper, outline) = (copper.to_string(), outline.to_string());
@@ -1549,48 +1666,39 @@ impl ConsoleApp {
             Ok((board, _cu, _ablate)) => match crate::place::bbox_size_mm(&board) {
                 Some((w, h)) => {
                     let round2 = |v: f64| (v * 100.0).round() / 100.0;
-                    let w = round2(w).clamp(5.0, 500.0);
-                    let h = round2(h).clamp(5.0, 500.0);
-                    self.fiducials.board_w_mm = w;
-                    self.fiducials.board_h_mm = h;
+                    let inset = |v: f64| round2(v - 2.0 * FID_EDGE_INSET_MM).clamp(5.0, 500.0);
+                    let (bw, bh) = (round2(w), round2(h));
+                    let (w, h) = (inset(w), inset(h));
+                    self.fiducials.rect_w_mm = w;
+                    self.fiducials.rect_h_mm = h;
                     self.runtime.log.push(LogLine {
-                        text: format!("board size from job: {w}×{h} mm (Gerber bbox)"),
+                        text: format!(
+                            "fiducial rect from job: board {bw}×{bh} mm (Gerber bbox) inset \
+                             {FID_EDGE_INSET_MM} mm per side → {w}×{h} mm"
+                        ),
                         err: false,
                     });
                 }
                 None => self.runtime.log.push(LogLine {
-                    text: "board size from job: empty board region".into(),
+                    text: "fiducial rect from job: empty board region".into(),
                     err: true,
                 }),
             },
             Err(e) => self.runtime.log.push(LogLine {
-                text: format!("board size from job: {e}"),
+                text: format!("fiducial rect from job: {e}"),
                 err: true,
             }),
         }
     }
 
-    /// Compute the layout from the current board/margin + field centre, write
-    /// it into the fiducial check's layout string, and generate the holes.
+    /// Compute the layout from the current rectangle + field centre, write it
+    /// into the fiducial check's layout string, and generate the holes.
     fn fid_holes_generate(&mut self) {
-        self.sync_auto_field_center();
-        let (cx, cy) = (
-            self.camera.field_cx_mm as f64,
-            self.camera.field_cy_mm as f64,
-        );
-        let (w, h, margin) = (
-            self.fiducials.board_w_mm,
-            self.fiducials.board_h_mm,
-            self.fiducials.margin_mm,
-        );
-        let layout = crate::fiducial::format_layout(&crate::fiducial::board_fid_layout(
-            cx, cy, w, h, margin,
-        ));
-        self.fiducials.layout = layout.clone();
+        let (w, h) = (self.fiducials.rect_w_mm, self.fiducials.rect_h_mm);
+        self.apply_fid_rect();
+        let layout = self.fiducials.layout.clone();
         self.runtime.log.push(LogLine {
-            text: format!(
-                "fiducial layout updated from board {w}×{h} mm, margin {margin} mm → {layout}"
-            ),
+            text: format!("fiducial layout updated from a {w}×{h} mm centred rectangle → {layout}"),
             err: false,
         });
         self.fiducial_generate_holes();

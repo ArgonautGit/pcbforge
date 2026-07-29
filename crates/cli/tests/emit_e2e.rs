@@ -16,12 +16,16 @@ fn tmp(tag: &str) -> PathBuf {
     d
 }
 
+/// An identity field map whose FITTED REGION straddles the origin. The span
+/// matters as well as the coefficients: the warp refuses geometry outside the
+/// region the map was fit over, and `--center` anchors the job's bbox centre on
+/// the origin, so half of it sits at negative coordinates.
 fn identity_field_map(tag: &str) -> PathBuf {
     use nalgebra::Point2;
     let pairs: Vec<_> = (0..4)
         .flat_map(|row| {
             (0..4).map(move |column| {
-                let point = Point2::new(column as f64 * 50.0, row as f64 * 50.0);
+                let point = Point2::new((column as f64 - 1.0) * 50.0, (row as f64 - 1.0) * 50.0);
                 (point, point)
             })
         })

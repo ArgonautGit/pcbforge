@@ -25,6 +25,51 @@ fn parse_coeffs(s: &str) -> Option<[f64; 23]> {
     arr.iter().all(|v| v.is_finite()).then_some(arr)
 }
 
+/// Bound on a restored reference-hole coordinate. Any bed this console drives
+/// is a fraction of this; the check is only here so a corrupt blob cannot seed
+/// the loop measurement with a coordinate that isn't a position.
+const REF_HOLE_MAX_MM: f64 = 10_000.0;
+
+/// Clamp on the three operator-set plane heights (mm above the bed surface,
+/// either sign). Nothing this console calibrates on or marks sits further off
+/// the bed, and the compensation is linear in the height differences — a
+/// corrupt blob must not be able to swing placement by metres.
+pub(super) const PLANE_HEIGHT_MAX_MM: f64 = 50.0;
+
+/// Parse the persisted `lens_px_bounds` row: `min_x min_y max_x max_y`.
+///
+/// Absent or blank is legitimate and silent — a lens map fit before the bounds
+/// were recorded, or restored from such a blob, simply has none. Anything else
+/// present but unusable is a corrupt row and gets a complaint: the previous
+/// `filter_map` dropped unparsable tokens one by one, so `0 0 nonsense 700`
+/// became a three-value list, failed the length check and disabled the ③
+/// extrapolation warnings with nothing said. "No bounds" and "bounds we threw
+/// away" look identical downstream, so they must not look identical here.
+fn parse_px_bounds(raw: Option<&String>, complaints: &mut Vec<String>) -> Option<[f64; 4]> {
+    let raw = raw?.trim();
+    if raw.is_empty() {
+        return None;
+    }
+    let bounds = raw
+        .split_whitespace()
+        .map(str::parse::<f64>)
+        .collect::<Result<Vec<_>, _>>()
+        .ok()
+        .and_then(|v| <[f64; 4]>::try_from(v).ok())
+        // An inverted box is not a box: it would accept nothing and reject
+        // every dot, which reads as a catastrophic fit rather than a bad row.
+        .filter(|[x0, y0, x1, y1]| {
+            [x0, y0, x1, y1].iter().all(|v| v.is_finite()) && x0 <= x1 && y0 <= y1
+        });
+    if bounds.is_none() {
+        complaints.push(format!(
+            "settings: lens_px_bounds is malformed ({raw}) — lens extrapolation \
+             checks are disabled until step 1 is re-fit"
+        ));
+    }
+    bounds
+}
+
 impl ConsoleApp {
     /// The persisted input fields, in a fixed key order.
     pub(super) fn settings_blob(&self) -> String {
@@ -44,8 +89,12 @@ impl ConsoleApp {
             ("job_wobble_size_mm", self.job.wobble_size_mm.to_string()),
             ("back_copper", self.job.back_copper.clone()),
             ("back_outline", self.job.back_outline.clone()),
+            ("back_lbrn2", self.job.back_lbrn2.clone()),
             ("thickness_mm", self.job.board_thickness_mm.to_string()),
             ("focal_mm", self.job.focal_mm.to_string()),
+            ("scan_center_auto", self.job.scan_center_auto.to_string()),
+            ("scan_center_x_mm", self.job.scan_center_mm.0.to_string()),
+            ("scan_center_y_mm", self.job.scan_center_mm.1.to_string()),
             ("place_frame", self.placement.frame.clone()),
             ("place_lbrn2", self.placement.lbrn2.clone()),
             (
@@ -53,6 +102,20 @@ impl ConsoleApp {
                 self.placement.lightburn_device.clone(),
             ),
             ("place_px_per_mm", self.placement.px_per_mm.to_string()),
+            ("drill_speed_mm_s", self.drill.speed_mm_s.to_string()),
+            ("drill_frequency_khz", self.drill.frequency_khz.to_string()),
+            ("drill_pulse_ns", self.drill.pulse_ns.to_string()),
+            ("drill_interval_mm", self.drill.interval_mm.to_string()),
+            ("drill_passes", self.drill.passes.to_string()),
+            ("drill_wobble", self.drill.wobble.to_string()),
+            (
+                "drill_wobble_step_mm",
+                self.drill.wobble_step_mm.to_string(),
+            ),
+            (
+                "drill_wobble_size_mm",
+                self.drill.wobble_size_mm.to_string(),
+            ),
             ("place_drills", self.placement.drills.clone()),
             ("place_drill_lbrn2", self.placement.drill_lbrn2.clone()),
             ("fid_frame", self.fiducials.frame.clone()),
@@ -62,11 +125,25 @@ impl ConsoleApp {
             ("fid_diameter_mm", self.fiducials.diameter_mm.to_string()),
             ("fid_height_mm", self.fiducials.height_mm.to_string()),
             ("fid_search_mm", self.fiducials.search_mm.to_string()),
+            (
+                "fid_surface_height_mm",
+                self.fiducials.surface_height_mm.to_string(),
+            ),
             ("fid_profile", self.fiducials.profile.token().to_string()),
             ("fid_out", self.fiducials.out.clone()),
-            ("fid_board_w_mm", self.fiducials.board_w_mm.to_string()),
-            ("fid_board_h_mm", self.fiducials.board_h_mm.to_string()),
-            ("fid_margin_mm", self.fiducials.margin_mm.to_string()),
+            ("fid_rect_w_mm", self.fiducials.rect_w_mm.to_string()),
+            // The commanded positions of the last fiducial-hole burn, as a
+            // layout string. The plate stays on the bed across a restart, and
+            // it is the only reference the camera↔laser loop check has.
+            (
+                "fid_ref_holes",
+                crate::fiducial::format_layout(&self.fiducials.ref_holes),
+            ),
+            ("fid_rect_h_mm", self.fiducials.rect_h_mm.to_string()),
+            (
+                "fid_live_recover_s",
+                self.fiducials.live_recover_s.to_string(),
+            ),
             ("cam_file", self.camera.file.clone()),
             (
                 "cam_orientation",
@@ -98,6 +175,16 @@ impl ConsoleApp {
                 dot_kind_token(self.calibration.paper.dot_kind).to_string(),
             ),
             ("calib_paper_out", self.calibration.paper_out.clone()),
+            // The two calibration heights, above the bed surface. They belong
+            // to the fits, not to the camera: a re-fit is what changes them.
+            (
+                "calib_paper_height_mm",
+                self.calibration.paper_height_mm.to_string(),
+            ),
+            (
+                "calib_laser_height_mm",
+                self.calibration.laser_height_mm.to_string(),
+            ),
             (
                 "calib_grid_origin_x",
                 self.calibration.grid_origin_mm.0.to_string(),
@@ -108,8 +195,8 @@ impl ConsoleApp {
             ),
             ("calib_grid_out", self.calibration.grid_out.clone()),
             (
-                "calib_allow_machine_scale",
-                self.calibration.allow_machine_scale.to_string(),
+                "calib_field_scale",
+                field_scale_token(self.calibration.field_scale).to_string(),
             ),
             (
                 "calib_accept_rms_um",
@@ -120,10 +207,6 @@ impl ConsoleApp {
                 self.calibration.accept_worst_um.to_string(),
             ),
             ("cam_show_bed", self.camera.show_bed.to_string()),
-            (
-                "place_field_correct",
-                self.placement.field_correct.to_string(),
-            ),
             ("field_mm", self.camera.field_mm.to_string()),
             (
                 "field_center_auto",
@@ -233,7 +316,21 @@ impl ConsoleApp {
                     .field
                     .as_ref()
                     .filter(|_| self.calibration.field_accepted)
-                    .map(|f| format!("{} {} {}", f.found, f.total, f.scale))
+                    .map(|f| {
+                        // Fifth token: how many dots the fit EXCLUDED as
+                        // outliers. Persisted for the same reason the fit mode
+                        // is — a restored calibration has to describe itself
+                        // honestly, and "passed once a dot was thrown away"
+                        // must not come back looking like a clean pass.
+                        format!(
+                            "{} {} {} {} {}",
+                            f.found,
+                            f.total,
+                            f.scale,
+                            field_scale_token(self.calibration.field_scale_used),
+                            f.rejected
+                        )
+                    })
                     .unwrap_or_default(),
             ),
             // The burned-grid frame anchor (paper mm → machine mm rigid). Five
@@ -261,8 +358,16 @@ impl ConsoleApp {
         ])
     }
 
-    /// Overlay any saved input fields from the settings file onto the defaults.
-    pub(super) fn load_settings(&mut self) {
+    /// Overlay any saved input fields from the settings file onto the defaults,
+    /// returning anything the operator has to be told about a value that was
+    /// present but unusable.
+    ///
+    /// The complaints are returned rather than logged: the sites that find them
+    /// are inside the expressions that build the restored calibration, where
+    /// `self` is already mutably borrowed. `ConsoleApp::new` drains them into
+    /// the log once construction is done.
+    pub(super) fn load_settings(&mut self) -> Vec<String> {
+        let mut complaints: Vec<String> = Vec::new();
         let m = crate::settings::load(&self.runtime.settings_path);
         let str_field =
             |m: &std::collections::BTreeMap<String, String>, k: &str, dst: &mut String| {
@@ -276,6 +381,7 @@ impl ConsoleApp {
         str_field(&m, "lbrn2", &mut self.job.emit_lbrn2);
         str_field(&m, "back_copper", &mut self.job.back_copper);
         str_field(&m, "back_outline", &mut self.job.back_outline);
+        str_field(&m, "back_lbrn2", &mut self.job.back_lbrn2);
         str_field(&m, "place_frame", &mut self.placement.frame);
         str_field(&m, "place_lbrn2", &mut self.placement.lbrn2);
         str_field(&m, "place_drills", &mut self.placement.drills);
@@ -351,8 +457,88 @@ impl ConsoleApp {
         {
             self.job.wobble_size_mm = v.clamp(0.0, 2.0);
         }
-        f64_field(&m, "thickness_mm", &mut self.job.board_thickness_mm);
-        f64_field(&m, "focal_mm", &mut self.job.focal_mm);
+        // The drill emit's own recipe, clamped to its DragValue ranges. A blob
+        // written before these keys existed keeps the drill defaults, which is
+        // what the operator's machine wants anyway.
+        if let Some(v) = m
+            .get("drill_speed_mm_s")
+            .and_then(|s| s.trim().parse().ok())
+            .filter(|v: &f64| v.is_finite())
+        {
+            self.drill.speed_mm_s = v.clamp(1.0, 15000.0);
+        }
+        if let Some(v) = m
+            .get("drill_frequency_khz")
+            .and_then(|s| s.trim().parse().ok())
+            .filter(|v: &f64| v.is_finite())
+        {
+            self.drill.frequency_khz = v.clamp(1.0, 4000.0);
+        }
+        u32_field(&m, "drill_pulse_ns", 0, 500, &mut self.drill.pulse_ns);
+        if let Some(v) = m
+            .get("drill_interval_mm")
+            .and_then(|s| s.trim().parse().ok())
+            .filter(|v: &f64| v.is_finite())
+        {
+            self.drill.interval_mm = v.clamp(0.0, 1.0);
+        }
+        u32_field(&m, "drill_passes", 1, 1000, &mut self.drill.passes);
+        if let Some(v) = m.get("drill_wobble").and_then(|s| s.trim().parse().ok()) {
+            self.drill.wobble = v;
+        }
+        if let Some(v) = m
+            .get("drill_wobble_step_mm")
+            .and_then(|s| s.trim().parse().ok())
+            .filter(|v: &f64| v.is_finite())
+        {
+            self.drill.wobble_step_mm = v.clamp(0.0, 2.0);
+        }
+        if let Some(v) = m
+            .get("drill_wobble_size_mm")
+            .and_then(|s| s.trim().parse().ok())
+            .filter(|v: &f64| v.is_finite())
+        {
+            self.drill.wobble_size_mm = v.clamp(0.0, 2.0);
+        }
+        // Back-side board thickness / focal offset, clamped to the DragValue
+        // ranges (a hand-edited or corrupt blob can't push them out of bounds).
+        if let Some(v) = m
+            .get("thickness_mm")
+            .and_then(|s| s.trim().parse().ok())
+            .filter(|v: &f64| v.is_finite())
+        {
+            self.job.board_thickness_mm = v.clamp(0.0, 10.0);
+        }
+        if let Some(v) = m
+            .get("focal_mm")
+            .and_then(|s| s.trim().parse().ok())
+            .filter(|v: &f64| v.is_finite())
+        {
+            self.job.focal_mm = v.clamp(1.0, 1000.0);
+        }
+        if let Some(v) = m
+            .get("scan_center_auto")
+            .and_then(|s| s.trim().parse().ok())
+        {
+            self.job.scan_center_auto = v;
+        }
+        // The scan center is a measured per-rig constant with no DragValue
+        // range of its own; clamp to a sane span so a hand-edited or corrupt
+        // blob can't push it wildly off the bed.
+        if let Some(v) = m
+            .get("scan_center_x_mm")
+            .and_then(|s| s.trim().parse().ok())
+            .filter(|v: &f64| v.is_finite())
+        {
+            self.job.scan_center_mm.0 = v.clamp(-1000.0, 1000.0);
+        }
+        if let Some(v) = m
+            .get("scan_center_y_mm")
+            .and_then(|s| s.trim().parse().ok())
+            .filter(|v: &f64| v.is_finite())
+        {
+            self.job.scan_center_mm.1 = v.clamp(-1000.0, 1000.0);
+        }
         f64_field(&m, "place_px_per_mm", &mut self.placement.px_per_mm);
         f64_field(&m, "fid_px_per_mm", &mut self.fiducials.px_per_mm);
         // Fiducial footprint + search window, clamped to the DragValue ranges
@@ -378,28 +564,58 @@ impl ConsoleApp {
         {
             self.fiducials.search_mm = v.clamp(0.1, 20.0);
         }
-        // ④ auto fiducial-layout board size + margin, clamped to the DragValue
-        // ranges (a hand-edited or corrupt blob can't push them out of bounds).
+        // Fiducial-rectangle spans, clamped to the DragValue ranges (a
+        // hand-edited or corrupt blob can't push them out of bounds). The
+        // superseded `fid_board_*` / `fid_margin_mm` keys are deliberately NOT
+        // read: a stored board size is an OUTLINE, and reading it as a
+        // centre-to-centre span would silently widen the layout by 2×margin.
         if let Some(v) = m
-            .get("fid_board_w_mm")
+            .get("fid_rect_w_mm")
             .and_then(|s| s.trim().parse().ok())
             .filter(|v: &f64| v.is_finite())
         {
-            self.fiducials.board_w_mm = v.clamp(5.0, 500.0);
+            self.fiducials.rect_w_mm = v.clamp(5.0, 500.0);
         }
         if let Some(v) = m
-            .get("fid_board_h_mm")
+            .get("fid_rect_h_mm")
             .and_then(|s| s.trim().parse().ok())
             .filter(|v: &f64| v.is_finite())
         {
-            self.fiducials.board_h_mm = v.clamp(5.0, 500.0);
+            self.fiducials.rect_h_mm = v.clamp(5.0, 500.0);
         }
+        // The reference fiducial holes, restored only if they still read as a
+        // hole pattern: finite coordinates on the bed, and enough of them for
+        // `measure_loop` to fit anything. A blob that fails any of that leaves
+        // the loop check unarmed (it then says so) rather than measuring the
+        // machine against nonsense.
+        if let Some(pts) = m
+            .get("fid_ref_holes")
+            .and_then(|s| crate::fiducial::parse_layout(s).ok())
+            .filter(|pts| {
+                pts.len() >= 3
+                    && pts.len() <= 64
+                    && pts.iter().all(|p| {
+                        p.0.is_finite()
+                            && p.1.is_finite()
+                            && p.0.abs() <= REF_HOLE_MAX_MM
+                            && p.1.abs() <= REF_HOLE_MAX_MM
+                    })
+            })
+        {
+            self.fiducials.ref_holes = pts;
+        }
+        // Live re-acquire cadence, clamped to the DragValue range for the usual
+        // reason and one more: the ladder turns it into a `Duration` with
+        // `from_secs_f64`, which panics on a negative or NaN value.
         if let Some(v) = m
-            .get("fid_margin_mm")
+            .get("fid_live_recover_s")
             .and_then(|s| s.trim().parse().ok())
             .filter(|v: &f64| v.is_finite())
         {
-            self.fiducials.margin_mm = v.clamp(0.5, 50.0);
+            self.fiducials.live_recover_s = v.clamp(
+                super::fiducial_ui::LIVE_RECOVER_MIN_S,
+                super::fiducial_ui::LIVE_RECOVER_MAX_S,
+            );
         }
         if let Some(k) = m
             .get("fid_shape")
@@ -467,14 +683,48 @@ impl ConsoleApp {
             }
         }
         self.sync_auto_field_center();
+        // The three height-compensation heights, all above the bed surface.
+        // Absent keys leave the 0.0 defaults — three equal heights, which is
+        // the behaviour the console had before the compensation existed.
+        for (key, dst) in [
+            (
+                "calib_paper_height_mm",
+                &mut self.calibration.paper_height_mm,
+            ),
+            (
+                "calib_laser_height_mm",
+                &mut self.calibration.laser_height_mm,
+            ),
+            (
+                "fid_surface_height_mm",
+                &mut self.fiducials.surface_height_mm,
+            ),
+        ] {
+            if let Some(v) = m
+                .get(key)
+                .and_then(|s| s.trim().parse().ok())
+                .filter(|v: &f64| v.is_finite())
+            {
+                *dst = v.clamp(-PLANE_HEIGHT_MAX_MM, PLANE_HEIGHT_MAX_MM);
+            }
+        }
         if let Some(v) = m.get("cam_show_bed").and_then(|s| s.trim().parse().ok()) {
             self.camera.show_bed = v;
         }
-        if let Some(v) = m
+        // The three-way choice replaced a bool. Read the retired key first so an
+        // operator who had opted into compensation keeps it, then let the new key
+        // win where both are present (a settings blob written since the change).
+        if let Some(true) = m
             .get("calib_allow_machine_scale")
-            .and_then(|s| s.trim().parse().ok())
+            .and_then(|s| s.trim().parse::<bool>().ok())
         {
-            self.calibration.allow_machine_scale = v;
+            self.calibration.field_scale = calib::FieldScale::Compensate;
+        }
+        if let Some(v) = m
+            .get("calib_field_scale")
+            .and_then(|s| field_scale_from_token(s.trim()))
+        {
+            self.calibration.field_scale = v;
         }
         if let Some(v) = m
             .get("calib_accept_rms_um")
@@ -489,15 +739,6 @@ impl ConsoleApp {
             .filter(|v: &f64| v.is_finite())
         {
             self.calibration.accept_worst_um = v.clamp(10.0, 1000.0);
-        }
-        // A persisted field-correction preference is only honored once a field
-        // cal exists this session (the placement frame needs it), so this just
-        // restores the operator's intent; calibrate_fit re-enables it on a fit.
-        if let Some(v) = m
-            .get("place_field_correct")
-            .and_then(|s| s.trim().parse().ok())
-        {
-            self.placement.field_correct = v;
         }
         if let Some(o) = m
             .get("cam_orientation")
@@ -576,14 +817,7 @@ impl ConsoleApp {
                     rms_um: stats.next().and_then(|s| s.parse().ok()).unwrap_or(0.0),
                     max_um: stats.next().and_then(|s| s.parse().ok()).unwrap_or(0.0),
                     residuals: Vec::new(),
-                    calib_px_bounds: m.get("lens_px_bounds").and_then(|s| {
-                        let vals: Vec<f64> = s
-                            .split_whitespace()
-                            .filter_map(|t| t.parse().ok())
-                            .filter(|v: &f64| v.is_finite())
-                            .collect();
-                        <[f64; 4]>::try_from(vals).ok()
-                    }),
+                    calib_px_bounds: parse_px_bounds(m.get("lens_px_bounds"), &mut complaints),
                 },
                 dots: Vec::new(),
                 found: stats.next().and_then(|s| s.parse().ok()).unwrap_or(0),
@@ -668,7 +902,31 @@ impl ConsoleApp {
                     // Per-fit feedback like `dots` — not persisted; a restored
                     // field has no fresh detection to count against.
                     extrapolated: 0,
+                    // Filled from the fifth token below, once the fourth has
+                    // been consumed. The COUNT restores the distinction the
+                    // standing status keys off; the prose does not, so a
+                    // restored fit says how many were excluded, not which.
+                    rejected: 0,
+                    rejection_note: String::new(),
                 });
+                // Fourth token is new; older saves predate the choice and were
+                // necessarily fit in a scale-corrected mode, so `Refuse` (the
+                // default) describes them.
+                self.calibration.field_scale_used = stats
+                    .next()
+                    .and_then(field_scale_from_token)
+                    .unwrap_or(calib::FieldScale::Refuse);
+                // Fifth token is newer still; older saves predate outlier
+                // rejection and were necessarily fit over every detected dot.
+                if let Some(field) = self.calibration.field.as_mut() {
+                    let rejected: usize = stats.next().and_then(|s| s.parse().ok()).unwrap_or(0);
+                    field.rejected = rejected;
+                    if rejected > 0 {
+                        field.rejection_note = format!(
+                            "{rejected} dot(s) were EXCLUDED from this fit as outliers; its                              RMS/worst are over the dots that remained. Re-run step 3 to see                              which, and by how much."
+                        );
+                    }
+                }
                 self.calibration.field_accepted = true;
             }
         }
@@ -686,7 +944,7 @@ impl ConsoleApp {
             );
             let Ok(px_to_mm) = vision::Homography::from_matrix(mat) else {
                 self.calibration.note = "ignored an invalid saved calibration matrix".into();
-                return;
+                return complaints;
             };
             self.calibration.anchor = Some(calib::Calibration {
                 px_to_mm,
@@ -704,6 +962,7 @@ impl ConsoleApp {
                 "loaded a saved calibration ({age}) — click ⟳ Re-anchor to re-lock to the taped grid"
             );
         }
+        complaints
     }
 
     /// Persist the input fields if they changed since the last save. Cheap to

@@ -10,6 +10,7 @@
 mod calibration_ui;
 mod camera_ui;
 mod commands;
+mod diag_records;
 mod fiducial_ui;
 mod image_ui;
 mod job_ui;
@@ -36,9 +37,11 @@ use crate::fiducial::{self, FidKind, FidRow};
 use crate::preview::{self, Layer};
 use crate::status::{self, StatusSnapshot};
 #[cfg(test)]
-use camera_ui::{CAM_VIEW_MAX, downscale_view};
+use camera_ui::{CAM_VIEW_MAX, CAMERA_IDLE_RELEASE, downscale_view, should_release_capture};
 #[cfg(test)]
 use commands::spawn_verb;
+#[cfg(test)]
+use fiducial_ui::{RECOVER_BACKOFF_FACTOR, should_global_recover};
 // Blocking: it shells out and waits for the child to exit, which for the
 // default `cargo run -q --bin pcbforge --` is a compile plus a run with the
 // window frozen. The console always uses `spawn_verb`; only tests want the
@@ -50,6 +53,7 @@ pub use commands::{job_shapes, preview_image};
 use job_ui::status_color;
 use lightburn_run::{LightburnRun, spawn_lightburn_load, spawn_lightburn_run};
 use projection::CameraProjection;
+use settings_io::PLANE_HEIGHT_MAX_MM;
 use state::*;
 
 /// Shared hint for image panels that support pan/zoom navigation.
@@ -107,6 +111,7 @@ pub struct ConsoleApp {
     calibration: CalibrationState,
     fiducials: FiducialState,
     placement: PlacementState,
+    drill: DrillState,
     ar: ArState,
     views: ViewState,
 }
@@ -118,11 +123,22 @@ impl ConsoleApp {
         let db_path = db_path.into();
         let status = status::snapshot(&db_path);
         let settings_path = crate::settings::path_for_db(&db_path);
+        let diag = crate::diag::Diag::open(
+            crate::diag::path_for_db(&db_path),
+            crate::diag::DEFAULT_CAP_BYTES,
+        );
         let mut app = Self {
             db_path,
             cli_cmd,
             runtime: RuntimeState {
                 settings_path,
+                diag,
+                diag_check_seq: 0,
+                diag_mirrored: 0,
+                diag_failure_reported: false,
+                diag_readback: None,
+                diag_overlay_key: None,
+                diag_overlay_bbox: None,
                 last_settings: String::new(),
                 settings_error: None,
                 status,
@@ -131,6 +147,9 @@ impl ConsoleApp {
                 verb_job: None,
                 pending_lightburn: None,
                 lightburn_run: None,
+                camera_capture: None,
+                camera_capture_src: None,
+                camera_last_used: None,
             },
             job: JobState {
                 kicad_project: String::new(),
@@ -141,6 +160,7 @@ impl ConsoleApp {
                 side: Side::Front,
                 back_copper: String::new(),
                 back_outline: String::new(),
+                back_lbrn2: "job-back.lbrn2".into(),
                 board_thickness_mm: 1.6,
                 focal_mm: 70.0,
                 scan_center_auto: true,
@@ -163,7 +183,7 @@ impl ConsoleApp {
                 orientation: Orientation::Normal,
                 live: false,
                 tex: None,
-                note: "Pick a source and press Live. Snapshot feeds the Fiducial/Place tabs.".into(),
+                note: "Pick a source and press Live. Snapshot feeds the Fiducial-check tab.".into(),
                 last: None,
                 view_scale: 1.0,
                 devices: crate::camera::list_devices(),
@@ -172,8 +192,6 @@ impl ConsoleApp {
                 field_center_auto: true,
                 field_cx_mm: 35.0,
                 field_cy_mm: 35.0,
-                capture: None,
-                capture_src: None,
             },
             calibration: CalibrationState {
                 anchor: None,
@@ -190,6 +208,8 @@ impl ConsoleApp {
                     dot_mm: 0.4,
                     dot_kind: calib::DotKind::Dark,
                 },
+                paper_height_mm: 0.0,
+                laser_height_mm: 0.0,
                 grid_origin_mm: (0.0, 0.0),
                 grid_out: "calib-grid.lbrn2".into(),
                 paper_out: "paper-grid.svg".into(),
@@ -204,30 +224,43 @@ impl ConsoleApp {
                 field_accepted: false,
                 accept_rms_um: 100.0,
                 accept_worst_um: 250.0,
-                allow_machine_scale: false,
+                field_scale: calib::FieldScale::Refuse,
+                field_scale_used: calib::FieldScale::Refuse,
                 lens_arrow_scale: 20.0,
                 anchor_resid_scale: 30.0,
                 edit_anchor_dots: false,
                 show_fit_feedback: true,
                 live: false,
-                capture: None,
-                capture_src: None,
                 note: "Generate a grid, burn it, image it, click the 4 corner dots (LL, LR, UR, UL), then Fit.".into(),
             },
             fiducials: FiducialState {
                 frame: String::new(),
+                // The corners of the default 50×50 rectangle, centred in the
+                // default 70 mm field (centre 35,35).
                 layout: "10,10; 60,10; 10,60; 60,60".into(),
                 px_per_mm: 10.0,
                 shape: crate::fiducial::ShapeKind::Circle,
                 diameter_mm: 1.0,
                 height_mm: 1.0,
                 search_mm: 2.0,
+                surface_height_mm: 0.0,
                 profile: crate::fiducial::ProfileKind::DarkDot,
                 out: "fid-holes.lbrn2".into(),
-                board_w_mm: 70.0,
-                board_h_mm: 50.0,
-                margin_mm: 5.0,
+                rect_w_mm: 50.0,
+                rect_h_mm: 50.0,
+                // 500 ms: the operator's default cadence for re-acquiring a
+                // board that moved under Live.
+                live_recover_s: 0.5,
                 click_place: false,
+                show_placement: true,
+                detected_mm: Vec::new(),
+                checked_layout: Vec::new(),
+                ref_holes: Vec::new(),
+                loop_health: None,
+                loop_note: "no fiducial holes have been burned from this console yet".into(),
+                loop_alarm: None,
+                adopt_confirm: None,
+                adopt_warn: None,
                 note: "Load a frame, click each marker onto its hole, then Check.".into(),
                 rows: Vec::new(),
                 measured_ppm: None,
@@ -239,9 +272,12 @@ impl ConsoleApp {
                 last_placed: false,
                 homography: None,
                 pose: None,
+                last_fit: None,
+                design_drag: false,
+                marker_drag: None,
+                drag_origin: None,
                 live: false,
-                capture: None,
-                capture_src: None,
+                last_global_recover: None,
             },
             placement: PlacementState {
                 frame: String::new(),
@@ -250,17 +286,29 @@ impl ConsoleApp {
                 tx_mm: 0.0,
                 ty_mm: 0.0,
                 rot_deg: 0.0,
+                scale: 1.0,
                 auto_pose: false,
                 job: Vec::new(),
-                frame_img: None,
-                base_rgba: None,
                 pivot: (0.0, 0.0),
-                tex: None,
-                note: "Load a frame + job, then drag / rotate to place it on the board.".into(),
-                field_correct: false,
+                note: "Load the design, then drag it onto the board on the Fiducial-check tab."
+                    .into(),
                 lightburn_device: cam::lbrn2::DEFAULT_DEVICE.to_string(),
                 drills: String::new(),
                 drill_lbrn2: "drill.lbrn2".into(),
+            },
+            // The operator's drill recipe: fast Line passes with a small
+            // wobble, twice over each hole, at a 5 ns Q-pulse. Frequency stays
+            // at the source value the drill emit has always used (the etch
+            // default).
+            drill: DrillState {
+                speed_mm_s: 1000.0,
+                frequency_khz: 30.0,
+                pulse_ns: 5,
+                interval_mm: 0.05,
+                passes: 2,
+                wobble: true,
+                wobble_step_mm: 0.02,
+                wobble_size_mm: 0.05,
             },
             ar: ArState {
                 overlay: false,
@@ -276,8 +324,16 @@ impl ConsoleApp {
                 images: std::collections::HashMap::new(),
             },
         };
-        app.load_settings();
+        let complaints = app.load_settings();
         app.runtime.last_settings = app.settings_blob();
+        // After `load_settings`, so the startup record reports the calibration
+        // the console actually came up with rather than the empty defaults.
+        app.diag_startup();
+        // A saved value that was present but unusable is a fault the operator
+        // has to see; the load path itself has no log access at that point.
+        for text in complaints {
+            app.runtime.log.push(LogLine { text, err: true });
+        }
         app
     }
 
@@ -289,9 +345,12 @@ impl ConsoleApp {
         // Pump the live-capture loops regardless of the visible tab, or a
         // tab-switch during ● Live leaves the device held with no consumer and
         // stop-requests unexecuted until the tab is revisited (LR-45). Each is
-        // a cheap no-op (and drops its capture) when its Live toggle is off.
+        // a cheap no-op when its Live toggle is off. None of them drops the
+        // shared capture: one tab's Live-off must not kill another tab's feed,
+        // so release goes solely through the idle rule below.
         self.pump_calib_live(ctx);
         self.pump_fid_live(ctx);
+        self.release_idle_capture();
         egui::TopBottomPanel::top("top").show(ctx, |ui| {
             ui.horizontal(|ui| {
                 ui.heading("PCBForge console");
@@ -330,6 +389,9 @@ impl ConsoleApp {
         // Persist the input fields after the frame's edits (no-op unless one
         // actually changed), so the Gerber paths survive a restart.
         self.save_settings_if_changed();
+        // Mirror any failure line this frame added into the diagnostic file.
+        // Frame-rate, but it writes nothing unless the log actually grew.
+        self.diag_mirror_errors();
     }
 
     /// A concise snapshot of the debuggable app state, for the headless
@@ -356,18 +418,20 @@ impl ConsoleApp {
         };
         let field = match &self.calibration.field {
             Some(c) => format!(
-                "{} dots, RMS/worst {:.0}/{:.0}µm, verdict={}, scale={:+.1}%, mirrored={}, extrapolated={}, {}",
+                "{} dots, RMS/worst {:.0}/{:.0}µm, verdict={}, scale={:+.1}%, fit_mode={}, mirrored={}, extrapolated={}, rejected={}, {}",
                 c.found,
                 c.field.rms_um,
                 c.field.max_um,
                 field_verdict_token(&c.field_verdict),
                 (c.scale - 1.0) * 100.0,
+                field_scale_token(self.calibration.field_scale_used),
                 if c.paper_to_machine.flip_x {
                     "yes"
                 } else {
                     "no"
                 },
                 c.extrapolated,
+                c.rejected,
                 if self.calibration.field_accepted {
                     "accepted"
                 } else {
@@ -386,6 +450,19 @@ impl ConsoleApp {
             },
             None => "no-frame",
         };
+        // The derived camera-ray geometry AND the three heights it is driven
+        // by, spelled out with the tab each is set on: the compensation only
+        // ever uses their differences, so the raw trio has to be readable here
+        // rather than only visible as a shifted burn.
+        let height_comp = {
+            let (text, active) = self.height_comp_status();
+            format!(
+                "active={active} paper={:.2} laser={:.2} surface={:.2} mm · {text}",
+                self.calibration.paper_height_mm,
+                self.calibration.laser_height_mm,
+                self.fiducials.surface_height_mm,
+            )
+        };
         let cam = match &self.camera.last {
             Some(g) => format!(
                 "{}×{} (view ×{:.3})",
@@ -393,6 +470,13 @@ impl ConsoleApp {
                 g.height(),
                 self.camera.view_scale
             ),
+            None => "none".into(),
+        };
+        // The one shared capture, so `state` shows whether the console is
+        // holding the device open and which tabs are asking for frames.
+        let shared_capture = match &self.runtime.camera_capture_src {
+            Some(crate::camera::Source::Device(i)) => format!("device {i}"),
+            Some(crate::camera::Source::File(_)) => "file".into(),
             None => "none".into(),
         };
         let calib_frame = match &self.calibration.frame_img {
@@ -427,50 +511,95 @@ impl ConsoleApp {
             self.job.wobble_step_mm,
             self.job.wobble_size_mm,
         );
-        // ④ auto fiducial-hole layout, resolved against the effective field
-        // centre (kept in sync with the auto toggle by `sync_auto_field_center`).
-        let fid_layout = fiducial::format_layout(&fiducial::board_fid_layout(
+        // The back side's own inputs: they persist across a side switch (only
+        // the per-side caches are dropped), so they report separately.
+        let back = format!(
+            "copper={} outline={} lbrn2={}",
+            if self.job.back_copper.trim().is_empty() {
+                "unset".into()
+            } else {
+                base(&self.job.back_copper)
+            },
+            if self.job.back_outline.trim().is_empty() {
+                "unset".into()
+            } else {
+                base(&self.job.back_outline)
+            },
+            if self.job.back_lbrn2.trim().is_empty() {
+                "unset".into()
+            } else {
+                base(&self.job.back_lbrn2)
+            },
+        );
+        // The drill emit's own recipe — it shares nothing with the etch numbers
+        // above, so a headless run has to be able to read it back separately.
+        let drill = format!(
+            "speed={} freq_khz={} pulse_ns={} interval={} passes={} wobble={} \
+             wobble_step={} wobble_size={}",
+            self.drill.speed_mm_s,
+            self.drill.frequency_khz,
+            self.drill.pulse_ns,
+            self.drill.interval_mm,
+            self.drill.passes,
+            self.drill.wobble,
+            self.drill.wobble_step_mm,
+            self.drill.wobble_size_mm,
+        );
+        // The fiducial rectangle's four positions, resolved against the effective
+        // field centre (kept in sync with the auto toggle by `sync_auto_field_center`).
+        let fid_layout = fiducial::format_layout(&fiducial::centered_fid_layout(
             self.camera.field_cx_mm as f64,
             self.camera.field_cy_mm as f64,
-            self.fiducials.board_w_mm,
-            self.fiducials.board_h_mm,
-            self.fiducials.margin_mm,
+            self.fiducials.rect_w_mm,
+            self.fiducials.rect_h_mm,
         ));
+        // How far the placement has drifted from the pose the last applied
+        // Check put it at — the number the offset readout quotes, so it has to
+        // be greppable from a headless run too.
+        let fid_offset = match self.placement_deviation() {
+            Some((mm, deg)) => format!("{mm:.2}mm/{deg:+.2}deg"),
+            None => "no_fit".into(),
+        };
         let fid_pose = match &self.fiducials.pose {
             Some(p) => format!(
-                "rot={:+.2} tx={:.2} ty={:.2} rms={:.3} flipped={} used={}",
-                p.rot_deg, p.tx_mm, p.ty_mm, p.rms_mm, p.flipped, p.used
+                "rot={:+.2} scale={:.4} tx={:.2} ty={:.2} rms={:.3} flipped={} used={}",
+                p.rot_deg, p.scale, p.tx_mm, p.ty_mm, p.rms_mm, p.flipped, p.used
             ),
             None => "none".into(),
         };
         format!(
             "tab={:?} side={:?} calib_mode={:?}\n\
              gerbers: {gerbers}\n\
+             back: {back}\n\
              calib_anchor: {calib}\n\
              camera_lens: {lens}\n\
-             laser_field: {field} field_correct={} scale_comp={} limits={:.0}/{:.0}µm\n\
+             laser_field: {field} scale_mode={} limits={:.0}/{:.0}µm\n\
              camera_projection: {projection}\n\
+             height_comp: {height_comp}\n\
              camera_frame: {cam}\n\
+             shared_capture: {shared_capture} live_camera={} live_calib={} live_fid={}\n\
              calib_frame: {calib_frame}\n\
              bed_overlay: show={} field={:.0}mm center=({:.1},{:.1}) auto={}\n\
-             place: x={:.2} y={:.2} rot={:.1}° auto_pose={} frame={} lightburn={} device={} drills={} drill_out={} note={:?}\n\
+             place: x={:.2} y={:.2} rot={:.1}° scale={:.4} auto_pose={} job_polys={} lightburn={} device={} drills={} drill_out={} note={:?}\n\
+             drill: {drill}\n\
+             place_intent: fid_offset={fid_offset} mirror_baseline={:.4}\n\
              calib_paper: n={} pitch={:.2}mm dot={:.2}mm contrast={} out={}\n\
              calib_burn: n={} pitch={:.2}mm dot={:.2}mm contrast={} corners_marked={} edit_anchor_dots={} feedback={} origin=({:.1},{:.1})\n\
-             fiducials: {} markers shape={} w={} h={} profile={} search={} out={} marking={}\n\
-             fid_board: w={} h={} margin={} layout={}\n\
+             fiducials: {} markers shape={} w={} h={} profile={} search={} out={} marking={} live_recover_s={}\n\
+             fid_rect: w={} h={} layout={}\n\
              fid_pose: {}\n\
+             fid_loop: {} ref_holes={} adopt_confirm={} adopt_warn={}\n\
+             diag: {} check={} {}\n\
              settings: {}",
             self.runtime.tab,
             self.job.side,
             self.calibration.mode,
-            self.placement.field_correct,
-            if self.calibration.allow_machine_scale {
-                "on"
-            } else {
-                "off"
-            },
+            field_scale_token(self.calibration.field_scale),
             self.calibration.accept_rms_um,
             self.calibration.accept_worst_um,
+            self.camera.live,
+            self.calibration.live,
+            self.fiducials.live,
             self.camera.show_bed,
             self.camera.field_mm,
             self.camera.field_cx_mm,
@@ -479,17 +608,15 @@ impl ConsoleApp {
             self.placement.tx_mm,
             self.placement.ty_mm,
             self.placement.rot_deg,
+            self.placement.scale,
             self.placement.auto_pose,
-            match (&self.placement.frame_img, &self.placement.tex) {
-                (Some(f), Some(_)) => format!("{}x{}", f.width(), f.height()),
-                (Some(_), None) => "loaded-no-tex".into(),
-                (None, _) => "none".into(),
-            },
+            self.placement.job.len(),
             self.lightburn_token(),
             self.placement.lightburn_device,
             base(&self.placement.drills),
             base(&self.placement.drill_lbrn2),
             self.placement.note,
+            self.mirror_scale_baseline(),
             self.calibration.paper.n,
             self.calibration.paper.pitch_mm,
             self.calibration.paper.dot_mm,
@@ -519,11 +646,25 @@ impl ConsoleApp {
                 Some(k) => k.to_string(),
                 None => "-".to_string(),
             },
-            self.fiducials.board_w_mm,
-            self.fiducials.board_h_mm,
-            self.fiducials.margin_mm,
+            self.fiducials.live_recover_s,
+            self.fiducials.rect_w_mm,
+            self.fiducials.rect_h_mm,
             fid_layout,
             fid_pose,
+            self.loop_health_token(),
+            self.fiducials.ref_holes.len(),
+            match self.fiducials.adopt_confirm {
+                Some(s) => format!("{s:.4}"),
+                None => "-".into(),
+            },
+            self.fiducials.adopt_warn.is_some(),
+            self.runtime.diag.path().display(),
+            self.runtime.diag_check_seq,
+            if self.runtime.diag.failed() {
+                "WRITE FAILED"
+            } else {
+                "ok"
+            },
             self.runtime.settings_error.as_deref().unwrap_or("saved"),
         )
     }

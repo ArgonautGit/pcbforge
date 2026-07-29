@@ -199,6 +199,44 @@ fn skip_advances_past_an_unconfirmable_hole() {
     assert!(out.contains("skipped hole #1"), "out: {out}");
 }
 
+/// The guide has only a typed px/mm — no lens map, no bed anchor — so every
+/// position it prints is drill-file mm in the camera plane. It must say so and
+/// must not present any number as a machine coordinate.
+#[test]
+fn output_names_its_frame_and_claims_no_machine_coordinates() {
+    let dir = tmp();
+    let drl = dir.join("board.drl");
+    std::fs::write(&drl, DRL).unwrap();
+    let (ok, out, err) = run(&[
+        "drill-guide",
+        "--drills",
+        &drl.to_string_lossy(),
+        "--state",
+        &dir.join("s.txt").to_string_lossy(),
+        "--overlay",
+        &dir.join("o.png").to_string_lossy(),
+        "--px-per-mm",
+        "10",
+    ]);
+    assert!(ok, "first step: {err}");
+    assert!(
+        out.contains("frame: camera plane at 10.00 px/mm"),
+        "names the frame it is working in: {out}"
+    );
+    assert!(
+        out.contains("NOT machine coordinates"),
+        "refuses the machine-coordinate reading: {out}"
+    );
+    assert!(
+        out.contains("(5.000, 5.000) drill-file mm"),
+        "labels the target's frame: {out}"
+    );
+    assert!(
+        !out.contains("machine mm"),
+        "never claims machine mm: {out}"
+    );
+}
+
 #[test]
 fn negative_coordinate_is_rejected() {
     // A sheet-frame (non-aux-origin) export lands off-frame; reject it with a

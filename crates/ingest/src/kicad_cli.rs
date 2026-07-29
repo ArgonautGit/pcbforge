@@ -168,9 +168,9 @@ impl KicadCli {
 
     /// Export the two Gerbers a job needs — the conductor and the board
     /// outline — from `board`, writing them into `out_dir` under stable names
-    /// (`copper.gbr`, `outline.gbr`) regardless of kicad-cli's own naming.
-    /// Each layer is exported on its own call so the mapping is unambiguous.
-    /// Returns `(copper, outline)`.
+    /// ([`copper_gerber_name`], [`OUTLINE_GERBER_NAME`]) regardless of
+    /// kicad-cli's own naming. Each layer is exported on its own call so the
+    /// mapping is unambiguous. Returns `(copper, outline)`.
     pub fn export_job_gerbers(
         &self,
         board: &Path,
@@ -179,8 +179,13 @@ impl KicadCli {
         outline_layer: &str,
     ) -> Result<(PathBuf, PathBuf), KicadCliError> {
         std::fs::create_dir_all(out_dir).ok();
-        let copper = self.export_one_gerber(board, copper_layer, out_dir, "copper.gbr")?;
-        let outline = self.export_one_gerber(board, outline_layer, out_dir, "outline.gbr")?;
+        let copper = self.export_one_gerber(
+            board,
+            copper_layer,
+            out_dir,
+            &copper_gerber_name(copper_layer),
+        )?;
+        let outline = self.export_one_gerber(board, outline_layer, out_dir, OUTLINE_GERBER_NAME)?;
         Ok((copper, outline))
     }
 
@@ -334,6 +339,18 @@ impl KicadCli {
         Ok((pth, npth))
     }
 }
+
+/// The stable name [`KicadCli::export_job_gerbers`] lands a copper export
+/// under: the layer name carried in the file name (`.` → `_`, KiCad's own
+/// convention) so a front and a back export sharing one output directory
+/// cannot overwrite each other.
+pub fn copper_gerber_name(copper_layer: &str) -> String {
+    format!("copper-{}.gbr", copper_layer.replace('.', "_"))
+}
+
+/// The stable name the board outline lands under. Side-independent — both
+/// sides plot the same `Edge.Cuts`, so one file serves them both.
+pub const OUTLINE_GERBER_NAME: &str = "outline.gbr";
 
 /// The paths inside single quotes of kicad-cli's "Created file '…'" /
 /// "Plotted to '…'" stdout lines, kept only when the file really exists.
@@ -489,11 +506,28 @@ mod tests {
         let (copper, outline) = cli
             .export_job_gerbers(&board, &dir, "F.Cu", "Edge.Cuts")
             .unwrap();
-        assert_eq!(copper, dir.join("copper.gbr"));
+        assert_eq!(copper, dir.join("copper-F_Cu.gbr"));
         assert_eq!(outline, dir.join("outline.gbr"));
         assert!(copper.is_file() && outline.is_file());
         // Both are real Gerber output (G-code-ish `%` header).
         assert!(std::fs::read_to_string(&copper).unwrap().contains('%'));
+        // The back side lands beside it, not on top of it — a double-sided job
+        // exports both into one directory and needs both to survive.
+        let (back_copper, back_outline) = cli
+            .export_job_gerbers(&board, &dir, "B.Cu", "Edge.Cuts")
+            .unwrap();
+        assert_eq!(back_copper, dir.join("copper-B_Cu.gbr"));
+        assert_eq!(back_outline, outline, "Edge.Cuts is shared by both sides");
+        assert!(copper.is_file(), "the front export survived the back one");
+    }
+
+    #[test]
+    fn copper_gerber_names_are_layer_specific() {
+        // Runs without kicad-cli: the console derives these same names to
+        // pre-fill its path fields, so front and back must never collide.
+        assert_eq!(copper_gerber_name("F.Cu"), "copper-F_Cu.gbr");
+        assert_eq!(copper_gerber_name("B.Cu"), "copper-B_Cu.gbr");
+        assert_ne!(copper_gerber_name("F.Cu"), copper_gerber_name("B.Cu"));
     }
 
     #[test]

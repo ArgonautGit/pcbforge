@@ -1450,8 +1450,9 @@ existing ING-6 kicad-cli invoker.
 - `ingest::kicad_cli::export_job_gerbers(board, out_dir, copper_layer,
   outline_layer)`: exports the conductor + outline on separate calls (so the
   layer→file mapping is unambiguous) and moves each plotted file to a stable
-  name — `copper.gbr` / `outline.gbr`. `resolve_board` accepts a `.kicad_pcb`
-  *or* a project directory containing exactly one board.
+  name — `copper.gbr` / `outline.gbr` (renamed to `copper-<layer>.gbr` on
+  2026-07-28, see that day's entries; outline unchanged). `resolve_board`
+  accepts a `.kicad_pcb` *or* a project directory containing exactly one board.
 - CLI `pcbforge gerbers --project <.kicad_pcb|dir> --out <dir>
   [--copper-layer F.Cu] [--outline-layer Edge.Cuts]`: prints `board/copper/
   outline` paths for a script or the console to pick up. Verified end-to-end:
@@ -1474,13 +1475,15 @@ runner:
 
 - `gerbers_from_kicad` now resolves the board (cheap, for the output dir),
   pre-fills the copper/outline fields with the deterministic output paths
-  (`<board dir>/pcbforge-gerbers/{copper,outline}.gbr`), and shells
-  `pcbforge gerbers …` via `run_verb` (thread + channel, non-blocking). The
-  files appear when the job finishes; its progress/errors stream to the Log.
-  Back side passes `--copper-layer B.Cu`.
+  (`<board dir>/pcbforge-gerbers/{copper,outline}.gbr`, renamed to
+  `copper-<layer>.gbr` on 2026-07-28, see that day's entries; outline
+  unchanged), and shells `pcbforge gerbers …` via `run_verb` (thread + channel,
+  non-blocking). The files appear when the job finishes; its progress/errors
+  stream to the Log. Back side passes `--copper-layer B.Cu`.
 - The UI interaction test is now deterministic (no kicad-cli needed): the fields
-  are pre-set synchronously, so it asserts `copper=copper.gbr` immediately. The
-  actual export is covered by the CLI `gerbers_e2e` tests.
+  are pre-set synchronously, so it asserts `copper=copper.gbr` immediately
+  (that assertion has since followed the 2026-07-28 rename). The actual export
+  is covered by the CLI `gerbers_e2e` tests.
 - `debug_driver` gained a `PCBFORGE_CLI` env override so it can drive *real*
   verbs (e.g. `PCBFORGE_CLI=./target/debug/pcbforge`) instead of the `true`
   no-op. Confirmed the button pre-fills the fields instantly (non-blocking) and
@@ -2514,3 +2517,1144 @@ disk for a manual run.
   the valuable one, it decides whether the job moves on the board. A
   `pcbforge calib-fit` verb is the payoff, since it makes the fit pipeline
   testable against real captured frames.
+
+## 2026-07-25 — Fiducial positions are a centred rectangle's W×H, not coordinates
+
+- The operator now gives **two numbers** — the centre-to-centre W and H of the
+  fiducial rectangle — and the four positions fall out of centring it in the
+  work area (the Camera-tab field, `field_cx_mm`/`field_cy_mm`). Typing
+  `x,y; x,y; …` was the only place in the console that asked for absolute bed
+  coordinates, and it asked for them twice over: the Fiducial-check tab's
+  `expected` text field, and ④'s board W/H + margin, which computed the same
+  thing a different way and only reached the check on Generate.
+- **Centred means centred, not four equal gaps.** `field_mm` is one scalar, so
+  a W≠H rectangle has unequal x/y insets; that is correct and intended.
+- `layout: String` stays the internal source of truth (`parse_layout` feeds
+  `expected_points`, the design-spacing scale, the homography correspondences
+  and `fid-holes --layout`). W/H **generate** it on edit rather than replacing
+  it — a per-frame rebuild would silently undo click-to-place, which writes
+  the layout directly. That containment is what kept the change small: the CLI
+  and every consumer downstream of `parse_layout` are untouched.
+- `board_fid_layout(cx, cy, w, h, margin)` became
+  `centered_fid_layout(cx, cy, w, h)`. Folding the margin out is the point:
+  W/H are hole-CENTRE spans, so the corners land exactly on them, and the
+  "margin swallows the shorter side" validation disappears with it.
+- Persisted `fid_board_w_mm`/`fid_board_h_mm`/`fid_margin_mm` are **not** read
+  as the new `fid_rect_*` keys. A stored board size is an outline; reading it
+  as a centre span would silently widen a saved layout by 2×margin. Old blobs
+  fall through to the 50×50 default, which reproduces the shipped default
+  layout exactly under the default 70 mm field.
+- ④'s "board size from job" survives as "rect from job board size", insetting
+  the Gerber bbox 5 mm per side — a constant, not a third knob back.
+- Labels are "fiducial rect W/H mm", deliberately not "width/height mm": those
+  already name the Rect *footprint* size in both forms, and a third pair would
+  make `click "width mm"` ambiguous in the accessibility tree.
+
+## 2026-07-25 — Fiducial holes: generate only, at the drill recipe
+
+- **The button no longer burns — it hands off.** "⚙ Generate + burn holes"
+  became "⚙ Generate holes → LightBurn (no burn)": it shells `fid-holes`, and
+  once the export finishes the file is FORCELOADed in LightBurn. START is never
+  sent. Exactly the contract the Place tab's drill emit already held, down to
+  the label shape.
+- That required the queued hand-off to learn the distinction, so
+  `pending_lightburn: Option<PathBuf>` became
+  `Option<PendingLightburn { path, start }>` and `chain_lightburn_after_verb`
+  picks `spawn_lightburn_run` vs. `spawn_lightburn_load`. The drill emit didn't
+  need this because it emits **in-process** — the file is already on disk, so
+  it can spawn the load directly. The fiducial path shells the CLI
+  asynchronously; without the flag there was no way to say "load this when the
+  export lands, but don't fire".
+- `!lightburn_busy()` still gates both generate buttons, for the reason the
+  drill button carries: the load-only run replaces `lightburn_run`, and
+  stomping a live burn's progress reporting would be rude.
+- `debug_summary` gained a `lightburn=pending-load` token alongside `pending`.
+  Whether a queued hand-off can fire the laser is precisely the thing a
+  headless `state` dump must not have to guess, and `is_some()` reported both
+  identically.
+- **These are drilled holes, so they burn at the drill recipe.** `fid-holes`
+  baked in `EmitLayer::fill` at a hardcoded 20 % / 1000 mm·s⁻¹ / 30 kHz / 1 ns
+  / 1 pass. It now takes `--mode` plus the same process flags `drill-emit`
+  takes, and the console passes `--mode line` with the Job-tab params — exactly
+  the recipe `emit_drill_at_placement` builds. A 1 mm circle scanned as a fill
+  is an engraved dot; traced as a Line layer it is a drilled one.
+- `--mode` defaults to **`line`** here, unlike `drill-emit`'s `fill`. The verb
+  has one caller (the console), and two defaults disagreeing across the
+  CLI/console boundary is the failure mode worth avoiding; `fill` on a fiducial
+  was arguably never right. The flag keeps it overridable.
+- `fid_holes_cmd` took a `FidHolesArgs` struct, mirroring `DrillEmitArgs` —
+  fifteen positional parameters was past the point where the
+  `too_many_arguments` allow was carrying its weight.
+- New failure path, by construction: Job-tab params now reach
+  `AblationParams::validate()` at write time, so a value the Job tab accepts
+  but lbrn2 rejects fails the export (visible in the Log). Impossible while the
+  recipe was baked in — worth knowing before it shows up on the bench.
+- **Open question left for the operator**, not silently resolved here:
+  `emit_drill_at_placement` builds a *Fill* layer, so "the drill settings" as
+  the repo implements them today are fill mode. Line was used here because it
+  was named explicitly. Either the Place-tab drill emit should be Line too (a
+  separate fix), or Line is fiducial-specific.
+
+## 2026-07-26 — Fiducial rows report the fit residual, not just detector drift
+
+- Symptom from the bench: four strong detections, every row reading `off < 700
+  µm`, and `fiducial fit RMS 3.39 mm too loose — placement not updated`. The
+  rows looked like a passing check.
+- They were measuring a different thing in a different frame. `summarize`
+  compares `found_mm` against the **search marker**, through
+  `BedMap::uniform_scale_y_flip` at the *seeded* px/mm. The pose fit compares
+  the **design layout** against machine mm through `place_projection`. A small
+  `off` only means the detector locked near where you clicked; it stays small
+  however wrong the fit is, so the two numbers were never comparable.
+- `fit_board_pose` now returns `PoseFit { pose, residuals_mm }` — per-point
+  distances aligned with the full layout — and `rms_mm` is derived from those,
+  so the aggregate and the per-point numbers cannot drift apart. Each summary
+  row gains `fit N.NN mm`.
+- Labelled **before** the mirror/RMS gates, deliberately: a rejected fit is
+  precisely when the operator needs to see which fiducial is the outlier.
+- `update_placement_from_fiducials` also stops swallowing the projection error
+  (`Err(_)` → `Err(e)`). `place_projection` fails either because nothing is
+  calibrated or because the calibration doesn't match this frame's
+  resolution/crop/orientation — and the old blanket "no camera→machine
+  calibration" reads as flatly untrue in the second case, which is the one
+  that's actually fixable.
+- Reverted from the rectangle work: ↺ reset was briefly made to rebuild a
+  ✕-cleared layout from W/H. That contradicts 2026-07-21 (clear means gone, or
+  an overgrown click-placed set has no one-step exit) and its regression test
+  caught it. Regeneration got its own button instead — **⟳ layout from W×H** —
+  which also covers the case editing the DragValue can't: wanting the value
+  already in the field, since `changed()` only fires on an actual change.
+
+## 2026-07-26 — The fiducial check seeds itself, and carries the operator's offset
+
+- **Seeding through the calibration, not the typed px/mm.** The ✛ markers lived
+  in the uniform seeded-px/mm frame, so where they landed was only ever as good
+  as the px/mm guess — which is why the tab asked for a click on each hole
+  before detection could find anything. But the holes are burned at *known
+  machine coordinates*, and `place_projection` is the map that says where a
+  machine-mm point images. `seed_fid_markers_from_projection` pushes
+  `expected_points()` (side-aware: mirrored + beam-offset on the Back) through
+  it and converts the pixels back into the tab's uniform frame. Every marker
+  then starts inside its own search window and the click round disappears.
+- It runs **only** on the explicit actions — ⤵ Load frame, 📷 Grab & check,
+  🎯 Check — and pointedly *not* from `sync_fid_markers`, which the overlay
+  calls every frame. Seeding there would drag the markers off their holes as
+  fast as an operator could place them; the same argument rules out seeding in
+  the Live pump.
+- When there is no usable projection every path keeps exactly its old
+  behaviour (Load opens the marking round; Grab/Check detect at the raw layout
+  seeds) and the projection's own reason is appended to the note — the operator
+  should know why they are back to clicking. The append happens *after*
+  `start_fid_marking`/`detect_fiducials`, both of which rewrite the note
+  wholesale.
+- 🎯 Check on a cold tab with a frame file now **returns** after the load
+  instead of falling through to a second detection. The load either seeded and
+  checked, or opened the click round whose last click checks; the fall-through
+  ran `check_frame` twice and buried the round's "click fiducial 1 of N"
+  prompt under a tally the operator hadn't asked for.
+- **One refine pass** in `detect_fiducials`. A small uniform placement error —
+  a nudged board, a slightly-off px/mm — moves every hole the same way, so the
+  fiducials that were found say where the missed ones went: shift the misses by
+  the mean hit displacement and look once more. Needs ≥2 hits so a single bad
+  detection can't drag the misses off on its own, and only the missed seeds
+  move, so the hits search unchanged windows and cannot regress. The refined
+  seeds stay local — writing them back would make the ✛ walk on every Check and
+  every frame under Live, the same stomp the sync rule above avoids.
+- **A manual placement adjustment now travels with the board.** Every
+  successful Check used to overwrite tx/ty/rot with "design centred on the
+  fiducial centroid", discarding whatever the operator had dragged. The fit
+  inside `fit_board_pose` is a nominal-bed → measured-bed correction, so the
+  adjustment is expressible in the *nominal* frame: map the current placement
+  back through the fit it was written under, measure it from the layout
+  centroid `b0`, and re-apply that offset under the new fit. `PoseFit` gained
+  `fit` and `layout_centroid` to hand both out.
+- The reference frame is `fiducials.last_fit`, set only on an APPLIED Check.
+  It is dropped wherever the nominal frame stops meaning anything: `set_side`
+  (the other face's fit is not a frame this face can be measured against),
+  `apply_fid_rect` and `clear_fid_markers` (the layout moved, so `b0` moved,
+  and the stored offset would displace the design by the difference). With no
+  stored fit the offset is zero — i.e. bit-for-bit the old centre-on-the-
+  fiducials behaviour, which is what the first Check after any of those does.
+- No `Rigid2::inverse` was added: `inverse_apply` already exists and is exactly
+  the `F · Rᵀ` mirrored form needed, with round-trip tests for both `flip_x`
+  cases. A second spelling of the same inverse is a second thing to get wrong.
+- Known asymmetry, left alone: `fiducials.pose` stays the *board's* fit, so
+  the verdict line's rotation is the board's, not the design's, when a rotation
+  offset is being carried. The pose is the measurement; the placement is what
+  the operator moved.
+
+## Fiducial location: whole-frame recovery when the markers are nowhere near
+
+- **The detector stays local; a second, independent path finds the holes when
+  the local search has nothing to search around.** `vision::find_fiducials` is
+  local because the honeycomb bed is covered in decoys (module header, field
+  photo 2026-07-14) — that has not changed. But the local search assumes the
+  markers are already near the holes, and when they are not (bad calibration,
+  board moved, a layout that was never in machine coordinates) *every* fiducial
+  misses and the operator is handed nothing to act on.
+  `vision::find_fiducial_candidates` scans the whole frame for fiducial-SIZED
+  blobs and `ui::fiducial::match_layout_to_candidates` picks out the subset
+  whose ARRANGEMENT matches the layout. Arrangement is a far stronger decoy
+  discriminator than any per-blob gate, so the candidate pass is deliberately
+  permissive — it over-admits and lets the match do the rejecting.
+- **Tiled local statistics, not a global threshold.** Median + MAD per tile of
+  ~8 dot diameters (clamped 32..=128 px), bilinearly interpolated from tile
+  CENTRES so there are no seams. A single global threshold drowns in the bed
+  glare gradient — the same reason the local search derives its threshold per
+  window. The mask sits at `MIN_SNR/2` σ above local background: `MIN_SNR` gates
+  a matched-filter *peak*, while a per-pixel mask must also keep the blob's
+  anti-aliased skirt or the area gate rejects what is left.
+- **Tolerance is span-relative, and the separation gate is a RATIO.** The bench
+  frame (`samples/fiducial/bench-plate-4holes.png`) shows the plate tilted
+  enough that its diagonals differ by 9%: no similarity fits the observed quad,
+  and the best one still leaves ~5% of the span on a corner. An absolute pixel
+  tolerance is therefore wrong twice over — it does not track camera distance,
+  and the layout's own pixel span is only as good as the operator's typed
+  px/mm. Hence `match_tol_px` (9% of the layout span) and a scale-ratio band of
+  ±30% instead of an absolute `|d_cand − d_layout|` test. The same perspective
+  is why the rotation gate is 20°, not "a few": one edge of that frame reads 16°
+  of apparent rotation on a board that is square to the machine.
+- **Hypotheses are ranked by candidate QUALITY before residual.** Ranking by RMS
+  alone picks decoys: a honeycomb bed is a regular grid, so among a hundred bed
+  holes some four sit on a near-perfect scaled copy of the layout and fit
+  *tighter* than the real, perspective-warped board. Residual cannot separate
+  them; how much each blob looks like a drilled fiducial can — on the bench
+  frame the four plate holes rank 0/2/7/11 of 161. `candidates_px` must
+  therefore arrive best-first, which is the contract
+  `find_fiducial_candidates` documents.
+- **A Check tries markers → projection → rectangle match, and keeps the first
+  that works.** `render_fiducials` used to re-seed from the calibrated
+  projection unconditionally before detecting. That threw away markers the
+  operator had already clicked onto the holes, and for a layout whose
+  coordinates are themselves click-derived the projection lands off the plate —
+  turning a working 4-of-4 Check into 0-of-4. Each stage runs at most once per
+  Check, the note names which one succeeded, and if none beats the operator's
+  markers they are restored: a failed Check must never park the ✛ set wherever
+  the last failed attempt left it. The whole-frame stage is skipped entirely
+  under Live — it is a full-frame scan, not something to run per streamed frame.
+
+## 2026-07-26 — "⌖ layout from detection": making the current pose nominal
+
+- The fiducial check exists to compensate for imperfect operator board
+  placement, but on the bench it kept refusing: `fit_board_pose` fits
+  layout → measured as a RIGID transform, and the operator's layout was a
+  hand-clicked quadrilateral standing in for a rectangle. No rotation and
+  translation absorb a shape error, so it landed in the residual (3.39 mm) and
+  the 0.5 mm gate refused. The gate was right — a job placed from that fit
+  burns in the wrong place — but "go hand-fix your layout" is a bad answer when
+  the console has just measured exactly where those holes are.
+- ⌖ adopts the measurement as the new nominal: the layout is replaced by the
+  `place_projection`-mapped detected positions. The residual is then zero by
+  construction, and every later Check measures only what changed SINCE — which
+  is precisely the placement error the path exists to correct. Teach it once
+  with the board where you want it; from then on a Check moves the job by
+  however far the board has drifted.
+- It also absorbs camera-calibration scale/skew error into the nominal, so a
+  rig whose calibration is imperfect still gets usable RELATIVE registration.
+  That is a real widening of what the feature tolerates, and worth knowing:
+  after adopting, the fit is trustworthy about board MOVEMENT, not about
+  absolute machine coordinates.
+- Deliberately a button, never automatic. Silently redefining the nominal would
+  promote a genuine misdetection to truth — the exact failure the RMS gate is
+  there to catch. Enabled only when EVERY fiducial was found, since a partial
+  adopt would drop points from the layout.
+- Front side only: back-side detections are compared against mirrored,
+  beam-offset expected positions, so writing them into the un-mirrored layout
+  frame would bake the flip in twice.
+- `detected_mm` is cached BEFORE the mirror/RMS gates — a refused fit is exactly
+  when ⌖ is needed — and cleared anywhere the layout or side changes, so a stale
+  measurement can never be adopted as a layout it no longer corresponds to.
+
+## 2026-07-26 — The fiducial pose fit carries uniform SCALE, and applies it
+
+- The rigid fit could not register the operator's board. Measured fiducial
+  spacing came out ~3.8% off the nominal layout. Rotation and translation have
+  nowhere to put a spacing error, so all of it landed in the residual: ~1.1 mm
+  RMS over a 40 mm square, against a 0.5 mm `POSE_MAX_RMS_MM` gate. The gate
+  refused every Check and the placement never moved — the feature was simply
+  unavailable on this machine.
+- `fit_board_pose` now uses `calib::fit_similarity` (uniform scale + rotation +
+  translation, reflection-aware) instead of `fit_rigid`. The residual collapses
+  to the true registration error and the fit is accepted.
+- The scale is APPLIED, not just reported. `Placement` gained a `scale` term;
+  `affine()` is now `bed = s·R(rot)·(g − pivot) + t`, and since
+  `correspondences()` encodes that affine as three point pairs and
+  `pcbforge register --fiducials` fits a full affine from them, the scale
+  survives into the emitted `.lbrn2`. **The burn is resized.** At 1.038 a
+  100 mm trace comes out 103.8 mm. `correspondences_recover_the_placement_affine`
+  covers a non-unit scale specifically to keep that path honest.
+- This is deliberate, at the operator's explicit instruction, after being warned
+  of the risk below. It is the opposite of the calibration path's rule: the
+  metric paper→machine anchor (`FieldCal::paper_to_machine`) stays RIGID so a
+  galvo scale error keeps showing up as residual and `FieldCal::scale` stays a
+  pure diagnostic. Only the board pose absorbs scale.
+- Safety band: `POSE_SCALE_MIN = 0.90` / `POSE_SCALE_MAX = 1.10`, checked next to
+  the RMS gate. This is not belt-and-braces — it is the only guard left. A
+  similarity fit absorbs a spacing error instead of exposing it, so a
+  self-consistent misdetection at 1.5× now fits with an RMS near zero and would
+  sail through `POSE_MAX_RMS_MM`. A few percent is a plausible machine or
+  calibration scale error; ±10% is the wrong holes, or a layout that does not
+  describe this board. Outside the band the placement is left untouched and the
+  note names the measured scale.
+- Never silent. The scale and the resulting resize percentage appear in the
+  fiducial note, in the coloured verdict line, in `debug_summary`, and as a
+  readout with a "reset scale to 1.000" button in the Place tab. It is reset to
+  1.0 wherever the placement returns to nominal (the `load_place` recenter
+  branch, `set_side`).
+- **Residual risk, accepted knowingly.** The fit cannot tell WHERE the 3.8%
+  comes from. If it is the machine or the board, applying it is the correction.
+  If it originates in the CAMERA CALIBRATION — a mis-scaled lens map or an
+  off-nominal `px_per_mm` — then the board is fine and applying the scale
+  introduces a real 3.8% dimensional error in the burn, on every job, invisibly
+  correct-looking on the overlay because the overlay is drawn through the same
+  bad calibration. Cross-check the burned dimensions against calipers before
+  trusting this on a job that has to fit real parts.
+- Second-order: on the BACK face the fit sources go through
+  `cam::flip::entry_to_exit_mm`, itself a magnification. The rigid fit forced any
+  error in that exit model into the residual; the similarity fit now absorbs it
+  too. So a back-face `pose.scale` is machine scale × exit-model error, not pure
+  machine scale — compare front and back before reading either as a machine
+  constant.
+
+## 2026-07-26 — The Place tab is deleted; placement moves onto the Fiducial check
+
+Fiducial registration now works on the bench, and the Fiducial-check tab already
+draws the placed job as red vector outlines over the very frame the fit was
+measured in. That made the Place tab a second, staler view of the same thing:
+its image was a separate camera grab, composited a second time, of a board that
+might have moved since. The operator's call was to delete it outright rather
+than keep two places to look.
+
+- **`CentralTab::Place`, `place_view`, `PlacementState::{frame_img, base_rgba,
+  tex}`, `set_place_tex`, `recompose` and `CameraProjection::label` are gone.**
+  None had a live consumer once the tab did; keeping them "just in case" would
+  have left a full-frame RGBA cache being rebuilt for nothing. `crates/ui/src/place.rs`
+  STAYS — `Placement`, `affine`, `correspondences`, `composite_over*` and
+  `bbox_center_mm` are a library the Camera tab's AR overlay and
+  `examples/dump_place.rs` still use.
+- **Frame dimensions, not a frame image.** The only thing the deleted image was
+  still load-bearing for was `(w, h)`, which `nonlinear_maps_for_frame` checks
+  against `lens_frame_signature` before it will field-warp an export. With
+  nothing setting `placement.frame_img` any more, both etch buttons and the
+  drill emit would have refused forever. `place_frame_dims()` supplies it from
+  the fiducial frame, falling back to the last camera grab, and `drag_place_px`
+  takes `(width, height)` explicitly the way `place_projection` already did.
+- **The buttons moved to the Actions sidebar**, keeping every safety gate
+  unchanged (back-side refusal, `lightburn_busy`, the design-loaded
+  precondition, the calibration checks): `⤵ Load design`, `▶ Etch here
+  (register)`, `🔥 Etch + Run`, `⚙ Drills from KiCad`, `⤓ Emit drill holes →
+  LightBurn (no burn)`. The x/y/rot readout and the fiducial-fitted `scale`
+  went with them — the scale RESIZES the burn, so it has to stay visible
+  wherever the pose is. The path fields (`out .lbrn2`, LightBurn device, drill
+  `.drl`, drill out `.lbrn2`, bed frame) moved to the Job tab, beside the
+  Gerbers that feed them. Persistence keys are untouched: same fields, drawn
+  elsewhere.
+- **`load_place` loads the DESIGN, not a bed frame.** It no longer grabs the
+  camera — a capture whose only purpose was to be a backdrop. It parses the
+  Job-tab Gerbers, sets `pivot = bbox_center_mm(&ablate)`, and (only when
+  `!auto_pose`) parks the job on the centre of the current fiducial frame mapped
+  through `place_projection`, or on the work-area centre when there is no frame
+  or no calibration to map one with. The `auto_pose` guard is unchanged: a
+  fiducial lock is never recentred over.
+- **Drill emit derives its own paths.** An empty drill field with a KiCad
+  project set is no longer a refusal — the emit resolves
+  `<board dir>/pcbforge-gerbers/{pth,npth}.drl`, fills the field with whichever
+  exist, and proceeds. It deliberately does NOT re-run kicad-cli: the .drl files
+  are re-read from disk on every emit, so a fresh export is picked up for free,
+  and shelling the exporter from a burn button would be a surprise. With no
+  project, or no files there, the original "name a drill file" error stands.
+
+## 2026-07-26 — Drag the design on the Fiducial-check tab
+
+The placement is now adjusted where it is drawn. A drag that STARTS on the
+outlined design moves it; Shift+drag rotates it; a drag starting anywhere else
+keeps marking fiducials exactly as before. Ctrl (pan/zoom) always wins.
+
+- **The hit test is the outline's screen-space bounding box**, accumulated while
+  the outline is projected. Deliberately coarser than the true outline: a
+  point-in-polygon test over every copper ring, every frame, to decide whether a
+  press starts a move would cost far more than it buys, and a grab handle that
+  is slightly generous is easier to hit than one that is exact.
+- **The overlay function was reordered.** The outline used to be projected in
+  the paint pass, after the click handlers; the bbox has to exist before input
+  is dispatched, so projection now happens first (`project_placed_design`),
+  input second, painting last from the collected polylines.
+- **"This drag started on the design" is latched**, in `FiducialState::design_drag`,
+  on `drag_started` and held to `drag_stopped`. A per-frame local cannot hold it,
+  and without it the release of a design drag would drop a ✛ or add a
+  click-placed fiducial. It is a gesture, not a setting, so it is never
+  persisted.
+- **Translation goes through `drag_place_px`,** i.e. it is applied in PIXEL
+  space and derived from the pivot each frame, so the outline tracks the cursor
+  under a perspective homography and the rounding never accumulates.
+- **Rotation sign.** `Placement::affine` builds `[cos, −sin; sin, cos]`, so
+  `rot_deg` is counter-clockwise in the y-UP machine frame. Screen rows grow
+  DOWNWARD, so the view is a mirror of that frame and `atan2` over raw screen
+  coordinates measures angles of the opposite sense. The machine delta is
+  therefore the NEGATED screen delta: `angle(prev) − angle(curr)`. Pinned by
+  test rather than by inspection —
+  `shift_drag_rotates_in_the_machine_sense_not_the_screen_sense` asserts that
+  sweeping the pointer up-screen from the pivot's +x axis is +90°, and that a
+  sweep across the ±180 seam nudges instead of spinning a full turn.
+- **A manual move or rotate does NOT clear `auto_pose`.** The adjustment is
+  meant to survive re-Checks: `update_placement_from_fiducials` maps the current
+  placement back through `last_fit` and re-applies the offset under the new fit,
+  so the nudge travels with the board.
+
+## 2026-07-26 — One shared capture thread, released when idle
+
+Every one-shot camera grab used to open the device, take a frame and close it,
+on the UI thread: measured at ~2.1 s (open 280 ms, first-frame warm-up ~1.2 s,
+MSMF close 630 ms). The warm-up is device init, not bandwidth — it is still
+~1.04 s at 1280×720 — so no resolution or format change touches it. The only
+fix is to stop reopening.
+
+- **One `Capture`, owned by `RuntimeState`,** not one per tab. There is one
+  camera, so there can only be one open device; the Camera, Calibration and
+  Fiducial tabs each owning their own meant two ● Live toggles fought over it.
+  `ensure_capture` starts it (or restarts it when the source changes),
+  `capture_latest` is what all three Live pumps poll, and `grab_shared` is the
+  one-shot path. A later grab is now a slot read instead of a device open.
+- **A `Source::File` grab still goes straight through `camera::grab`.** It is
+  cheap, needs no device, and pushing it through a capture thread would trade a
+  guaranteed-current read of the file for whatever frame the thread last
+  happened to take.
+- **The first device grab after opening still blocks**, polling at 20 ms up to
+  4 s — the warm-up is charged by the device no matter who pays it, and 4 s
+  leaves headroom over the measured 1.2–1.5 s while still failing with a message
+  rather than hanging. Every grab after that takes the fast path.
+- **● Live off no longer releases the device.** This is a real behaviour change.
+  A tab's Live toggle now only means "this tab stops asking"; if the per-tab
+  pumps still dropped the capture, turning Live off on one tab would kill
+  another tab's feed. Release happens in exactly one place, `ui()`'s
+  `release_idle_capture`, once no tab is live AND the capture has been unused
+  for 10 s. Holding device N locks every other program off it — a
+  `pcbforge cam --grab --device 1` fails device-busy — so 10 s is picked to
+  outlast the pause between two "grab once" clicks (which is what makes the
+  second cheap) without keeping the CLI out for a shift.
+- **A failed grab drops the shared capture instead of caching it.** When the
+  device won't open, `device_loop` offers the error and its thread exits — the
+  slot is then empty forever. Reusing that capture would starve every later grab
+  into the 4 s timeout and replace the real "open camera N: …" message with a
+  generic one, for the whole idle window. So `grab_shared` clears the capture on
+  any error and the next attempt reopens.
+- **`device_loop` throttles when nobody is reading.** `Capture::latest` *takes*
+  the slot, so a still-occupied slot proves the last frame went unread: the loop
+  naps 15 ms instead of decoding another 5 MP frame. Without this, a
+  long-lived shared capture would burn a core the whole time it idled. It never
+  throttles a real feed — a live pump polls once per UI frame (~16 ms, it calls
+  `request_repaint`) against 109–125 ms/frame off the device, so the consumer
+  drains ~7× faster than the thread fills and the slot is empty at nearly every
+  check. Even `pump_calib_live`, which re-anchors per frame and so polls slower,
+  pays at worst one extra nap of latency, not a stall.
+
+## 2026-07-26 — The console keeps a durable diagnostic log
+
+Diagnosing the console meant asking the operator to screenshot the note line.
+That is slow, lossy, and gone the moment the app restarts — and the note line
+carries a sentence, not the numbers. The immediate motivation is a measured
+disagreement between the two paths that are supposed to agree: a fiducial check
+locks at 0.09 mm RMS and draws the design inside the fiducial rectangle, while
+the exported `placed.lbrn2` holds geometry centred ~67 mm left and ~35 mm below
+the detected fiducial centroid. Both paths start at `Placement::affine()`; the
+overlay continues through `CameraProjection::to_px` and the export through
+`Placement::correspondences()` → `pcbforge register --fiducials`. Nothing on
+screen says which leg is wrong.
+
+- **A plain-text file beside the settings blob**, `<db>.console-log`, from
+  `crate::diag`. std only, no logging crate, no background thread: the console
+  writes a handful of records per operator action, and a dependency (or a
+  channel and a drain thread) would be more machinery than the problem needs.
+- **One record per line, flushed per record.** Records are infrequent and the
+  last one before a crash is the interesting one, so buffering would discard
+  exactly what the file exists for. Embedded newlines fold to ` | ` — several
+  of the console's own log lines are multi-line, and a reader greps by line.
+- **Truncate at startup, rotate once to `.console-log.prev`.** A session's log
+  is about that session; keeping history would mean managing it. One rotation
+  covers the real case — the operator restarts the console and *then* reports
+  the problem. Hard-capped at 8 MB, closing with a "log capped" line rather
+  than filling the disk.
+- **Never fatal.** Every write failure is swallowed and latched; the app
+  mentions it once in the Log panel and then stops trying. A diagnostic that can
+  take the console down is worse than no diagnostic.
+- **Never per UI frame.** This is the constraint the design is built around:
+  `fid_frame_overlay` and the Live pumps run at frame rate. Records come from
+  state changes and explicit actions. The one value that *can* move every frame
+  — the placed design's machine-mm bbox — is guarded twice: by the placement
+  snapshot (which also skips the vertex sweep) and by a 0.05 mm epsilon on the
+  resulting box.
+- **`check=N` on everything that follows one fiducial check.** The check, the
+  overlay it produced and both halves of the export it fed are written from
+  different code paths, frames or a CLI round-trip apart — the export readback
+  only lands when the child process exits. Physical adjacency is impossible, so
+  `grep check=7` provides it instead.
+- **Three machine-mm numbers, chosen to isolate the legs.** The detected
+  fiducial centroid, the affine bbox (the common prefix of overlay and export,
+  so comparing it with the written file isolates the export leg), and the drawn
+  outline's screen bbox back-projected through the same projection (so comparing
+  it with the affine bbox isolates the projection leg).
+- **The export is measured, not assumed.** Once the verb reports success the
+  written `.lbrn2` is re-read and its geometry bbox logged, using the same
+  vertex parser the tests assert with (`diag::lbrn2_verts`, lifted out of
+  `app/tests.rs` rather than written twice). The record names its units:
+  coordinates are COMMANDED mm when a field map was applied and physical mm
+  otherwise — a distinction that is itself a candidate explanation.
+- **The readback is armed only when `run_verb` actually started the job.** A
+  refused click must not attribute an older file to it.
+- **Failure lines are mirrored by index, not at the call sites.** `LogLine`s
+  with `err: true` are pushed from ~50 places across every module; a per-frame
+  sweep over the tail of `runtime.log` cannot be forgotten when a new error path
+  is added. The cursor is adjusted alongside `pump_verb`'s 500-line trim, which
+  shifts every index down.
+
+## 2026-07-26 — ③ gains a third scale mode: correct the distortion, keep 1:1
+
+A rig measured its burn 32.2% smaller than the paper ruler. Step ③ offered only
+two answers, and both were wrong for it: refuse the fit, or absorb the scale
+into the field polynomial. Absorbing rescales command space by `1/scale`, so a
+90 mm work area needs 132 mm of command to cover — the operator loses a third of
+the machine to make shapes measure right.
+
+- **`allow_machine_scale: bool` becomes `calib::FieldScale`** with three
+  variants: `Refuse` (unchanged default), `Compensate` (the old `true`), and
+  the new `DistortionOnly`. The first two are behaviourally identical to before
+  — `Refuse`'s gate, its error text's marker, and `Compensate`'s absorbed-scale
+  arithmetic are untouched.
+- **`DistortionOnly` divides the uniform scale out of the FIELD POLYNOMIAL'S FIT
+  TARGETS, and nowhere else.** The measured physical positions are rescaled
+  about the commanded lattice's centroid by `1/scale` before `fit_field` sees
+  them, so the polynomial learns only the non-uniform component and comes out at
+  unit magnification: commanding X mm asks for X mm plus the distortion
+  correction. `FieldCal::scale` still reports the measured factor.
+- **`paper_to_machine` stays `fit_rigid`.** This is the load-bearing constraint,
+  not an implementation detail: that alignment is also `camera_px_to_physical`'s
+  metric anchor. Fitting a similarity there would absorb the scale into the
+  camera projection, and fiducial measurement, placement and the overlay would
+  silently inherit the factor — a far worse bug than the one being fixed. The
+  scale is therefore removed downstream of the frame alignment, on the fit
+  targets alone.
+- **The centroid is the fixed point** because `fit_rigid` maps the measured
+  centroid exactly onto the commanded one, so the normalization introduces no
+  translation. That assumes the grid is centred on the scan field; ③ already
+  warns when it is well off the configured field centre.
+- **Extrapolation is intended.** The map is queried across the whole configured
+  work area, not just the burned grid's span, and is deliberately not clamped to
+  it. A synthetic test sweeps 0–90 mm against a grid covering 15–75 mm and
+  asserts the correction stays finite, strictly monotonic, and tracking the true
+  radial inverse to ~1.5 mm. That bounds this synthetic pincushion at these
+  points; it does not certify extrapolated accuracy on a real measured field.
+- **What follows the fit vs. what follows the measurement.** `rms_um`, `max_um`
+  and `FieldDot::resid_um` are evaluated in the frame the polynomial was fit in,
+  so they always agree with each other and the overlay's dot colouring stays
+  meaningful. `physical_mm`, `field_um`, `scale` and `to_px` stay on the RAW
+  measurement — `to_px` especially, since the Place overlay shares the rigid
+  anchor's true-mm frame.
+- **The mis-size stays visible.** `DistortionOnly` does not correct the scale,
+  so the ③ status line names the mode and prints the measured percentage for as
+  long as that fit is active — not just in the one-shot fit note. The mode that
+  produced the active fit is tracked separately from the pending control choice
+  and persisted as a fourth `field_stats` token, so a restored calibration
+  describes itself honestly.
+- **Settings migration.** The retired bool `calib_allow_machine_scale` is still
+  read (`true` → `Compensate`, `false`/absent → `Refuse`); the new
+  `calib_field_scale` key (`refuse|compensate|distortion_only`) is what gets
+  written, and wins when both are present.
+
+## 2026-07-26 — Drag one ✛ onto its hole instead of remarking all four
+
+Fixing a single missed fiducial meant restarting the click-in-order round or
+clicking through every marker again. A primary drag that starts on a ✛ now
+moves that marker and re-checks on release.
+
+- **Priority: navigation → marker → design → mark.** Ctrl (pan/zoom) suppresses
+  everything, as everywhere else. The MARKER hit test runs BEFORE the design's,
+  because the design's grab handle is a coarse screen-space bounding box that
+  almost always contains the markers — testing the design first would make a ✛
+  ungrabbable whenever the outline is shown. Consequence, accepted and stated in
+  the on-screen hint: a Shift+drag starting on a ✛ moves the marker rather than
+  rotating the design.
+- **The grab is latched for the gesture** (`FiducialState::marker_drag`), like
+  `design_drag`: re-picking the nearest marker per frame lets a fast drag hop
+  between them. Both latches are read through one `fid_marking_allowed()`, so
+  the marking round, click-to-place and right-click-remove paths cannot drift
+  apart — a drag that grabbed something never also drops a ✛ on release.
+- **Only `search` moves; `layout` is never written.** The layout is the design
+  nominal that `fit_board_pose` fits against and that `scale_from_design`
+  measures the true px/mm from, so a dragged position leaking into it turns a
+  1 mm correction over a 50 mm baseline into ~2% of scale error everywhere
+  downstream (LR-17). A search marker says "look here"; the layout says "the
+  hole is here by design".
+- **Re-detect once on RELEASE, not per frame.** The ladder's third stage is a
+  whole-frame candidate scan. The ladder tries the operator's markers first, so
+  a good manual placement is kept — but only while it clears the ladder's
+  `AUTO_RECOVER_BELOW` bar or beats the later stages outright; below that a
+  projection seed or rectangle match may still win and move the ✛ set.
+- **The latched index is bounds-checked**, as `fid_mark_click`'s is: a typed
+  layout edit re-runs `sync_fid_markers` every frame and can shrink `search`
+  under an in-flight drag.
+- **Unverified end to end.** Canvas gestures are not accessible widgets, so the
+  press/move/release path itself is not driven by any test; the hit test, the
+  per-frame move, the suppression gate and the release re-check are covered as
+  units.
+
+## 2026-07-26 — One scuffed dot must not veto a whole ③ field calibration
+
+A real fit came back 49/49 dots, RMS 310 µm, worst 2075 µm against 100/250 µm
+limits — refused. That one dot carried 91% of the total squared residual; the
+other 48 sat at ~92 µm RMS, comfortably inside the limit. `fit_laser_field` now
+identifies outlying dots, refits without them, and reports what it excluded.
+
+- **MAD, not the standard deviation.** `sigma = 1.4826 · median|r − median r|`.
+  The SD is inflated by exactly the outliers being looked for, which is how a
+  2 mm dot hides itself inside its own spread estimate.
+- **The cut is `median + K·sigma`, floored.** `FieldDot::resid_um` is a
+  Euclidean magnitude, not a signed zero-mean residual, so its distribution sits
+  well away from zero; a literal `K·sigma` cut about zero lands at ~155 µm on
+  the case above and eats healthy 160–200 µm dots. `FIELD_OUTLIER_K = 3.5`, the
+  middle of the conventional 3–4 band.
+- **`FIELD_OUTLIER_FLOOR_UM = 250` — nothing below it is ever rejected.** A
+  near-perfect grid has a tiny sigma and would otherwise start discarding dots
+  for being merely ordinary. The floor is the console's default worst-dot
+  acceptance limit: a dot inside that limit can never be why a fit was refused,
+  so there is nothing to gain by dropping it. The limits are not threaded into
+  the fit on purpose — coupling by value means tightening acceptance raises the
+  bar without also licensing the fit to discard more evidence.
+- **`FIELD_OUTLIER_MAX_FRAC = 0.10`, and above it NOTHING is dropped.** More
+  than a small share reading as outliers is a bad capture or a model that does
+  not describe this field, not stray dots. The fit still returns so the operator
+  has numbers to read, the existing gates refuse as before, and the note says
+  the cap is why. Deleting an eighth of the evidence to make a laser
+  calibration pass is the failure this whole feature could otherwise become.
+- **A bad boundary corner SUSPENDS rejection entirely.** Not just "don't drop
+  that corner": drop nothing at all. Deleting the corner's neighbours removes
+  the constraints holding the polynomial away from it, the surface bends toward
+  the bad corner and its residual falls back under the limit — the same defeat
+  the four-corner gate exists to prevent, arriving by deleting the witnesses
+  instead of the victim. A corner sits at the bi-cubic's maximum leverage, so
+  this is not hypothetical: at 1.2 mm of corner error an earlier
+  drop-the-neighbours version excluded 2 innocent dots and pulled the corner's
+  residual from ~490 µm down to 258 µm, 8 µm from passing. A sweep from 0.8 to
+  1.6 mm now asserts nothing is ever excluded and acceptance always fails.
+  Note that `field_live_acceptance` checks corner PRESENCE in `dots`, and
+  rejected dots stay in `dots` (the overlay draws them) — so what refuses a
+  corner outlier is the residual gate, with the corner's error still in it, not
+  the corner gate.
+- **Rejection is not "not found".** `found` still counts every detected dot, so
+  the ≥80% coverage gate is unaffected. Excluded dots stay in `dots` with
+  `rejected = true` and keep a residual measured against the final map, which
+  reads large — that is the point.
+- **Only the field polynomial is refit.** `paper_to_machine`, the similarity and
+  `scale` stay over all dots: one outlier perturbs them by a rigid/uniform-scale
+  amount, and the polynomial absorbs constant and linear terms exactly, so the
+  survivors' residuals are unchanged by it. Refitting them would only make the
+  anchor that placement and the overlay share disagree with the dots it was
+  measured from. `to_px` and the pincushion-vs-noise verdict DO move to the
+  survivors — a 2 mm outlier reads as scatter and would have the verdict tell
+  the operator "correction won't help" about a fit just accepted.
+- **Two passes.** The cut comes from a robust spread, so the first pass already
+  sees an uninflated sigma and the second finds nothing in practice. Unbounded
+  iteration only adds ways for the set to erode one dot at a time until what is
+  left agrees with itself.
+- **Every failure path still returns a fit.** A refit that errors, or a cut over
+  the cap, falls back to the all-dots fit with `rejected = 0` and a note saying
+  so. Turning a marginal calibration into an `Err` would take away numbers the
+  operator could previously read.
+- **It is never silent.** `FieldCal::rejected` and `rejection_note` ride on the
+  one-shot fit note, on the standing ③ status line (`N EXCLUDED as outliers`),
+  in `debug_summary`, and in the fit-feedback overlay, where excluded dots are
+  struck out with a magenta ✕ at double radius instead of being coloured by a
+  residual they did not contribute to. A fit that passes only because a dot was
+  thrown away has to look different from one that passes outright.
+- **The count is persisted, the prose is not.** A fifth `field_stats` token
+  carries `rejected` across a restart, for the same reason the fit mode is
+  persisted: a restored calibration has to describe itself honestly, and
+  "passed once a dot was thrown away" must not come back looking like a clean
+  pass. The restored note says how many were excluded and to re-run ③ to see
+  which — the per-dot residuals are per-fit feedback and are not stored.
+- **Extrapolation is called out by name.** When an excluded dot also lies
+  outside the region the ① lens calibration covered, the note says so: that
+  combination is the signature of the metric ruler extrapolating rather than of
+  the laser field curving, and it routes the operator to a larger paper grid or
+  a smaller burn grid instead of to the machine.
+- **① `fit_camera_lens` was deliberately left alone.** It has the same shape and
+  plausibly the same vulnerability (the same session saw 74/81 dots there), but
+  the ① fit IS the metric ruler everything downstream is measured against, so
+  discarding evidence there has a wider blast radius and wants its own decision.
+
+## 2026-07-26 — Fiducial detection on brushed metal: matched filter, response-domain SNR, joint selection
+
+The operator's real surface is brushed, scratched, specular aluminium. Their
+diagnostic log recorded **95 of 168 checks finding fewer than 3 of the 4 holes**.
+`samples/fiducial/brushed-plate-4holes.png` is that frame, now committed as the
+acceptance fixture. Sampled patches on it: a hole reads min 15 / max 173 / mean
+115.1, and nearby "clean" plate reads min 6 / max 176 / mean 115.4. The mark and
+its background are statistically indistinguishable, and the brush scratches carry
+*more* contrast than the fiducials. Every part of the old detector keyed off raw
+pixel statistics, so every part of it failed here.
+
+- **A real disc-matched filter replaces the box mean.** The old "matched filter"
+  was a box mean at `dot_px/4` — a blur, answering "is anything here dark?",
+  which a 120 px scratch answers as loudly as a 2 mm hole. It is now centre mean
+  minus surrounding-annulus mean at the mark's own size: a compact blob of the
+  right size responds strongly, an elongated scratch does not, because the
+  surround contains the scratch too and cancels the centre. Centre and surround
+  are square approximations evaluated from one summed-area table, O(1) per pixel.
+  True discs would need a per-radius kernel and buy nothing — the discriminator
+  is the size and compactness of the support, not its outline.
+- **The centre follows the smaller extent, the surround the larger.** A surround
+  keyed to the smaller extent is filled ~45% by a 2 mm × 1 mm rectangle, which
+  cancels the contrast being measured; that mis-sizing cost 1.4 px of centroid
+  accuracy on the rect fixture. The search window grew to `search_px + surround`
+  to match, so a candidate at the edge of its window still gets an unclipped
+  surround.
+- **SNR is measured on the filter response, not on raw pixels.** This is the
+  point of the change: the response is what discriminates, so the response is
+  what gets a noise floor. On this plate the raw MAD is set by brush texture
+  (σ ≈ 19 grey levels where a hole's own contrast is ~63), and the old
+  `MIN_SNR = 3.5` against it excluded real holes.
+- **The gate is `MIN_RESPONSE_SNR = 3.0`, bracketed by measurement.** In the
+  detector's own windows, seeded 5 px off truth, the four holes read 3.42 / 6.03
+  / 5.38 / 6.03 — and at 3.0 they are the *only* candidates any of those four
+  windows produces. Not one scratch clears the gate. That is the evidence: there
+  is nothing between "every true hole" and "nothing else" to tune against. The
+  floor is the top-left hole at 3.42, weakest because its window straddles a
+  broad dark band that inflates the response MAD. The gate was not raised to
+  chase that margin — it would be fitting one frame's noise and would start
+  missing real holes.
+- **`SCAN_THR_SIGMA` was decoupled from the gate.** It used to be `MIN_SNR * 0.5`,
+  but it applies to raw-pixel σ in the whole-frame scan — a different noise
+  domain. Leaving it derived would have let the response-domain retune silently
+  move the scan's mask. It is now a standalone literal at its existing value, so
+  the scan stays bit-for-bit what the bench-plate arrangement match was tuned to.
+- **Thresholds are keyed to each candidate, not to the window's worst pixel.**
+  The old component threshold was `bg + 0.4·(peak − bg)` where `peak` was the
+  single most extreme pixel in the window — on scratched metal, essentially
+  never the fiducial. Each candidate is now thresholded against its own local
+  median and its own filter response.
+- **Sites are chosen jointly, not independently.** `find_fiducials` now collects
+  the top 5 candidates per site and picks the *combination* maximising summed
+  match quality minus a span-relative penalty on the residual of a similarity
+  fitted from the expected positions to the chosen points. Four independent
+  per-site picks are four chances to lock onto a different scratch; one geometric
+  decision is not, because a scratch has to sit where the layout says a mark
+  should be in order to compete. The public signature is unchanged — `ui` and the
+  CLI both call it.
+- **The fit is inline, not `calib::fit_similarity`.** `calib` depends on
+  `vision`, so calling it from here is a dependency cycle. It is the closed-form
+  2D Umeyama fit, done in *pixel* space rather than mm: the bed map may embed a
+  y-flip, and fitting through it would demand a reflection-aware similarity,
+  whereas expected-px → found-px is near-identity.
+- **Combinations are bounded and the fallback is real.** The product of the
+  per-site candidate counts is accumulated with `checked_mul` (it overflows
+  before any comparison could catch it) and capped at 20 000 — K=5 over 6 sites
+  is 15 625, and 5⁷ is 78 125. Past the cap, selection falls back to
+  consensus-offset: the largest cluster of candidate-minus-expected offsets wins,
+  then each site takes the candidate best reconciling quality with that
+  consensus. Same shape of answer as `calib::square_grid`'s lattice selection,
+  and linear in the candidate count. No real fixture reaches that branch (they
+  are all K=5 over ≤6 sites), so it is covered directly instead: two unit tests
+  on hand-built sites and an eight-site end-to-end case at 5⁸ combinations.
+  Agreement with the consensus is a HARD window there, not a penalty — scoring
+  disagreement continuously let a far-outside candidate accumulate a penalty
+  several times any candidate's score and invert the ranking, so the worst
+  candidate would have won. That was found by testing the branch, not by
+  reading it.
+- **Joint selection never manufactures a miss.** It reorders preferences; it does
+  not veto. A site with no candidate surviving the existing area/shape/aspect/
+  distance gates still returns `NoCandidate` exactly as before, and the geometric
+  term is a soft penalty with no hard reject at any threshold — it has to be,
+  since the truth quad's own worst similarity residual (22.5 px) is about the
+  whole search radius (22.3 px).
+- **Below three sites, geometry is skipped.** A similarity has 4 degrees of
+  freedom, so two point pairs fit it exactly and the residual is identically
+  zero. With fewer than three live sites the per-site ranking is already the
+  whole answer.
+- **Distance became a prior, not the rule.** `min_by(dist)` is gone: candidates
+  rank on match quality minus a penalty on `(dist / search_px)²`. The hard
+  `dist <= search_px` bound stays — that is the search-window contract, not a
+  heuristic.
+- **`find_fiducial_candidates` deliberately does NOT share the new filter.** The
+  code is shared and available, but the whole-frame pass's job is the opposite
+  one: be permissive and hand the caller's arrangement matcher everything that
+  could be a mark. Narrowing it to compact-blob responses would drop marks the
+  arrangement could have vouched for, and its only validation is the bench-plate
+  recovery test, which the change would silently re-tune.
+
+### What this fixture is NOT
+
+**The four holes are the corners of a 40 × 40 mm square on the plate, but they
+are not a square in the image, and the acceptance test does not claim they are.**
+Measured on the ground-truth centres: sides 450.8 / 476.1 / 435.1 / 418.3 px —
+13.8% spread about the 446.3 px nominal — and diagonals 644.3 / 614.9 px, 4.8%
+apart. Bottom longer than top with left longer than right is a coherent
+perspective pattern, not measurement error. `samples/fiducial/README.md` already
+records exactly this for the older bench fixture: "the plate is tilted relative
+to the camera — its diagonals differ by ~9%, so the observed quad is genuinely
+perspective-warped and no similarity fits it." The test therefore asserts
+per-corner distance to the measured centres (the load-bearing check), each side
+within 10% of nominal, side spread under 20%, and diagonals within 8% — and
+explicitly not equal sides, which would be a false claim about this bench.
+
+### Fixtures retuned, and why it is not gate-loosening
+
+Two low-contrast tests rendered a dot at depth 6 over ±6 noise as a stand-in for
+"too dim to see". A matched filter averages over a dot-sized region, cutting
+uniform pixel noise by roughly √(area), so that dot is now genuinely recoverable
+— it locks 1.5 px from truth. The fixtures were re-rendered dimmer (depth 1.5 in
+`vision`, 0.6 in `ui`, where the noise model differs) so they still model absence
+of signal. `dim_low_contrast_burn_is_now_found` asserted `snr < 5.0` against the
+old raw-pixel gate; that comparison is now between two different quantities, so
+the claim moved to where it still holds — the dim burn is found, at its true
+centre, with a healthy score. `SNR_FULL` (the score's saturation point) dropped
+from 10 to 6 for the same reason: response SNR runs lower than raw-pixel SNR for
+the same mark, and keeping 10 would have shown the operator four amber "weak"
+rows for four correct bench locks.
+
+### Known limit, recorded rather than tuned away
+
+A window seeded 22 px up into the broad dark brush band drops the top-left hole
+to SNR 2.31 and the site reports `LowContrast`. That is the safe failure — a miss
+naming the SNR, per the VIS-4 "low contrast is a lighting problem" rule, not a
+confident lock on a scratch — and it is covered by
+`brushed_plate_band_seeded_site_refuses_rather_than_locks_on_texture`. Separately,
+a site seeded on nothing but scratches returns a weak detection (snr 3.11, score
+0.185) rather than an outright miss. It sits under the console's `SCORE_OK` of
+0.25 where all four real holes score 0.34–0.83, so it shows as an amber row. A
+detector-side score floor would have suppressed it, but that would also take away
+the amber rows the operator is meant to see and judge, and a gate placed to
+exclude it would sit inside the 10% margin above the weakest true hole.
+
+## 2026-07-26 — Live re-acquires a moved board: stage 3 throttled, not skipped
+
+The fiducial ladder's third stage — the whole-frame rectangle match — used to be
+skipped outright under ● Live (`best_hits < AUTO_RECOVER_BELOW && !live`). That
+made a moved board unrecoverable without a manual Check, which is exactly the
+moment the operator has their hands on the work and not on the console. Stage 3
+now runs under Live too, gated on a cooldown instead of on `!live`.
+
+### Why it was skipped, in numbers
+
+The scan (`find_fiducial_candidates` plus the arrangement matcher) measures
+171–190 ms in release on the 2592×1944 bench frames, and 1.3–4.5 s in a dev
+build. The live loop's iteration is ~194 ms release (device ~8.7 fps). Running
+the scan on every frame that comes up short therefore roughly HALVES the feed —
+the original reason for the skip, and still a real constraint. Stages 1–2
+(operator markers, projection seed) are cheap and keep running per frame.
+
+### The two windows
+
+`GLOBAL_RECOVER_COOLDOWN` is 1 s, applied after a scan that recovered holes: one
+180 ms scan per second is ~18% of live time, dropping the feed from ~5 to
+~4.2 fps while it re-acquires. That is the price of following a board that just
+moved, and it is paid only while the board is actually lost.
+
+`GLOBAL_RECOVER_BACKOFF` is 4 s, applied after a scan that found nothing — and
+after the cheap early `Err` exits (bad scale, too few layout points, no frame)
+that never reach the scan at all, since none of those change frame to frame. A
+hopeless scene (board removed, lens cap on) must not burn 180 ms every second
+forever; at 4 s it costs ~4.5% of live time. This backoff is also what keeps a
+DEV build usable, where the same scan costs 1.3–4.5 s: one per 4 s is a painful
+feed but a moving one, where per-frame would wedge the console. There is no
+build-profile switch — one rule, tuned for the release console that is what the
+operator actually runs.
+
+The timestamp is stamped on ATTEMPT, before the outcome is known, then shortened
+to the 1 s window if the scan improved things. Stamping only on success would
+leave the hopeless case scanning every frame — the precise failure the backoff
+exists to prevent.
+
+### Consequences accepted
+
+The scan runs on the UI thread, so when it fires it costs one visible hitch
+(~180 ms release). Deliberately not moved to a background thread: the frame, the
+ladder's mutable state and egui's context would all have to cross the boundary,
+which is out of proportion to a sub-200 ms hitch at most once a second.
+
+Streamed frames are the ONLY thing throttled. A manual Check pressed while Live
+is on initially shared the feed's budget (both reached detection with just the
+`live` flag to go on), which made the button sometimes do nothing and let a
+failed Check suppress the feed's next scans — so detection now takes a
+`streamed` parameter set only by the Live pump, and every explicit action
+(Check, load, grab, the final marking click, a marker-drag release) scans
+unconditionally. When the cooldown suppresses a streamed scan, the note carries
+`rectangle match throttled under Live` — consistent with the existing rule that
+the note says which stage located the holes and why the others did not. A successful recovery under Live behaves exactly as it does
+for a Check: the matched markers are installed, detection re-runs from them, and
+the note says `located via rectangle match (…)`. A failed one leaves the
+operator's ✛ set untouched.
+
+The cooldown decision is a free-standing predicate, `should_global_recover`
+(same shape as `should_release_capture`), unit-tested for first-scan, in-window
+suppression, the two differing windows, and a Check ignoring the cooldown
+entirely; a second test drives the real ladder and asserts the second
+consecutive short Live frame reports throttled rather than rescanning. The live
+loop itself — real frames streaming off a device while the board moves — is not
+testable headlessly and is not claimed to be.
+
+## 2026-07-26 — The Live re-acquire cadence is an operator setting, not a constant
+
+The stage-3 throttle shipped with two hard-coded windows: 1 s after a
+whole-frame rectangle match that RECOVERED holes, 4 s after one that found
+nothing. Both numbers were tuned on the bench and neither was reachable from the
+console. The operator wants a board that keeps drifting followed more closely
+than once a second, and asked for 500 ms.
+
+So the pair collapses to one dial: `FiducialState::live_recover_s`, the
+re-acquire interval in seconds, default **0.5**, exposed as a `re-acquire s`
+DragValue beside the ● Live checkbox and persisted as `fid_live_recover_s`. The
+failure window stays a fixed 4× multiple (`RECOVER_BACKOFF_FACTOR`), which
+preserves the shipped 1 s : 4 s ratio rather than inventing a second dial nobody
+asked for — the two windows were never independent, they were one cadence and a
+"this is going nowhere" multiplier.
+
+### Why the interval is clamped, in two places
+
+0.1 ..= 10.0 s, enforced in the DragValue range AND on load in `settings_io`.
+The load clamp is not belt-and-braces: the settings file is plain text an
+operator can edit, and the ladder turns the value into a `Duration` with
+`from_secs_f64`, which PANICS on a negative or NaN. A clamp only in the widget
+would leave a hand-typed `-1` to take the console down on the next lost frame.
+The ladder re-clamps at the stamp site too, for the same reason and at no cost.
+
+The floor is also what bounds the real protection here. The backoff is what
+keeps a hopeless scene — board removed, lens cap on, wrong layout — from burning
+~180 ms every interval forever for a result that cannot change, and what keeps a
+DEV build alive, where the same scan costs 1.3–4.5 s. A very low interval
+weakens that, so 0.1 s is the floor and 0.4 s of backoff is the worst the
+operator can dial in.
+
+### Consequences accepted
+
+At the 0.5 s default the scan costs about a third of live time while it is
+re-acquiring, against ~18% at the old 1 s — a slower feed, deliberately traded
+for following a moving board. That is the operator's call to make, which is the
+point of surfacing it.
+
+`should_global_recover` is untouched: it already read the window out of
+`last_global_recover`'s `(Instant, Duration)` tuple, so making the window
+configurable needed no change to the predicate at all. Its test now derives the
+probe times from the windows instead of naming 2 s and 4 s outright, and asserts
+the configured interval is what governs (0.2 s in → a 0.2 s success window and a
+0.8 s failure window). The ladder-level test pins the interval at 10 s rather
+than inheriting the default, so two back-to-back detection passes on a loaded
+machine cannot walk past a sub-second window and rescan. The value appears in
+`debug_summary()`'s `fiducials:` line, so a headless `state` dump shows it, and
+a headless interaction test drives the field by its label and reads the change
+back out of that line — presence alone would have passed on the caption.
+
+## 2026-07-28 — LR-03 blocker list
+
+LR-03 (back-side "Etch here" refused until `register` gains `--mirror-x`,
+IMP-05) is not just a missing flag. Everything below is a dead path only
+because the mirror is refused; each becomes a live burn-geometry hazard the
+day `register --mirror-x` ships. Recorded so closing LR-03 does not happen
+without closing these too.
+
+- The mirror gate (`pose.flipped` vs the selected side) is degenerate for
+  mirror-symmetric fiducial layouts — including the default 4-corner
+  rectangle — where a physical flip is indistinguishable from a correspondence
+  swap and fits as a pure ~1.023 scale that passes the 0.90–1.10
+  `POSE_SCALE_MIN`/`MAX` gate. (Being fixed on this branch.)
+- Stage-3 whole-frame recovery matches the raw layout under proper rotations
+  ≤20° only — reflection-blind, so it fails outright on the back for
+  asymmetric layouts and silently succeeds with swapped correspondences for
+  symmetric ones. (Being fixed on this branch.)
+- Unset focal length/board thickness silently absorbs the ~2.3% exit parallax
+  (`entry_to_exit_mm`) into `pose.scale`, inside the 0.90–1.10 gate — an
+  oversized back job that reads as a clean fit. (Being fixed on this branch.)
+- `emit --mirror-x` without `--outline` corners each side on its own copper
+  bounding box, so front and back land in unrelated frames. (Being fixed on
+  this branch: mirror-x now requires `--outline`.)
+- LR-15 (back-side AR overlay double-mirror) was deferred as "display-only" —
+  that deferral is conditional on LR-03 staying closed. It is not independently
+  safe.
+- `exit_to_entry_mm` (the inverse of the parallax model) does not exist, so
+  adopting a measured back-side layout as the new nominal stays front-only
+  until it does.
+
+## 2026-07-28 — Scan-center frame convention
+
+`scan_center_mm` is a DESIGN-frame point; `scan_center_auto` is the
+fiducial-layout centroid in that same frame. `cam::flip` already documents the
+field as design-frame, but the console's hover text implied a measured machine
+quantity, and the two must not drift apart.
+
+The fit itself does not care: a wrong scan center is a constant offset in
+source space that the similarity fit's translation term absorbs, so it never
+shows up as residual. Downstream uses are not so forgiving — the parallax
+model (`entry_to_exit_mm`) is applied about this point, so a design-frame
+value fed a machine-frame number silently mis-shifts every back-side fiducial
+expectation by the difference. One convention is recorded: design frame. The
+console setting is persisted as of this branch. VIS-3 (field-center
+calibration) will supply a measured value mapped into the design frame at that
+point — not a second, competing frame.
+
+## 2026-07-28 — Recovery cannot choose a branch
+
+`recover --mark-done` followed `next` unconditionally at every stage,
+including one with a `next_alt`. At `flip`, that meant MarkDone jumped a
+double-sided board straight to `done`, skipping
+`fiducials_bottom`/`bulk_bottom`/`iso_check_bottom` — recreating, through the
+recovery door, exactly the LR-04 "silently skip the bottom side" scrap
+scenario the strict `PCBFORGE_DOUBLE_SIDED` parse was built to prevent.
+
+Fixed fail-closed: `recover --mark-done` now refuses at any stage that has a
+`next_alt` rather than guessing which branch the operator meant.
+
+## 2026-07-28 — The drill emit gets its own recipe
+
+"Emit drill holes" borrowed the Job tab's etch recipe (speed / frequency /
+Q-pulse / interval / passes) and emitted a **Fill** layer. Etching copper and
+punching through FR-4 are not the same process, and the settings that make a
+good isolation fill are not the settings that drill: the operator's drill
+numbers are 1000 mm/s, Line mode, 0.05 mm interval, wobble 0.02 mm step /
+0.05 mm size, 2 passes.
+
+So the drill emit now carries its own persisted recipe (`drill_*` keys,
+`DrillState`) with those values as defaults, and writes a Line layer — a hole
+is TRACED around its outline, not scan-filled. Power stays fixed at 20%: the
+emitter needs a `maxPower` and `AblationParams::validate` rejects 0, but pulse
+energy on this source is set by frequency and Q-pulse width, so it is not an
+operator knob. Frequency and Q-pulse keep the values the drill path already
+emitted (30 kHz / 1 ns).
+
+`cam::lbrn2` used to write `interval` for Fill layers only. It now writes it
+for a Line layer too when the caller sets one above zero — `EmitLayer::line`
+defaults it to 0, so every other Line layer (isolation, board cut, fiducial
+holes) emits exactly what it did before and the device profile keeps its own
+value there.
+
+The fiducial-hole generator stays on the etch recipe: those holes are burned
+into the jig, not through a board.
+
+## 2026-07-28 — The camera moved and the closed loop said nothing
+
+A bench incident: the camera was physically shifted after calibration, leaving
+the camera→machine map 1.065× and 8.5° wrong — ~9 mm of burn error at the
+corners of a 40 mm board. It was diagnosed only afterwards, from the
+diagnostic log, and only because the console happens to burn its own fiducial
+holes: it commanded a 40.00 mm hole square, and later Checks read those same
+holes back as 42.4×42.9 mm rotated 8.5°.
+
+That is a closed loop with a known fixed point. The laser cut the holes where
+it was told to and a drilled board cannot un-drill, resize or rotate itself, so
+commanded-vs-detected is camera↔laser error and nothing else. A fiducial fit
+against a nominal layout cannot make the same claim: a board is allowed to sit
+anywhere, so its rotation and translation prove nothing, and its scale can
+always be argued to be the board.
+
+Two console behaviours let the error through:
+
+1. **Layout adoption laundered it.** Faced with fits that would not settle, the
+   operator re-typed the fiducial layout to the DETECTED positions (in this
+   incident, and once before). From then on every Check compared the
+   measurement to itself: scale 1.000, rotation 0.017°, every gate green, the
+   full error still in every burn.
+2. **The one signal that fired scrolled away.** The mirror-scale ambiguity
+   warning (`warned-mirror-scale-ambiguous`) fired on seven consecutive checks
+   as a single line of note text under a button row.
+
+Two guards, both in the console:
+
+**Adoption refuses a size change.** The nominal layout and the detections are
+the same physical holes, so between them a board may move and turn — the fit
+absorbs both and neither is examined — but it cannot change SIZE. Past 2%,
+"⌖ layout from detection" refuses and names the number, pointing at the camera
+lens and laser field calibrations rather than at the layout. The threshold is
+chosen for a near-zero false-positive rate: 0.1% on a 40 mm square is 40 µm,
+and this console has already cost a bench once by refusing a legitimate 1.021
+front fit on an assumed baseline. A jig change does legitimately re-site holes,
+so the escape exists — but as a second, differently-labelled press carrying the
+percentage on its face and a line in the log, never as a silence. Typing
+coordinates cannot be gated the same way, so the console watches for the
+result instead: a layout that matches the last detections to within 0.2 mm and
+is a different size from the layout they were measured against latches a
+warning, whoever performed the adoption.
+
+**The loop is measured automatically.** The commanded positions of the last
+fid-holes burn are persisted (`fid_ref_holes`); every later Check whose
+detections match that pattern (nearest-neighbour, then verified against the
+fitted similarity — a mismatch declines with "no reference holes matched"
+rather than reporting garbage) yields a scale and rotation that are pure loop
+error. Green at ≤1% / ≤0.5°; past 2% / 1° a latched banner sits at the top of
+the fiducial tab until dismissed or until a healthy loop clears it. It does NOT
+refuse etches: the correspondence is a heuristic and a re-jigged plate must not
+be able to stop the bench. The contract is the banner, the number, the etch log
+line and `debug_summary()`.
+
+## 2026-07-28 — Height-induced camera parallax is modelled, not assumed away
+
+The ① camera-lens calibration is a *plane* measurement: every `px → mm` read is
+where that pixel's view ray crosses the plane the printed paper grid lay on. The
+operator's camera looks at the bed roughly 23° off perpendicular, so a feature
+that actually sits `h` mm above that plane is read at the wrong place — its ray
+keeps going and meets the calibration plane further from the camera, ~0.49 mm
+per mm of height on this rig, almost all of it along the foreshortened axis
+(≈ machine Y). Nothing downstream can see this. The lens fit's residuals are
+perfect; the answer is simply for the wrong surface. A 1.6 mm board sitting on
+the calibration surface is a ~0.8 mm registration error that reads as clean.
+
+**Two heights, both operator-set, both persisted, both defaulting to 0.** `mark
+surface height mm` is where the marked surface sits above the ① plane; `field
+cal plane mm` is where the ③ burned field grid sat. Positive is up, toward the
+camera. Only their DIFFERENCE moves anything: the burned-grid frame and the ③
+field polynomial were built from camera readings of dots at the ③ plane, so
+they are keyed on ①-plane readings *of features at that height*, not on true
+positions. The correction restates a reading from the mark height into the ③
+height's convention and hands that to the frame — one insertion point between
+the lens map and everything downstream, so detections, the overlay and the
+registered burn all move together or not at all. `0/0` is bit-for-bit the
+behaviour the console had before this existed, and a test asserts exactly that.
+
+**The geometry is derived from the lens fit, not typed in.** Sampling
+`px_to_mm` over the region the fit covers and re-fitting a plane homography
+separates two things a tilted pinhole leaves in that map: the perspective row
+`∇w` (fractional depth change per mm, `sin(tilt) / working_distance`, pointing
+away from the camera) and the Jacobian anisotropy at the field centre
+(`σ_min/σ_max = cos(tilt)`). Either alone leaves tilt and distance
+underdetermined; together they give both, and the nadir follows. The correction
+is then a pure radial scaling about the nadir — `h · tan(tilt)` at the field
+centre, per-pixel everywhere else, first order in `h / standoff` — which
+captures the apparent scale change as well as the lateral shift for free.
+
+Asking the operator for the tilt instead was rejected: a protractor against a
+camera housing is not the optical axis, and the number that matters is the one
+the calibration already contains.
+
+**It reports itself rather than being trusted.** `debug_summary()` and the
+camera panel carry the derived tilt, working distance, foreshortened-axis
+bearing (in machine axes) and the correction actually applied at field centre
+for the configured heights, so a wrong derivation is a visible number instead of
+a silently shifted burn. Caveat stated in the code: the polynomial lens map also
+carries genuine barrel/pincushion curvature, and a homography fit to it absorbs
+some of that into `∇w`, so this is a model of the fitted map rather than
+independent metrology of the mount. Where the fit has no usable perspective at
+all — an affine or near-perpendicular map — the feature reports "no tilt model
+in the lens fit" and applies nothing, rather than inventing a small tilt from
+fit noise and moving every placement by it.
+
+### 2026-07-28 addendum — three heights above the bed, each on the tab that knows it
+
+The two relative heights above turned out to be unanswerable at the console.
+"Above the ① calibration plane" asks the operator to remember, weeks later,
+what the paper sheet sat on, and it put both numbers on the Camera tab, which
+is where neither of them is learned. The stored quantities are now three
+ABSOLUTE heights sharing one reference — **the bed surface, positive up** —
+each recorded where the fact exists: `paper grid height mm` beside the ①
+controls on the Calibrate tab, `laser grid height mm` beside the ③ controls,
+and `surface height mm` on the Fiducial-check tab, next to the board it
+describes and to the ●/○ compensation status line (moved off the Camera tab
+with it). Nothing about the model changed: `plane_shift()` differences them
+into exactly the pair `PlaneShift` always took (`mark = surface − paper`,
+`field = laser − paper`), and `calib::tilt` is untouched. Only differences
+matter, so all-equal is still the identity, and all-zero is still the shipped
+default and bit-for-bit the pre-compensation chain.
+
+Keys: `calib_paper_height_mm`, `calib_laser_height_mm`, `fid_surface_height_mm`
+(±50 mm clamp, as before). The hours-old `mark_height_mm` / `field_plane_mm`
+keys are retired with no migration — they never reached a bench, and silently
+reinterpreting a relative height as an absolute one would be the one failure
+this whole entry exists to prevent. `debug_summary()`'s `height_comp:` line now
+quotes the raw trio alongside the derived geometry, because the differences are
+what the projection uses but the trio is what the operator typed.
+

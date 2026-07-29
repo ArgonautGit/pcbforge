@@ -20,20 +20,30 @@ pub struct Placement {
     pub tx_mm: f64,
     pub ty_mm: f64,
     pub rot_deg: f64,
+    /// Uniform scale about the pivot, from the fiducial fit (`fit_board_pose`).
+    /// This RESIZES the emitted job — 1.038 burns the design 3.8% larger — so
+    /// it is not a view setting. Nominal is 1.0.
+    pub scale: f64,
     /// Job pivot in Gerber mm (typically the job bbox center).
     pub pivot_mm: (f64, f64),
 }
 
 impl Placement {
     /// The affine `[a,b,c,d,e,f]` (mm→mm) taking Gerber coords to bed coords:
-    /// `bed = R(rot)·(g − pivot) + (tx,ty)`.
+    /// `bed = s·R(rot)·(g − pivot) + (tx,ty)`.
     pub fn affine(&self) -> [f64; 6] {
         let (s, c) = self.rot_deg.to_radians().sin_cos();
         let (px, py) = self.pivot_mm;
-        // bed = R·g + (t − R·pivot)
-        let cx = self.tx_mm - (c * px - s * py);
-        let cy = self.ty_mm - (s * px + c * py);
-        [c, -s, cx, s, c, cy]
+        let k = self.scale;
+        // Build the constant from the SCALED coefficients rather than scaling a
+        // separately-rounded R·pivot: that way `affine(pivot)` cancels to
+        // exactly (tx,ty) in floating point at any scale, which the placement
+        // readout and the register round-trip both depend on.
+        let (a0, a1) = (k * c, -(k * s));
+        let (a3, a4) = (k * s, k * c);
+        let cx = self.tx_mm - (a0 * px + a1 * py);
+        let cy = self.ty_mm - (a3 * px + a4 * py);
+        [a0, a1, cx, a3, a4, cy]
     }
 
     /// Three `dx,dy=tx,ty` correspondences (Gerber → bed) encoding this
@@ -162,7 +172,7 @@ pub fn composite_projected(
 }
 
 /// In-place variant of [`composite_projected`] for callers that keep a cached
-/// RGBA base frame (the Place tab re-blends on every drag step — rebuilding
+/// RGBA base frame (the AR overlay re-blends on every live frame — rebuilding
 /// the base from the gray frame each time costs a full-frame conversion).
 pub(crate) fn composite_over_projected(
     img: &mut ColorImage,
@@ -395,6 +405,7 @@ mod tests {
             tx_mm: 5.0,
             ty_mm: 5.0,
             rot_deg: 0.0,
+            scale: 1.0,
             pivot_mm: (5.0, 5.0),
         };
         let a = p.affine();
@@ -409,6 +420,7 @@ mod tests {
             tx_mm: 40.0,
             ty_mm: 25.0,
             rot_deg: 0.0,
+            scale: 1.0,
             pivot_mm: (5.0, 5.0),
         };
         let a = p.affine();
@@ -420,15 +432,51 @@ mod tests {
         assert!((bx - 40.0).abs() < 1e-9 && (by - 25.0).abs() < 1e-9);
     }
 
+    /// A non-unit scale still lands the pivot exactly on (tx,ty) — the whole
+    /// point of scaling ABOUT the pivot — and stretches everything else by
+    /// exactly that factor.
+    #[test]
+    fn scale_resizes_about_the_pivot() {
+        for rot_deg in [0.0, 37.0, -110.0] {
+            let p = Placement {
+                tx_mm: 40.0,
+                ty_mm: 25.0,
+                rot_deg,
+                scale: 1.038,
+                pivot_mm: (5.0, 5.0),
+            };
+            let a = p.affine();
+            let apply = |x: f64, y: f64| (a[0] * x + a[1] * y + a[2], a[3] * x + a[4] * y + a[5]);
+            let (bx, by) = apply(5.0, 5.0);
+            assert_eq!(
+                (bx, by),
+                (40.0, 25.0),
+                "the pivot maps EXACTLY to (tx,ty) at any scale/rotation"
+            );
+            // 10 mm from the pivot in the design lands 10·s mm from it on the bed.
+            let (qx, qy) = apply(15.0, 5.0);
+            assert!(
+                ((qx - bx).hypot(qy - by) - 10.0 * p.scale).abs() < 1e-9,
+                "rot {rot_deg}: span {} vs {}",
+                (qx - bx).hypot(qy - by),
+                10.0 * p.scale
+            );
+        }
+    }
+
     #[test]
     fn correspondences_recover_the_placement_affine() {
         // The 3 correspondences must fit back to exactly the placement affine
-        // (this is what register does downstream).
+        // (this is what register does downstream). The non-unit scale is
+        // load-bearing: it proves the fiducial-fitted resize survives the trip
+        // through `register --fiducials` into the burned file, rather than
+        // being silently dropped at the 3-pair encoding.
         use nalgebra::Point2;
         let p = Placement {
             tx_mm: 30.0,
             ty_mm: -10.0,
             rot_deg: 20.0,
+            scale: 1.05,
             pivot_mm: (7.0, 3.0),
         };
         let pairs: Vec<(Point2<f64>, Point2<f64>)> = p
@@ -470,6 +518,7 @@ mod tests {
             tx_mm: 10.0,
             ty_mm: 10.0,
             rot_deg: 0.0,
+            scale: 1.0,
             pivot_mm: (0.0, 0.0),
         };
         // Homography = a pure 8 px/mm scale (bed-mm (10,10) → px (80,80)),
@@ -498,6 +547,7 @@ mod tests {
             tx_mm: 10.0,
             ty_mm: 10.0,
             rot_deg: 0.0,
+            scale: 1.0,
             pivot_mm: (0.0, 0.0),
         };
         let curved = |x: f64, y: f64| Some((8.0 * x + 0.02 * x * x, 8.0 * y));
@@ -526,6 +576,7 @@ mod tests {
             tx_mm: 5.0,
             ty_mm: 5.0,
             rot_deg: 0.0,
+            scale: 1.0,
             pivot_mm: (0.0, 0.0),
         };
         let img = composite(&frame, &job, &p, 10.0, None, [200, 60, 60], 0.5);
@@ -556,6 +607,7 @@ mod tests {
             tx_mm: 5.0,
             ty_mm: 3.0, // 3 mm up from the machine origin — near the BOTTOM
             rot_deg: 0.0,
+            scale: 1.0,
             pivot_mm: (0.0, 0.0),
         };
         let img = composite(&frame, &job, &p, 10.0, None, [200, 60, 60], 0.9);
@@ -581,6 +633,7 @@ mod tests {
             tx_mm: 5.0,
             ty_mm: 5.0,
             rot_deg: 0.0,
+            scale: 1.0,
             pivot_mm: (0.0, 0.0),
         };
         let img = composite(&frame, &job, &p, 10.0, None, [220, 40, 40], 0.6);
@@ -604,6 +657,7 @@ mod tests {
             tx_mm: 0.0,
             ty_mm: 0.0,
             rot_deg: 0.0,
+            scale: 1.0,
             pivot_mm: (0.0, 0.0),
         };
         // Finite projection pushing the whole poly far negative (off-frame).
@@ -637,6 +691,7 @@ mod tests {
             tx_mm: 1.0,
             ty_mm: 1.0,
             rot_deg: 0.0,
+            scale: 1.0,
             pivot_mm: (0.0, 0.0),
         };
         // Uniform 10 px/mm, y-up: bed x∈[-1,3] → cols [-10,30]; bed y∈[-1,3] →
