@@ -684,6 +684,29 @@ fn the_camera_laser_loop_readout_is_on_the_fiducial_tab() {
     assert!(h.query_by_label_contains("adopt anyway").is_none());
 }
 
+/// The frame-file replay is the tab's demoted, explicit path: its button is
+/// dead until there is a path to replay, so the only action available on a
+/// fresh tab is the camera one.
+#[test]
+fn the_from_file_button_is_disabled_until_a_frame_path_is_typed() {
+    let mut h = console();
+    h.get_by_label("◎ Fiducial check").click();
+    h.run();
+    assert!(
+        h.get_by_label("⤵ from file").is_disabled(),
+        "no path, no replay"
+    );
+
+    let field = h.get_by_label("frame file (optional)");
+    field.focus();
+    field.type_text("some-frame.png");
+    h.run();
+    assert!(
+        !h.get_by_label("⤵ from file").is_disabled(),
+        "a typed path enables the replay button"
+    );
+}
+
 #[test]
 fn fiducial_tab_exposes_its_controls_after_the_panel_split() {
     let mut h = console();
@@ -699,6 +722,10 @@ fn fiducial_tab_exposes_its_controls_after_the_panel_split() {
     assert!(
         h.query_by_label("🎯 Check fiducials").is_some(),
         "Check button present after the split"
+    );
+    assert!(
+        h.query_by_label("📷 Load frame").is_some(),
+        "the camera is the tab's primary acquisition button"
     );
     assert!(
         h.query_by_label("↺ reset markers").is_some(),

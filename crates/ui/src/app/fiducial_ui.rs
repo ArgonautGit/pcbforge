@@ -418,13 +418,23 @@ impl ConsoleApp {
     /// markers from the design layout (so they start near nominal, ready to
     /// click onto the real holes).
     pub fn load_fid_frame(&mut self, ctx: &Context) {
-        let img = match image::open(crate::clean_path(&self.fiducials.frame)) {
+        let path = crate::clean_path(&self.fiducials.frame);
+        let img = match image::open(&path) {
             Ok(i) => i.to_luma8(),
             Err(e) => {
                 self.fiducials.note = format!("frame: {e}");
                 return;
             }
         };
+        // A saved frame is a replay, and a replay of the wrong image is exactly
+        // what this path gets used for by accident (a stale path left in the
+        // field). Refuse it here, naming the file, rather than installing it and
+        // letting the placement fail later with a resolution error that names
+        // nothing.
+        if let Some(mismatch) = self.frame_calibration_mismatch(&img) {
+            self.fiducials.note = format!("frame: {path} is {mismatch}");
+            return;
+        }
         if !self.set_fid_frame(ctx, img) {
             return;
         }
@@ -447,12 +457,17 @@ impl ConsoleApp {
 
     /// Grab one frame from the camera (the source picked in the Camera tab —
     /// device or file), install it as the fiducial-check frame, and detect
-    /// immediately. The one-click camera path for the fiducial check; ● Live
-    /// does the same continuously.
+    /// immediately. The tab's primary acquisition path; ● Live does the same
+    /// continuously.
     pub fn grab_fid_frame(&mut self, ctx: &Context) {
         match self.grab_shared() {
             Ok(img) => {
                 let img = self.camera.orientation.apply(img);
+                // Unlike a file replay this is installed anyway: the operator
+                // may be mid-recalibration, and then the camera — not the
+                // stored calibration — is the ground truth they asked for. The
+                // warning is appended after detection, which rewrites the note.
+                let mismatch = self.frame_calibration_mismatch(&img);
                 self.set_fid_frame(ctx, img);
                 // Put the markers on the holes through the calibration when
                 // there is one; without it, detect at the raw layout seeds as
@@ -462,6 +477,9 @@ impl ConsoleApp {
                     self.fiducials.marking = None;
                 }
                 self.detect_fiducials(false);
+                if let Some(m) = mismatch {
+                    self.fiducials.note.push_str(&format!("  ·  ⚠ camera: {m}"));
+                }
                 if let Some(e) = fallback {
                     // Appended after detection, which rewrites the note.
                     self.fiducials.note.push_str(&format!("  ·  {e}"));
@@ -469,6 +487,26 @@ impl ConsoleApp {
             }
             Err(e) => self.fiducials.note = format!("camera: {e}"),
         }
+    }
+
+    /// How an incoming frame disagrees with the camera-lens calibration's own
+    /// resolution, as the tail of a note naming the source ("… is {this}").
+    /// `None` when there is no lens calibration to disagree with, or the frame
+    /// matches it.
+    ///
+    /// Checked where the frame ENTERS the tab, so a wrong image is named at the
+    /// moment it is offered rather than several steps later, when the placement
+    /// projection refuses with no idea what it is looking at.
+    fn frame_calibration_mismatch(&self, img: &image::GrayImage) -> Option<String> {
+        self.calibration.lens.as_ref()?;
+        let ((cw, ch), _) = self.calibration.lens_frame_signature?;
+        let (w, h) = img.dimensions();
+        ((w, h) != (cw, ch)).then(|| {
+            format!(
+                "{w}×{h}, not a usable frame for this calibration — the camera \
+                 lens is calibrated for {cw}×{ch}"
+            )
+        })
     }
 
     /// Install `img` as the fiducial-check frame (texture + cache) and sync
@@ -1316,19 +1354,14 @@ impl ConsoleApp {
     /// summary rows, and measured scale.
     pub fn render_fiducials(&mut self, ctx: &Context) {
         self.sync_fid_markers();
-        // No frame yet: pull one from the file path if set, else grab from
-        // the camera — so Check works camera-first without a file.
+        // No frame yet: ALWAYS grab from the camera. The frame-file path is
+        // replayed only by its own ⤵ from file button — a Check that quietly
+        // preferred a path left in the field decoded whatever stale image it
+        // pointed at, and the operator had no sign the board under the camera
+        // was never looked at.
         if self.fiducials.frame_img.is_none() {
-            if crate::clean_path(&self.fiducials.frame).is_empty() {
-                self.grab_fid_frame(ctx);
-                return; // grab already detects (or reported the error)
-            }
-            self.load_fid_frame(ctx);
-            // The load finished the job: it either seeded through the
-            // calibration and checked, or opened the click round whose last
-            // click checks. Falling through would detect a second time and
-            // bury the round's "click fiducial 1 of N" prompt.
-            return;
+            self.grab_fid_frame(ctx);
+            return; // grab already detects (or reported the error)
         }
         if self.fiducials.search.is_empty() {
             self.fiducials.note = "load a frame first".into();
@@ -2222,12 +2255,33 @@ impl ConsoleApp {
             .spacing([8.0, 6.0])
             .show(ui, |ui| {
                 let lbl = ui.label("frame file (optional)");
-                ui.add(egui::TextEdit::singleline(&mut self.fiducials.frame).desired_width(240.0))
+                // The file path and the button that replays it live together:
+                // this is the only thing the path does, and the button is the
+                // only way to reach it.
+                ui.horizontal(|ui| {
+                    ui.add(
+                        egui::TextEdit::singleline(&mut self.fiducials.frame).desired_width(240.0),
+                    )
                     .labelled_by(lbl.id)
                     .on_hover_text(
-                        "Leave empty to use the camera (source picked in the \
-                         Camera tab); set a path to check a saved image instead.",
+                        "A saved image to replay with ⤵ from file. Everything \
+                         else on this tab — 📷 Load frame, 🎯 Check, ● Live — \
+                         goes to the camera and ignores this path.",
                     );
+                    let has_path = !crate::clean_path(&self.fiducials.frame).is_empty();
+                    if ui
+                        .add_enabled(has_path, egui::Button::new("⤵ from file"))
+                        .on_hover_text(
+                            "Replay the saved frame at this path instead of the \
+                             camera. Checks an image taken earlier — it does NOT \
+                             look at the board under the camera now.",
+                        )
+                        .clicked()
+                    {
+                        let ctx = ui.ctx().clone();
+                        self.load_fid_frame(&ctx);
+                    }
+                });
                 ui.end_row();
                 ui.label("fiducial rect W mm");
                 let mut rect_edited = ui
@@ -2362,23 +2416,17 @@ impl ConsoleApp {
         // last buttons simply become unreachable at any sane window width.
         ui.horizontal_wrapped(|ui| {
             if ui
-                .button("📷 Grab & check")
+                .button("📷 Load frame")
                 .on_hover_text(
-                    "Grab one frame from the camera (source picked in the \
-                     Camera tab) and run detection on it.",
+                    "Take one frame from the camera source picked in the Camera \
+                     tab and run detection on it. This tab checks the board \
+                     that is under the camera now; to replay a saved image \
+                     instead, use ⤵ from file beside the frame-file path.",
                 )
                 .clicked()
             {
                 let ctx = ui.ctx().clone();
                 self.grab_fid_frame(&ctx);
-            }
-            if ui
-                .button("⤵ Load frame")
-                .on_hover_text("Load the frame file above instead of the camera.")
-                .clicked()
-            {
-                let ctx = ui.ctx().clone();
-                self.load_fid_frame(&ctx);
             }
             if ui.button("🎯 Check fiducials").clicked() {
                 let ctx = ui.ctx().clone();

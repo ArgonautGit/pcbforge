@@ -504,10 +504,10 @@ fn job_tab_lays_out_with_the_placement_paths_and_actions() {
     assert!(!out.shapes.is_empty(), "job tab must render");
 }
 
-/// The fiducial check runs straight off the camera: "Grab & check" pulls
+/// The fiducial check runs straight off the camera: "📷 Load frame" pulls
 /// one frame from the camera source (a File source here — the same
 /// contract a capture app fulfills) and detects on it in one step, and
-/// "Check fiducials" with no frame file falls back to the camera too.
+/// "Check fiducials" with no frame in memory goes to the camera too.
 #[test]
 fn fiducial_check_grabs_from_the_camera() {
     let dir = std::env::temp_dir().join(format!("ui-fidgrab-{}", std::process::id()));
@@ -568,6 +568,129 @@ fn fiducial_check_grabs_from_the_camera() {
         app3.fiducials.note.starts_with("camera:"),
         "camera error surfaced: {}",
         app3.fiducials.note
+    );
+}
+
+/// A path left in the frame-file field does NOT divert the check. Check is
+/// camera-first unconditionally now: a stale path used to win, so the console
+/// decoded some old image while the board sat under the camera unlooked-at.
+/// The file is reachable only through its own ⤵ from file button.
+#[test]
+fn check_ignores_a_stale_frame_path_and_uses_the_camera() {
+    let dir = std::env::temp_dir().join(format!("ui-fidstale-{}", std::process::id()));
+    std::fs::create_dir_all(&dir).unwrap();
+    let ppm = 10.0;
+    let holes = [(10.0, 10.0), (60.0, 10.0), (10.0, 60.0)];
+    // What the camera sees, and a stale saved image of nothing at all.
+    let cam = dir.join("bed-now.png");
+    write_hole_frame(&cam, ppm, &holes);
+    let stale = dir.join("stale.png");
+    image::GrayImage::from_pixel(48, 32, image::Luma([200]))
+        .save(&stale)
+        .unwrap();
+
+    let mut app = ConsoleApp::new(tmp_db(), vec!["true".into()]);
+    app.camera.use_device = false;
+    app.camera.file = cam.to_string_lossy().into();
+    app.fiducials.frame = stale.to_string_lossy().into();
+    app.fiducials.layout = "10,10; 60,10; 10,60".into();
+    app.fiducials.px_per_mm = ppm;
+    let ctx = Context::default();
+    app.render_fiducials(&ctx);
+
+    assert_eq!(
+        app.fiducials.frame_img.as_ref().map(|f| f.dimensions()),
+        Some((700, 700)),
+        "the camera frame was installed, not the 48×32 file: {}",
+        app.fiducials.note
+    );
+    assert_eq!(
+        app.fiducials.found.iter().filter(|f| f.is_some()).count(),
+        3,
+        "Check detected on the camera frame: {:?}",
+        app.fiducials.rows
+    );
+
+    // …and with the camera dead, Check says so — it does not silently fall
+    // back to the file the operator can still see in the field.
+    let mut blind = ConsoleApp::new(tmp_db(), vec!["true".into()]);
+    blind.camera.use_device = false;
+    blind.camera.file = String::new();
+    blind.fiducials.frame = stale.to_string_lossy().into();
+    blind.fiducials.layout = "10,10; 60,10; 10,60".into();
+    blind.render_fiducials(&ctx);
+    assert!(
+        blind.fiducials.note.starts_with("camera:") && blind.fiducials.frame_img.is_none(),
+        "the camera's own error is what Check reports: {}",
+        blind.fiducials.note
+    );
+}
+
+/// Frames are resolution-checked where they enter the tab. A saved image that
+/// does not match the lens calibration is refused outright — named, with both
+/// resolutions — instead of being installed to fail several steps later in the
+/// placement projection, which knows nothing about where the frame came from.
+#[test]
+fn a_file_frame_that_does_not_match_the_calibration_is_refused_by_name() {
+    let dir = std::env::temp_dir().join(format!("ui-fidres-{}", std::process::id()));
+    std::fs::create_dir_all(&dir).unwrap();
+    let path = dir.join("not-a-frame.png");
+    image::GrayImage::from_pixel(48, 32, image::Luma([200]))
+        .save(&path)
+        .unwrap();
+
+    // Calibrated at 800×800 (see `nonlinear_app`).
+    let mut app = nonlinear_app();
+    app.fiducials.frame = path.to_string_lossy().into();
+    app.load_fid_frame(&Context::default());
+
+    assert!(
+        app.fiducials.frame_img.is_none(),
+        "the mismatched frame was not installed"
+    );
+    let note = &app.fiducials.note;
+    assert!(
+        note.contains(&*path.to_string_lossy())
+            && note.contains("48×32")
+            && note.contains("800×800")
+            && note.contains("not a usable frame for this calibration"),
+        "the note names the file and both resolutions: {note}"
+    );
+}
+
+/// The camera is treated differently on the same mismatch: it is the source the
+/// operator asked for and may well be the one that is right (mid-recalibration,
+/// the stored resolution is the stale half), so its frame is installed — but
+/// loudly, at the moment it arrives.
+#[test]
+fn a_camera_frame_that_does_not_match_the_calibration_warns_but_installs() {
+    let dir = std::env::temp_dir().join(format!("ui-fidrescam-{}", std::process::id()));
+    std::fs::create_dir_all(&dir).unwrap();
+    let path = dir.join("bed.png");
+    let ppm = 10.0;
+    write_hole_frame(&path, ppm, &[(10.0, 10.0), (60.0, 10.0), (10.0, 60.0)]);
+
+    // Calibrated at 800×800 (see `nonlinear_app`); the frame is 700×700.
+    let mut app = nonlinear_app();
+    app.camera.use_device = false;
+    app.camera.file = path.to_string_lossy().into();
+    app.fiducials.layout = "10,10; 60,10; 10,60".into();
+    app.fiducials.px_per_mm = ppm;
+    app.grab_fid_frame(&Context::default());
+
+    assert_eq!(
+        app.fiducials.frame_img.as_ref().map(|f| f.dimensions()),
+        Some((700, 700)),
+        "the camera frame is installed anyway: {}",
+        app.fiducials.note
+    );
+    let note = &app.fiducials.note;
+    assert!(
+        note.contains("⚠ camera")
+            && note.contains("700×700")
+            && note.contains("800×800")
+            && note.contains("not a usable frame for this calibration"),
+        "the warning names the camera and both resolutions: {note}"
     );
 }
 
